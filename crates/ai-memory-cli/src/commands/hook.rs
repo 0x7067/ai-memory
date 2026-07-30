@@ -26,9 +26,9 @@ use crate::cli::HookArgs;
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
-    marker_query_suffix_without_briefing, marker_requests_briefing, resolve_cwd_with_fallbacks,
-    url_encode,
+    build_client, canonical_context, canonical_context_for_agent, capture_policy, extract_cwd,
+    get_handoff, marker_query_suffix, marker_query_suffix_without_briefing,
+    marker_requests_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -701,11 +701,12 @@ fn parse_hook_payload(mut payload: String) -> serde_json::Result<(String, serde_
 }
 
 fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option<String>) {
-    let (cwd, session_id) = canonical_context(raw);
+    let agent_kind = AgentKind::from_wire(agent);
+    let (cwd, session_id) = canonical_context_for_agent(agent_kind, raw);
     if cwd.is_some() {
         return (cwd, session_id);
     }
-    if AgentKind::from_wire(agent) == AgentKind::Devin {
+    if agent_kind == AgentKind::Devin {
         (
             resolve_cwd_with_fallbacks(raw, env_lookup, || std::env::current_dir().ok()),
             session_id,
@@ -806,6 +807,23 @@ mod tests {
     fn resolve_data_dir_leaves_plain_path_untouched() {
         let resolved = resolve_data_dir(Some(Path::new(r"C:\Users\me\ai-memory")));
         assert_eq!(resolved, PathBuf::from(r"C:\Users\me\ai-memory"));
+    }
+
+    #[test]
+    fn cursor_hook_context_uses_one_conversation_across_official_fixtures() {
+        for fixture in [
+            include_str!("../../../../tests/fixtures/cursor/session-start.json"),
+            include_str!("../../../../tests/fixtures/cursor/stop.json"),
+        ] {
+            let payload: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            assert_eq!(
+                hook_context("cursor", &payload),
+                (
+                    Some("/workspace/cursor-project".into()),
+                    Some("cursor-conversation-123".into())
+                )
+            );
+        }
     }
 
     #[test]

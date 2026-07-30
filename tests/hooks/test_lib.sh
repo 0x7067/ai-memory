@@ -87,7 +87,7 @@ assert_eq "extract cwd from antigravity workspacePaths" "/home/u/agy" "$(ai_memo
 CURSOR_SESSION_START=$(tr '\n' ' ' <"$(dirname "$0")/../fixtures/cursor/session-start.json")
 assert_eq "extract cwd from Cursor workspace_roots fixture" "/workspace/cursor-project" \
     "$(ai_memory_extract_cwd "$CURSOR_SESSION_START")"
-assert_eq "extract session from Cursor conversation_id fixture" "cursor-conversation-123" \
+assert_eq "legacy Cursor fixture keeps session_id precedence" "cursor-startup-session-456" \
     "$(ai_memory_extract_session_id "$CURSOR_SESSION_START")"
 PAYLOAD_PRECEDENCE='{"session_id":"existing","conversationId":"old","conversation_id":"cursor","cwd":"/existing","workspacePaths":["/old"],"workspace_roots":["/cursor"]}'
 assert_eq "Cursor cwd alias preserves existing precedence" "/existing" \

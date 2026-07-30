@@ -345,32 +345,40 @@ impl HookEnvelope {
         // Cursor uses `conversation_id`.
         // JSON keys are case-sensitive, so all spellings must be listed
         // or tool events fail the router's "missing session_id" check.
-        let body_session_id = extract_string(
-            &raw,
-            &[
-                "session_id",
-                "sessionId",
-                "sessionID",
-                "session",
-                "conversationId",
-                "conversation_id",
-            ],
-        )
-        .or_else(|| {
-            extract_string_path(
-                &raw,
-                &[
-                    &["info", "id"],
-                    &["properties", "sessionID"],
-                    &["properties", "info", "id"],
-                    &["event", "properties", "sessionID"],
-                    &["event", "properties", "info", "id"],
-                    &["payload", "info", "id"],
-                    &["payload", "properties", "sessionID"],
-                    &["payload", "properties", "info", "id"],
-                ],
-            )
-        });
+        let cursor_conversation_id = if agent == AgentKind::Cursor {
+            extract_string(&raw, &["conversation_id"])
+        } else {
+            None
+        };
+        let body_session_id = cursor_conversation_id
+            .or_else(|| {
+                extract_string(
+                    &raw,
+                    &[
+                        "session_id",
+                        "sessionId",
+                        "sessionID",
+                        "session",
+                        "conversationId",
+                        "conversation_id",
+                    ],
+                )
+            })
+            .or_else(|| {
+                extract_string_path(
+                    &raw,
+                    &[
+                        &["info", "id"],
+                        &["properties", "sessionID"],
+                        &["properties", "info", "id"],
+                        &["event", "properties", "sessionID"],
+                        &["event", "properties", "info", "id"],
+                        &["payload", "info", "id"],
+                        &["payload", "properties", "sessionID"],
+                        &["payload", "properties", "info", "id"],
+                    ],
+                )
+            });
         let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
             .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
@@ -1269,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_extracts_official_cursor_fixtures() {
+    fn official_cursor_fixtures_resolve_to_one_conversation() {
         for (event, fixture) in [
             (
                 "session-start",
@@ -1297,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_aliases_preserve_existing_precedence() {
+    fn cursor_conversation_id_precedes_other_session_aliases() {
         let env = HookEnvelope::from_query_and_body(
             HookQuery {
                 event: "session-start".into(),
@@ -1311,6 +1319,25 @@ mod tests {
                 "cwd": "/existing/cwd",
                 "workspacePaths": ["/existing/workspace"],
                 "workspace_roots": ["/cursor/workspace"]
+            }),
+        );
+
+        assert_eq!(env.session_id.as_deref(), Some("cursor-conversation"));
+        assert_eq!(env.cwd.as_deref(), Some("/existing/cwd"));
+    }
+
+    #[test]
+    fn non_cursor_session_alias_precedence_is_unchanged() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "existing-session",
+                "conversation_id": "cursor-conversation",
+                "cwd": "/existing/cwd"
             }),
         );
 

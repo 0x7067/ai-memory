@@ -1,5 +1,6 @@
 {
   "hook_event_name": "sessionStart",
+  "session_id": "cursor-startup-session-456",
   "conversation_id": "cursor-conversation-123",
   "generation_id": "cursor-generation-123",
   "model": "cursor-model",

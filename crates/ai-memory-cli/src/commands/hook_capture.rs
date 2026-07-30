@@ -158,6 +158,30 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
     (cwd, session)
 }
 
+/// Canonical routing context with agent-specific identity rules.
+///
+/// Cursor can send both a startup-only `session_id` and the durable
+/// `conversation_id` on SessionStart, then only `conversation_id` on later
+/// events. Prefer the conversation id for Cursor so one native session does
+/// not split across two stored sessions. Every other agent keeps the generic
+/// precedence in [`canonical_context`].
+#[must_use]
+pub fn canonical_context_for_agent(
+    agent: ai_memory_core::AgentKind,
+    payload: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let (cwd, session_id) = canonical_context(payload);
+    if agent != ai_memory_core::AgentKind::Cursor {
+        return (cwd, session_id);
+    }
+    let conversation_id = payload
+        .get("conversation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    (cwd, conversation_id.or(session_id))
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
@@ -680,14 +704,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_context_matches_official_cursor_fixtures() {
+    fn official_cursor_fixtures_resolve_to_one_native_conversation() {
         for fixture in [
             include_str!("../../../../tests/fixtures/cursor/session-start.json"),
             include_str!("../../../../tests/fixtures/cursor/stop.json"),
         ] {
             let payload: serde_json::Value = serde_json::from_str(fixture).unwrap();
             assert_eq!(
-                canonical_context(&payload),
+                canonical_context_for_agent(ai_memory_core::AgentKind::Cursor, &payload),
                 (
                     Some("/workspace/cursor-project".into()),
                     Some("cursor-conversation-123".into())
@@ -697,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_aliases_preserve_existing_native_precedence() {
+    fn cursor_conversation_id_precedes_other_native_session_aliases() {
         let payload = serde_json::json!({
             "session_id": "existing-session",
             "conversationId": "existing-conversation",
@@ -708,7 +732,24 @@ mod tests {
         });
 
         assert_eq!(
-            canonical_context(&payload),
+            canonical_context_for_agent(ai_memory_core::AgentKind::Cursor, &payload),
+            (
+                Some("/existing/cwd".into()),
+                Some("cursor-conversation".into())
+            )
+        );
+    }
+
+    #[test]
+    fn non_cursor_session_alias_precedence_is_unchanged() {
+        let payload = serde_json::json!({
+            "session_id": "existing-session",
+            "conversation_id": "cursor-conversation",
+            "cwd": "/existing/cwd"
+        });
+
+        assert_eq!(
+            canonical_context_for_agent(ai_memory_core::AgentKind::ClaudeCode, &payload),
             (
                 Some("/existing/cwd".into()),
                 Some("existing-session".into())
