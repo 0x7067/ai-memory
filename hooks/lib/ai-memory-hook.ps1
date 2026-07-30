@@ -11,6 +11,10 @@ function Get-AiMemoryCwd {
         if ($null -ne $Paths -and $Paths.Count -gt 0 -and $Paths[0] -is [string] -and $Paths[0].Length -gt 0) {
             return $Paths[0]
         }
+        $Paths = $Parsed.workspace_roots
+        if ($null -ne $Paths -and $Paths.Count -gt 0 -and $Paths[0] -is [string] -and $Paths[0].Length -gt 0) {
+            return $Paths[0]
+        }
     } catch {
     }
     $match = [regex]::Match($Payload, '"cwd"\s*:\s*"([^"]*)"')
@@ -324,7 +328,8 @@ function Invoke-AiMemoryHook {
                 $ParsedPayload.sessionId,
                 $ParsedPayload.sessionID,
                 $ParsedPayload.session,
-                $ParsedPayload.conversationId
+                $ParsedPayload.conversationId,
+                $ParsedPayload.conversation_id
             ) | Where-Object { $_ } | Select-Object -First 1
             if ($NativeSessionId) {
                 $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"

@@ -1,10 +1,9 @@
 #!/bin/sh
 # cursor SessionStart hook.
-# 1. Forwards the event JSON to the ai-memory server (fire-and-forget).
-# 2. Synchronously fetches any pending cross-agent handoff and prints
-#    it to stdout — agent CLIs prepend session-start hook stdout to
-#    the next session, so the resuming agent sees prior context with
-#    no human in the loop.
+# Forwards the event JSON to the ai-memory server (fire-and-forget).
+# Cursor does not reliably deliver SessionStart additional_context to the
+# agent. Do not consume the single-use handoff until that delivery is proven;
+# it remains available through MCP memory_handoff_accept.
 #
 _lib_dir="$(dirname "$0")"
 [ -f "$_lib_dir/_lib.sh" ] || _lib_dir="$_lib_dir/.."
@@ -17,5 +16,4 @@ QS=$(ai_memory_marker_qs "$CWD")
 
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=cursor${QS}" >/dev/null 2>&1 || true
-ai_memory_get_handoff "$SERVER/handoff?agent=cursor${QS}" 2>/dev/null || true
 exit 0

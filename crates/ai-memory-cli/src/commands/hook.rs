@@ -239,6 +239,7 @@ fn payload_has_session_id(raw: &serde_json::Value) -> bool {
         "sessionID",
         "session",
         "conversationId",
+        "conversation_id",
     ]
     .iter()
     .any(|key| {
@@ -570,10 +571,9 @@ where
         )
         .await;
         // Only fetch the handoff for agents that inject the session-start
-        // hook's stdout as context. Grok ignores it, so fetching here would
-        // consume the handoff server-side (the GET is destructive) and then
-        // discard the result — silently losing it. Those agents recover the
-        // handoff on demand via the MCP `memory_handoff_accept` tool.
+        // hook's stdout as context. A fetch consumes the handoff server-side,
+        // so agents without proven delivery recover it on demand through the
+        // MCP `memory_handoff_accept` tool.
         if AgentKind::from_wire(&args.agent).session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
@@ -1608,6 +1608,7 @@ mod tests {
             ("sessionId", serde_json::json!("two")),
             ("sessionID", serde_json::json!("three")),
             ("conversationId", serde_json::json!("four")),
+            ("conversation_id", serde_json::json!("five")),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             std::fs::write(
@@ -1810,6 +1811,43 @@ mod tests {
         while let Some(request) = first_request(&mut requests).await {
             assert!(!request.starts_with("GET /handoff"), "{request}");
         }
+    }
+
+    #[tokio::test]
+    async fn cursor_session_start_fixture_never_fetches_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut args = kimi_hook_args("session-start", &base);
+        args.agent = "cursor".into();
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            args,
+            include_str!("../../../../tests/fixtures/cursor/session-start.json").to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        let mut captured = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+            captured.push(request);
+        }
+        let capture = captured
+            .iter()
+            .find(|request| request.starts_with("POST /hook"))
+            .expect("Cursor SessionStart capture request");
+        assert!(
+            capture.contains("cwd=%2Fworkspace%2Fcursor-project"),
+            "{capture}"
+        );
+        assert!(
+            capture.contains("\"conversation_id\":\"cursor-conversation-123\""),
+            "{capture}"
+        );
     }
 
     #[tokio::test]

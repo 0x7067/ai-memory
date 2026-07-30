@@ -84,9 +84,47 @@ PAYLOAD_NESTED='{"session_id":"x","cwd":"/home/u/root","tool_input":{"cwd":"/tmp
 assert_eq "extract cwd prefers first match" "/home/u/root" "$(ai_memory_extract_cwd "$PAYLOAD_NESTED")"
 PAYLOAD_AGY='{"conversationId":"x","workspacePaths":["/home/u/agy","/tmp/other"]}'
 assert_eq "extract cwd from antigravity workspacePaths" "/home/u/agy" "$(ai_memory_extract_cwd "$PAYLOAD_AGY")"
+CURSOR_SESSION_START=$(tr '\n' ' ' <"$(dirname "$0")/../fixtures/cursor/session-start.json")
+assert_eq "extract cwd from Cursor workspace_roots fixture" "/workspace/cursor-project" \
+    "$(ai_memory_extract_cwd "$CURSOR_SESSION_START")"
+assert_eq "extract session from Cursor conversation_id fixture" "cursor-conversation-123" \
+    "$(ai_memory_extract_session_id "$CURSOR_SESSION_START")"
+PAYLOAD_PRECEDENCE='{"session_id":"existing","conversationId":"old","conversation_id":"cursor","cwd":"/existing","workspacePaths":["/old"],"workspace_roots":["/cursor"]}'
+assert_eq "Cursor cwd alias preserves existing precedence" "/existing" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_PRECEDENCE")"
+assert_eq "Cursor session alias preserves existing precedence" "existing" \
+    "$(ai_memory_extract_session_id "$PAYLOAD_PRECEDENCE")"
 PAYLOAD_WINDOWS='{"session_id":"x","cwd":"C:\\dev\\myproject"}'
 assert_eq "extract cwd unescapes Windows JSON path" 'C:\dev\myproject' \
     "$(ai_memory_extract_cwd "$PAYLOAD_WINDOWS")"
+
+# --- Cursor SessionStart handoff safety -------------------------------
+mkdir -p "$TMP/fake-bin"
+cat >"$TMP/fake-bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$AI_MEMORY_TEST_CURL_CALLS"
+case " $* " in
+    *" -X POST "*) printf '{}';;
+    *) printf 'DESTRUCTIVE_HANDOFF_FETCH';;
+esac
+EOF
+chmod +x "$TMP/fake-bin/curl"
+AI_MEMORY_TEST_CURL_CALLS="$TMP/cursor-curl-calls"
+export AI_MEMORY_TEST_CURL_CALLS
+CURSOR_OUTPUT=$(printf '%s' "$CURSOR_SESSION_START" \
+    | PATH="$TMP/fake-bin:$PATH" AI_MEMORY_HOOK_URL="http://hook.test" \
+        sh hooks/cursor/session-start.sh)
+assert_eq "Cursor SessionStart bundle prints no handoff" "" "$CURSOR_OUTPUT"
+assert_eq "Cursor SessionStart bundle makes one request" "1" \
+    "$(wc -l <"$AI_MEMORY_TEST_CURL_CALLS" | tr -d ' ')"
+CURSOR_CALL=$(sed -n '1p' "$AI_MEMORY_TEST_CURL_CALLS")
+case "$CURSOR_CALL" in
+    *"-X POST http://hook.test/hook?event=session-start&agent=cursor"*)
+        CURSOR_CALL_KIND="post-only"
+        ;;
+    *) CURSOR_CALL_KIND="unexpected" ;;
+esac
+assert_eq "Cursor SessionStart bundle only posts capture" "post-only" "$CURSOR_CALL_KIND"
 
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path

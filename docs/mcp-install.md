@@ -188,6 +188,13 @@ native HTTP or generated bridge paths.
   ai-memory maps `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`,
   `preToolUse`, `postToolUse`, `postToolUseFailure`, `preCompact`, and
   `stop` to the shared capture path.
+- Cursor does not reliably deliver the documented `additional_context` result
+  from `sessionStart` to the agent. ai-memory captures the event but does not
+  fetch the single-use handoff there. Ask Cursor to call
+  `memory_handoff_accept` through MCP when resuming.
+- If Cursor exits before its `sessionEnd` hook runs, use
+  `ai-memory finalize-session --agent cursor` to close the latest matching
+  session through the same finalization path.
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>
@@ -894,7 +901,7 @@ that *starts* the next one - to play nicely with ai-memory:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex and Antigravity CLI have no reliable true session-end event: run `ai-memory finalize-session` for Codex or `ai-memory finalize-session --agent antigravity-cli` for Antigravity after the final turn. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Gemini CLI / Antigravity CLI / Kimi Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Cursor, Grok, and Zero are explicitly excluded because delivery is absent or unreliable; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any
@@ -913,8 +920,9 @@ selected agent in that scope.
 So a typical mixed workflow looks like:
 
 - **Claude Code → Cursor.** Claude Code's `SessionEnd` creates the
-  handoff automatically. Cursor's `sessionStart` hook fetches and
-  prepends it when `install-hooks --agent cursor --apply` is installed.
+  handoff automatically. Cursor's `sessionStart` hook captures the new
+  session but leaves the handoff pending because its context result is not
+  reliably delivered. Ask Cursor to call `memory_handoff_accept`.
 - **Claude Desktop → Claude Code.** Claude Desktop doesn't write a
   handoff (no hooks). To resume in Claude Code, you'd have had to
   call `memory_handoff_begin` manually in Claude Desktop before

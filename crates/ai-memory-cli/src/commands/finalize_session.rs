@@ -308,4 +308,26 @@ mod tests {
         assert_eq!(query.get("workspace").map(String::as_str), Some("default"));
         assert_eq!(query.get("project").map(String::as_str), Some("project"));
     }
+
+    #[test]
+    fn synthetic_end_url_uses_requested_cursor_agent() {
+        let endpoint =
+            ServerEndpoint::from_pair(Some("http://127.0.0.1:49374/base".to_string()), None);
+        let url = session_end_hook_url(
+            &endpoint,
+            "/tmp/project",
+            "default",
+            "project",
+            AgentKind::Cursor,
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(parsed.path(), "/base/hook");
+        assert_eq!(query.get("event").map(String::as_str), Some("session-end"));
+        assert_eq!(query.get("agent").map(String::as_str), Some("cursor"));
+        assert_eq!(query.get("workspace").map(String::as_str), Some("default"));
+        assert_eq!(query.get("project").map(String::as_str), Some("project"));
+    }
 }

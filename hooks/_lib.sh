@@ -74,7 +74,8 @@ ai_memory_parse_toml_flag() {
 # Returns the value or nothing. This is intentionally a tiny shell fallback,
 # not a JSON parser; taking the first match preserves the top-level cwd when
 # tool payloads contain nested `cwd` fields later in the object. Antigravity
-# CLI sends `workspacePaths: ["/repo", ...]` instead of `cwd`.
+# CLI sends `workspacePaths: ["/repo", ...]` instead of `cwd`; Cursor sends
+# `workspace_roots`.
 # Undo the JSON string escapes that can appear in a path value: \\ -> \
 # and \/ -> /. Windows payloads carry cwd as "C:\\dev\\proj"; without this
 # the doubled backslashes leak into the query string (#188).
@@ -93,6 +94,14 @@ ai_memory_extract_cwd() {
         return 0
     fi
     rest=${payload#*\"workspacePaths\"}
+    if [ "$rest" != "$payload" ]; then
+        raw=$(printf '%s' "$rest" \
+            | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
+            | head -n 1)
+        ai_memory_json_unescape_path "$raw"
+        return 0
+    fi
+    rest=${payload#*\"workspace_roots\"}
     [ "$rest" = "$payload" ] && return 0
     raw=$(printf '%s' "$rest" \
         | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
@@ -105,7 +114,7 @@ ai_memory_extract_cwd() {
 # only; native `ai-memory hook` uses a real JSON parser.
 ai_memory_extract_session_id() {
     payload="${1:-$(cat)}"
-    for key in session_id sessionId sessionID session conversationId; do
+    for key in session_id sessionId sessionID session conversationId conversation_id; do
         rest=${payload#*\"$key\"}
         if [ "$rest" != "$payload" ]; then
             printf '%s' "$rest" \

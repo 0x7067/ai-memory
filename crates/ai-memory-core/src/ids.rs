@@ -289,7 +289,9 @@ impl AgentKind {
     /// into the resuming session as context. Agents that consume it return
     /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
     ///
-    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
+    /// Cursor currently drops documented `additional_context` output before it
+    /// reaches the agent, so accepting a handoff there would lose it. Grok
+    /// ignores hook stdout on `SessionStart` (per Grok's hooks docs:
     /// "For events like SessionStart or PostToolUse, stdout is ignored"), and
     /// Zero's agent loop discards the sessionStart dispatch result entirely
     /// (`internal/agent/loop.go` ignores `Dispatch`'s return there), so
@@ -310,7 +312,7 @@ impl AgentKind {
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
             self,
-            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Other
+            Self::Cursor | Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Other
         )
     }
 
@@ -366,10 +368,10 @@ mod tests {
         );
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("grok-2"), AgentKind::Other);
-        // Grok cannot inject the session-start handoff (ignores hook stdout);
-        // every other agent can.
+        // Agents without proven SessionStart delivery keep the handoff pending.
         assert!(!AgentKind::Grok.session_start_injects_handoff());
         assert!(!AgentKind::Zero.session_start_injects_handoff());
+        assert!(!AgentKind::Cursor.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
         assert!(!AgentKind::Other.session_start_injects_handoff());

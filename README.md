@@ -26,7 +26,7 @@
 | Codex | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. No automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
 | Devin CLI | Supported | MCP config + lifecycle hooks. Hooks use Devin's `PostCompaction` event, inject handoffs via `hookSpecificOutput.additionalContext`, and omit subagent events because Devin does not expose them. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin; generated plugin enforces capture exclusions. |
-| Cursor | Supported | MCP config + lifecycle hooks. |
+| Cursor | Supported | MCP config + lifecycle hooks. Capture works, but automatic SessionStart handoff fetch is disabled because Cursor does not reliably deliver `additional_context`; recover handoffs with MCP `memory_handoff_accept`. Use `ai-memory finalize-session --agent cursor` if `sessionEnd` does not run. |
 | Gemini CLI | Supported | MCP config + lifecycle hooks. |
 | Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension; generated extension enforces capture exclusions. |
 | Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
@@ -183,8 +183,10 @@ priors are at the [bottom](#influences-and-prior-art).
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
   captures lifecycle events but ignores SessionStart stdout, so ask it to call
-  `memory_handoff_accept` when resuming from a handoff. Zero has the same
-  no-stdout behavior and also must call `memory_handoff_accept`.
+  `memory_handoff_accept` when resuming from a handoff. Cursor also keeps the
+  handoff pending because its documented `additional_context` result does not
+  reliably reach the agent. Zero has the same no-stdout behavior. All three
+  recover the pending handoff with `memory_handoff_accept`.
 - **"What did we decide about X six weeks ago?"** Type
   `memory_query X` from the agent (or `ai-memory search X` from a
   terminal) - FTS5 over the wiki. Pages are LLM-consolidated, so
@@ -577,8 +579,9 @@ with bearer auth, host allowlisting, and TLS/reverse-proxy options.
 
 Day to day, you mostly do not think about ai-memory. Lifecycle hooks
 capture prompts, tool calls, compaction checkpoints, and session
-boundaries. SessionStart hooks fetch pending handoffs before your first
-prompt in the next agent.
+boundaries. Clients with a proven SessionStart delivery path fetch pending
+handoffs before your first prompt in the next agent. Other clients keep the
+single-use handoff pending for MCP `memory_handoff_accept`.
 
 Useful entry points:
 

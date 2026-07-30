@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "stop",
+  "conversation_id": "cursor-conversation-123",
+  "generation_id": "cursor-generation-123",
+  "model": "cursor-model",
+  "cursor_version": "2.4.0",
+  "workspace_roots": [
+    "/workspace/cursor-project"
+  ],
+  "status": "completed",
+  "loop_count": 0,
+  "transcript_path": "/tmp/cursor-transcript.jsonl"
+}

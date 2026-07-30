@@ -341,7 +341,8 @@ impl HookEnvelope {
         let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
         // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
         // tool.execute.*/session.* events; Claude Code uses `session_id`,
-        // Codex `sessionId`, and Antigravity CLI uses `conversationId`.
+        // Codex `sessionId`, Antigravity CLI uses `conversationId`, and
+        // Cursor uses `conversation_id`.
         // JSON keys are case-sensitive, so all spellings must be listed
         // or tool events fail the router's "missing session_id" check.
         let body_session_id = extract_string(
@@ -352,6 +353,7 @@ impl HookEnvelope {
                 "sessionID",
                 "session",
                 "conversationId",
+                "conversation_id",
             ],
         )
         .or_else(|| {
@@ -372,6 +374,7 @@ impl HookEnvelope {
         let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
             .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
+            .or_else(|| extract_first_string_array_item(&raw, &["workspace_roots"]))
             .or_else(|| {
                 extract_string_path(
                     &raw,
@@ -1263,6 +1266,56 @@ mod tests {
         );
         assert_eq!(env.cwd.as_deref(), Some("/workspace/project"));
         assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+    }
+
+    #[test]
+    fn envelope_extracts_official_cursor_fixtures() {
+        for (event, fixture) in [
+            (
+                "session-start",
+                include_str!("../../../tests/fixtures/cursor/session-start.json"),
+            ),
+            (
+                "stop",
+                include_str!("../../../tests/fixtures/cursor/stop.json"),
+            ),
+        ] {
+            let raw: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("cursor".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+
+            assert_eq!(env.agent, AgentKind::Cursor);
+            assert_eq!(env.session_id.as_deref(), Some("cursor-conversation-123"));
+            assert_eq!(env.cwd.as_deref(), Some("/workspace/cursor-project"));
+        }
+    }
+
+    #[test]
+    fn cursor_aliases_preserve_existing_precedence() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                agent: Some("cursor".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "existing-session",
+                "conversationId": "existing-conversation",
+                "conversation_id": "cursor-conversation",
+                "cwd": "/existing/cwd",
+                "workspacePaths": ["/existing/workspace"],
+                "workspace_roots": ["/cursor/workspace"]
+            }),
+        );
+
+        assert_eq!(env.session_id.as_deref(), Some("existing-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/existing/cwd"));
     }
 
     #[test]

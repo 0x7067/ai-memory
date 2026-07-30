@@ -112,6 +112,15 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
                 .map(str::to_owned)
         })
         .or_else(|| {
+            payload
+                .get("workspace_roots")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
             [
                 ["path", "cwd"].as_slice(),
                 ["info", "directory"].as_slice(),
@@ -130,6 +139,7 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
         "sessionID",
         "session",
         "conversationId",
+        "conversation_id",
     ])
     .or_else(|| {
         [
@@ -666,6 +676,43 @@ mod tests {
         assert_eq!(
             canonical_context(&generated),
             (Some("/generated".into()), Some("nested".into()))
+        );
+    }
+
+    #[test]
+    fn canonical_context_matches_official_cursor_fixtures() {
+        for fixture in [
+            include_str!("../../../../tests/fixtures/cursor/session-start.json"),
+            include_str!("../../../../tests/fixtures/cursor/stop.json"),
+        ] {
+            let payload: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            assert_eq!(
+                canonical_context(&payload),
+                (
+                    Some("/workspace/cursor-project".into()),
+                    Some("cursor-conversation-123".into())
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_aliases_preserve_existing_native_precedence() {
+        let payload = serde_json::json!({
+            "session_id": "existing-session",
+            "conversationId": "existing-conversation",
+            "conversation_id": "cursor-conversation",
+            "cwd": "/existing/cwd",
+            "workspacePaths": ["/existing/workspace"],
+            "workspace_roots": ["/cursor/workspace"]
+        });
+
+        assert_eq!(
+            canonical_context(&payload),
+            (
+                Some("/existing/cwd".into()),
+                Some("existing-session".into())
+            )
         );
     }
 

@@ -1432,8 +1432,17 @@ fn apply_to_cursor_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    println!();
+    print!("{CURSOR_HANDOFF_GUIDANCE}");
     Ok(())
 }
+
+const CURSOR_HANDOFF_GUIDANCE: &str = "\
+Cursor lifecycle capture is active, but ai-memory does not fetch a pending\n\
+handoff on sessionStart because Cursor does not reliably deliver that hook's\n\
+additional_context to the agent. Recover it with MCP memory_handoff_accept.\n\
+If Cursor does not run sessionEnd, close the latest scoped session with\n\
+`ai-memory finalize-session --agent cursor`.\n";
 
 fn merge_cursor_hooks(
     staged: &Path,
@@ -2927,7 +2936,10 @@ fn render_agent_output(
         out.push_str(&instruction);
         out.push('\n');
     }
-    if label == "antigravity-cli" {
+    if label == "cursor" {
+        out.push('\n');
+        out.push_str(CURSOR_HANDOFF_GUIDANCE);
+    } else if label == "antigravity-cli" {
         out.push('\n');
         out.push_str(ANTIGRAVITY_FINALIZATION_GUIDANCE);
     }
@@ -5302,10 +5314,53 @@ model = "gpt-5"
             parsed["hooks"]["preToolUse"].is_array(),
             "preToolUse hook should be present"
         );
+        let session_start = parsed["hooks"]["sessionStart"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            session_start.contains("hook --event session-start")
+                && session_start.contains("--agent cursor"),
+            "Cursor sessionStart must invoke the native Cursor capture command: {session_start}"
+        );
+        let session_end = parsed["hooks"]["sessionEnd"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            session_end.contains("hook --event session-end")
+                && session_end.contains("--agent cursor"),
+            "Cursor sessionEnd must invoke the native Cursor finalization command: {session_end}"
+        );
         assert_eq!(
             parsed["version"], 1,
             "version: 1 must be set at the top level"
         );
+    }
+
+    #[test]
+    fn cursor_manual_render_explains_safe_handoff_recovery_and_finalization() {
+        let temp = TempDir::new().unwrap();
+        stub_scripts(temp.path(), &["session-start.sh", "session-end.sh"]);
+        let output = render_agent_output(
+            "cursor",
+            temp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            &[CURSOR_PROFILE.events],
+        );
+
+        assert!(output.contains("does not fetch a pending"));
+        assert!(output.contains("MCP memory_handoff_accept"));
+        assert!(output.contains("ai-memory finalize-session --agent cursor"));
+    }
+
+    #[test]
+    fn cursor_bundled_session_start_does_not_fetch_a_handoff() {
+        let posix = include_str!("../../../../hooks/cursor/session-start.sh");
+        let powershell = include_str!("../../../../hooks/cursor/session-start.ps1");
+
+        assert!(!posix.contains("ai_memory_get_handoff"));
+        assert!(!powershell.contains("-FetchHandoff"));
     }
 
     #[test]
