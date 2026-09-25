@@ -9,7 +9,8 @@ pub use harness::{
     apply_yolo, build_launch_plan, build_launch_plan_with_env, clean_path, crush_data_dir,
     crush_global_config_path, env_dir_override, has_native_session_selector,
     kiro_explicit_session_id, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, store_override_vars,
+    kiro_selects_v3_engine, omp_agent_dir, omp_profile_flag, omp_profile_flag_env,
+    store_override_vars,
 };
 pub use repository::{RepositoryIdentity, inspect_repository};
 pub use transcript::{

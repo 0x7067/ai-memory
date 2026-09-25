@@ -18,8 +18,8 @@ use ai_memory_workstream::{
     discover_native_session, export_transcript, has_native_session_selector, inspect_repository,
     kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
     kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
-    list_native_sessions, native_session_exists, native_session_in_checkout, store_override_vars,
-    wait_for_transcript_flush,
+    list_native_sessions, native_session_exists, native_session_in_checkout, omp_profile_flag,
+    omp_profile_flag_env, store_override_vars, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -401,7 +401,7 @@ pub(super) async fn run_from_with_wiring(
     if config.run_autowire && !no_autowire {
         // A Kiro v3 resume from the default store drops `KIRO_HOME` from the
         // child, so its hooks and MCP belong under the default home.
-        let mut wire_env = run_env.clone();
+        let mut wire_env = autowire_env(harness, &run_env, &plan.args, &launch_env);
         if remove_kiro_home {
             upsert_env(
                 &mut wire_env,
@@ -940,6 +940,32 @@ fn upsert_env(entries: &mut Vec<(String, String)>, key: String, value: String) {
     } else {
         entries.push((key, value));
     }
+}
+
+/// The environment auto-wire resolves install targets from: the launch's own
+/// `--env` entries, adjusted where the child runs with something else. OMP
+/// ranks `--profile` above `OMP_PROFILE`, so the flag is passed on through the
+/// profile variables (see [`omp_profile_flag_env`], which reads the launch
+/// environment `launch_env`).
+fn autowire_env(
+    harness: ManagedHarness,
+    run_env: &[(String, String)],
+    native_args: &[OsString],
+    launch_env: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<(String, String)> {
+    let mut env = run_env.to_vec();
+    let mut set = |name: &str, value: String| {
+        env.retain(|(key, _)| key != name);
+        env.push((name.to_string(), value));
+    };
+    if harness == ManagedHarness::Omp
+        && let Some(profile) = omp_profile_flag(native_args).filter(|name| !name.is_empty())
+    {
+        for (name, value) in omp_profile_flag_env(&profile, launch_env) {
+            set(&name, value);
+        }
+    }
+    env
 }
 
 /// The launched harness's home variables (its store overrides, plus the
@@ -3330,13 +3356,20 @@ mod tests {
         );
         assert_eq!(
             blank_home_overrides(
-                ManagedHarness::Pi,
+                ManagedHarness::Omp,
                 &env(&[
                     ("PI_CODING_AGENT_SESSION_DIR", ""),
                     ("PI_CODING_AGENT_DIR", "/x")
                 ])
             ),
             ["PI_CODING_AGENT_SESSION_DIR"]
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Omp,
+                &env(&[("PI_CONFIG_DIR", " "), ("XDG_DATA_HOME", "")])
+            ),
+            ["PI_CONFIG_DIR", "XDG_DATA_HOME"]
         );
         assert_eq!(
             blank_home_overrides(
@@ -3568,5 +3601,72 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&captured).unwrap(), "unset");
 
         server.abort();
+    }
+
+    /// OMP ranks `--profile` above `OMP_PROFILE`, so auto-wire sees what the
+    /// child will run with; everything else in `--env` passes through
+    /// untouched.
+    #[test]
+    fn autowire_env_follows_what_the_child_runs_with() {
+        let run_env = vec![
+            ("OMP_PROFILE".to_string(), "other".to_string()),
+            ("KIRO_HOME".to_string(), "/custom".to_string()),
+            ("FOO".to_string(), "x".to_string()),
+        ];
+        let lookup = |env: &[(String, String)], name: &str| {
+            let values: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .collect();
+            values
+        };
+        // Only the run_env: no process environment leaks into the test.
+        let only = |env: Vec<(String, String)>| {
+            move |name: &str| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let launch = only(run_env.clone());
+
+        let args = [OsString::from("--profile"), OsString::from("work")];
+        let omp = autowire_env(ManagedHarness::Omp, &run_env, &args, &launch);
+        assert_eq!(lookup(&omp, "OMP_PROFILE"), ["work"]);
+        assert_eq!(lookup(&omp, "KIRO_HOME"), ["/custom"]);
+        assert_eq!(lookup(&omp, "FOO"), ["x"]);
+        assert_eq!(
+            autowire_env(ManagedHarness::Pi, &run_env, &args, &launch),
+            run_env,
+            "only OMP reads --profile"
+        );
+        assert_eq!(
+            autowire_env(ManagedHarness::Omp, &run_env, &[], &launch),
+            run_env
+        );
+
+        // `--profile default` under an environment a profiled parent OMP
+        // exported: OMP drops the inherited agent dir, and so must auto-wire.
+        let home = Path::new("/home/me");
+        let inherited = vec![
+            ("OMP_PROFILE".to_string(), "work".to_string()),
+            (
+                "PI_CODING_AGENT_DIR".to_string(),
+                "/home/me/.omp/profiles/work/agent".to_string(),
+            ),
+            ("PI_CONFIG_DIR".to_string(), String::new()),
+        ];
+        let default_args = [OsString::from("--profile"), OsString::from("default")];
+        let wired = autowire_env(
+            ManagedHarness::Omp,
+            &inherited,
+            &default_args,
+            &only(inherited.clone()),
+        );
+        assert_eq!(
+            ai_memory_workstream::omp_agent_dir(home, None, only(wired)).unwrap(),
+            home.join(".omp").join("agent")
+        );
     }
 }
