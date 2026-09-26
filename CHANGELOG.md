@@ -208,6 +208,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches the spool or the wire. The captured excerpt continues the work in
   the next session's automatic handoff; it is not rendered into the
   git-tracked session page. (#865)
+- `install-hooks --agent hermes` (alias `hermes-agent`) and
+  `setup-agent --agent hermes` for **Hermes Agent** (Nous Research). Hermes
+  splits a configured hook `command` with `shlex.split` and runs it with **no
+  shell**, with the event JSON on stdin, so the generated block invokes the
+  native `hook` subcommand directly — the same shape Zero and ZCode use, and no
+  `.sh`/`.ps1` bundle is staged. Two events are wired, `pre_tool_call` and
+  `post_tool_call`, whose payload (`tool_name` / `tool_input`) is the envelope
+  the router already mapped for `agent=hermes`; this is what finally gives
+  Hermes sessions tool observations. `~/.hermes/config.yaml` is printed, never
+  written: it is YAML the operator also edits, and Hermes gates user hooks
+  behind its own acceptance prompt (`hooks_auto_accept`). Session lifecycle
+  stays with the ai-memory memory-provider plugin, so a hook-driven
+  `session-end` cannot double-close a session. (#623 follow-up, #933)
 
 ### Changed
 - A capture into a project its author may not write is dropped server-side
