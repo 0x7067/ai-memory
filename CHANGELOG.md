@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `restricted` yet, this is a pure pass-through; enforcing `restricted` across
   the unscoped-read and raw-id bypass classes plus the root-only management
   surface (setting `restricted`, issuing grants) follow in a later slice. (#708)
-- Per-project authorization is enforced (second slice of #708, completing
+- Per-project authorization is enforced (third slice of #708, completing
   [`design-per-project-authz.md`](docs/design-per-project-authz.md)). A
   `restricted` project admits root, its creator and grant holders; `open`, the
   default and what every existing project stays after upgrading, admits any
