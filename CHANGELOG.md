@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any non-blocking observer/mirror webhook on success. `restore-page` and
   version history remain intact. See `docs/okf.md` for the full design.
   (#964)
+- `ai-memory run` now finalizes the session when a harness without a native
+  session-end hook exits (Command Code, Kiro CLI v2 and v3, Antigravity CLI),
+  so the summary, handoff and opt-in SessionEnd consolidation no longer wait
+  for a manual `ai-memory finalize-session`. Only a session the run can tie to
+  itself (named, chosen before the spawn, or linked during the run) is closed,
+  including again after it was resumed; if finalizing fails, the run prints
+  the exact command to run and keeps the harness's exit code. (#941)
 - `[consolidation] input_token_safety_margin` (float, default `0.8`, validated
   to `(0.0, 1.0]`) scales the approximate char-count input budget. The
   `max_input_tokens` budget uses a flat chars-per-token heuristic that

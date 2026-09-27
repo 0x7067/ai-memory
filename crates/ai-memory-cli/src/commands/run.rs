@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use ai_memory_core::{
     AgentKind, FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
     ManagedRunContextResponse, ManagedRunStatus, PrepareManagedRunRequest,
-    PrepareManagedRunResponse,
+    PrepareManagedRunResponse, SessionId,
 };
 use ai_memory_workstream::{
     AmbiguousNativeSession, ExportedTranscript, LaunchMode, LaunchPlan, LaunchRoots,
@@ -564,6 +564,33 @@ pub(super) async fn run_from_with_wiring(
     } else {
         None
     };
+    let own_session_id = match own_native_session(
+        &plan,
+        harness,
+        &home,
+        &repository.cwd,
+        server_status.as_ref(),
+    ) {
+        Ok(own) => own,
+        Err(error) => {
+            // Only a linked session is checked, so the server reported its id.
+            if harness.lacks_session_end_hook()
+                && let Some(linked) = server_status
+                    .as_ref()
+                    .and_then(|status| status.native_session_id.as_deref())
+            {
+                eprintln!(
+                    "ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
+                    harness.as_str(),
+                    harness.agent_kind().as_str(),
+                    SessionId::from_native(linked),
+                    super::render_shared::shell_quote(&workspace),
+                    super::render_shared::shell_quote(&project)
+                );
+            }
+            None
+        }
+    };
     let native_session_id = acquired_try!(
         resolve_native_session_after_run(
             &plan,
@@ -621,7 +648,79 @@ pub(super) async fn run_from_with_wiring(
         prepared.workstream_name
     );
     interrupt_task.abort();
+    if let Some((session, finalized)) = finalize_hookless_session(
+        config,
+        harness,
+        own_session_id.as_deref(),
+        &workspace,
+        &project,
+    )
+    .await
+    {
+        let agent = harness.agent_kind().as_str();
+        match finalized {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!("ai-memory: finalized the {agent} session {session}");
+            }
+            // No session under that id for this agent and owner in this
+            // scope: its hooks are not installed or never fired, or they
+            // filed it under another workspace/project.
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                super::render_shared::shell_quote(&workspace),
+                super::render_shared::shell_quote(&project)
+            ),
+        }
+    }
     Ok(exit_code)
+}
+
+/// How long finalizing may hold up the harness's exit code.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Finalizes the run's own session when the harness has no native session-end
+/// hook, which would otherwise leave it open until a manual
+/// `ai-memory finalize-session` (#941). The harness has exited, so the session
+/// is over for this run.
+/// Returns the stored session id and the ids finalized, or `None` when there
+/// is nothing to do.
+async fn finalize_hookless_session(
+    config: &Config,
+    harness: ManagedHarness,
+    own_session_id: Option<&str>,
+    workspace: &str,
+    project: &str,
+) -> Option<(SessionId, Result<Vec<String>>)> {
+    let native_session_id = own_session_id?;
+    if !harness.lacks_session_end_hook() {
+        return None;
+    }
+    let session = SessionId::from_native(native_session_id);
+    let args = crate::cli::FinalizeSessionArgs {
+        agent: harness.agent_kind(),
+        workspace: Some(workspace.to_string()),
+        project: Some(project.to_string()),
+        all_owners: false,
+        all: false,
+        session_id: Some(session),
+        // These harnesses keep capturing under the same id when a session is
+        // resumed, so a later run must be able to end it again. A re-end
+        // with nothing new since the last one changes nothing on the server.
+        reopen: true,
+        json: false,
+    };
+    // Tokio keeps SIGINT once it has been captured, so listen afresh: Ctrl-C
+    // skips a slow finalize instead of being dropped.
+    let finalized = tokio::select! {
+        finalized = tokio::time::timeout(
+            FINALIZE_TIMEOUT,
+            super::finalize_session::finalize(config, &args),
+        ) => finalized
+            .unwrap_or_else(|_| Err(anyhow!("timed out after {}s", FINALIZE_TIMEOUT.as_secs()))),
+        Ok(()) = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
+    };
+    Some((session, finalized.map(|(_, _, ids)| ids)))
 }
 
 async fn capture_interrupts(interrupted: CancellationToken) {
@@ -681,6 +780,36 @@ async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &
     }
 }
 
+/// The session this run can prove is its own: the one it launched or resumed,
+/// or the one its child linked under the run's id. A concurrent launch in the
+/// same checkout cannot link under this run's id, while discovery can only
+/// guess from timing. A descendant process inherits the id too, so the linked
+/// session must also be this checkout's.
+fn own_native_session(
+    plan: &LaunchPlan,
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    server_status: Option<&ManagedRunStatus>,
+) -> Result<Option<String>> {
+    if plan.mode == LaunchMode::Passthrough {
+        return Ok(None);
+    }
+    if let Some(native_session_id) = &plan.expected_session_id {
+        return Ok(Some(native_session_id.clone()));
+    }
+    let Some(linked) = server_status
+        .filter(|status| status.native_session_linked)
+        .and_then(|status| status.native_session_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let in_checkout =
+        native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
+            .with_context(|| format!("reading native session {linked}"))?;
+    Ok(in_checkout.then(|| linked.to_string()))
+}
+
 async fn resolve_native_session_after_run(
     plan: &LaunchPlan,
     harness: ManagedHarness,
@@ -692,22 +821,12 @@ async fn resolve_native_session_after_run(
     if plan.mode == LaunchMode::Passthrough {
         return Ok(None);
     }
-    if let Some(native_session_id) = &plan.expected_session_id {
-        return Ok(Some(native_session_id.clone()));
+    if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status) {
+        return Ok(Some(own));
     }
-    // A session linked under this run's id was reported by this run's child,
-    // which a concurrent launch in the same checkout cannot do; discovery
-    // only sees the newest session there. A descendant process inherits the
-    // id too, so the session must also be this checkout's.
     let linked = server_status
         .filter(|status| status.native_session_linked)
         .and_then(|status| status.native_session_id.as_deref());
-    if let Some(linked) = linked
-        && native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
-            .unwrap_or(false)
-    {
-        return Ok(Some(linked.to_string()));
-    }
     let fresh = !has_native_session_selector(harness, &plan.args);
     let discovered = match discover_native_session(
         harness,
@@ -730,8 +849,8 @@ async fn resolve_native_session_after_run(
         }
         Err(error) => return Err(error),
     };
-    // A linked session set aside above belongs to another checkout, so it is
-    // no fallback either.
+    // A linked session `own_native_session` rejected (not in this checkout,
+    // or its native store could not be read) is no fallback either.
     Ok(discovered.or_else(|| {
         server_status
             .and_then(|status| status.native_session_id.clone())
@@ -2742,12 +2861,27 @@ mod tests {
             context_delivered: true,
             state: "active".to_string(),
         };
-        for (linked, native, expected) in [
-            (true, "prepared", Some("prepared")),
-            (false, "prepared", Some("concurrent-newer")),
-            (true, "nested", Some("concurrent-newer")),
+        for (linked, native, expected, own) in [
+            (true, "prepared", Some("prepared"), Some("prepared")),
+            (false, "prepared", Some("concurrent-newer"), None),
+            (true, "nested", Some("concurrent-newer"), None),
         ] {
             let status = status(linked, native);
+            // Only a session the run can prove is its own: never a discovered
+            // one, which may be a concurrent launch's (#941 finalizes it).
+            assert_eq!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    temp.path(),
+                    &cwd,
+                    Some(&status)
+                )
+                .unwrap()
+                .as_deref(),
+                own,
+                "own: linked={linked} native={native}"
+            );
             assert_eq!(
                 resolve_native_session_after_run(
                     &plan,
@@ -3687,5 +3821,120 @@ mod tests {
             ai_memory_workstream::omp_agent_dir(home, None, only(wired)).unwrap(),
             home.join(".omp").join("agent")
         );
+    }
+
+    /// Harnesses without a native session-end hook get their session closed
+    /// when the managed run ends (#941): the exact session is looked up by the
+    /// stored id its native id maps to, and a synthetic session-end is posted.
+    /// Harnesses with their own hook, and runs with no session, are left alone.
+    #[tokio::test]
+    async fn run_end_finalizes_the_session_of_a_hookless_harness() {
+        use std::sync::Mutex;
+
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+
+        use crate::config::Config;
+
+        #[derive(Default)]
+        struct Seen {
+            lookups: Vec<std::collections::HashMap<String, String>>,
+            batches: Vec<serde_json::Value>,
+        }
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let app = Router::new()
+            .route(
+                "/admin/open-sessions",
+                get(
+                    |State(seen): State<Arc<Mutex<Seen>>>,
+                     Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                        let session_id = query.get("session_id").cloned().unwrap_or_default();
+                        seen.lock().unwrap().lookups.push(query);
+                        axum::Json(serde_json::json!({
+                            "sessions": [{ "session_id": session_id, "cwd": "/tmp/repo" }]
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/hook/batch",
+                post(
+                    |State(seen): State<Arc<Mutex<Seen>>>, axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        seen.lock().unwrap().batches.push(body);
+                        axum::Json(serde_json::json!({ "accepted": 1 }))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.server_url = format!("http://{address}");
+
+        assert!(
+            finalize_hookless_session(
+                &config,
+                ManagedHarness::Claude,
+                Some("claude-1"),
+                "ws",
+                "proj"
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            finalize_hookless_session(&config, ManagedHarness::Antigravity, None, "ws", "proj")
+                .await
+                .is_none()
+        );
+        assert!(
+            seen.lock().unwrap().lookups.is_empty(),
+            "nothing to finalize yet"
+        );
+
+        let (session, finalized) = finalize_hookless_session(
+            &config,
+            ManagedHarness::Antigravity,
+            Some("agy-session-1"),
+            "ws",
+            "proj",
+        )
+        .await
+        .expect("a hookless harness with its own session is finalized");
+        let stored = SessionId::from_native("agy-session-1").to_string();
+        assert_eq!(session.to_string(), stored);
+        assert_eq!(finalized.unwrap(), vec![stored.clone()]);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.lookups.len(), 1, "one exact-session lookup");
+        let lookup = &seen.lookups[0];
+        assert_eq!(
+            lookup.get("session_id"),
+            Some(&stored),
+            "looked up by the stored id"
+        );
+        assert_eq!(
+            lookup.get("agent").map(String::as_str),
+            Some("antigravity-cli")
+        );
+        assert_eq!(lookup.get("workspace").map(String::as_str), Some("ws"));
+        assert_eq!(lookup.get("project").map(String::as_str), Some("proj"));
+        assert_eq!(
+            lookup.get("include_ended").map(String::as_str),
+            Some("true"),
+            "a resumed session that was already ended is ended again"
+        );
+        assert_eq!(seen.batches.len(), 1, "one synthetic session-end batch");
+        assert!(
+            seen.batches[0].to_string().contains(&stored),
+            "the session-end targets that session: {}",
+            seen.batches[0]
+        );
+        drop(seen);
+        server.abort();
     }
 }

@@ -352,6 +352,13 @@ resume, continue, session, or fork selector.
 5. Imports use deterministic event ids, incremental source cursors, immutable
    sanitized JSONL segments, and bounded batches. A retry cannot duplicate
    history. The native process's exit code is preserved.
+6. Command Code, Kiro CLI and Antigravity CLI have no native session-end hook,
+   so for them the run then finalizes the session itself (again after a
+   resume), as `ai-memory finalize-session --reopen` would: summary, handoff
+   and opt-in SessionEnd consolidation. It does this only for a session named
+   on the command line, chosen before the spawn, or linked during the run,
+   never for one it had to look for. If finalizing fails, it prints the exact
+   `finalize-session` command to run instead.
 
 The next harness receives a bounded recent delta because no agent context window
 can safely absorb an unbounded transcript. The complete visible ledger remains

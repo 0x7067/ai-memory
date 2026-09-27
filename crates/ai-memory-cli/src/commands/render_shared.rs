@@ -1836,7 +1836,7 @@ fn to_git_bash_path(path: &str) -> String {
 /// command path. Leaves only conservative shell-safe characters unquoted;
 /// wraps everything else in single quotes and escapes embedded `'` via
 /// `'\''`.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| {
         c.is_ascii_alphanumeric()
             || matches!(c, '-' | '_' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ',')

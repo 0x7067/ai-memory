@@ -80,6 +80,17 @@ macro_rules! id_newtype {
 id_newtype!(pub WorkspaceId, "Workspace identifier (top of the 3-tuple).");
 id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
+
+impl SessionId {
+    /// The stored id for a harness's own session id: the id itself when it is
+    /// a UUID, otherwise a deterministic v5 UUID of it, so hook POSTs and later
+    /// lookups by native id share one key.
+    #[must_use]
+    pub fn from_native(raw: &str) -> Self {
+        Self::from_str(raw)
+            .unwrap_or_else(|_| Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+    }
+}
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
@@ -747,6 +758,23 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentKind>(&devin).unwrap(),
             AgentKind::Devin
+        );
+    }
+
+    #[test]
+    fn session_id_from_native_keeps_uuids_and_hashes_other_ids() {
+        let uuid = SessionId::new();
+        assert_eq!(SessionId::from_native(&uuid.to_string()), uuid);
+        let hashed = SessionId::from_native("agy-session-1");
+        assert_eq!(
+            hashed,
+            SessionId::from_native("agy-session-1"),
+            "deterministic"
+        );
+        assert_eq!(
+            hashed.0,
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, b"agy-session-1"),
+            "the key hook POSTs have always used"
         );
     }
 }
