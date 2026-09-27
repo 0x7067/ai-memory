@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immutable to automation. Such updates are now skipped with a warning; the
   rest of the batch is written. `_slots/` pages, which are pinned
   automatically, keep their state/invariant rules. (#934)
+- Session consolidation no longer writes a page title that already exists
+  in the project. A colliding session title gets a deterministic
+  `(session <8-char-id>)` suffix (stable for the same session, distinct
+  across sessions) and a matching leading H1 is retitled with it. The
+  consolidator prompt tells the model to name THIS session rather than a
+  generic harness-run phrase and not to reuse listed titles; that wording
+  is compact enough that the advertised 6000-token input floor still
+  projects observation bodies instead of dropping them. (#926)
 
 ## [2.4.1] - 2026-09-25
 
