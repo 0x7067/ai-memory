@@ -1162,8 +1162,11 @@ OpenClaw distinguishes transports explicitly. Use
   `~/.omp/profiles/<name>/agent/mcp.json` under a named profile
   (`OMP_PROFILE`, or the legacy `PI_PROFILE`), or
   `$PI_CODING_AGENT_DIR/mcp.json` when that variable relocates the default
-  profile; OMP's `PI_CONFIG_DIR` renames the `~/.omp` root in each case
+  profile.
 - Project: `.omp/mcp.json`
+
+`PI_CONFIG_DIR` changes the `.omp` root relative to your home. An explicit
+`PI_CODING_AGENT_DIR` for the default profile keeps its own path.
 
 The current Oh My Pi package exposes the `omp` binary and native
 `.omp` config directories. Use `omp` (or `oh-my-pi`) for this integration;
@@ -1191,8 +1194,8 @@ ai-memory install-hooks --agent omp --apply
 This writes `~/.omp/agent/extensions/ai-memory-omp.ts`, which OMP discovers
 as a direct TypeScript extension on startup. Restart `omp` after
 installing or changing the file. `--profile <name>` (or `OMP_PROFILE`)
-targets `~/.omp/profiles/<name>/agent/extensions/`, and a named profile
-ignores `PI_CODING_AGENT_DIR`, as OMP does. For the default profile,
+targets `~/.omp/profiles/<name>/agent/extensions/`. Named profiles ignore
+`PI_CODING_AGENT_DIR`. For the default profile,
 `PI_CODING_AGENT_DIR` relocates OMP's whole `~/.omp/agent` home, so the
 extension and `mcp.json` move to `$PI_CODING_AGENT_DIR` instead.
 

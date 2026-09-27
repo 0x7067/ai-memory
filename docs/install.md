@@ -1339,26 +1339,31 @@ not interchangeable — only Pi's bridges MCP tools.
 
 `omp --profile <name>` relocates OMP's agent home to
 `~/.omp/profiles/<name>/agent`. Point the installers at the same profile so
-the extension and the MCP entry land where that profile loads them:
+the extension and MCP entry are installed in that directory:
 
 ```bash
 ai-memory install-hooks --agent omp --profile work --apply
-# or set it once for the shell, which install-mcp also reads:
+# Or pass OMP_PROFILE to each installer:
 OMP_PROFILE=work ai-memory install-hooks --agent omp --apply
 OMP_PROFILE=work ai-memory install-mcp --client omp --apply
 ```
 
-The profile resolves the way OMP resolves it: `--profile` beats
-`OMP_PROFILE`, which beats the legacy `PI_PROFILE` whenever it is set, even
-to an empty value. Names are trimmed, an empty name or `default` selects the
-default profile, and a name OMP refuses is refused here too. A named profile
-ignores `PI_CODING_AGENT_DIR`, as OMP does; only the default profile honors
-it. OMP's `PI_CONFIG_DIR` renames the `~/.omp` root (joined under your home,
-as OMP joins it), and the extension and `mcp.json` follow it; an
-`$XDG_DATA_HOME/omp` directory moves only OMP's sessions, never these files.
-`uninstall --profile <name>` removes the same files, and also sweeps the
-default profile's directory and the `~/.omp` locations earlier releases wrote
-to, whatever `PI_CONFIG_DIR` says.
+`--profile` takes precedence over `OMP_PROFILE`. The legacy `PI_PROFILE` is
+used only when `OMP_PROFILE` is unset. Names are trimmed and validated using
+OMP's rules. An empty environment value, a whitespace-only name or `default`
+selects the default profile; an explicit `--profile ""` is rejected.
+
+A named profile ignores `PI_CODING_AGENT_DIR`. The default profile uses it
+unless it points to the named profile directory exported by a parent OMP
+process. `PI_CONFIG_DIR` changes the `.omp` root relative to your home using
+OMP's path-joining rules; it does not replace an explicit agent directory.
+The extension and `mcp.json` stay in the agent directory even when sessions
+move to XDG storage. See [native adapter behavior](managed-workstreams.md#native-adapter-behavior)
+for the session paths.
+
+`uninstall --profile <name>` removes the profile's integration files. It also
+checks the default profile and the legacy `~/.omp` locations, including when
+`PI_CONFIG_DIR` selects a different root.
 
 ```bash
 ai-memory install-hooks --agent pi --apply \

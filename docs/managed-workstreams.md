@@ -381,9 +381,17 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Command Code | native default creation | `--session <uuid>` | `~/.commandcode/projects/*/<uuid>.jsonl` |
 | Kiro CLI v2 | native default creation | `--resume-id <uuid>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
 | Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
-| OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`: `~/.omp/agent`, `~/.omp/profiles/<name>/agent` under a named profile, or `$PI_CODING_AGENT_DIR` for the default profile, with `~/.omp` renamed by `PI_CONFIG_DIR`; on Linux and macOS, `$XDG_DATA_HOME/omp/sessions` (`.../omp/profiles/<name>/sessions`) once that OMP directory exists and the agent dir is not relocated |
+| OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`, or the XDG session directory described below |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
+
+OMP's agent directory is `~/.omp/agent` for the default profile and
+`~/.omp/profiles/<name>/agent` for a named profile. `PI_CONFIG_DIR` changes the
+`.omp` root relative to the user's home. The default profile can also use
+`PI_CODING_AGENT_DIR`. On Linux and macOS, sessions move to
+`$XDG_DATA_HOME/omp/sessions`, or `$XDG_DATA_HOME/omp/profiles/<name>/sessions`
+for a named profile, when that OMP directory exists and the agent directory
+has not been relocated.
 
 Command Code v3 transcripts are self-describing and append-only. The adapter
 requires the UUID filename, header id, and canonical header `cwd` to agree
@@ -422,14 +430,17 @@ run a `crushrc` to read one set only there; pass `--data-dir` in that case. Nati
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
-`KIRO_HOME`, and `GROK_HOME`, plus OMP's `PI_CONFIG_DIR` and profile (a
-leading `--profile`, then `OMP_PROFILE`, then `PI_PROFILE`), which ignores
-`PI_CODING_AGENT_DIR` as OMP does. A `--profile` later in the command line is
-left to OMP; set
-`OMP_PROFILE` (or `--env OMP_PROFILE=<name>`) when you need it there. A blank
-value (empty or whitespace only) counts as unset everywhere: session import,
-hooks and MCP all fall back to the default home, and `ai-memory run` removes
-it from the launched harness's environment so the harness does too.
+`KIRO_HOME`, and `GROK_HOME`, plus OMP's `PI_CONFIG_DIR`.
+OMP profile selection follows a leading `--profile`, then `OMP_PROFILE`, then
+`PI_PROFILE`. A named profile ignores `PI_CODING_AGENT_DIR`. A `--profile`
+later in the command line is left to OMP; use `OMP_PROFILE` or
+`--env OMP_PROFILE=<name>` so ai-memory can resolve the same profile.
+
+Blank directory overrides (empty or whitespace-only values) count as unset.
+Session import, hooks and MCP use their fallback paths, and `ai-memory run`
+removes those values from the child environment. Profile variables follow a
+different rule: an empty `OMP_PROFILE` selects the default profile and still
+takes precedence over `PI_PROFILE`.
 Export these in the environment `ai-memory run` itself sees, or pass them with
 `--env` (below), not only inside a harness wrapper script. `ai-memory run`
 resolves the native session directory, and auto-wires hooks and MCP, from that
