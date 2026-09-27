@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `ai-memory bootstrap` on a repository small enough for one chunk no longer
+  asks the provider for 64K output tokens. The output cap was keyed on the
+  number of chunks, so the only chunk of a small repo got the one-shot cap
+  meant for `--chunk-input-tokens 0`, and every such run failed on a
+  64K-context model. Under chunking (the default) every call now asks for up
+  to 16K; only `--chunk-input-tokens 0` keeps 64K. The `--max-input-tokens`
+  help no longer claims its 150K default leaves room for 64K of output in a
+  200K window. (#928)
+
 ## [2.4.1] - 2026-09-25
 
 ### Changed
