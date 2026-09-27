@@ -16,6 +16,7 @@ mod most_recently_active_scope;
 mod multi_session;
 mod pinned_pages;
 mod project_authz;
+mod reclaim_ledger_versions;
 mod related_walk;
 mod retrieval_superseded;
 mod retrieval_tuning_streams;
