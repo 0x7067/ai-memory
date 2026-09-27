@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `docs/jev-reranker-adapter.md` gains a choice-contrastive variant of the
+  Jev reranker adapter
+  (`docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`): one
+  `choice` question over the whole candidate list instead of one rubric
+  `score` per candidate, choice probability mapped to `relevance`. On the
+  same live golden set and 35B backend it measured hit@1 0.778 / NDCG@10
+  0.893 at 0.75 s mean rerank latency versus 0.636 / 0.833 at 2.2 s for
+  the rubric adapter, and it is the shape in which replay-trained small
+  judges hold their quality (4B: 0.808 vs 0.596). Safe because the
+  reranker leg is sort-only; the rubric-adapter caveat on absolute
+  relevance semantics is scoped to consumers that read absolute values.
 - `ai-memory reclaim-ledger-versions` drops the superseded versions of the raw
   hook event ledger that the pre-2.1.1 indexer left behind (#660), and nothing
   else. It reports what it would remove and changes nothing unless
