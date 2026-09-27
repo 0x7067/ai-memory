@@ -8,7 +8,7 @@ on a homelab box where mistakes are harder to undo.
 
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
-| `purge-project --confirm` | ✅ yes | the one project's data | no | Deletes the UUID-namespaced wiki root and raw workstream segments; sibling projects remain untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
+| `purge-project --confirm` | ✅ yes | the one project's data, **plus** any observation stamped into a different project by one of this project's sessions (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this project's sessions authored or accepted | no | Deletes the UUID-namespaced wiki root and raw workstream segments. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing — see below. |
 | `purge-session --session-id --confirm` | ✅ yes | the one session's data | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped — a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
 | `handoffs --expire-all --confirm` | ✅ yes | no (state change only) | no (but nothing is destroyed) | Marks every **open** handoff in the scope `expired` so it stops being offered to an agent. Rows, summaries and provenance are kept and stay visible in the audit log. Unlike the automatic sweep it does **not** spare manual handoffs or ones from another directory — those exemptions are exactly what a leftover backlog is made of, so honouring them would clear nothing. `--older-than-days N` keeps recent batons. Owner-scoped: never touches another user's baton. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
@@ -208,6 +208,52 @@ What happens, in order:
 raw segment directory is removed on the server and appears in
 `files_deleted`; a failed removal appears in `files_failed` alongside wiki
 cleanup failures.
+
+#### Preview without `--confirm`
+
+Without `--confirm`, the CLI first asks the server for a preview
+(`"dry_run": true` in the request). `dry_run` always wins over `confirm` —
+`{"confirm": true, "dry_run": true}` still only previews, the same way
+`reclaim-ledger-versions` treats its own `dry_run` field — so a preview
+request can never become destructive by accident.
+
+The preview runs the same lookups and counts steps 1-3 above use to decide
+what a confirmed purge would delete — same 404 on an unknown scope, same
+`409` on a live managed-run lease without `--force` — and returns those
+counts, including the two cross-project ones (an observation deleted, or a
+handoff's session reference nulled, in a project other than the one named;
+see the matrix row above), without ever issuing the `DELETE` in step 4. It
+does not run the delete and roll it back: on a large project that would cost
+as much writer-actor time as a real purge (every hook capture queued behind
+it pays for that), for no benefit over just counting. Because step 4 never
+runs, step 5's filesystem cleanup never runs either (`files_deleted` /
+`files_failed` are always empty), and neither the `purged_scopes` tombstone
+nor the `audit_log` row from step 4's transaction is written; neither
+checkpoint is taken. The reply carries `"dry_run": true`. The CLI prints:
+
+```
+Would purge default/my-project: 3 pages, 1 sessions, 1063 observations, 0 handoffs, 3 embeddings, 0 workstreams, 0 managed runs.
+```
+
+(with a trailing "Plus N observations in other projects via their sessions"
+/ "Plus N handoffs ..." clause when either cross-project count is non-zero),
+then still refuses with the existing "destructive and irreversible" message
+and a non-zero exit — the preview is information layered on top of the
+refusal, never a substitute for `--confirm`.
+
+A preview also skips the blocking admission call a confirmed purge makes
+before deleting anything (`admit_purge_project`): nothing was decided yet,
+so there is nothing for a `Reject`-policy or scope-guard webhook to act on.
+This means a `200` preview is not a guarantee — that same webhook only runs
+on the confirmed path and can still refuse the real purge afterward.
+
+If the server is unreachable, times out (a few seconds, auth-token refresh
+included), or predates this field (a plain `400`), the CLI falls back
+silently to the plain refusal with no preview line, so no existing script's
+exit code or error shape changes — only a confirmed purge is ever
+destructive. A `404`/`409`/`403` (or any other unexpected status) prints the
+server's own error before the refusal instead, since the operator asked what
+would happen and the server has a real answer.
 
 Failure modes:
 

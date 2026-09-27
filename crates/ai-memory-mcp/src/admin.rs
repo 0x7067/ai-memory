@@ -4142,6 +4142,21 @@ struct PurgeProjectRequest {
     /// the cost and for what it does not guarantee.
     #[serde(default)]
     compact: bool,
+    /// Preview only: report the counts a purge of this scope would produce
+    /// without deleting anything. Wins over `confirm` — `{"confirm": true,
+    /// "dry_run": true}` still only previews, exactly like
+    /// `reclaim-ledger-versions` treats its own `dry_run` field — so a
+    /// preview request can never accidentally become destructive.
+    /// `#[serde(default)]` here is what keeps an *old* CLI (built before this
+    /// field existed, so it never sends `dry_run` at all) parsing the same
+    /// request it always sent. The other direction — a *new* CLI talking to
+    /// an *old* server that doesn't know this field yet — needs nothing on
+    /// this struct at all: an unknown JSON field is simply not a
+    /// `Deserialize` error on the server, so the old server ignores it and
+    /// the new CLI's fallback (see `commands/purge_project.rs`) handles the
+    /// resulting plain 400.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/purge-project`.
@@ -4159,6 +4174,19 @@ pub struct PurgeProjectReport {
     pub handoffs_deleted: u64,
     /// Number of `page_embeddings` rows deleted.
     pub embeddings_deleted: u64,
+    /// `observations` rows in a **different** project, deleted collaterally
+    /// because their `session_id` belongs to a session that lives in this
+    /// one (`observations.session_id` is `ON DELETE CASCADE`, without regard
+    /// to the observation's own `project_id`) — the mirror of the incident
+    /// this preview guards against. Always present, zero when there is none,
+    /// so a caller can tell "no collateral damage" apart from "field absent
+    /// on an older server".
+    pub collateral_observations_deleted: u64,
+    /// `handoffs` rows in a different project whose `from_session_id` or
+    /// `accepted_by_session` is set to `NULL` (not deleted — those columns
+    /// are `ON DELETE SET NULL`) because they referenced a session that
+    /// lives in this project.
+    pub collateral_handoffs_denulled: u64,
     /// Number of managed `workstreams` rows deleted via cascade.
     pub workstreams_deleted: u64,
     /// Number of `managed_runs` rows deleted via cascade.
@@ -4180,6 +4208,16 @@ pub struct PurgeProjectReport {
     /// Post-purge checkpoint, if the purge changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// `true` for a preview: `dry_run: true` in the request always wins over
+    /// `confirm`, so this is only ever `false` on a run that actually
+    /// deleted rows. The counts above are read directly by the same queries
+    /// a confirmed purge uses to decide what to delete — never by running
+    /// the delete and rolling it back — so `files_deleted`/`files_failed`
+    /// are always empty and `pre_checkpoint`/`checkpoint` always absent: no
+    /// wiki file was touched, no admission webhook ran, and no audit row was
+    /// written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 async fn remove_workstream_segment_storage(
@@ -4259,6 +4297,13 @@ async fn handle_purge_project(
     Json(req): Json<PurgeProjectRequest>,
 ) -> impl IntoResponse {
     let author_id = author_ext.map(|axum::Extension(u)| u);
+    // `dry_run` always wins, exactly like `reclaim-ledger-versions` (its
+    // handler passes `req.dry_run` straight into the op regardless of any
+    // other field): `{"confirm": true, "dry_run": true}` must never run the
+    // destructive path just because `confirm` also happened to be set.
+    if req.dry_run {
+        return purge_project_preview(&state, &req, author_id).await;
+    }
     if !req.confirm {
         return (
             StatusCode::BAD_REQUEST,
@@ -4316,7 +4361,15 @@ async fn handle_purge_project(
 
     let summary = match state
         .writer
-        .purge_project(ws_id, proj_id, &label, author_id, req.force, compaction)
+        .purge_project(
+            ws_id,
+            proj_id,
+            &label,
+            author_id,
+            req.force,
+            compaction,
+            ai_memory_store::PurgeMode::Commit,
+        )
         .await
     {
         Ok(s) => s,
@@ -4369,6 +4422,8 @@ async fn handle_purge_project(
         observations_deleted: summary.observations_deleted,
         handoffs_deleted: summary.handoffs_deleted,
         embeddings_deleted: summary.embeddings_deleted,
+        collateral_observations_deleted: summary.collateral_observations_deleted,
+        collateral_handoffs_denulled: summary.collateral_handoffs_denulled,
         workstreams_deleted: summary.workstreams_deleted,
         managed_runs_deleted: summary.managed_runs_deleted,
         workstream_ids: summary.workstream_ids,
@@ -4377,6 +4432,102 @@ async fn handle_purge_project(
         files_failed,
         pre_checkpoint,
         checkpoint,
+        dry_run: false,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+/// Preview branch of `POST /admin/purge-project`: reached whenever `dry_run`
+/// is true, regardless of `confirm` (see the `dry_run`-always-wins check in
+/// `handle_purge_project`). `ai_memory_store::purge_project` under
+/// `PurgeMode::Preview` counts every row a confirmed purge would delete —
+/// via the same `SELECT`s the confirmed path itself uses to decide what to
+/// delete, not a separately-maintained estimate — and returns without ever
+/// issuing the `DELETE`, so there is no cascade to roll back, unlike
+/// `move-session`'s dry run (which does run its write and rolls it back: a
+/// session's rows are cheap; a whole project's are not, and this preview is
+/// now the default no-`--confirm` behavior of a command a hook can also
+/// race against).
+///
+/// Deliberately skipped, unlike the confirmed path above: it never opens the
+/// blocking admission call (`admit_purge_project`) at all — nothing was
+/// decided yet, so there is nothing for a mirror to act on — plus wiki file
+/// removal (nothing was deleted) and both checkpoints (the git tree does not
+/// change). Because admission never runs, a `200` here is not a guarantee:
+/// a `Reject`-policy or scope-guard admission webhook only runs on the
+/// confirmed path and can still refuse the real purge afterward.
+///
+/// Because admission never runs here, a `200` preview is not a promise the
+/// confirmed purge will succeed: a `Reject`-policy or scope-guard admission
+/// webhook only runs on the confirmed path and can still refuse it after the
+/// operator has already seen this preview.
+///
+/// Scope resolution and its 404 run exactly as the real purge's do, so an
+/// unknown workspace/project answers identically either way.
+async fn purge_project_preview(
+    state: &Arc<AdminState>,
+    req: &PurgeProjectRequest,
+    author_id: Option<ai_memory_core::UserId>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (ws_id, proj_id) = match lookup_ws_proj_no_create(state, &req.workspace, &req.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    let label = format!("{}/{}", req.workspace, req.project);
+
+    let summary = match state
+        .writer
+        .purge_project(
+            ws_id,
+            proj_id,
+            &label,
+            author_id,
+            req.force,
+            // A preview never deletes anything, so there is nothing to
+            // reclaim; `ops::purge_project` also forces `compacted: false`
+            // for `PurgeMode::Preview` regardless of this value.
+            ai_memory_store::Compaction::Skip,
+            ai_memory_store::PurgeMode::Preview,
+        )
+        .await
+    {
+        Ok(s) => s,
+        // Same conflict a confirmed purge would hit, reported the same way:
+        // the preview is a promise of what a real purge would do, and a real
+        // purge would refuse here too.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let report = PurgeProjectReport {
+        label: summary.label,
+        pages_deleted: summary.pages_deleted,
+        sessions_deleted: summary.sessions_deleted,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        embeddings_deleted: summary.embeddings_deleted,
+        collateral_observations_deleted: summary.collateral_observations_deleted,
+        collateral_handoffs_denulled: summary.collateral_handoffs_denulled,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
+        compacted: false,
+        files_deleted: Vec::new(),
+        files_failed: Vec::new(),
+        pre_checkpoint: None,
+        checkpoint: None,
+        dry_run: true,
     };
 
     (
@@ -6629,6 +6780,7 @@ async fn copy_purge_merge(
             None,
             false,
             ai_memory_store::Compaction::Skip,
+            ai_memory_store::PurgeMode::Commit,
         )
         .await
     {
@@ -12106,6 +12258,95 @@ mod tests {
                 "{method} {uri} must require authentication in multi-user mode"
             );
         }
+    }
+
+    /// The preview branch (no `confirm`, `dry_run: true`) sits behind the
+    /// exact same root-only gate as the rest of `/admin/purge-project` — it
+    /// is reached through the same handler and route, so there is no
+    /// separate check to forget. Mirrors
+    /// `multiuser_admin_routes_reject_db_user_tier` /
+    /// `multiuser_admin_routes_reject_anonymous` above, but with a payload
+    /// shaped like a preview request instead of `admin_route_samples()`'s
+    /// confirmed one. The root control case proves the gate — not the
+    /// route — is what is being tested: root reaches the handler (answered
+    /// with `404`, since this router's store has no `default/scratch`
+    /// project), while the DB user and anonymous requests below never get
+    /// that far.
+    #[tokio::test]
+    async fn multiuser_purge_project_dry_run_rejects_db_user_and_anonymous() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+
+        let preview_body = serde_json::json!({
+            "workspace": "default",
+            "project": "scratch",
+            "confirm": false,
+            "dry_run": true
+        });
+
+        // Root control case: reaches the handler (proven by getting past
+        // both auth statuses below into the route's own 404 for an unknown
+        // project), unlike the DB-user and anonymous requests.
+        let root_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-project")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::from(serde_json::to_vec(&preview_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            root_resp.status(),
+            StatusCode::NOT_FOUND,
+            "root must reach the preview handler, not be blocked by the auth gate"
+        );
+
+        let db_user_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-project")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer db-user-token")
+                    .body(Body::from(serde_json::to_vec(&preview_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db_user_resp.status(),
+            StatusCode::FORBIDDEN,
+            "a dry-run preview must stay root-only for DB users in multi-user mode"
+        );
+
+        let anon_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/purge-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&preview_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            anon_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a dry-run preview must require authentication in multi-user mode"
+        );
     }
 
     #[tokio::test]

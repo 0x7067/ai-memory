@@ -803,3 +803,462 @@ async fn purge_project_idempotent_second_call_is_404() {
         "second purge must 404 because project is already gone"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dry-run preview (no `confirm`, `dry_run: true`)
+// ---------------------------------------------------------------------------
+
+/// The preview must report the exact counts a confirmed purge would produce
+/// — not an estimate — and it must not touch anything: the confirmed purge
+/// run right after it must succeed with identical counts, and the project's
+/// files and DB rows must still be intact in between.
+#[tokio::test]
+async fn purge_project_dry_run_reports_the_same_counts_the_confirmed_purge_will() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let (ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
+    let proj_dir = state.wiki.project_root(ws, doomed);
+
+    let preview = post(
+        state.clone(),
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": false, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK, "a preview must succeed");
+    let preview_body = body_json(preview).await;
+    assert_eq!(preview_body["dry_run"], true);
+    assert_eq!(preview_body["pages_deleted"], 1);
+    assert_eq!(preview_body["sessions_deleted"], 1);
+    assert_eq!(preview_body["observations_deleted"], 3);
+    assert_eq!(preview_body["handoffs_deleted"], 1);
+    assert_eq!(preview_body["files_deleted"], json!([]));
+    assert_eq!(preview_body["files_failed"], json!([]));
+    assert_eq!(preview_body["compacted"], false);
+    assert!(
+        preview_body.get("pre_checkpoint").is_none(),
+        "a preview must not checkpoint the wiki tree"
+    );
+    assert!(
+        preview_body.get("checkpoint").is_none(),
+        "a preview must not checkpoint the wiki tree"
+    );
+
+    // Nothing was touched: the project directory and its row are still there.
+    assert!(
+        proj_dir.exists(),
+        "a preview must not remove the project directory"
+    );
+    assert!(
+        store
+            .reader
+            .find_project(ws, "doomed".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "a preview must not delete the project row"
+    );
+
+    // The confirmed purge right after it must succeed with the same counts.
+    let confirmed = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": true }),
+    )
+    .await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    let confirmed_body = body_json(confirmed).await;
+    assert_eq!(
+        confirmed_body.get("dry_run"),
+        None,
+        "a confirmed purge report has no dry_run key"
+    );
+    for field in [
+        "pages_deleted",
+        "sessions_deleted",
+        "observations_deleted",
+        "handoffs_deleted",
+    ] {
+        assert_eq!(
+            confirmed_body[field], preview_body[field],
+            "the confirmed purge's {field} must match what the preview reported"
+        );
+    }
+    assert!(
+        !proj_dir.exists(),
+        "the confirmed purge must remove the project directory"
+    );
+}
+
+/// A dry run must not dispatch the admission webhook: nothing was decided
+/// yet, so there is nothing for a mirror to act on. Uses the same
+/// `Ignore`/non-blocking capture-hook pattern as
+/// `purge_session_reports_file_cleanup_failure_after_db_commit` above, but
+/// asserts the opposite — that no payload ever arrives — within a short
+/// timeout.
+#[tokio::test]
+async fn purge_project_dry_run_does_not_dispatch_admission_webhook() {
+    let (url, rx) = spawn_capture_hook().await;
+
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "async-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeProject],
+        blocking: false,
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
+    seed_two_projects(&store, &state.wiki).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": false, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), rx).await;
+    assert!(
+        outcome.is_err(),
+        "a dry run must not dispatch the purge-project admission webhook"
+    );
+}
+
+/// A non-existent project must still 404 on a preview, exactly like the
+/// confirmed purge does.
+#[tokio::test]
+async fn purge_project_dry_run_nonexistent_returns_404() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project": "nonexistent",
+            "confirm": false,
+            "dry_run": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp).await;
+    assert!(body["error"].as_str().unwrap_or("").contains("not found"));
+}
+
+/// A non-existent workspace must also 404 on a preview.
+#[tokio::test]
+async fn purge_project_dry_run_nonexistent_workspace_returns_404() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "ghost-workspace",
+            "project": "x",
+            "confirm": false,
+            "dry_run": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The incident this feature guards against, exercised through the HTTP
+/// route rather than the store function directly: a session lives in one
+/// project but one of its observations is stamped into another (the
+/// pre-#871 Windows path-casing split). The preview of the *other* project
+/// must count that observation even though no session row lives there —
+/// exactly the number a naive "0 sessions, 0 pages" glance would miss.
+#[tokio::test]
+async fn purge_project_dry_run_counts_observations_stamped_from_another_projects_session() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let owner = store
+        .writer
+        .get_or_create_project(ws, "owner", None)
+        .await
+        .unwrap();
+    let doomed = store
+        .writer
+        .get_or_create_project(ws, "looks-empty", None)
+        .await
+        .unwrap();
+
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: sid,
+            workspace_id: ws,
+            project_id: owner,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    // The stray observation: same session, different project_id.
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: doomed,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "stray".into(),
+                body: "stray body".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project": "looks-empty",
+            "confirm": false,
+            "dry_run": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["sessions_deleted"], 0,
+        "the session row itself lives in the owner project"
+    );
+    assert_eq!(
+        body["observations_deleted"], 1,
+        "the stray observation stamped into the previewed project must be counted"
+    );
+}
+
+/// BLOCKING fix: `dry_run` must always win over `confirm`. Before this test
+/// existed, `{"confirm": true, "dry_run": true}` ran the real destructive
+/// purge — `handle_purge_project` only checked `dry_run` inside the
+/// `!confirm` branch, so a caller that (accidentally or not) sent both
+/// `true` got the worst of both: a request that reads like a preview and
+/// behaves like a purge. `reclaim-ledger-versions` never had this hole
+/// because its handler passes `req.dry_run` straight into the op regardless
+/// of `confirm`; `purge-project` now checks `dry_run` first, unconditionally,
+/// exactly the same way.
+#[tokio::test]
+async fn purge_project_confirm_true_and_dry_run_true_still_only_previews() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let (ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
+    let proj_dir = state.wiki.project_root(ws, doomed);
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project": "doomed",
+            "confirm": true,
+            "dry_run": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["dry_run"], true,
+        "confirm: true must not defeat dry_run: true"
+    );
+    assert_eq!(body["pages_deleted"], 1);
+    assert_eq!(body["sessions_deleted"], 1);
+    assert_eq!(body["observations_deleted"], 3);
+
+    // The only proof that matters: nothing was actually deleted.
+    assert!(
+        proj_dir.exists(),
+        "{{confirm: true, dry_run: true}} must not delete the project directory"
+    );
+    assert!(
+        store
+            .reader
+            .find_project(ws, "doomed".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "{{confirm: true, dry_run: true}} must not delete the project row"
+    );
+}
+
+/// The mirror of the incident, exercised through the HTTP route: purging a
+/// project P also collaterally deletes an observation stamped into a
+/// *different* project Q (because `observations.session_id` cascades
+/// regardless of the observation's own `project_id`), and orphans (nulls the
+/// session reference of, without deleting) a handoff that lives in Q too.
+/// Neither shows up in the plain `observations_deleted`/`handoffs_deleted`
+/// counts, which is exactly why the two `collateral_*` fields exist.
+#[tokio::test]
+async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage_in_another_project()
+ {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let doomed = store
+        .writer
+        .get_or_create_project(ws, "doomed", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: sid,
+            workspace_id: ws,
+            project_id: doomed,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    // Collateral observation: session lives in `doomed`, observation is
+    // stamped into `other`.
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: other,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "collateral".into(),
+                body: "collateral body".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    // Collateral handoff: lives in `other`, authored by the `doomed` session.
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: other,
+            from_session_id: Some(sid),
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "collateral handoff".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let preview = post(
+        state.clone(),
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": false, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview_body = body_json(preview).await;
+    assert_eq!(preview_body["collateral_observations_deleted"], 1);
+    assert_eq!(preview_body["collateral_handoffs_denulled"], 1);
+
+    let confirmed = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": true }),
+    )
+    .await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    let confirmed_body = body_json(confirmed).await;
+    assert_eq!(confirmed_body["collateral_observations_deleted"], 1);
+    assert_eq!(confirmed_body["collateral_handoffs_denulled"], 1);
+
+    // `other` survives as a project; only the collateral rows are affected.
+    assert_eq!(
+        store.reader.status_counts().await.unwrap().observations,
+        0,
+        "the collateral observation in `other` must actually be gone"
+    );
+}
+
+/// A live managed-run lease under the project must still refuse the preview
+/// with the same `409` a confirmed purge would, unless `force` overrides it
+/// — the preview promises to describe what a confirmed call would do, and a
+/// confirmed call would refuse here too.
+#[tokio::test]
+async fn purge_project_dry_run_conflicts_on_a_live_managed_run_without_force() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let (workspace_id, _keep, project_id) = seed_two_projects(&store, &state.wiki).await;
+    store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id,
+            project_id,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": false, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a live managed run must still 409 a preview without --force"
+    );
+}

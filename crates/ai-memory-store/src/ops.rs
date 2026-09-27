@@ -139,6 +139,22 @@ pub struct PurgeSummary {
     pub handoffs_deleted: u64,
     /// Number of `page_embeddings` rows deleted (cascades through pages).
     pub embeddings_deleted: u64,
+    /// `observations` rows belonging to a **different** project that are
+    /// deleted anyway, collaterally, because `observations.session_id`
+    /// carries `ON DELETE CASCADE` to `sessions` — a project's cascade does
+    /// not check the observation's own `project_id`. This is the mirror of
+    /// the incident this preview guards against: not "this scope holds more
+    /// than it looks like", but "purging this scope also reaches into
+    /// another one" (V01 `observations.session_id REFERENCES sessions(id)
+    /// ON DELETE CASCADE`).
+    pub collateral_observations_deleted: u64,
+    /// `handoffs` rows belonging to a different project whose
+    /// `from_session_id` or `accepted_by_session` is about to be set to
+    /// `NULL` — not deleted, just orphaned from the session that authored or
+    /// accepted them — because those columns are `ON DELETE SET NULL` to
+    /// `sessions` (V02). The row and its text survive; only the link back to
+    /// the purged project's session does not.
+    pub collateral_handoffs_denulled: u64,
     /// Number of `workstreams` rows deleted. These cascade from `projects`,
     /// so a project that looks empty by page/session/observation count can
     /// still take a managed workstream — and its portable event ledger — down
@@ -4151,6 +4167,22 @@ pub enum Compaction {
     Reclaim,
 }
 
+/// What [`purge_project`] does once it has finished counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeMode {
+    /// Run the delete for real and commit it.
+    Commit,
+    /// Stop right after the counts and roll the (read-only, so far)
+    /// transaction back. No `DELETE`, no cascade, no tombstone insert, no
+    /// audit row — the whole point is to never pay for a real purge's cost
+    /// just to undo it: on a project with a lot of rows, running and then
+    /// rolling back the actual `DELETE FROM projects` cascade would hold the
+    /// single writer actor (invariant #2) for as long as a real purge does,
+    /// and every hook capture queued behind it pays for that with a 429 or a
+    /// dropped observation. A preview only ever issues `SELECT`s.
+    Preview,
+}
+
 /// Every FTS5 index in the schema, which is what [`reclaim_freed_pages`]
 /// rebuilds.
 ///
@@ -4928,10 +4960,23 @@ pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreRe
 /// cascades out of `projects`, so purging a scope whose lease is still live
 /// would delete the lease row out from under a running agent.
 ///
+/// `mode = `[`PurgeMode::Preview`] runs every count above — including the two
+/// collateral ones — and then returns without ever issuing the `DELETE`, the
+/// tombstone insert, or the audit row: the transaction so far has only ever
+/// read, so rolling it back is free. This intentionally does *not* run the
+/// delete and roll it back (as [`move_session`]'s dry run does): on a large
+/// project that would hold the single writer actor (invariant #2) for as
+/// long as a real purge takes, and every hook capture queued behind it pays
+/// for that. The counts are what the confirmed call *would* delete, read the
+/// same way the confirmed call itself decides what to delete — not a
+/// separately-maintained estimate — but they are a snapshot, not a promise:
+/// a write between the preview and a later `--confirm` can change them.
+///
 /// # Errors
 /// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
 /// still live and `force` is false, or [`StoreError`] if any SQL statement
 /// fails. The transaction is rolled back automatically on error.
+#[allow(clippy::too_many_arguments)]
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -4940,6 +4985,7 @@ pub fn purge_project(
     author_id: Option<ai_memory_core::UserId>,
     force: bool,
     compaction: Compaction,
+    mode: PurgeMode,
 ) -> StoreResult<PurgeSummary> {
     let tx = conn.transaction()?;
 
@@ -5019,6 +5065,33 @@ pub fn purge_project(
         &pid[..],
     )?;
 
+    // Collateral damage in OTHER projects, via `sessions` cascading out of
+    // this one. `observations.session_id` is `ON DELETE CASCADE` (V01) with
+    // no regard for the observation's own `project_id`, so an observation
+    // stamped into a sibling project — the same split the incident this
+    // preview guards against turns on — is deleted right along with the
+    // session that wrote it, even though nothing in that sibling project's
+    // own row count says so.
+    let collateral_observations_deleted = count(
+        "SELECT COUNT(*) FROM observations \
+         WHERE project_id != ?1 \
+           AND session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+        &pid[..],
+    )?;
+    // `handoffs.from_session_id` / `accepted_by_session` are `ON DELETE SET
+    // NULL` (V02): a handoff living in another project is not deleted, but
+    // loses the link back to whichever of this project's sessions authored
+    // or accepted it.
+    let collateral_handoffs_denulled = count(
+        "SELECT COUNT(*) FROM handoffs \
+         WHERE project_id != ?1 \
+           AND ( \
+             from_session_id IN (SELECT id FROM sessions WHERE project_id = ?1) \
+             OR accepted_by_session IN (SELECT id FROM sessions WHERE project_id = ?1) \
+           )",
+        &pid[..],
+    )?;
+
     // Collect all distinct on-disk paths for the caller to clean up.
     // We use DISTINCT because multiple versions of the same logical page
     // share a path; the file only exists once. The statement must be
@@ -5045,6 +5118,29 @@ pub fn purge_project(
             .map(|raw| ai_memory_core::WorkstreamId::from_slice(&raw).map(|id| id.to_string()))
             .collect::<Result<Vec<_>, _>>()?
     };
+
+    if mode == PurgeMode::Preview {
+        // Nothing was written — every statement above was a `SELECT` — so
+        // rolling back here is immediate; it never had to pay for the
+        // `DELETE FROM projects` cascade this function's `Commit` mode runs
+        // below, which is the whole point (see `PurgeMode::Preview`'s doc).
+        tx.rollback()?;
+        return Ok(PurgeSummary {
+            label: workspace_project_label.to_string(),
+            page_paths,
+            pages_deleted,
+            sessions_deleted,
+            observations_deleted,
+            handoffs_deleted,
+            embeddings_deleted,
+            collateral_observations_deleted,
+            collateral_handoffs_denulled,
+            workstreams_deleted,
+            managed_runs_deleted,
+            workstream_ids,
+            compacted: false,
+        });
+    }
 
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
@@ -5080,7 +5176,8 @@ pub fn purge_project(
 
     tx.commit()?;
 
-    if compaction == Compaction::Reclaim {
+    let compacted = compaction == Compaction::Reclaim;
+    if compacted {
         reclaim_freed_pages(conn)?;
     }
 
@@ -5092,10 +5189,12 @@ pub fn purge_project(
         observations_deleted,
         handoffs_deleted,
         embeddings_deleted,
+        collateral_observations_deleted,
+        collateral_handoffs_denulled,
         workstreams_deleted,
         managed_runs_deleted,
         workstream_ids,
-        compacted: compaction == Compaction::Reclaim,
+        compacted,
     })
 }
 
@@ -6440,6 +6539,7 @@ pub(crate) mod tests {
             None,
             false,
             Compaction::Skip,
+            PurgeMode::Commit,
         )
         .unwrap();
 
@@ -6482,6 +6582,7 @@ pub(crate) mod tests {
             None,
             false,
             Compaction::Skip,
+            PurgeMode::Commit,
         )
         .unwrap();
         assert!(!summary.compacted, "the default does not VACUUM");
@@ -6516,6 +6617,7 @@ pub(crate) mod tests {
             None,
             false,
             Compaction::Reclaim,
+            PurgeMode::Commit,
         )
         .unwrap();
         assert!(summary.compacted, "the summary reports that VACUUM ran");
@@ -6530,6 +6632,320 @@ pub(crate) mod tests {
             bytes.windows(12).any(|w| w == b"obs-survivor"),
             "the sibling project's text is untouched by the compaction"
         );
+    }
+
+    /// A preview's counts come from the same `SELECT`s the confirmed path
+    /// uses to decide what to delete, not a separately-maintained estimate,
+    /// so a preview and the confirmed run right after it must agree exactly
+    /// (barring a write landing in between, which neither this nor a real
+    /// `--confirm`-less-then-`--confirm` operator workflow can rule out).
+    #[test]
+    fn purge_project_dry_run_reports_the_same_counts_a_real_purge_would() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_session(&mut conn, ws, proj, "canaryproj");
+
+        let preview = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a dry run must not error");
+        assert_eq!(preview.pages_deleted, 1);
+        assert_eq!(preview.sessions_deleted, 1);
+        assert_eq!(preview.observations_deleted, 1);
+        assert!(!preview.compacted, "a rolled-back run never reclaims bytes");
+
+        let real = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect("the confirmed purge must still succeed after the preview");
+        assert_eq!(
+            (
+                real.pages_deleted,
+                real.sessions_deleted,
+                real.observations_deleted
+            ),
+            (
+                preview.pages_deleted,
+                preview.sessions_deleted,
+                preview.observations_deleted
+            ),
+            "the dry run's counts must match what the confirmed run actually deletes"
+        );
+    }
+
+    /// The incident this feature guards against: an operator purged a
+    /// project believing it held 0 sessions / 0 pages, and it actually held
+    /// over a thousand observations whose `project_id` pointed at the purged
+    /// project even though their `session_id` belonged to a session that
+    /// lived in a *different* project (a pre-#871 Windows path-casing
+    /// split). `purge_project` counts `observations` directly by
+    /// `project_id`, not by joining through `sessions`, so this must still
+    /// show up in a dry run's `observations_deleted` — the exact number a
+    /// naive "count sessions, look empty" check would miss.
+    #[test]
+    fn purge_project_dry_run_counts_observations_whose_session_lives_in_another_project() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "elsewhere", None).unwrap();
+
+        // The session (and its own observation) live in `other`, not `proj`.
+        let (sid, _page) = seed_session(&mut conn, ws, other, "elsewhere-owner");
+
+        // A second observation of that same session is stamped into `proj` —
+        // the split this test pins.
+        let stray = NewObservation {
+            session_id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "stray".into(),
+            body: "obs-stray-in-doomed-project".into(),
+            importance: 5,
+        };
+        insert_observation(&mut conn, &stray).unwrap();
+
+        let preview = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a dry run must not error");
+        assert_eq!(
+            preview.sessions_deleted, 0,
+            "the session row itself lives in `other`, not the previewed project"
+        );
+        assert_eq!(
+            preview.observations_deleted, 1,
+            "the stray observation stamped into the previewed project must still be counted"
+        );
+
+        // Nothing was actually touched: the session and its own observation
+        // in `other` are both still there, dry run or not.
+        let survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                rusqlite::params![&sid.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            survived, 1,
+            "the session in the other project must survive the dry run"
+        );
+    }
+
+    /// Bite check: every project-scoped row count, the purge tombstone, and
+    /// the audit trail must all be identical before and after a
+    /// [`PurgeMode::Preview`] run. If `Preview` ever fell through to the
+    /// `Commit` path's `DELETE` / tombstone insert / audit insert, this is
+    /// the test that would catch it.
+    #[test]
+    fn purge_project_dry_run_changes_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let prepared = open_managed_run(&mut conn, &ws, &proj);
+        seed_workstream_event(&conn, &prepared.workstream_id, "canaryevt");
+        seed_session(&mut conn, ws, proj, "canaryproj");
+
+        let before = row_snapshot(&conn);
+
+        let preview = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            true, // force: a live managed run sits under this project
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a dry run must not error even with a live managed run");
+        assert!(preview.pages_deleted >= 1);
+        assert!(preview.observations_deleted >= 1);
+        assert_eq!(preview.workstreams_deleted, 1);
+        assert_eq!(preview.managed_runs_deleted, 1);
+
+        let after = row_snapshot(&conn);
+        assert_eq!(
+            before, after,
+            "a dry run must leave every project-scoped table's row count unchanged"
+        );
+    }
+
+    /// The mirror of the incident this whole feature guards against: instead
+    /// of the purged project holding more than it looks like (rows counted
+    /// in `observations_deleted`), purging it reaches OUT and takes rows
+    /// from a project the operator never named. `observations.session_id`
+    /// is `ON DELETE CASCADE` (V01) with no regard for the observation's own
+    /// `project_id`, and `handoffs.from_session_id` /
+    /// `accepted_by_session` are `ON DELETE SET NULL` (V02) — neither of
+    /// which the plain `observations_deleted`/`handoffs_deleted` counts (by
+    /// `project_id = P`) can see, because these rows belong to a different
+    /// project.
+    #[test]
+    fn purge_project_counts_collateral_damage_in_another_project() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other-project", None).unwrap();
+
+        // A session (and its own observation) rooted in the project being
+        // purged.
+        let (sid, _page) = seed_session(&mut conn, ws, proj, "owner");
+
+        // An observation in the OTHER project, stamped by the same session.
+        let stray_observation = NewObservation {
+            session_id: sid,
+            workspace_id: ws,
+            project_id: other,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "stray".into(),
+            body: "obs-in-other-project".into(),
+            importance: 5,
+        };
+        insert_observation(&mut conn, &stray_observation).unwrap();
+
+        // A handoff in the OTHER project, authored by that same session.
+        insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: other,
+                from_session_id: Some(sid),
+                from_agent: ai_memory_core::AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "handoff in other project".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+
+        let preview = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a preview must not error");
+        assert_eq!(
+            preview.collateral_observations_deleted, 1,
+            "the observation in the other project must be counted as collateral"
+        );
+        assert_eq!(
+            preview.collateral_handoffs_denulled, 1,
+            "the handoff in the other project must be counted as collateral"
+        );
+        // The preview changed nothing: both rows are still exactly as seeded.
+        let obs_in_other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                rusqlite::params![&other.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_in_other, 1);
+
+        let real = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect("the confirmed purge must succeed");
+        assert_eq!(real.collateral_observations_deleted, 1);
+        assert_eq!(real.collateral_handoffs_denulled, 1);
+
+        // The prediction must match what the cascade actually did: the
+        // collateral observation is really gone from the other project (its
+        // own project row was never touched)...
+        let obs_in_other_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                rusqlite::params![&other.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            obs_in_other_after, 0,
+            "the collaterally-cascaded observation must actually be gone"
+        );
+        // ...and the handoff row itself survives (it belongs to `other`,
+        // which was never purged) but its session reference is nulled, not
+        // the row.
+        let (handoffs_in_other, from_session_id): (i64, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(from_session_id) FROM handoffs WHERE project_id = ?1",
+                rusqlite::params![&other.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            handoffs_in_other, 1,
+            "the handoff row in the other project must survive"
+        );
+        assert!(
+            from_session_id.is_none(),
+            "the handoff's from_session_id must be nulled, not the row deleted"
+        );
+    }
+
+    /// Row counts of every table a real purge touches, used to prove a dry
+    /// run changed nothing. `purged_scopes` and `audit_log` are included
+    /// deliberately: both are written inside the same transaction as the
+    /// delete, so a rollback must take them back out too, not just the
+    /// cascade.
+    fn row_snapshot(conn: &Connection) -> Vec<(&'static str, i64)> {
+        [
+            "pages",
+            "sessions",
+            "observations",
+            "handoffs",
+            "page_embeddings",
+            "workstreams",
+            "managed_runs",
+            "workstream_events",
+            "projects",
+            "purged_scopes",
+            "audit_log",
+        ]
+        .iter()
+        .map(|table| {
+            (
+                *table,
+                count(conn, &format!("SELECT COUNT(*) FROM {table}")),
+            )
+        })
+        .collect()
     }
 
     /// The reason `reclaim_freed_pages` rebuilds all three FTS indexes rather
@@ -6569,6 +6985,7 @@ pub(crate) mod tests {
             None,
             true,
             Compaction::Reclaim,
+            PurgeMode::Commit,
         )
         .unwrap();
 
@@ -11418,6 +11835,7 @@ pub(crate) mod tests {
             None,
             false,
             Compaction::Skip,
+            PurgeMode::Commit,
         )
         .expect("purge of fresh project should succeed");
         // Now try to rename the project that no longer exists. The
@@ -11483,6 +11901,7 @@ pub(crate) mod tests {
             Some(author),
             false,
             Compaction::Skip,
+            PurgeMode::Commit,
         )
         .expect("purge should succeed");
 
@@ -11538,6 +11957,7 @@ pub(crate) mod tests {
             None,
             false,
             Compaction::Skip,
+            PurgeMode::Commit,
         )
         .expect_err("an active managed run must block the purge");
 
@@ -11579,6 +11999,7 @@ pub(crate) mod tests {
             None,
             true,
             Compaction::Skip,
+            PurgeMode::Commit,
         )
         .expect("force purges regardless of the live lease");
 
@@ -11615,6 +12036,7 @@ pub(crate) mod tests {
             None,
             false,
             Compaction::Skip,
+            PurgeMode::Commit,
         )
         .expect("a lapsed lease is not a running agent");
 

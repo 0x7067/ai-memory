@@ -878,6 +878,7 @@ mod tests {
                 None,
                 false,
                 crate::Compaction::Skip,
+                crate::PurgeMode::Commit,
             )
             .await
             .expect("a grant in force does not stand in a purge's way");

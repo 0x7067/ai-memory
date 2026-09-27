@@ -223,6 +223,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session-end` cannot double-close a session. (#623 follow-up, #933)
 
 ### Changed
+- `ai-memory purge-project` without `--confirm` now previews what a confirmed
+  purge would delete before refusing: `Would purge <ws>/<proj>: N pages, N
+  sessions, N observations, …`, with the same 404/409 a real purge gives.
+  Before, the counts only appeared after the rows were gone. The server takes
+  a new `dry_run` field on `POST /admin/purge-project` that always wins over
+  `confirm`. It only counts; no delete, wiki removal, webhook, audit row or
+  checkpoint runs. The preview and the confirmed report also count what the
+  purge cascades into *other* projects through this project's sessions
+  (`collateral_observations_deleted`, `collateral_handoffs_denulled`). The
+  CLI still exits non-zero without `--confirm`; against an older server, or
+  if the preview times out, it prints only the existing refusal. (#945)
 - A capture into a project its author may not write is dropped server-side
   and counted as `dropped_unauthorized` in status, never stored. The native
   hook client treats a 403 from the server as final and drops the event
