@@ -203,6 +203,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now write `$CODEX_HOME/config.toml`, matching `hooks.json`; `uninstall`
   sweeps the legacy `~/.codex/config.toml` too, and `install-hooks` still
   infers the server URL and token from it until the entry is rewritten. (#820)
+- Corrected OMP's install and session paths for named profiles. Hooks and
+  `mcp.json` now use the profile's agent directory and ignore
+  `PI_CODING_AGENT_DIR`. Profile selection follows `--profile`, then
+  `OMP_PROFILE`, then the legacy `PI_PROFILE`. Names are trimmed and
+  validated; empty environment values, whitespace-only names and `default`
+  select the default profile. Returning to the default profile also drops
+  an agent directory inherited from a named parent profile.
+  `PI_CONFIG_DIR` changes the `.omp` root relative to the user's home.
+  On Linux and macOS, `run omp`, `backfill` and `doctor` read sessions from
+  `$XDG_DATA_HOME/omp/sessions` (or `omp/profiles/<name>/sessions` under
+  `$XDG_DATA_HOME`) when the corresponding OMP directory exists and the agent
+  directory has not been relocated. `run omp` also honors
+  `PI_CODING_AGENT_SESSION_DIR` and a leading native `--profile`.
+  Uninstall checks the active and default profiles plus the legacy `.omp`
+  locations, and an invalid OMP profile no longer stops cleanup for other
+  agents. (#820)
 - A whitespace-only `KIMI_CODE_HOME`, `KIRO_HOME` or `GROK_HOME` pointed
   installs at a blank-named directory under the working directory, and a
   whitespace-only relocation variable did the same for `ai-memory run`'s
