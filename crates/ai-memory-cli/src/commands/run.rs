@@ -3356,6 +3356,16 @@ mod tests {
         );
         assert_eq!(
             blank_home_overrides(
+                ManagedHarness::Pi,
+                &env(&[
+                    ("PI_CODING_AGENT_SESSION_DIR", ""),
+                    ("PI_CODING_AGENT_DIR", "/x")
+                ])
+            ),
+            ["PI_CODING_AGENT_SESSION_DIR"]
+        );
+        assert_eq!(
+            blank_home_overrides(
                 ManagedHarness::Omp,
                 &env(&[
                     ("PI_CODING_AGENT_SESSION_DIR", ""),
