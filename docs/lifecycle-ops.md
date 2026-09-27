@@ -17,6 +17,7 @@ on a homelab box where mistakes are harder to undo.
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
+| `reclaim-ledger-versions` | ✅ yes | superseded pre-#660 ledger page *versions* only | no (the latest page version stays) | Dry-run by default; needs `--confirm` to delete. Online through the writer actor, safe alongside the live writer. Content-gated: only non-latest, non-decay `log.md`/`log-YYYY-MM.md` versions whose body opens with a ledger hook entry are removed; a real page that merely shares the name is untouched. `--compact` additionally rebuilds FTS and `VACUUM`s to reclaim the freed bytes. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
 | `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
@@ -612,6 +613,33 @@ The dry run therefore names each scope it would drain, with counts:
 
 `POST /admin/move-session` reports the same list as `source_scopes`. Read it
 before confirming.
+
+### `reclaim-ledger-versions`
+
+```bash
+# Dry run — reports how many superseded ledger versions (and bytes) would go:
+ai-memory reclaim-ledger-versions
+# Apply, and rewrite the database to actually free the disk:
+ai-memory reclaim-ledger-versions --confirm --compact
+```
+
+Before #660 the wiki indexer stored every rewrite of an OKF event ledger
+(`log.md`, `log-YYYY-MM.md`) as a fresh page version. On a busy store those
+superseded versions dominate the database (one report: ~95 % of a 45 GB store).
+This online command deletes exactly that residue: a page version is removed only
+when it is **not** the latest, is not a retention-decay version, its path matches
+the ledger shape, **and** its own body opens with a `## [timestamp]` ledger hook
+entry — so a genuine page that merely happens to be named `log-2026-09.md` is
+never touched, and no live/latest page is affected. Deletion runs through the
+single writer actor in one transaction; derived rows (embeddings, links,
+feedback) cascade, and the kept latest version's supersession back-pointer is
+nulled rather than cascade-deleted, so the surviving page stays reachable.
+
+It is dry-run by default and requires `--confirm` to write. Like `purge-*`, the
+logical delete alone does not shrink the file: pass `--compact` to rebuild the
+FTS index and `VACUUM`. `--drop-latest` (also content-gated) additionally
+reclaims the latest ledger version when you no longer need the in-wiki ledger at
+all.
 
 ### `checkpoints`
 
