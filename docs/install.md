@@ -2167,7 +2167,9 @@ remote or uses a custom host/port.
                             "scratch" only as a defensive fallback for
                             hook events with no usable cwd.)
 --max-input-tokens N       (default: 150000; total source budget after prune)
---chunk-input-tokens N     (default: 24000; per LLM call; 0 = single call)
+--chunk-input-tokens N     (default: 24000; per LLM call, each asking for up
+                            to 16K output tokens; 0 = single call asking for
+                            up to 64K, so input + 64K must fit the context)
 --since "30 days ago"      (git log filter; supports "N days/months/years ago" + YYYY-MM-DD)
 --exclude-git              (skip commit history)
 --exclude-readme           (skip README)

@@ -516,7 +516,8 @@ impl Bootstrap {
             let mut prior: Vec<String> = pages_by_path.keys().cloned().collect();
             prior.sort_unstable();
             let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
-            let request = build_chunk_request(chunk, idx + 1, llm_chunks, &prior_refs);
+            let request =
+                build_chunk_request(chunk, idx + 1, llm_chunks, chunk_budget, &prior_refs);
             info!(
                 chunk = idx + 1,
                 total = llm_chunks,
@@ -1351,6 +1352,7 @@ fn build_chunk_request(
     sources: &[BootstrapSource],
     chunk_index: usize,
     chunk_total: usize,
+    chunk_budget: usize,
     prior_paths: &[&str],
 ) -> ChatRequest {
     let mut buf = String::with_capacity(8_192);
@@ -1384,12 +1386,7 @@ fn build_chunk_request(
         buf.push_str(&src.text);
         buf.push_str("\n\n");
     }
-    let max_tokens = if chunk_total > 1 {
-        // Each chunk targets a smaller page batch; keeps Cursor bridge responses bounded.
-        16_000
-    } else {
-        64_000
-    };
+    let max_tokens = bootstrap_chunk_max_tokens(chunk_budget);
     ChatRequest {
         system: Some(SYSTEM_PROMPT.into()),
         messages: vec![ChatMessage {
@@ -1399,6 +1396,20 @@ fn build_chunk_request(
         max_tokens,
         temperature: Some(0.2),
     }
+}
+
+/// Output cap for one bootstrap LLM call.
+///
+/// With chunking on (the default), every call is a chunk that fits
+/// `chunk_budget`, including the only chunk of a small repo, so every call
+/// gets the chunk cap: it keeps Cursor bridge responses bounded and, with the
+/// default 24K chunk budget, fits a 64K-context model. Keying the cap on the
+/// chunk count instead sent a small repo's single chunk 64K output tokens,
+/// which no 64K-context model can accept. Only an operator who disables
+/// chunking (`chunk_budget == 0`, one call with the whole pruned bundle) gets
+/// the large cap.
+const fn bootstrap_chunk_max_tokens(chunk_budget: usize) -> u32 {
+    if chunk_budget == 0 { 64_000 } else { 16_000 }
 }
 
 /// Highest `decisions/NNNN-…` serial seen in `prior_paths`, or 0.
@@ -1777,6 +1788,24 @@ mod tests {
         };
         let chunks = plan_bootstrap_chunks(vec![s], DEFAULT_CHUNK_INPUT_TOKENS);
         assert_eq!(chunks.len(), 1);
+    }
+
+    /// A repo small enough for one chunk, under default chunking, must get the
+    /// chunk output cap: asking for 64K output tokens made every call fail on
+    /// a 64K-context model. Control: disabling chunking keeps the one-shot cap.
+    #[test]
+    fn a_small_repos_only_chunk_gets_the_chunk_output_cap() {
+        let s = BootstrapSource {
+            kind: SourceKind::Readme,
+            label: "README".into(),
+            text: "hello".into(),
+        };
+        let chunks = plan_bootstrap_chunks(vec![s], DEFAULT_CHUNK_INPUT_TOKENS);
+        assert_eq!(chunks.len(), 1);
+        let chunked = build_chunk_request(&chunks[0], 1, 1, DEFAULT_CHUNK_INPUT_TOKENS, &[]);
+        assert_eq!(chunked.max_tokens, 16_000);
+        let one_shot = build_chunk_request(&chunks[0], 1, 1, 0, &[]);
+        assert_eq!(one_shot.max_tokens, 64_000);
     }
 
     #[test]
