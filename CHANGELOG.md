@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone. Prunes and chunks now fill 80% of each budget by the estimate, the
   same default consolidation uses; a run may plan more chunks than before.
   (#937)
+- The `bootstrap.md` manifest no longer shows bare `---` separators when a
+  chunk returns no rationale. Empty rationales are dropped before the
+  per-chunk ones are joined, and a run where no chunk returned one says so.
+  (#939)
 
 ## [2.4.1] - 2026-09-25
 
