@@ -394,6 +394,13 @@ pub(crate) enum WriteCmd {
         force: bool,
         /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
         compaction: crate::ops::Compaction,
+        /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
+        /// never issues the delete — unlike [`WriteCmd::MoveSession`]'s dry
+        /// run, which runs the real write and rolls it back. See
+        /// [`crate::ops::PurgeMode`]'s doc for why: a rolled-back delete on a
+        /// large project would still hold the writer actor for as long as a
+        /// real purge does.
+        mode: crate::ops::PurgeMode,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     /// Delete one session and everything derived from it, inside a single
@@ -1844,9 +1851,15 @@ impl WriterHandle {
     /// returned [`PurgeSummary`] includes pre-delete row counts and
     /// the distinct page paths that the caller must remove from disk.
     ///
+    /// `mode = `[`ops::PurgeMode::Preview`] stops right after counting and
+    /// never issues the delete — see [`ops::purge_project`] for why, and for
+    /// the two collateral counts (`collateral_observations_deleted`,
+    /// `collateral_handoffs_denulled`) either mode reports.
+    ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
     /// propagates the SQL error from the purge transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn purge_project(
         &self,
         workspace_id: WorkspaceId,
@@ -1855,6 +1868,7 @@ impl WriterHandle {
         author_id: Option<ai_memory_core::UserId>,
         force: bool,
         compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -1864,6 +1878,7 @@ impl WriterHandle {
             author_id,
             force,
             compaction,
+            mode,
             reply: tx,
         })
         .await?;
@@ -3523,6 +3538,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 author_id,
                 force,
                 compaction,
+                mode,
                 reply,
             } => {
                 let result = ops::purge_project(
@@ -3533,6 +3549,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     author_id,
                     force,
                     compaction,
+                    mode,
                 );
                 send_or_warn(reply, result, "purge_project");
             }

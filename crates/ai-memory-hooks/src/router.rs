@@ -7888,6 +7888,7 @@ mod tests {
                 None,
                 false,
                 ai_memory_store::Compaction::Skip,
+                ai_memory_store::PurgeMode::Commit,
             )
             .await
             .unwrap();
@@ -8710,6 +8711,7 @@ mod tests {
                 None,
                 false,
                 ai_memory_store::Compaction::Skip,
+                ai_memory_store::PurgeMode::Commit,
             )
             .await
             .unwrap();
