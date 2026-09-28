@@ -96,6 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immutable to automation. Such updates are now skipped with a warning; the
   rest of the batch is written. `_slots/` pages, which are pinned
   automatically, keep their state/invariant rules. (#934)
+- The `/api/v1` single-page route's `ETag` now covers the whole JSON it
+  returns. It hashed only the markdown body and author, so pinning a page,
+  a frontmatter edit, or a new backlink changed the response without
+  changing the tag, and a client revalidating with `If-None-Match` got
+  `304` and kept the stale page. (#971)
 - Session consolidation no longer writes a page title that already exists
   in the project. A colliding session title gets a deterministic
   `(session <8-char-id>)` suffix (stable for the same session, distinct
