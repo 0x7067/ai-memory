@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
 ### Fixed
+- The `/web` page view keeps a leading H1 that is not the page title. It
+  dropped the body's first H1 whatever it said, as a duplicate of the title
+  in the header, but a frontmatter `title:` outranks the H1 and a setext H1
+  never names the page, so a heading like `# Token refresh after sleep`
+  under `title: Auth decisions` vanished from the rendered page. An H1 that
+  repeats the title is still dropped. (#967)
 - `memory_query` now returns `global_scope_hits` (standing `_global` user/team
   preferences) for a single-project query whose project is named explicitly
   with `workspace`+`project`, not only when scope is omitted. The routing
