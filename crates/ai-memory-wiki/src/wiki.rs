@@ -3022,6 +3022,41 @@ mod tests {
         assert!(ai_memory_core::okf::is_conformant(&parsed.frontmatter));
     }
 
+    /// A `[[project:path]]` written as inline code is an example, not a
+    /// dependency: the page shows it as code. Indexing it made lint report a
+    /// broken cross-project link on a page that has none.
+    #[tokio::test]
+    async fn a_cross_project_link_in_inline_code_is_not_a_dangling_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/linking.md",
+            "Link across projects with `[[other-project:notes/example]]`.\n\
+             This page depends on [[other-project:notes/real]].\n",
+            serde_json::json!({"title": "Linking"}),
+        ))
+        .await
+        .unwrap();
+
+        let dangling = store
+            .reader
+            .dangling_cross_project_links(ws, proj)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = dangling.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/real.md"]);
+    }
+
     /// OKF requires every timestamp to carry an explicit UTC offset, while
     /// the TTL key also accepts a bare date. The file on disk must name the
     /// instant the TTL machinery hides the page, not the date as typed.
