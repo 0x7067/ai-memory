@@ -413,6 +413,9 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
         compaction: crate::ops::Compaction,
+        /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
+        /// never issues the delete — see [`crate::ops::PurgeMode`]'s doc.
+        mode: crate::ops::PurgeMode,
         reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
     },
     /// Reclaim free pages on demand: rebuild the FTS indexes and `VACUUM`,
@@ -1898,6 +1901,11 @@ impl WriterHandle {
     /// cleanup. Calling this directly commits the rows with no guard, so a
     /// watcher reindex can reinsert the page before the file is removed (#653).
     ///
+    /// `mode = `[`ops::PurgeMode::Preview`] stops right after counting and
+    /// never issues the delete — see [`ops::purge_session`] for why, and for
+    /// the two collateral counts (`collateral_observations_deleted`,
+    /// `collateral_handoffs_denulled`) either mode reports.
+    ///
     /// # Errors
     /// [`StoreError::NotFound`] when the session is absent from that scope,
     /// [`StoreError::WriterClosed`], or a propagated SQL error.
@@ -1908,6 +1916,7 @@ impl WriterHandle {
         session_id: SessionId,
         author_id: Option<ai_memory_core::UserId>,
         compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
     ) -> StoreResult<crate::ops::PurgeSessionSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeSession {
@@ -1916,6 +1925,7 @@ impl WriterHandle {
             session_id,
             author_id,
             compaction,
+            mode,
             reply: tx,
         })
         .await?;
@@ -3559,6 +3569,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 session_id,
                 author_id,
                 compaction,
+                mode,
                 reply,
             } => {
                 let result = ops::purge_session(
@@ -3568,6 +3579,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     session_id,
                     author_id,
                     compaction,
+                    mode,
                 );
                 send_or_warn(reply, result, "purge_session");
             }

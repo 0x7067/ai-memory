@@ -9,7 +9,7 @@ on a homelab box where mistakes are harder to undo.
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
 | `purge-project --confirm` | ✅ yes | the one project's data, **plus** any observation stamped into a different project by one of this project's sessions (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this project's sessions authored or accepted | no | Deletes the UUID-namespaced wiki root and raw workstream segments. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing — see below. |
-| `purge-session --session-id --confirm` | ✅ yes | the one session's data | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped — a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
+| `purge-session --session-id --confirm` | ✅ yes | the one session's data, **plus** any observation stamped into a different project by this session (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this session authored or accepted | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped — a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing — see below. |
 | `handoffs --expire-all --confirm` | ✅ yes | no (state change only) | no (but nothing is destroyed) | Marks every **open** handoff in the scope `expired` so it stops being offered to an agent. Rows, summaries and provenance are kept and stay visible in the audit log. Unlike the automatic sweep it does **not** spare manual handoffs or ones from another directory — those exemptions are exactly what a leftover backlog is made of, so honouring them would clear nothing. `--older-than-days N` keeps recent batons. Owner-scoped: never touches another user's baton. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
@@ -69,6 +69,65 @@ content in its objects *and its commit messages*, and any backup taken before
 the purge still contains everything. Removing the bytes from the live SQLite
 file is worth doing on its own terms; do not describe it to a user as a
 guarantee that the content is unrecoverable, because it is not.
+
+### Preview without `--confirm`
+
+Without `--confirm`, the CLI first asks the server for a preview
+(`"dry_run": true` in the request, exactly like `purge-project`'s own field).
+`dry_run` always wins over `confirm` — `{"confirm": true, "dry_run": true}`
+still only previews — so a preview request can never become destructive by
+accident.
+
+The preview runs the same lookups and counts a confirmed purge uses to decide
+what to delete — same 404 for a session outside the named scope — including
+two cross-project counts for what purging this *session* collaterally
+deletes or orphans in a *different* project through its own id
+(`collateral_observations_deleted`, `collateral_handoffs_denulled` — the same
+shape `purge-project`'s preview reports one level up, at project rather than
+session granularity), without ever issuing the `DELETE`. It never runs the
+delete and rolls it back. Because nothing is deleted, `removed_paths` in the
+reply names the wiki page paths a confirmed purge *would* remove — not paths
+already gone — and `files_deleted`/`files_failed` are always empty, since no
+file is touched; neither the `purged_sessions` tombstone nor the `audit_log`
+row is written, and neither checkpoint is taken. The reply carries
+`"dry_run": true`. The CLI prints:
+
+```
+Would purge session from default/my-app: 1063 observations, 0 handoffs, 1 pages, 0 auto-improve runs.
+```
+
+(with a trailing "Plus N observations in other projects via this session" /
+"Plus N handoffs ..." clause when either cross-project count is non-zero;
+note the session id itself is never printed — the caller already has it, and
+this command exists to make a session stop existing), then still refuses with
+the existing "destructive and irreversible" message and a non-zero exit — the
+preview is information layered on top of the refusal, never a substitute for
+`--confirm`.
+
+A preview also skips the blocking admission call a confirmed purge makes
+before deleting anything (`admit_purge_session`): nothing was decided yet, so
+there is nothing for a `Reject`-policy webhook to act on. This means a `200`
+preview is not a guarantee — that same webhook only runs on the confirmed
+path and can still refuse the real purge afterward.
+
+If the server is unreachable, times out (a few seconds, auth-token refresh
+included), or predates this field (a plain `400`), the CLI falls back
+silently to the plain refusal with no preview line. A `404`/`403` (or any
+other unexpected status) prints the server's own error before the refusal
+instead, since the operator asked what would happen and the server has a
+real answer.
+
+A handoff this session only *accepted* (did not author) keeps its row and
+its text either way — confirmed or previewed — and loses only its
+`accepted_by_session` pointer (`ON DELETE SET NULL`) once the session row is
+actually gone; it is never counted in `handoffs_deleted`. Two more places a
+purged session's id is referenced are neither counted nor previewed today,
+as a known follow-up: `agent_messages.from_session_id` /
+`claimed_by_session` (the cross-project mailbox, V64) and another project's
+`auto_improve_runs.session_id`, both `ON DELETE SET NULL` and out of scope
+for this preview's two `collateral_*` fields, which only cover observations
+and handoffs — the same set `purge-project`'s own preview covers, one level
+up.
 
 ### The same is true of `purge-project` and `delete-workspace`
 

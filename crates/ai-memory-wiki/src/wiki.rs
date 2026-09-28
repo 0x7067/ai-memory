@@ -1292,9 +1292,21 @@ impl Wiki {
         compaction: ai_memory_store::Compaction,
     ) -> WikiResult<PurgeSessionOutcome> {
         let _guard = self.mutation_lock.write().await;
+        // Always `Commit`: a caller that only wants a preview (the HTTP
+        // handler's `dry_run` branch) goes straight through
+        // `WriterHandle::purge_session` instead, bypassing this wrapper
+        // entirely, so the file-removal loop below never runs over paths
+        // that a preview only *predicts* would be removed.
         let summary = self
             .writer
-            .purge_session(workspace_id, project_id, session_id, author_id, compaction)
+            .purge_session(
+                workspace_id,
+                project_id,
+                session_id,
+                author_id,
+                compaction,
+                ai_memory_store::PurgeMode::Commit,
+            )
             .await?;
         let mut files_deleted = Vec::with_capacity(summary.removed_paths.len());
         let mut files_failed = Vec::new();

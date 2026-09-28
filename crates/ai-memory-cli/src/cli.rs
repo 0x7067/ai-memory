@@ -1247,6 +1247,18 @@ pub struct PurgeSessionArgs {
     pub project: Option<String>,
     /// REQUIRED for the purge to run. Without this flag the CLI errors
     /// out — purging is destructive and irreversible.
+    ///
+    /// Before erroring, the CLI asks the server for a preview (bounded to a
+    /// few seconds, auth refresh included): the reported counts
+    /// (observations, handoffs, pages, auto-improve runs, plus any
+    /// collateral rows a purge of this session would delete or orphan in
+    /// *another* project) come from the same queries a confirmed purge
+    /// itself uses to decide what to delete. The preview is best-effort and
+    /// never changes the outcome, only what gets printed before it: a
+    /// 404/403 (or anything else unexpected) prints the server's own error
+    /// first; a timeout, an unreachable server, or an older server that
+    /// predates this preview just gets the plain refusal, same as before
+    /// this existed.
     #[arg(long)]
     pub confirm: bool,
     /// Also reclaim the freed bytes: rebuild the affected FTS indexes and

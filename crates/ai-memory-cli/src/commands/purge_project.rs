@@ -1,13 +1,12 @@
 //! `ai-memory purge-project` — thin HTTP client for project purge.
 
-use std::time::Duration;
-
 use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::cli::PurgeProjectArgs;
+use crate::commands::purge_preview::{PreviewOutcome, refused_message, run_preview};
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, ServerResponseError, post_json};
+use crate::http_client::{ServerEndpoint, post_json};
 
 /// Request sent to `POST /admin/purge-project`.
 #[derive(Serialize)]
@@ -28,13 +27,6 @@ struct PurgeProjectRequest {
     /// misread.
     dry_run: bool,
 }
-
-/// How long the preview request (auth resolution plus the HTTP round trip)
-/// is allowed to take before this falls back to the plain refusal. The
-/// preview is optional information layered on top of a refusal that must
-/// still happen either way, so it must never be the reason `--confirm` takes
-/// noticeably longer than it used to.
-const PREVIEW_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One line naming what a purge (real or previewed) removed, in the fixed
 /// order the operator can grep for: pages, sessions, observations, handoffs,
@@ -79,34 +71,6 @@ fn purge_summary_line(verb: &str, label: &str, report: &serde_json::Value) -> St
     line
 }
 
-/// What became of the best-effort preview request, reduced to what deciding
-/// whether — and what — to print needs. Kept separate from the network call
-/// itself so the printing decision is a pure function and testable without a
-/// server.
-enum PreviewOutcome {
-    /// A 200 with `"dry_run": true`: the server understood the request and
-    /// ran the preview.
-    Previewed(serde_json::Value),
-    /// A 200 without `dry_run` set: an old-enough server both predates the
-    /// field AND happens to 200 an unrecognized shape. Treated the same as
-    /// not getting a preview at all.
-    Ignored,
-    /// A non-2xx response with a body worth showing: the scope resolved to
-    /// something the operator should know about before the refusal (a 404
-    /// naming the missing project, a 409 naming the live managed run, a 403
-    /// naming the auth problem), or an unexpected status this command has no
-    /// specific handling for.
-    Refused { status: u16, body: String },
-    /// The request predates `dry_run` support (400, the pre-existing
-    /// "confirm=true" refusal body) — not worth repeating, since `run` below
-    /// prints its own version of exactly that message next regardless.
-    OlderServer,
-    /// Timed out or never reached a server at all (DNS/connect failure,
-    /// auth-refresh hang, etc). Indistinguishable from the operator's
-    /// perspective, and neither is this command's business to diagnose.
-    Unreachable,
-}
-
 /// Decide what to print, if anything, before the refusal — pure, so it is
 /// unit-tested without a server. `fallback_label` is used only when the
 /// server's own report has no `label` field.
@@ -116,48 +80,8 @@ fn preview_message(outcome: &PreviewOutcome, fallback_label: &str) -> Option<Str
             let label = report["label"].as_str().unwrap_or(fallback_label);
             Some(purge_summary_line("Would purge", label, report))
         }
-        PreviewOutcome::Refused { status, body } => {
-            let message = serde_json::from_str::<serde_json::Value>(body)
-                .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-                .unwrap_or_else(|| body.clone());
-            Some(format!("Preview refused ({status}): {message}"))
-        }
+        PreviewOutcome::Refused { status, body } => Some(refused_message(*status, body)),
         PreviewOutcome::Ignored | PreviewOutcome::OlderServer | PreviewOutcome::Unreachable => None,
-    }
-}
-
-/// Run the preview request under [`PREVIEW_TIMEOUT`] and classify the
-/// result. Auth resolution (`ServerEndpoint::from_config_resolving_auth`,
-/// which can itself refresh an OIDC token over the network) runs inside the
-/// same timeout so a hung refresh cannot silently make `--confirm`-less
-/// purge-project block far longer than the rest of this command ever has.
-async fn run_preview(config: &Config, request: &PurgeProjectRequest) -> PreviewOutcome {
-    let attempt = tokio::time::timeout(PREVIEW_TIMEOUT, async {
-        let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-        post_json::<_, serde_json::Value>(&endpoint, "/admin/purge-project", request).await
-    })
-    .await;
-
-    let Ok(result) = attempt else {
-        return PreviewOutcome::Unreachable;
-    };
-    match result {
-        Ok(report) if report["dry_run"].as_bool().unwrap_or(false) => {
-            PreviewOutcome::Previewed(report)
-        }
-        Ok(_) => PreviewOutcome::Ignored,
-        Err(e) => match e.downcast_ref::<ServerResponseError>() {
-            Some(resp) if resp.status().as_u16() == 400 => PreviewOutcome::OlderServer,
-            Some(resp) => PreviewOutcome::Refused {
-                status: resp.status().as_u16(),
-                body: resp.body().to_string(),
-            },
-            // Not an HTTP response at all: connect/DNS failure, request
-            // timeout already handled above, or a body that failed to
-            // deserialize as JSON.
-            None => PreviewOutcome::Unreachable,
-        },
     }
 }
 
@@ -170,8 +94,9 @@ async fn run_preview(config: &Config, request: &PurgeProjectRequest) -> PreviewO
 /// Without `--confirm`, first asks the server for a preview (`dry_run:
 /// true`, which wins over `confirm` server-side): the server reports the
 /// counts a confirmed purge would produce without deleting anything. That
-/// preview is best-effort, bounded by [`PREVIEW_TIMEOUT`], and never changes
-/// the outcome — only what gets printed before it:
+/// preview is best-effort, bounded by
+/// [`purge_preview::PREVIEW_TIMEOUT`](crate::commands::purge_preview::PREVIEW_TIMEOUT),
+/// and never changes the outcome — only what gets printed before it:
 /// - a successful preview prints the "Would purge ..." line;
 /// - a 404/409/403 (or any other unexpected status) prints the server's own
 ///   error first, since the operator asked what would happen and the server
@@ -197,7 +122,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             compact: args.compact,
             dry_run: true,
         };
-        let outcome = run_preview(config, &request).await;
+        let outcome = run_preview(config, "/admin/purge-project", &request).await;
         let fallback_label = format!("{}/{}", workspace, project);
         if let Some(line) = preview_message(&outcome, &fallback_label) {
             println!("{line}");
@@ -455,7 +380,7 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
         assert!(matches!(outcome, PreviewOutcome::OlderServer));
         assert!(preview_message(&outcome, "default/scratch").is_none());
     }
@@ -471,7 +396,7 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
         match &outcome {
             PreviewOutcome::Refused { status, body } => {
                 assert_eq!(*status, 404);
@@ -501,7 +426,7 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
         let msg = preview_message(&outcome, "default/scratch").expect("must print a line");
         assert!(msg.starts_with("Would purge default/scratch: 3 pages, 1 sessions, 1063"));
     }
@@ -518,7 +443,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let config = config_for(&tmp, format!("http://{addr}"));
-        let outcome = run_preview(&config, &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
         assert!(matches!(outcome, PreviewOutcome::Unreachable));
         assert!(preview_message(&outcome, "default/scratch").is_none());
     }
