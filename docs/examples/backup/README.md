@@ -76,5 +76,5 @@ The remote is your own channel, not ai-memory's. Follow the existing
 private repository, a fine-grained token scoped to that one repo (or an SSH
 deploy key), and rotate credentials the same way you rotate any other
 long-lived push credential. The script never commits files matched by
-`SECRET_EXCLUDES` (default: `*.env`, `auth.json`, `.secrets`); the mirror
+`SECRET_EXCLUDES` (default: `*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt`); the mirror
 repo's `.gitignore` catches anything the rsync exclude missed.

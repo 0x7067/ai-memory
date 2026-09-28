@@ -123,7 +123,7 @@ The wiki is already a git repository. If your only goal is off-site *wiki*
 storage, adding a remote and pushing is enough:
 
 ```bash
-data_dir=$(ai-memory status --format=json | jq -r .data_dir)
+data_dir=$(ai-memory status --json | jq -r .data_dir)
 cd "$data_dir/wiki"
 git remote add origin git@github.com:<you>/ai-memory-wiki.git
 git push -u origin main
@@ -163,7 +163,7 @@ cadence):
 
 1. `rsync -a --delete` the data dir into the mirror checkout, applying an
    exclude list for `models/`, `db/`, `logs/`, `.serve.lock`, and any glob
-   listed in `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets` by default).
+   listed in `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt` by default).
 2. `rsync -a --delete` the config dir under the same exclude rules so
    `config.toml` is captured but env files, OAuth tokens, and private CA
    bundles are not.
@@ -209,7 +209,7 @@ out-of-scope for v1). What that means in practice:
   fine-grained personal-access token scoped to the mirror repository only.
   Rotate on the same cadence you rotate other long-lived push credentials.
 - **Explicit secret exclusion.** The example script rejects any file matching
-  `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets` by default), and the
+  `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt` by default), and the
   suggested mirror-repo `.gitignore` matches the same set. Add anything else
   install-specific — private CA bundles, host-side certificates, cloud
   credential files — to both lists.

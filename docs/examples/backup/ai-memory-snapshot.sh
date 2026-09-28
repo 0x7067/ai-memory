@@ -28,7 +28,7 @@
 : "${LOG_DIR:=$HOME/logs/ai-memory-snapshot}"     # rotated per run
 : "${TARBALL_RETENTION_DAYS:=30}"                 # how long to keep tarballs
 : "${LOG_RETENTION_DAYS:=30}"                     # how long to keep run logs
-: "${SECRET_EXCLUDES:=*.env auth.json .secrets}"  # glob patterns for files never to sync
+: "${SECRET_EXCLUDES:=*.env auth.json .secrets *.pem *.key *.crt}"  # glob patterns for files never to sync
 
 set -euo pipefail
 
