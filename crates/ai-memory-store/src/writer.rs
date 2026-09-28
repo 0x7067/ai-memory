@@ -340,6 +340,13 @@ pub(crate) enum WriteCmd {
         expected_latest_id: PageId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    SoftDeleteForReconcileIfLatest {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     HardDeleteDecayedPageChain {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -1826,6 +1833,30 @@ impl WriterHandle {
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::SoftDeleteForDecayIfLatest {
+            workspace_id,
+            project_id,
+            path,
+            expected_latest_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Tombstone the expected latest page whose file the watcher's reconcile
+    /// pass found missing on two consecutive passes (opt-in, see #929).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn soft_delete_for_reconcile_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SoftDeleteForReconcileIfLatest {
             workspace_id,
             project_id,
             path,
@@ -3569,6 +3600,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     expected_latest_id,
                 );
                 send_or_warn(reply, result, "soft_delete_for_decay_if_latest");
+            }
+            WriteCmd::SoftDeleteForReconcileIfLatest {
+                workspace_id,
+                project_id,
+                path,
+                expected_latest_id,
+                reply,
+            } => {
+                let result = ops::soft_delete_for_reconcile_if_latest(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    expected_latest_id,
+                );
+                send_or_warn(reply, result, "soft_delete_for_reconcile_if_latest");
             }
             WriteCmd::HardDeleteDecayedPageChain {
                 workspace_id,

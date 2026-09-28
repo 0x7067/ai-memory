@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The watcher's reconcile pass can now optionally tombstone a wiki page whose
+  file has disappeared from disk, closing part of the gap left by #929 (the
+  watcher only reconciled create/modify events, so a deleted file stayed
+  indexed until `ai-memory delete-page` ran explicitly). Opt-in and default
+  `false` (`[maintenance] reconcile_tombstones_deleted_pages`), so existing
+  installs see no behavior change unless they turn it on. When enabled, a
+  page's file must be observed missing on two consecutive 30s reconcile
+  passes, re-verified against the live filesystem immediately before acting;
+  a circuit breaker refuses to act on a whole scope when more than `max(3,
+  50%)` of its candidate pages look missing in one pass, or when a
+  non-partial walk finds nothing at all (either shape is far more likely a
+  walk/mount problem than genuine mass deletion); and reserved/indexed-but-
+  unwalked paths (`bootstrap.md`, `_meta.md`, `_pending/` sidecars, and
+  `sessions/*.md` — excluded because a same-workspace `move-session` re-home
+  can leave one with a correct row and no file, a separate pre-existing bug)
+  are never candidates. The action is a soft tombstone (`is_latest = 0` +
+  `superseded_at`, the same shape decay eviction already uses), picked up by
+  the SAME aged-tombstone hard-delete sweep decay eviction uses — it is not
+  exempt from it. What actually protects it: it is never destroyed while its
+  chain has no successor; if the file returns, the new version re-links onto
+  the tombstoned chain instead of starting a fresh, disconnected one, so
+  nothing is left orphaned for that sweep to destroy. It never runs the
+  blocking admission gate (nothing can refuse it), but does fire-and-forget
+  any non-blocking observer/mirror webhook on success. `restore-page` and
+  version history remain intact. See `docs/okf.md` for the full design.
+  (#964)
 - `[consolidation] input_token_safety_margin` (float, default `0.8`, validated
   to `(0.0, 1.0]`) scales the approximate char-count input budget. The
   `max_input_tokens` budget uses a flat chars-per-token heuristic that
