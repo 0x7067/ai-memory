@@ -147,17 +147,32 @@ leaderboard. `AI_MEMORY_LLM_HEADERS=HTTP-Referer=https://example.com,X-Title=my-
 overrides them per operator. `AI_MEMORY_LLM_REASONING_EFFORT` is honoured on
 this path: OpenRouter hosts receive `reasoning: { effort, exclude: true }`.
 
-OpenRouter is a chat gateway; it does not serve first-class embeddings. Either
-run a local sentence-transformer
-(`AI_MEMORY_EMBEDDING_PROVIDER=local`, see
-[`local-embeddings.md`](local-embeddings.md)), or route the OpenAI-shaped
-embedding client at OpenRouter with
-`AI_MEMORY_EMBEDDING_PROVIDER=openai` +
-`AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` + a dedicated
-`EMBEDDING_API_KEY` (documented in
-[`install.md#llm-provider-tiers`](install.md#llm-provider-tiers)). The two
-endpoints are independent, so setting `AI_MEMORY_LLM_BASE_URL` alone does not
-redirect embeddings.
+OpenRouter also serves OpenAI-compatible **embedding** models — the default
+`/api/v1/models` listing filters them out, but they exist and answer the same
+`/v1/embeddings` shape as any openai-compat endpoint. List them with
+`curl "https://openrouter.ai/api/v1/models?category=embedding"` or the
+"Embeddings" filter in the OpenRouter web UI. Configure the embedder through
+the openai-compat path — not the openai path, which has an OpenAI-specific
+key precedence chain:
+
+```bash
+export AI_MEMORY_EMBEDDING_PROVIDER=openai-compat
+export AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
+export AI_MEMORY_EMBEDDING_MODEL=baai/bge-m3
+export AI_MEMORY_EMBEDDING_DIM=1024
+# LLM_API_KEY is reused automatically when EMBEDDING_API_KEY is unset on
+# the openai-compat embedder path; no second key is required.
+```
+
+`AI_MEMORY_EMBEDDING_DIM` is mandatory for openai-compat embeddings and must
+match the model. Recommended embedding models are covered in the model
+selection guide below. For English-only content the built-in local
+sentence-transformer (`AI_MEMORY_EMBEDDING_PROVIDER=local`, see
+[`local-embeddings.md`](local-embeddings.md)) is a valid alternative that
+avoids hosted egress; for any non-English content, hosted OpenRouter
+embeddings are the practical choice. The two endpoints are still independent,
+so setting `AI_MEMORY_LLM_BASE_URL` alone does not redirect embeddings — set
+`AI_MEMORY_EMBEDDING_BASE_URL` too.
 
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
