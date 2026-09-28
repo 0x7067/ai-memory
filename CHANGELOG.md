@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory backup-agents` and `ai-memory restore-agents` now snapshot, export,
+  and restore host AI agent configurations, skills, plugins, and project
+  instructions across supported harnesses. Backups sanitize secrets by default,
+  include deterministic manifests with SHA-256 checksums, support dry-run
+  previews and agent/scope filters, and restore through path-guarded atomic writes.
+  (#962)
 - `install-skills --agent hermes` (and the `hermes` entry in
   `memory_install_self_routing`'s `target_hints`) installs the managed routing
   skills into Hermes Agent's `.hermes/skills` (project) or `~/.hermes/skills`
