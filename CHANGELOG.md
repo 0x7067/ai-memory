@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `docs/llm-providers.md` now has a dedicated OpenRouter subsection and a
+  matching row in the recommended-defaults table. The wiring
+  (`openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1`)
+  and the `HTTP-Referer` / `X-Title` app-attribution headers were already
+  shipped, and `docker/.env.production.example` already ships an OpenRouter
+  default, but the provider-facing doc mentioned OpenRouter only inside the
+  generic `openai-compat` row. The new subsection covers a full working
+  env-file, the `openai-compat` embedder path for OpenRouter's hidden-but-
+  supported embedding models (`baai/bge-m3`,
+  `intfloat/multilingual-e5-large`), a pointer to
+  `docs/llm-provider-comparison.md` for model selection, and a security /
+  gotchas block (auth-token requirement for non-loopback binds, env-file
+  hygiene, cheap-model consolidation drift, `:free`-tier shared-pool
+  limits, reasoning-model incompatibility). (#949)
+
 ### Fixed
 - `memory_query` now returns `global_scope_hits` (standing `_global` user/team
   preferences) for a single-project query whose project is named explicitly
