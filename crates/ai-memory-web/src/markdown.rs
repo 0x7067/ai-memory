@@ -387,20 +387,26 @@ fn escape_html(input: &str) -> String {
     out
 }
 
-/// Drop the leading H1 from a markdown body if present. Static-site
-/// convention: the first H1 IS the page title, and the page template
-/// already renders the title in its header — leaving it in the body
-/// duplicates it on screen. No-op when the body doesn't start with
-/// an H1 (handles `# Title`, both ATX `# Title` and setext
-/// `Title\n=====` forms).
+/// Drop the leading H1 from a markdown body when it repeats `title`.
+/// Static-site convention: the first H1 IS the page title, and the page
+/// template already renders the title in its header — leaving it in the
+/// body duplicates it on screen. An H1 that reads differently is not a
+/// duplicate: a frontmatter `title:` outranks the H1, and a setext H1 never
+/// names the page at all, so dropping one of those hid the only place the
+/// page said it. No-op when the body doesn't start with that H1 (handles
+/// both ATX `# Title` and setext `Title\n=====` forms).
 #[must_use]
-pub fn strip_leading_h1(body: &str) -> &str {
+pub fn strip_leading_h1<'a>(body: &'a str, title: &str) -> &'a str {
+    let title = title.trim();
     // Skip any leading blank lines.
     let trimmed = body.trim_start_matches(['\n', '\r']);
     // ATX form: `# Title` (one `#`, NOT `## …`).
     if let Some(rest) = trimmed.strip_prefix("# ") {
-        let after_line = rest.find('\n').map_or("", |nl| &rest[nl + 1..]);
-        return after_line.trim_start_matches(['\n', '\r']);
+        let (heading, after_line) = rest.split_once('\n').unwrap_or((rest, ""));
+        if heading.trim() == title {
+            return after_line.trim_start_matches(['\n', '\r']);
+        }
+        return body;
     }
     // Setext form: `Title\n====…` (1+ equals signs). Look ahead.
     if let Some((first_line, after_first)) = trimmed.split_once('\n')
@@ -408,6 +414,7 @@ pub fn strip_leading_h1(body: &str) -> &str {
         && let Some((second_line, after_second)) = after_first.split_once('\n')
         && !second_line.is_empty()
         && second_line.chars().all(|c| c == '=')
+        && first_line.trim() == title
     {
         return after_second.trim_start_matches(['\n', '\r']);
     }
@@ -527,38 +534,53 @@ mod tests {
 
     #[test]
     fn strip_atx_h1_drops_first_heading() {
-        let out = strip_leading_h1("# Title\n\nbody text\n");
+        let out = strip_leading_h1("# Title\n\nbody text\n", "Title");
         assert_eq!(out, "body text\n");
     }
 
     #[test]
     fn strip_atx_h1_tolerates_leading_blank_lines() {
-        let out = strip_leading_h1("\n\n# Title\n\nbody\n");
+        let out = strip_leading_h1("\n\n# Title\n\nbody\n", "Title");
         assert_eq!(out, "body\n");
     }
 
     #[test]
     fn strip_atx_h1_leaves_h2_alone() {
-        let out = strip_leading_h1("## Subhead\n\nbody\n");
+        let out = strip_leading_h1("## Subhead\n\nbody\n", "Subhead");
         assert_eq!(out, "## Subhead\n\nbody\n");
     }
 
     #[test]
     fn strip_atx_h1_leaves_body_without_title_alone() {
-        let out = strip_leading_h1("just a paragraph\n");
+        let out = strip_leading_h1("just a paragraph\n", "Title");
         assert_eq!(out, "just a paragraph\n");
     }
 
     #[test]
+    fn strip_atx_h1_keeps_a_heading_that_is_not_the_title() {
+        let body = "# Token refresh\n\nbody\n";
+        assert_eq!(strip_leading_h1(body, "Auth decisions"), body);
+        // A heading-only body that repeats the title leaves nothing.
+        assert_eq!(strip_leading_h1("# Title", "Title"), "");
+        assert_eq!(strip_leading_h1("# Title\r\n\r\nbody", "Title"), "body");
+    }
+
+    #[test]
     fn strip_setext_h1_drops_first_heading() {
-        let out = strip_leading_h1("Title\n=====\n\nbody\n");
+        let out = strip_leading_h1("Title\n=====\n\nbody\n", "Title");
         assert_eq!(out, "body\n");
+    }
+
+    #[test]
+    fn strip_setext_h1_keeps_a_heading_that_is_not_the_title() {
+        let body = "Cache warmup\n============\n\nbody\n";
+        assert_eq!(strip_leading_h1(body, "setext"), body);
     }
 
     #[test]
     fn strip_does_not_eat_setext_h2() {
         // `----` underlines are H2, not H1. Leave them alone.
-        let out = strip_leading_h1("Title\n----\n\nbody\n");
+        let out = strip_leading_h1("Title\n----\n\nbody\n", "Title");
         assert_eq!(out, "Title\n----\n\nbody\n");
     }
 

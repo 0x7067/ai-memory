@@ -178,6 +178,76 @@ async fn smoke_page_view_returns_200() {
     assert!(text.contains("Hello world"), "expected rendered body");
 }
 
+#[tokio::test]
+async fn page_view_keeps_a_leading_h1_that_is_not_the_title() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    // A frontmatter title wins the header, so an H1 that says something
+    // else is the only place the page says it.
+    let mut titled = wiki_req(
+        ws,
+        proj,
+        "decisions/auth.md",
+        "# Token refresh after sleep\n\nRefresh on wake.",
+    );
+    titled.frontmatter = serde_json::json!({"kind": "decision", "title": "Auth decisions"});
+    wiki.write_page(titled).await.unwrap();
+    // The title falls back to the path stem, since only an ATX `# ` line
+    // names a page, so a setext H1 is not a repeat of it either.
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "notes/setext.md",
+        "Cache warmup\n============\n\nWarm on boot.",
+    ))
+    .await
+    .unwrap();
+    // An H1 that is the title is still dropped, or the header repeats.
+    wiki.write_page(wiki_req(ws, proj, "notes/same.md", "# Same title\n\nBody."))
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+    };
+
+    let text = get("/w/default/scratch/p/decisions/auth.md").await;
+    assert!(text.contains("Auth decisions"), "expected the title");
+    assert!(
+        text.contains("<h1>Token refresh after sleep</h1>"),
+        "an H1 unlike the title was dropped: {text}"
+    );
+    let text = get("/w/default/scratch/p/notes/setext.md").await;
+    assert!(
+        text.contains("<h1>Cache warmup</h1>"),
+        "a setext H1 unlike the title was dropped: {text}"
+    );
+    let text = get("/w/default/scratch/p/notes/same.md").await;
+    assert!(
+        !text.contains("<h1>Same title</h1>"),
+        "an H1 that repeats the title should not render twice: {text}"
+    );
+}
+
 // ── /web HTML chrome for multi-user attribution ──────────────────────
 
 #[tokio::test]
