@@ -33,7 +33,7 @@ use crate::auto_improve::{
     PendingAutoImproveScope, bytes32, opt_bytes32, summary_from_row, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
-use crate::fts_query::prepare_fts5_query;
+use crate::fts_query::{FtsStopwords, prepare_fts5_query};
 use crate::maintenance::MaintenanceJob;
 use crate::retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 use crate::users::TOKEN_HASH_LEN;
@@ -1726,6 +1726,11 @@ pub struct ReaderPool {
     /// on the handle, so clones taken after [`Self::set_retrieval_tuning`]
     /// share the operator's choice while the pool itself stays untouched.
     tuning: RetrievalTuning,
+    /// Operator-configured FTS stopword list (issue #953, `[search.fts]`).
+    /// Lives on the handle for the same reason `tuning` does: clones taken
+    /// after [`Self::set_fts_stopwords`] share the operator's choice.
+    /// Cheap to clone (`FtsStopwords` is `Arc`-backed).
+    fts_stopwords: FtsStopwords,
 }
 
 struct Inner {
@@ -1748,6 +1753,7 @@ impl ReaderPool {
                 soft_cap: soft_cap.max(1),
             }),
             tuning: RetrievalTuning::default(),
+            fts_stopwords: FtsStopwords::default(),
         })
     }
 
@@ -1755,6 +1761,14 @@ impl ReaderPool {
     /// Only handles cloned from this one afterwards observe the change.
     pub fn set_retrieval_tuning(&mut self, tuning: RetrievalTuning) {
         self.tuning = tuning;
+    }
+
+    /// Configure the FTS stopword list applied by every search path that
+    /// prepares a bare natural-language query (see [`prepare_fts5_query`]).
+    /// Only handles cloned from this one afterwards observe the change.
+    /// Defaults to [`FtsStopwords::default`] (the built-in English list).
+    pub fn set_fts_stopwords(&mut self, stopwords: FtsStopwords) {
+        self.fts_stopwords = stopwords;
     }
 
     /// The ranking signals this handle applies (default: none).
@@ -1896,8 +1910,9 @@ impl ReaderPool {
         query: String,
         limit: usize,
     ) -> StoreResult<Vec<WorkstreamEvent>> {
+        let stopwords = self.fts_stopwords.clone();
         self.with_conn(move |conn| {
-            crate::workstream::search_events(conn, workstream_id, &query, limit)
+            crate::workstream::search_events(conn, workstream_id, &query, limit, &stopwords)
         })
         .await
     }
@@ -1938,7 +1953,7 @@ impl ReaderPool {
         limit: usize,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<PageHit>> {
-        let fts_query = normalize_fts_query(&query);
+        let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -2030,7 +2045,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
-        let fts_query = normalize_fts_query(&query);
+        let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -2161,7 +2176,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
-        let fts_query = normalize_fts_query(&query);
+        let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
@@ -2257,7 +2272,7 @@ impl ReaderPool {
         candidate_limit: usize,
         as_of_us: i64,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
-        let fts_query = normalize_fts_query(&query);
+        let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
@@ -2500,7 +2515,7 @@ impl ReaderPool {
         query: String,
         limit: usize,
     ) -> StoreResult<Vec<ObservationHit>> {
-        let fts_query = normalize_fts_query(&query);
+        let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -2865,7 +2880,7 @@ impl ReaderPool {
         let fts_query = page
             .query
             .as_deref()
-            .map(normalize_fts_query)
+            .map(|q| normalize_fts_query(q, &self.fts_stopwords))
             .filter(|q| !q.is_empty());
         let kinds: Vec<&'static str> = page
             .kinds
@@ -10480,10 +10495,10 @@ fn count_workspace(conn: &Connection, sql: &str, workspace_id: WorkspaceId) -> S
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
 }
 
-fn normalize_fts_query(query: &str) -> String {
+fn normalize_fts_query(query: &str, stopwords: &FtsStopwords) -> String {
     // Delegates to prepare_fts5_query: neutralises `word:` column syntax and
     // quotes tokens so `-` / `*` are not FTS5 operators.
-    prepare_fts5_query(query)
+    prepare_fts5_query(query, stopwords)
 }
 
 /// Count rows in a time-bounded window. Used by [`ReaderPool::briefing`]

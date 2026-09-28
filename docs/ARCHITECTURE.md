@@ -773,6 +773,60 @@ belief_authority_weight = 0.0     # fold read-time belief-strength confidence (P
                                   # exposed in explain regardless (inert). DEFAULT OFF,
                                   # R2-gated: do not default on without a positive R2 delta.
 
+[search.fts]                      # FTS5 query-preparation tuning (contrast with [retrieval]:
+                                  # this is not a ranking signal). Omit the whole section for
+                                  # byte-identical behaviour on every existing install.
+# stopwords = []                  # words dropped from a bare natural-language FTS query
+                                  # before the OR-join. Three states:
+                                  #   - key absent (the default): the built-in English list
+                                  #     (a/an/and/the/…, ~60 entries) — unchanged behaviour.
+                                  #   - stopwords = []: disables the filter entirely, English
+                                  #     included.
+                                  #   - a non-empty list: REPLACES the default outright with
+                                  #     exactly those words (does not extend the English list).
+                                  # Entries are folded to lowercase with Unicode case folding
+                                  # (not ASCII-only — a sentence-initial "É" or all-caps "NÃO"
+                                  # still matches a lowercase entry), and a query token is
+                                  # compared the same way, but diacritics are never stripped:
+                                  # "e" and "é" stay distinct. What matters here is how a query
+                                  # is actually TYPED, not how wiki content is spelled — content
+                                  # matches through the FTS index's own diacritic-folding
+                                  # tokenizer regardless, but this filter only ever sees the
+                                  # literal characters someone typed. So a list for an accented
+                                  # language should include every spelling a user or agent might
+                                  # type, e.g. Portuguese BOTH "e" and "é", BOTH "nao" and "não".
+                                  # The filter also matches whitespace-split raw tokens before
+                                  # any punctuation handling, so an entry never matches a token
+                                  # with attached punctuation ("de," / "que?") — the same
+                                  # limitation English stopwords have always had. Explicit FTS5
+                                  # syntax (quoted phrases, OR/AND/NOT/NEAR, parens) always
+                                  # bypasses this filter, exactly as it does with the built-in
+                                  # list; a bare query made ONLY of configured stopwords keeps
+                                  # them all rather than returning nothing. At most 2000 entries
+                                  # of at most 64 characters each, no internal whitespace
+                                  # (entries are matched against single whitespace-split
+                                  # tokens); anything past that fails startup.
+                                  #
+                                  # Env override: AI_MEMORY_SEARCH_FTS_STOPWORDS as a
+                                  # comma-separated string — the same convention
+                                  # allowed_hosts/cors_allow_origins/auth.trusted_proxy_cidrs
+                                  # use for a Vec<String> — but read once as data in
+                                  # Config::load rather than through the usual `__`-split env
+                                  # layer, because a present-but-blank env var must mean
+                                  # "unset" (leave config.toml's value alone), never an
+                                  # accidental "disable filtering"; the automatic layer merges
+                                  # raw values before any such distinction could be made.
+                                  #
+                                  # Non-English example — a Portuguese-majority wiki, so its
+                                  # own function words (not English's) get filtered, spelling
+                                  # out both accented and unaccented forms someone might type:
+                                  # stopwords = [
+                                  #   "a", "o", "as", "os", "de", "da", "do", "das", "dos",
+                                  #   "em", "um", "uma", "uns", "umas", "com", "para", "por",
+                                  #   "que", "se", "no", "na", "nos", "nas", "e", "ou",
+                                  #   "nao", "não", "voce", "você",
+                                  # ]
+
 [dream]                           # B2/B3/B4 opt-in LLM "dream" pass. OFF by default,
                                   # R2-gated before it may default on. Never deletes a source.
 enabled = false                   # true starts the scheduled pass — but ONLY if a provider AND
