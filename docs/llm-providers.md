@@ -202,6 +202,57 @@ and similar available through the same catalogue) is the practical choice.
 The two endpoints are still independent, so setting `AI_MEMORY_LLM_BASE_URL`
 alone does not redirect embeddings — set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 
+### Security and gotchas
+
+- **Bind address vs. port publish.** When running inside a container, the
+  process-level bind (`--bind 0.0.0.0:49374` or similar) does not decide
+  who can reach the port — that is decided by the container's publish
+  spec. `-p 127.0.0.1:49374:49374` restricts to loopback on the host;
+  `-p 49374:49374` publishes on every host interface. If the port is
+  ever reachable beyond loopback, generate a bearer token first:
+  ```bash
+  ai-memory generate-auth-token
+  export AI_MEMORY_AUTH_TOKEN=<token>
+  export AI_MEMORY_ALLOWED_HOSTS=<host,host,...>
+  ```
+  The server logs a loud startup warning about non-loopback exposure
+  without a token; treat it as blocking. `AI_MEMORY_ALLOWED_HOSTS`
+  guards against DNS-rebinding. TLS termination is expected to sit in
+  front of the process — see [`docs/https-via-proxy.md`](https-via-proxy.md).
+- **Secret hygiene.** The env file that holds `LLM_API_KEY` (and any
+  provider-specific key you set) should be `chmod 600` and outside any
+  directory a version-control tool sees. If you back up
+  `~/.config/ai-memory/` (see [`docs/backup.md`](backup.md)), exclude
+  the env file — the sample script and mirror `.gitignore` shipped
+  there already exclude `*.env` by default.
+- **Cheap models can drift.** LLM consolidation writes durable wiki
+  pages, so a model that occasionally fabricates a `kind: decision`
+  page for a session that made no decision leaves a page in the wiki
+  that ai-memory will treat as first-class evidence on subsequent
+  reads. This is a known cost of running a smaller / cheaper model on
+  the consolidation prompt. Spot-check
+  `<data_dir>/wiki/<workspace>/<project>/decisions/` during the first
+  week on a new model for pages you do not recognize; if any appear,
+  either raise the provider tier for consolidation only (keep the
+  cheaper model for retrieval reranking) or unset
+  `AI_MEMORY_LLM_PROVIDER` to fall back to the deterministic
+  rule-based path.
+- **`:free`-suffix models draw from a shared quota.** Any model id
+  ending in `:free` on OpenRouter is served from a pool shared across
+  all users of the free tier, not the caller's paid budget. When that
+  pool is exhausted, requests fail with an upstream-shared-pool
+  rate-limit error. Fine for evaluation, unreliable for production;
+  prefer a model listed with multiple upstream providers on its
+  OpenRouter page.
+- **Reasoning-mode models are ineligible for consolidation.**
+  Consolidation and lint use a strict-JSON output contract; reasoning
+  models route most of their token budget through internal reasoning
+  and either stall past the 300 s per-request ceiling or return empty
+  strings. `docs/install.md#llm-provider-tiers` has the standing "what
+  we don't recommend" note listing the pattern; the same applies to
+  any OpenRouter model flagged as a reasoning/thinking variant. Prefer
+  a non-reasoning peer for `AI_MEMORY_LLM_MODEL`.
+
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
 `claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
