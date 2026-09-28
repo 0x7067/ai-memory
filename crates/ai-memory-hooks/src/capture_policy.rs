@@ -392,6 +392,17 @@ struct CompiledPattern {
     /// Whole segments before the first glob; a matching path must start here.
     literal_prefix: String,
 }
+impl CompiledPattern {
+    /// Upper bound on `glob_match` steps for one candidate, directory glob included.
+    fn match_cost(&self, candidate: &str) -> usize {
+        let pattern = self.path.chars().count()
+            + self
+                .directory_base
+                .as_deref()
+                .map_or(0, |base| base.chars().count());
+        pattern.saturating_mul(candidate.chars().count())
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flavor {
     Posix,
@@ -505,11 +516,15 @@ impl CapturePolicy {
                 // still name an ignored file whose content lands in the
                 // output (`cat docs/adr/*.md`). An exhausted match budget
                 // fails closed like an unprovable file candidate.
-                ToolFamily::NonFile => match extracted
-                    .command
-                    .as_deref()
-                    .map(|command| self.match_command(command, cwd))
-                {
+                ToolFamily::NonFile => match extracted.command.as_deref().map(|command| {
+                    let base = match extracted.workdir.as_deref() {
+                        Some(dir) if is_absolute(dir) => dir.to_owned(),
+                        // `join` would turn an unusable cwd into `/dir`.
+                        Some(dir) if is_absolute(cwd) => join(cwd, dir),
+                        _ => cwd.to_owned(),
+                    };
+                    self.match_command(command, &base)
+                }) {
                     Some(Ok(true) | Err(())) => (CaptureDisposition::Drop, extracted.state),
                     Some(Ok(false)) | None => (CaptureDisposition::Keep, extracted.state),
                 },
@@ -545,13 +560,7 @@ impl CapturePolicy {
                 .filter(|pattern| pattern.flavor == candidate.flavor)
             {
                 work = work
-                    .checked_add(
-                        pattern
-                            .path
-                            .chars()
-                            .count()
-                            .saturating_mul(candidate.path.chars().count()),
-                    )
+                    .checked_add(pattern.match_cost(&candidate.path))
                     .ok_or(())?;
                 if work > MAX_MATCH_WORK {
                     return Err(());
@@ -598,13 +607,7 @@ impl CapturePolicy {
                         continue;
                     }
                     work = work
-                        .checked_add(
-                            pattern
-                                .path
-                                .chars()
-                                .count()
-                                .saturating_mul(candidate.path.chars().count()),
-                        )
+                        .checked_add(pattern.match_cost(&candidate.path))
                         .ok_or(())?;
                     if work > MAX_MATCH_WORK {
                         return Err(());
@@ -656,6 +659,7 @@ struct Extracted {
     family: ToolFamily,
     paths: Option<Vec<String>>,
     command: Option<String>,
+    workdir: Option<String>,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -714,6 +718,13 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
     let command = (family == ToolFamily::NonFile)
         .then(|| args.and_then(shell_command))
         .flatten();
+    // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
+    // when given, so relative arguments resolve from there.
+    let workdir = command
+        .as_ref()
+        .and_then(|_| args?.get("workdir")?.as_str())
+        .filter(|dir| !dir.trim().is_empty())
+        .map(str::to_owned);
     let state = if family == ToolFamily::File && paths.is_none() {
         ExtractionState::MissingOrMalformed
     } else {
@@ -740,6 +751,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         family,
         paths,
         command,
+        workdir,
         call_id,
         state,
     }
@@ -771,7 +783,7 @@ fn family(name: &str) -> ToolFamily {
         "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
         | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
-        "bash" | "shell" | "shell_command" | "execute" | "run_command" | "web_search"
+        "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
         | "terminal" | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
@@ -1107,13 +1119,13 @@ fn glob_match(
     directory_base: Option<&str>,
     insensitive: bool,
 ) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let candidate: Vec<char> = candidate.chars().collect();
-    if directory_base
-        .is_some_and(|base| equal_chars(&base.chars().collect::<Vec<_>>(), &candidate, insensitive))
-    {
+    // `dir/**` also names `dir` itself, and `dir` may hold globs
+    // (`docs/a?r/**`), exactly as in the generated TypeScript.
+    if directory_base.is_some_and(|base| glob_match(base, candidate, None, insensitive)) {
         return true;
     }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let candidate: Vec<char> = candidate.chars().collect();
     let mut previous = vec![false; pattern.len() + 1];
     previous[0] = true;
     for index in 1..=pattern.len() {
@@ -1184,13 +1196,6 @@ fn glob_reaches(glob: &str, prefix: &str, insensitive: bool) -> bool {
         offset += 1;
     }
     false
-}
-fn equal_chars(left: &[char], right: &[char], insensitive: bool) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(&a, &b)| char_equal(a, b, insensitive))
 }
 fn char_equal(left: char, right: char, insensitive: bool) -> bool {
     if insensitive && left.is_ascii() && right.is_ascii() {
@@ -1744,65 +1749,49 @@ mod tests {
         json!({"tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "call-1"})
     }
 
+    /// The drop/keep tables live in the shared fixture so the generated
+    /// TypeScript matcher runs the very same vectors (#961).
     #[test]
-    fn shell_commands_reading_ignored_paths_are_dropped() {
-        let policy = shell_policy();
-        for (command, cwd) in [
-            ("cat docs/adr/0001.md", "/repo"),
-            ("cat ./docs/adr/0001.md", "/repo"),
-            ("cat /repo/docs/adr/0001.md", "/repo"),
-            ("cat ../docs/adr/0001.md", "/repo/sub"),
-            ("cat docs/adr/*.md", "/repo"),
-            ("cat docs/*/0001.md", "/repo"),
-            ("ls docs/*", "/repo"),
-            ("cat 'docs/adr/a b.md'", "/repo"),
-            ("cat \"docs/adr/a b.md\"", "/repo"),
-            (r"cat docs/adr/a\ b.md", "/repo"),
-            ("head -n5 docs/adr/x.md | wc -l", "/repo"),
-            ("grep --file=docs/adr/x.md pattern", "/repo"),
-            ("FILE=docs/adr/x.md sh -c 'cat $FILE'", "/repo"),
-            ("cd /tmp && cat /repo/docs/adr/x.md;echo", "/repo"),
-            ("wc -l <docs/adr/x.md", "/repo"),
-            ("cat ~/notes/today.md", "/repo"),
-            ("cat docs/adr", "/repo"),
-        ] {
-            let decision = policy.inspect(AgentKind::ClaudeCode, &bash(command), cwd);
+    fn shell_fixture_vectors() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
+        let shell = &fixture["shell"];
+        let ignore_paths = shell["ignore_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pattern| pattern.as_str().unwrap().to_owned())
+            .collect();
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig { ignore_paths }),
+            "/repo",
+            Some("/home/me"),
+        );
+        for vector in shell["vectors"].as_array().unwrap() {
+            let payload = vector
+                .get("payload")
+                .cloned()
+                .unwrap_or_else(|| json!({"tool": "bash", "args": {"command": vector["command"]}}));
+            let payload: Value =
+                serde_json::from_str(&payload.to_string().replace("{root}", "/repo")).unwrap();
+            let cwd = vector["cwd"]
+                .as_str()
+                .map_or_else(|| "/repo".to_owned(), |sub| format!("/repo/{sub}"));
+            let decision = policy.inspect(AgentKind::OpenCode, &payload, &cwd);
+            let protocol = decision.protocol();
             assert_eq!(
-                decision.protocol().disposition(),
-                CaptureDisposition::Drop,
-                "command: {command}"
+                serde_json::to_value(protocol.disposition()).unwrap(),
+                vector["disposition"],
+                "vector: {vector}"
             );
-            assert_eq!(decision.protocol().tool_family(), ToolFamily::NonFile);
-        }
-    }
-
-    #[test]
-    fn shell_commands_not_touching_ignored_paths_are_kept() {
-        let policy = shell_policy();
-        for command in [
-            "cat src/main.rs",
-            "cat docs/adrx.md",
-            "cat docs/adr-notes/x.md",
-            "ls docs",
-            "cat *.md",
-            "git add .",
-            "cargo test -p ai-memory-hooks",
-            "echo 'docs/adr is ignored'x",
-            "cat notes/today.md",
-            "",
-        ] {
-            let decision = policy.inspect(AgentKind::ClaudeCode, &bash(command), "/repo");
             assert_eq!(
-                decision.protocol().disposition(),
-                CaptureDisposition::Keep,
-                "command: {command}"
+                protocol.tool_family(),
+                ToolFamily::NonFile,
+                "vector: {vector}"
             );
             // Unchanged protocol fields keep old and new servers agreeing.
-            assert_eq!(decision.protocol().path_count(), 0);
-            assert_eq!(
-                decision.protocol().extraction_state(),
-                ExtractionState::Extracted
-            );
+            assert_eq!(protocol.path_count(), 0);
+            assert_eq!(protocol.extraction_state(), ExtractionState::Extracted);
         }
     }
 
@@ -1831,6 +1820,14 @@ mod tests {
                 AgentKind::OpenCode,
                 json!({"tool": "bash", "args": {"command": "cat docs/adr/x.md"}}),
             ),
+            (
+                AgentKind::OpenClaw,
+                json!({"tool": "exec", "args": {"command": "cat 0001.md", "workdir": "docs/adr"}}),
+            ),
+            (
+                AgentKind::Devin,
+                json!({"tool_name": "exec", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
         ] {
             let decision = policy.inspect(agent, &raw, "/repo");
             if decision.protocol().tool_family() == ToolFamily::NonFile {
@@ -1842,6 +1839,7 @@ mod tests {
             } else {
                 // `exec_command` is not a recognized shell tool name; it keeps
                 // today's unknown-tool behavior rather than guessing.
+                assert_eq!(raw["tool_name"], "exec_command", "raw: {raw}");
                 assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
             }
         }

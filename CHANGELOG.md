@@ -20,7 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The generated OpenCode, OMP, Pi and OpenClaw integrations now apply the same
   lexical shell-command `ignore_paths` matching as the native hook, so a `bash`
   call such as `cat docs/adr/0001.md` is dropped there too instead of being
-  captured. Refresh or reinstall generated plugins to pick it up. (#948)
+  captured. Both matchers now also recognize OpenClaw's and Devin's `exec` shell
+  tool, resolve relative arguments from a shell tool's `workdir` (OpenCode
+  `bash`, OpenClaw `exec`, Codex `shell`) instead of the event cwd, and treat
+  `dir/**` as covering `dir` itself when `dir` holds a glob (`docs/a?r/**`), as
+  the generated plugins already did. Refresh or reinstall generated plugins to
+  pick it up. (#948)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the

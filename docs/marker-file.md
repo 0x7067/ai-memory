@@ -235,11 +235,12 @@ That form contains only bounded routing/tool/decision metadata, never paths,
 patterns, arguments, output, errors, titles, or nested payload. Unknown tools
 retain current behavior.
 
-Recognized shell tools (`Bash`, `shell`, `execute_bash`, `terminal`, …) have no
-path field, so the command line is split into words lexically, the way a POSIX
-shell quotes and separates them, without expanding or running anything. Each
-argument that is not a flag, plus the value of a `--flag=value` or
-`NAME=value` word, is resolved from the event's `cwd` like a file-tool path. If
+Recognized shell tools (`Bash`, `shell`, `exec`, `execute_bash`, `terminal`, …)
+have no path field, so the command line is split into words lexically, the way
+a POSIX shell quotes and separates them, without expanding or running anything.
+Each argument that is not a flag, plus the value of a `--flag=value` or
+`NAME=value` word, is resolved like a file-tool path: from the tool's own
+`workdir` argument when it has one, otherwise from the event's `cwd`. If
 one matches a pattern, the whole event is **dropped**, exactly like a matching
 file read. An argument containing `*` or `?` also matches when its glob can
 reach a pattern's directory: `cat docs/*/0001.md` is dropped under
