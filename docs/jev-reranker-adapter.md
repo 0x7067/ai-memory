@@ -91,6 +91,11 @@ AI_MEMORY_LLM_BASE_URL=http://127.0.0.1:18097/v1
 AI_MEMORY_RERANKER=llm
 ```
 
+To run the choice-contrastive variant instead, point `ExecStart` at
+`jev_rerank_shim_choice.py`; reranker requests then log
+`jev-choice N candidates in X.XXXs`. Everything else (env, unit,
+provider config) is identical.
+
 Verify the split with `journalctl -u <unit>`: reranker requests log
 `jev N candidates in X.XXXs`, everything else is silent (proxied).
 
@@ -129,15 +134,64 @@ question is asked once per candidate): ~0.2 s for 10 candidates, ~1.6 s
 mean for the 15–30-candidate batches the live server sends, still an order
 of magnitude under any hosted reasoning model.
 
+## Choice-contrastive variant
+
+[`jev_rerank_shim_choice.py`](examples/jev-reranker-adapter/jev_rerank_shim_choice.py)
+flips the question shape: instead of one rubric `score` per candidate, it
+asks a single `choice` question over the whole candidate list and maps each
+candidate's choice probability directly to `relevance`. The production
+wording asks which specific page contains the answer, and tells the model
+not to pick an index, catalog, or summary when a more specific page answers.
+On a 30-candidate pool that wording moved the 35B from 0.828 to 0.879 hit@1
+(5 fixed, 0 broken) versus "which document is most relevant?". The table
+below is the earlier choice-versus-rubric comparison, not that wording test.
+
+That is deliberately the substitution the caveat below used to warn about.
+It is sound here because the reranker's consumer is **sort-only**: the
+server reorders candidates by `relevance` and never thresholds or sums its
+absolute value, and a per-question monotonic map preserves order exactly.
+The old warning applies to consumers that *read* absolute relevance
+grades; the reranker leg does not, and the caveat below is now scoped to
+that case.
+
+Measured on one production deployment (same 102-query golden set, same
+live server and backend, end-to-end through the adapter):
+
+| Backend model | Adapter | hit@1 | NDCG@10 | mean rerank latency |
+|---|---|---|---|---|
+| 35B (Qwen3.6-35B-A3B) | rubric `score` | 0.636 | 0.833 | 2.2 s |
+| 35B (Qwen3.6-35B-A3B) | **choice** | **0.778** | **0.893** | **0.75 s** |
+| 4B replay-trained | rubric `score` | 0.596 | 0.776 | 8.2 s |
+| 4B replay-trained | **choice** | **0.808** | **0.895** | 1.16 s |
+
+Two takeaways. First, the choice shape beat the rubric shape by 14–21
+hit@1 points *on the same backend model*: relative comparison is an easier
+judgement than absolute grading, and it shows up in both quality and
+latency (one batched question for the whole list instead of one question
+per candidate). Second, the rubric shape is where replay-trained small
+models collapse (0.596 on 4B vs 0.636 on 35B); in the choice shape the
+same 4B overtakes the 35B. If your backend is a small replay-trained
+judge, the choice adapter is the difference between usable and not.
+
+Prefer the choice adapter when the reranker leg is the only consumer.
+Keep the rubric adapter if anything downstream reads absolute relevance
+grades (thresholding, logging heuristics, score fusion) — choice
+probabilities carry no absolute meaning and their scale shifts with
+candidate count.
+
 ## Caveats
 
 - The adapter keys on the exact system-prompt prefix above. If the
   reranker prompt wording changes in a future release, detection (not
   scoring) breaks first: reranker requests would be proxied to the hosted
   model, which is the pre-adapter behavior, not an outage.
-- Scoring uses Jev's calibrated rubric grades. Do not substitute
-  per-candidate choice probabilities: those are normalized across options
-  (winner ≈ 0.99, rest ≈ 0.001) and do not fit the reranker's 0–1
-  relevance semantics.
+- Rubric scoring produces absolute relevance grades. If anything
+  downstream of `relevance` reads absolute values (thresholding, fusion,
+  logged heuristics), keep the rubric adapter: per-candidate choice
+  probabilities from the choice adapter are normalized across the whole
+  candidate list (winner ≈ 0.99, rest ≈ 0.001, scale shifts with
+  candidate count) and carry ordering information only. The sort-only
+  reranker leg itself reads no absolute values, which is why the choice
+  variant is safe to substitute for it.
 - Run the adapter on loopback or a trusted private network. It forwards
   `Authorization` headers verbatim and adds no authentication of its own.
