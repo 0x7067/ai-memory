@@ -115,10 +115,16 @@ pub enum Command {
     ReclaimLedgerVersions(ReclaimLedgerVersionsArgs),
     /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
     Backup(BackupArgs),
+    /// Snapshot AI agent configurations, skills, and plugins into a portable archive.
+    #[command(name = "backup-agents")]
+    BackupAgents(BackupAgentsArgs),
     /// Export one project's wiki as an OKF v0.2 bundle tarball.
     ExportOkf(ExportOkfArgs),
     /// Restore a backup tarball into the data directory.
     Restore(RestoreArgs),
+    /// Restore AI agent configurations, skills, and plugins from an archive.
+    #[command(name = "restore-agents")]
+    RestoreAgents(RestoreAgentsArgs),
     /// Rebuild the SQLite index from the wiki/ markdown (the "DB is
     /// rebuildable from files" guarantee). Recreates workspaces/projects from
     /// each scope's `_meta.md` manifest and reindexes every page. Run with the
@@ -1746,6 +1752,37 @@ pub struct BackupArgs {
     pub to: PathBuf,
 }
 
+/// Scope of assets to collect for `backup-agents`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AgentBackupScope {
+    /// Global user assets only.
+    Global,
+    /// Project assets only.
+    Project,
+    /// Both global and project assets.
+    Both,
+}
+
+/// Arguments for `backup-agents`.
+#[derive(Debug, Args)]
+pub struct BackupAgentsArgs {
+    /// Destination tarball (`.tar.gz`).
+    #[arg(long, short = 'o')]
+    pub to: PathBuf,
+    /// Comma-separated list of agent names to include (e.g. `claude,codex,antigravity`). Defaults to all detected.
+    #[arg(long, value_delimiter = ',')]
+    pub agents: Option<Vec<String>>,
+    /// Scope of assets to collect: `global`, `project`, or `both`.
+    #[arg(long, default_value = "both")]
+    pub scope: AgentBackupScope,
+    /// Include raw un-redacted credentials and tokens in MCP configs (sets file mode 0600 on archive).
+    #[arg(long)]
+    pub include_secrets: bool,
+    /// Preview assets that would be backed up without creating an archive.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments for `export-okf`.
 #[derive(Debug, Args)]
 pub struct ExportOkfArgs {
@@ -1767,6 +1804,23 @@ pub struct RestoreArgs {
     #[arg(long, short = 'i')]
     pub from: PathBuf,
     /// Overwrite an existing non-empty data dir.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Arguments for `restore-agents`.
+#[derive(Debug, Args)]
+pub struct RestoreAgentsArgs {
+    /// Source archive (`.tar.gz`).
+    #[arg(long, short = 'i')]
+    pub from: PathBuf,
+    /// Optional comma-separated list of agents to restore. Defaults to all present in archive.
+    #[arg(long, value_delimiter = ',')]
+    pub agents: Option<Vec<String>>,
+    /// Actually write restored files to disk (default is dry-run inspection).
+    #[arg(long)]
+    pub apply: bool,
+    /// Overwrite existing target files even if they differ.
     #[arg(long)]
     pub force: bool,
 }
