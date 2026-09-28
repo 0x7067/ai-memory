@@ -47,6 +47,76 @@ running `reindex` after a restore), pair the git mirror with a periodic
 (external disk, network share, or on WSL2 the Windows-side filesystem via
 `/mnt/c/`).
 
+## Security: what ends up in your wiki
+
+Read this before configuring a remote — decide what is acceptable to have
+off your machine, then pick the shape of backup that matches.
+
+The wiki captures **everything the coding agent sees during a session**
+that ai-memory's sanitizer classifies as observations to store: user
+prompts, tool inputs and outputs, page bodies written by consolidation.
+The sanitizer strips obvious credentials (see `SECURITY.md`), but it
+cannot prove that every prompt or tool response was safe to store. In
+practice this means: if any user has ever pasted an API key, a password,
+a private client name, a customer record, or a file path they consider
+sensitive into a captured session, it is on disk in the wiki tree, and
+whatever you push will carry it.
+
+For any remote target — even a private repository on a service you
+control — assume an operator or administrator on the receiving side
+could read the contents. Employer-managed cloud repositories
+(GitHub Enterprise, GitLab self-hosted, Bitbucket Data Center) may be
+routinely audited by administrators, and a repository private to you on
+a shared account is still readable by whoever administers the account.
+
+**Suggested exclusions**, in addition to the derived-state and
+secret-file rules already covered above. The mirror repository's
+`.gitignore` should carry at least:
+
+```
+# Provider credentials and OAuth material — never push
+config/*.env
+config/*.key
+config/*.pem
+config/auth.json
+config/.secrets
+
+# Derived index and downloadable state
+data/models/
+data/db/
+data/logs/
+data/.serve.lock
+```
+
+The example `.gitignore` under [`docs/examples/backup/`](examples/backup/README.md)
+ships this list already; expand it for anything install-specific
+(host-side certificates, private CA bundles, cloud credential files,
+site-specific env files).
+
+**Alternatives when the wiki content is too sensitive to store as text
+on a remote** — pick whichever fits the threat model:
+
+- **Encrypted archive to object storage.** `restic` or `borg` snapshots
+  of the data dir to a private object store (S3, Backblaze B2, Wasabi,
+  or a self-hosted MinIO) with a passphrase-derived encryption key. The
+  content leaves the host encrypted; the object-store operator sees
+  ciphertext.
+- **Selective encryption inside the mirror repo.** `git-crypt` on paths
+  known to carry sensitive material (for example `data/wiki/**/*.md`)
+  keeps the git-remote workflow but encrypts blobs before push. Set up
+  keys before the first commit; retro-encryption of history is manual.
+- **`age`-encrypted tarball to a second location.** Simpler than
+  `restic`/`borg`, no state file: pipe `tar czf - <data-dir>` through
+  `age -R <recipients>` and drop the ciphertext onto an external disk
+  or a network share.
+- **Local-only backup, no remote.** Rotate encrypted tarballs onto an
+  external USB drive that lives off-site; give up remote-git
+  convenience for zero third-party exposure.
+
+If none of the wiki content is more sensitive than what already lives
+in your project's source repository, a private mirror repo is fine —
+this section is for the case where it is.
+
 ## Backing up the wiki to a remote git repository
 
 The wiki is already a git repository. If your only goal is off-site *wiki*

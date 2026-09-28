@@ -11,11 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/backup.md` documents the remote-git-mirror backup pattern for a
   single-user install: what to include, what to exclude (derived SQLite index,
   models cache, logs, secrets), how to schedule with a `systemd --user` timer,
-  how to restore, and the security posture per `SECURITY.md`. A worked example
-  ships under `docs/examples/backup/` (snapshot script, `.service` and
-  `.timer` unit files, `.gitignore` for the mirror repo). Pointers added
-  from `docs/deploy.md#backups`, `docs/airgapped-install.md`, and the
-  README docs table. The on-box `ai-memory backup --to <tarball>` command
+  how to restore, and the security posture per `SECURITY.md`, including a
+  "what ends up in your wiki" section that names the exposure (sanitized
+  prompts, tool I/O, page bodies) and lists encrypted-archive alternatives
+  (`age`, `restic`, `borg`, `git-crypt`) for cases where a private mirror
+  repo is not enough. A worked example ships under `docs/examples/backup/`
+  (snapshot script, `.service` and `.timer` unit files, `.gitignore` for
+  the mirror repo). Pointers added from `docs/deploy.md#backups`,
+  `docs/airgapped-install.md`, and the README docs table. The on-box
+  `ai-memory backup --to <tarball>` command
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
 ### Fixed
