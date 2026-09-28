@@ -441,6 +441,9 @@ pub(crate) enum WriteCmd {
         force: bool,
         /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
         compaction: crate::ops::Compaction,
+        /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
+        /// never issues the delete — see [`crate::ops::PurgeMode`]'s doc.
+        mode: crate::ops::PurgeMode,
         reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
     },
     /// Rename a workspace's `name` column (UUID-keyed dir doesn't move).
@@ -1935,6 +1938,11 @@ impl WriterHandle {
     /// Delete a workspace and, via the `workspace_id` cascade, every project /
     /// page / session under it. Refuses a non-empty workspace unless `force`.
     ///
+    /// `mode = `[`ops::PurgeMode::Preview`] stops right after counting and
+    /// never issues the delete — see [`ops::delete_workspace`] for why, and
+    /// for the two collateral counts (`collateral_observations_deleted`,
+    /// `collateral_handoffs_denulled`) either mode reports.
+    ///
     /// # Errors
     /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and
     /// `force` is false; [`StoreError::NotFound`] when the workspace is absent;
@@ -1944,12 +1952,14 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         force: bool,
         compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
     ) -> StoreResult<DeleteWorkspaceSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeleteWorkspace {
             workspace_id,
             force,
             compaction,
+            mode,
             reply: tx,
         })
         .await?;
@@ -3601,9 +3611,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 force,
                 compaction,
+                mode,
                 reply,
             } => {
-                let result = ops::delete_workspace(&mut conn, &workspace_id, force, compaction);
+                let result =
+                    ops::delete_workspace(&mut conn, &workspace_id, force, compaction, mode);
                 send_or_warn(reply, result, "delete_workspace");
             }
             WriteCmd::RenameWorkspace {

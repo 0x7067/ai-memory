@@ -13,7 +13,7 @@ on a homelab box where mistakes are harder to undo.
 | `handoffs --expire-all --confirm` | ✅ yes | no (state change only) | no (but nothing is destroyed) | Marks every **open** handoff in the scope `expired` so it stops being offered to an agent. Rows, summaries and provenance are kept and stay visible in the audit log. Unlike the automatic sweep it does **not** spare manual handoffs or ones from another directory — those exemptions are exactly what a leftover backlog is made of, so honouring them would clear nothing. `--older-than-days N` keeps recent batons. Owner-scoped: never touches another user's baton. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
-| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
+| `/admin/delete-workspace` | ✅ yes | the workspace and every child project, **plus** any observation stamped into a different workspace by one of this workspace's sessions (cascades regardless of the observation's own `workspace_id`), and it nulls (does not delete) the session reference on any handoff in a different workspace that this workspace's sessions authored or accepted | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). `"dry_run": true` previews the same counts, including the cross-workspace ones, without deleting anything — see below. |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
@@ -405,7 +405,13 @@ logical delete; see
 2. Run blocking `op=purge_workspace` admission. A reject-policy webhook aborts
    before DB rows or files are removed.
 3. Take a pre-delete checkpoint if the wiki tree is dirty.
-4. Delete the workspace in one writer-actor transaction.
+4. Delete the workspace in one writer-actor transaction, counting
+   `projects_deleted`, `pages_deleted`, `sessions_deleted`,
+   `observations_deleted`, `handoffs_deleted`, `embeddings_deleted`,
+   `workstreams_deleted`, `managed_runs_deleted`, plus the two cross-workspace
+   counts (`collateral_observations_deleted`, `collateral_handoffs_denulled`
+   — the same shape `purge-project`'s preview reports one level down, at
+   project rather than workspace granularity) before issuing the `DELETE`.
 5. Remove `<wiki_root>/<workspace_id>` and every affected
    `<data_dir>/raw/workstreams/<workstream_id>` directory from disk. The
    response reports `workstreams_deleted`, `managed_runs_deleted`, and the
@@ -423,6 +429,33 @@ Failure modes:
 - **Filesystem removal fails after SQL commit** → 200 with `files_failed`
   populated and `partial_failure: true` on async mirror notifications; manual
   cleanup of the reported path is required.
+
+#### Preview with `"dry_run": true`
+
+`"dry_run": true` in the request body always wins — `{"force": true,
+"dry_run": true}` still only previews — so a preview request can never
+become destructive by accident, the same pattern `purge-project` uses for
+its own `dry_run` field. The preview runs step 4's
+counts (including the two cross-workspace ones) against the same rows a
+confirmed delete would remove, using the same `409` for a non-empty
+workspace without `force` and the same `404` for an unknown workspace, and
+returns before ever issuing the `DELETE`. Steps 2, 3, 5, 6, and 7 never run
+under `dry_run`: no admission call, no wiki directory removal, no mirror
+dispatch, no checkpoint — `files_deleted`/`files_failed` are always empty and
+`pre_checkpoint`/`checkpoint` are always absent. The reply carries
+`"dry_run": true`. There is no CLI subcommand for `delete-workspace` today,
+so this preview is HTTP-only.
+
+The two `collateral_*` fields cover only observations and handoffs, the same
+set `purge-project`'s own preview covers. `agent_messages` (V64, the
+cross-workspace mailbox) is affected the same cross-workspace way and is
+neither counted nor previewed today, as a known follow-up: a message TO a
+*different* workspace's mailbox is deleted outright if it was sent FROM the
+workspace being deleted (`from_workspace_id` is `ON DELETE CASCADE`, with no
+regard for the message's own `to_workspace_id`), and `from_session_id`/
+`claimed_by_session` pointers on messages elsewhere are nulled, not deleted,
+when they reference a session that lived in the deleted workspace (`ON DELETE
+SET NULL`).
 
 ### `move-project`
 
