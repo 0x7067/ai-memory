@@ -5289,12 +5289,34 @@ pub fn purge_project(
 }
 
 /// Summary returned by [`delete_workspace`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DeleteWorkspaceSummary {
     /// Projects removed (0 when the workspace was already empty).
     pub projects_deleted: u64,
     /// `pages` rows removed via cascade (all versions).
     pub pages_deleted: u64,
+    /// `sessions` rows removed via cascade.
+    pub sessions_deleted: u64,
+    /// `observations` rows removed via cascade.
+    pub observations_deleted: u64,
+    /// `handoffs` rows removed via cascade (every handoff whose own
+    /// `workspace_id` is this workspace, not just the ones this workspace's
+    /// sessions authored or accepted).
+    pub handoffs_deleted: u64,
+    /// `page_embeddings` rows removed via cascade (cascades through pages).
+    pub embeddings_deleted: u64,
+    /// `observations` rows belonging to a **different** workspace, deleted
+    /// collaterally because `observations.session_id` is `ON DELETE CASCADE`
+    /// to `sessions` without regard to the observation's own `workspace_id`
+    /// — the same shape [`PurgeSummary::collateral_observations_deleted`] and
+    /// [`PurgeSessionSummary::collateral_observations_deleted`] guard
+    /// against, one level up at workspace granularity.
+    pub collateral_observations_deleted: u64,
+    /// `handoffs` rows belonging to a different workspace whose
+    /// `from_session_id` or `accepted_by_session` is about to be set to
+    /// `NULL` (not deleted — those columns are `ON DELETE SET NULL`) because
+    /// they referenced a session that lived in this workspace.
+    pub collateral_handoffs_denulled: u64,
     /// Managed `workstreams` rows removed via cascade.
     pub workstreams_deleted: u64,
     /// `managed_runs` rows removed via cascade.
@@ -5313,6 +5335,18 @@ pub struct DeleteWorkspaceSummary {
 /// observations / handoffs / managed workstreams. The caller removes the
 /// on-disk workspace and raw workstream directories afterwards.
 ///
+/// `mode = `[`PurgeMode::Preview`] runs every count below — including the two
+/// collateral ones — against the same rows in `projects`, `pages`, `sessions`,
+/// `observations`, `handoffs`, `page_embeddings`, `workstreams` and
+/// `managed_runs` the confirmed call would delete, then returns without ever
+/// issuing the `DELETE`, the tombstone insert, or the reclaim: the
+/// transaction so far has only ever read, so rolling it back is free (see
+/// [`PurgeMode::Preview`]'s doc). The non-empty-workspace guard
+/// runs identically under both modes, so a preview of a workspace that would
+/// be refused reports the same [`StoreError::WorkspaceNotEmpty`] a confirmed
+/// call would, rather than a set of counts that were never going to be
+/// produced.
+///
 /// # Errors
 /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and `force`
 /// is false; [`StoreError::NotFound`] when the workspace does not exist.
@@ -5321,9 +5355,26 @@ pub fn delete_workspace(
     workspace_id: &WorkspaceId,
     force: bool,
     compaction: Compaction,
+    mode: PurgeMode,
 ) -> StoreResult<DeleteWorkspaceSummary> {
     let tx = conn.transaction()?;
     let wid = workspace_id.as_bytes();
+
+    // Checked up front, under both modes: a `Commit` run would otherwise only
+    // discover a missing workspace via the `DELETE FROM workspaces` below
+    // returning zero rows, and a `Preview` run issues no `DELETE` at all — so
+    // without this, previewing a nonexistent workspace would silently return
+    // every count as zero instead of `NotFound`, unlike every other lookup in
+    // this codebase.
+    let exists: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+        rusqlite::params![&wid[..]],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Err(StoreError::NotFound("workspace".into()));
+    }
+
     let count = |sql: &str| -> StoreResult<u64> {
         let n: Option<i64> = tx
             .query_row(sql, rusqlite::params![&wid[..]], |row| row.get(0))
@@ -5336,12 +5387,46 @@ pub fn delete_workspace(
         return Err(StoreError::WorkspaceNotEmpty(projects_deleted));
     }
     let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE workspace_id = ?1")?;
+    let sessions_deleted = count("SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1")?;
+    let observations_deleted = count("SELECT COUNT(*) FROM observations WHERE workspace_id = ?1")?;
+    let handoffs_deleted = count("SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1")?;
+    // page_embeddings cascade through pages; count pages that have them.
+    let embeddings_deleted = count(
+        "SELECT COUNT(*) FROM page_embeddings \
+         WHERE page_id IN (SELECT id FROM pages WHERE workspace_id = ?1)",
+    )?;
     let workstreams_deleted = count("SELECT COUNT(*) FROM workstreams WHERE workspace_id = ?1")?;
     let managed_runs_deleted = count(
         "SELECT COUNT(*) FROM managed_runs mr \
          JOIN workstreams w ON w.id = mr.workstream_id \
          WHERE w.workspace_id = ?1",
     )?;
+
+    // Collateral damage in OTHER workspaces, via `sessions` cascading out of
+    // this one. `observations.session_id` is `ON DELETE CASCADE` (V01) with
+    // no regard for the observation's own `workspace_id`, so an observation
+    // stamped into a different workspace's project — the same shape
+    // `purge_project`'s preview guards against, one level up — is deleted
+    // right along with the session that wrote it, even though nothing in
+    // that other workspace's own row count says so.
+    let collateral_observations_deleted = count(
+        "SELECT COUNT(*) FROM observations \
+         WHERE workspace_id != ?1 \
+           AND session_id IN (SELECT id FROM sessions WHERE workspace_id = ?1)",
+    )?;
+    // `handoffs.from_session_id` / `accepted_by_session` are `ON DELETE SET
+    // NULL` (V02): a handoff living in another workspace is not deleted, but
+    // loses the link back to whichever of this workspace's sessions authored
+    // or accepted it.
+    let collateral_handoffs_denulled = count(
+        "SELECT COUNT(*) FROM handoffs \
+         WHERE workspace_id != ?1 \
+           AND ( \
+             from_session_id IN (SELECT id FROM sessions WHERE workspace_id = ?1) \
+             OR accepted_by_session IN (SELECT id FROM sessions WHERE workspace_id = ?1) \
+           )",
+    )?;
+
     let workstream_ids: Vec<String> = {
         let mut stmt = tx.prepare("SELECT id FROM workstreams WHERE workspace_id = ?1")?;
         let rows = stmt
@@ -5351,6 +5436,28 @@ pub fn delete_workspace(
             .map(|raw| ai_memory_core::WorkstreamId::from_slice(&raw).map(|id| id.to_string()))
             .collect::<Result<Vec<_>, _>>()?
     };
+
+    if mode == PurgeMode::Preview {
+        // Nothing was written — every statement above was a `SELECT` — so
+        // rolling back here is immediate; it never had to pay for the
+        // `DELETE FROM workspaces` cascade this function's `Commit` mode runs
+        // below, which is the whole point (see `PurgeMode::Preview`'s doc).
+        tx.rollback()?;
+        return Ok(DeleteWorkspaceSummary {
+            projects_deleted,
+            pages_deleted,
+            sessions_deleted,
+            observations_deleted,
+            handoffs_deleted,
+            embeddings_deleted,
+            collateral_observations_deleted,
+            collateral_handoffs_denulled,
+            workstreams_deleted,
+            managed_runs_deleted,
+            workstream_ids,
+            compacted: false,
+        });
+    }
 
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
@@ -5380,6 +5487,12 @@ pub fn delete_workspace(
     Ok(DeleteWorkspaceSummary {
         projects_deleted,
         pages_deleted,
+        sessions_deleted,
+        observations_deleted,
+        handoffs_deleted,
+        embeddings_deleted,
+        collateral_observations_deleted,
+        collateral_handoffs_denulled,
         workstreams_deleted,
         managed_runs_deleted,
         workstream_ids,
@@ -6387,7 +6500,8 @@ pub(crate) mod tests {
         let prepared = open_managed_run(&mut conn, &ws, &proj);
 
         // Non-empty (holds the "scratch" project + a page) → refused w/o force.
-        let err = delete_workspace(&mut conn, &ws, false, Compaction::Skip).unwrap_err();
+        let err = delete_workspace(&mut conn, &ws, false, Compaction::Skip, PurgeMode::Commit)
+            .unwrap_err();
         assert!(
             matches!(err, StoreError::WorkspaceNotEmpty(n) if n >= 1),
             "expected WorkspaceNotEmpty, got {err:?}"
@@ -6402,7 +6516,8 @@ pub(crate) mod tests {
         assert_eq!(ws_still, 1, "refused delete must not touch the row");
 
         // Force cascades: project + page gone, workspace row gone.
-        let summary = delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
+        let summary =
+            delete_workspace(&mut conn, &ws, true, Compaction::Skip, PurgeMode::Commit).unwrap();
         assert!(
             summary.projects_deleted >= 1 && summary.pages_deleted >= 1,
             "{summary:?}"
@@ -6424,7 +6539,8 @@ pub(crate) mod tests {
 
         // Deleting again → NotFound.
         assert!(matches!(
-            delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap_err(),
+            delete_workspace(&mut conn, &ws, true, Compaction::Skip, PurgeMode::Commit)
+                .unwrap_err(),
             StoreError::NotFound(_)
         ));
     }
@@ -6433,7 +6549,14 @@ pub(crate) mod tests {
     fn delete_workspace_empty_succeeds_without_force() {
         let (_tmp, mut conn, _ws, _proj) = fresh_db();
         let empty = get_or_create_workspace(&mut conn, "orphan-ws").unwrap();
-        let summary = delete_workspace(&mut conn, &empty, false, Compaction::Skip).unwrap();
+        let summary = delete_workspace(
+            &mut conn,
+            &empty,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert_eq!(summary.projects_deleted, 0);
         assert_eq!(summary.pages_deleted, 0);
         assert_eq!(summary.workstreams_deleted, 0);
@@ -6648,7 +6771,7 @@ pub(crate) mod tests {
     fn delete_workspace_tombstones_the_whole_workspace() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
 
-        delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
+        delete_workspace(&mut conn, &ws, true, Compaction::Skip, PurgeMode::Commit).unwrap();
 
         // The whole-workspace tombstone covers every project id in that ws,
         // including ones whose rows are already gone via cascade.
@@ -7025,6 +7148,7 @@ pub(crate) mod tests {
             "managed_runs",
             "workstream_events",
             "projects",
+            "workspaces",
             "purged_scopes",
             "audit_log",
         ]
@@ -7104,11 +7228,19 @@ pub(crate) mod tests {
 
         let skipped = {
             let other = get_or_create_workspace(&mut conn, "doomed").unwrap();
-            delete_workspace(&mut conn, &other, false, Compaction::Skip).unwrap()
+            delete_workspace(
+                &mut conn,
+                &other,
+                false,
+                Compaction::Skip,
+                PurgeMode::Commit,
+            )
+            .unwrap()
         };
         assert!(!skipped.compacted, "the default does not VACUUM");
 
-        let summary = delete_workspace(&mut conn, &ws, true, Compaction::Reclaim).unwrap();
+        let summary =
+            delete_workspace(&mut conn, &ws, true, Compaction::Reclaim, PurgeMode::Commit).unwrap();
         assert!(summary.compacted, "the summary reports that VACUUM ran");
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
@@ -7116,6 +7248,195 @@ pub(crate) mod tests {
         assert!(
             !bytes.windows(12).any(|w| w == b"obs-canaryws"),
             "Reclaim must remove the deleted workspace's text from the file"
+        );
+    }
+
+    /// A preview's counts come from the same `SELECT`s the confirmed path
+    /// uses to decide what to delete, not a separately-maintained estimate,
+    /// so a preview and the confirmed run right after it must agree exactly —
+    /// compared as the whole struct, not a hand-picked subset of fields, so a
+    /// field added later cannot silently go uncompared. Mirrors
+    /// `purge_project_dry_run_reports_the_same_counts_a_real_purge_would` one
+    /// level up, at workspace granularity.
+    #[test]
+    fn delete_workspace_dry_run_reports_the_same_counts_a_real_delete_would() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (_sid, page_id) = seed_session(&mut conn, ws, proj, "canaryws");
+        let prepared = open_managed_run(&mut conn, &ws, &proj);
+        store_embeddings(
+            &mut conn,
+            &[EmbeddingWrite {
+                page_id,
+                vector_bytes: vec![0u8; 4],
+                provider: "test".into(),
+                model: "model".into(),
+                dim: 1,
+            }],
+        )
+        .unwrap();
+
+        let preview = delete_workspace(&mut conn, &ws, true, Compaction::Skip, PurgeMode::Preview)
+            .expect("a dry run must not error");
+        assert_eq!(preview.projects_deleted, 1);
+        assert_eq!(preview.pages_deleted, 1);
+        assert_eq!(preview.sessions_deleted, 1);
+        assert_eq!(preview.observations_deleted, 1);
+        assert_eq!(preview.embeddings_deleted, 1);
+        assert_eq!(preview.workstreams_deleted, 1);
+        assert_eq!(preview.managed_runs_deleted, 1);
+        assert_eq!(
+            preview.workstream_ids,
+            vec![prepared.workstream_id.to_string()]
+        );
+        assert!(!preview.compacted, "a rolled-back run never reclaims bytes");
+
+        let real = delete_workspace(&mut conn, &ws, true, Compaction::Skip, PurgeMode::Commit)
+            .expect("the confirmed delete must still succeed after the preview");
+        assert_eq!(
+            real, preview,
+            "the dry run's whole summary must match what the confirmed run actually deletes \
+             (both ran with the same Compaction::Skip, so `compacted` agrees too)"
+        );
+    }
+
+    /// Bite check: every table's row count must be identical before and
+    /// after a [`PurgeMode::Preview`] run of `delete_workspace` — including
+    /// `workspaces` itself and `purged_scopes`, the two tables a confirmed
+    /// delete's own transaction writes to directly (`delete_workspace`, unlike
+    /// `purge_project`, writes no `audit_log` row at all, so that table's
+    /// count is trivially unchanged either way and is included here only for
+    /// parity with the other bite checks). If `Preview` ever fell through to
+    /// the `Commit` path's `DELETE` / tombstone insert, this is the test that
+    /// would catch it. Mirrors `purge_project_dry_run_changes_nothing`.
+    #[test]
+    fn delete_workspace_dry_run_changes_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let prepared = open_managed_run(&mut conn, &ws, &proj);
+        seed_workstream_event(&conn, &prepared.workstream_id, "canaryevt");
+        seed_session(&mut conn, ws, proj, "canaryws");
+
+        let before = row_snapshot(&conn);
+
+        let preview = delete_workspace(
+            &mut conn,
+            &ws,
+            true, // force: a live managed run and a project sit under this workspace
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a dry run must not error even with a live managed run");
+        assert!(preview.pages_deleted >= 1);
+        assert!(preview.observations_deleted >= 1);
+        assert_eq!(preview.workstreams_deleted, 1);
+        assert_eq!(preview.managed_runs_deleted, 1);
+
+        let after = row_snapshot(&conn);
+        assert_eq!(
+            before, after,
+            "a dry run must leave every table's row count unchanged, including workspaces itself"
+        );
+    }
+
+    /// The mirror of the incident this whole feature guards against, one
+    /// level up from `purge_project_counts_collateral_damage_in_another_project`:
+    /// deleting a workspace reaches OUT and takes rows from a *different*
+    /// workspace. `observations.session_id` is `ON DELETE CASCADE` (V01) with
+    /// no regard for the observation's own `workspace_id`, and
+    /// `handoffs.from_session_id` / `accepted_by_session` are `ON DELETE SET
+    /// NULL` (V02) — neither of which the plain
+    /// `observations_deleted`/`handoffs_deleted` counts (by `workspace_id =
+    /// W`) can see, because these rows belong to a different workspace.
+    #[test]
+    fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_damage_in_another_workspace()
+     {
+        let (_tmp, mut conn, doomed_ws, doomed_proj) = fresh_db();
+        let (sid, _page) = seed_session(&mut conn, doomed_ws, doomed_proj, "doomed-owner");
+
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "other-proj", None).unwrap();
+
+        // Collateral observation: session lives in `doomed_ws`, observation is
+        // stamped into `other_ws`.
+        let collateral_obs = NewObservation {
+            session_id: sid,
+            workspace_id: other_ws,
+            project_id: other_proj,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "collateral".into(),
+            body: "obs-collateral".into(),
+            importance: 5,
+        };
+        insert_observation(&mut conn, &collateral_obs).unwrap();
+
+        // Collateral handoff: lives in `other_ws`, authored by the `doomed_ws`
+        // session.
+        insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: other_ws,
+                project_id: other_proj,
+                from_session_id: Some(sid),
+                from_agent: ai_memory_core::AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "collateral handoff".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+
+        let preview = delete_workspace(
+            &mut conn,
+            &doomed_ws,
+            true,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a dry run must not error");
+        assert_eq!(preview.collateral_observations_deleted, 1);
+        assert_eq!(preview.collateral_handoffs_denulled, 1);
+
+        let confirmed = delete_workspace(
+            &mut conn,
+            &doomed_ws,
+            true,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect("the confirmed delete must still succeed after the preview");
+        assert_eq!(confirmed.collateral_observations_deleted, 1);
+        assert_eq!(confirmed.collateral_handoffs_denulled, 1);
+
+        // `other_ws` survives as a workspace; only the collateral rows are
+        // affected.
+        let other_ws_still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+                rusqlite::params![other_ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_ws_still, 1, "the other workspace must survive");
+        let observations_left = count(&conn, "SELECT COUNT(*) FROM observations");
+        assert_eq!(
+            observations_left, 0,
+            "the collateral observation in `other_ws` must actually be gone"
+        );
+        let from_session_id: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT from_session_id FROM handoffs WHERE workspace_id = ?1",
+                rusqlite::params![other_ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            from_session_id.is_none(),
+            "the handoff's from_session_id must be nulled, not the row deleted"
         );
     }
 

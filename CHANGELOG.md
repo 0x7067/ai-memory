@@ -264,6 +264,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *other* projects through this session's own id. The CLI still exits
   non-zero without `--confirm`; against an older server, or if the preview
   times out, it prints only the existing refusal. (#957)
+- `POST /admin/delete-workspace` takes a `dry_run` field that always wins
+  over `force` and previews what a confirmed delete would remove, with the
+  same 404/409 a confirmed delete gives. It only counts: no admission call,
+  directory removal, mirror dispatch or checkpoint. The preview and the
+  confirmed response now also report `sessions_deleted`,
+  `observations_deleted`, `handoffs_deleted` and `embeddings_deleted`
+  (previously only projects, pages, workstreams and managed runs), plus
+  `collateral_observations_deleted` and `collateral_handoffs_denulled` for
+  rows in *other* workspaces reached through this workspace's sessions.
+  `merge-workspace` is unaffected. There is no CLI subcommand, so this is
+  HTTP-only. (#963)
 - `ai-memory purge-project` without `--confirm` now previews what a confirmed
   purge would delete before refusing: `Would purge <ws>/<proj>: N pages, N
   sessions, N observations, …`, with the same 404/409 a real purge gives.

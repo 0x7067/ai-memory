@@ -4752,6 +4752,16 @@ struct DeleteWorkspaceRequest {
     /// the cost and for what it does not guarantee.
     #[serde(default)]
     compact: bool,
+    /// Preview only: report the counts a delete of this workspace would
+    /// produce without deleting anything. Wins over `force` in the sense
+    /// that matters — `{"force": true, "dry_run": true}` still only
+    /// previews, exactly like `purge-project` treats its own `dry_run` field,
+    /// so a preview request can never accidentally become destructive.
+    /// `#[serde(default)]` here is what keeps an *old* caller (built before
+    /// this field existed, so it never sends `dry_run` at all) parsing the
+    /// same request it always sent.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/delete-workspace`.
@@ -4763,6 +4773,27 @@ pub struct DeleteWorkspaceResult {
     pub projects_deleted: u64,
     /// `pages` rows removed via cascade (all versions).
     pub pages_deleted: u64,
+    /// `sessions` rows removed via cascade.
+    pub sessions_deleted: u64,
+    /// `observations` rows removed via cascade.
+    pub observations_deleted: u64,
+    /// `handoffs` rows removed via cascade.
+    pub handoffs_deleted: u64,
+    /// `page_embeddings` rows removed via cascade.
+    pub embeddings_deleted: u64,
+    /// `observations` rows in a **different** workspace, deleted collaterally
+    /// because their `session_id` belongs to a session that lived in this one
+    /// (`observations.session_id` is `ON DELETE CASCADE`, without regard to
+    /// the observation's own `workspace_id`) — the mirror of the incident
+    /// `purge-project`'s preview guards against, one level up. Always
+    /// present, zero when there is none, so a caller can tell "no collateral
+    /// damage" apart from "field absent on an older server".
+    pub collateral_observations_deleted: u64,
+    /// `handoffs` rows in a different workspace whose `from_session_id` or
+    /// `accepted_by_session` is set to `NULL` (not deleted — those columns
+    /// are `ON DELETE SET NULL`) because they referenced a session that lived
+    /// in this workspace.
+    pub collateral_handoffs_denulled: u64,
     /// Managed `workstreams` rows removed via cascade.
     pub workstreams_deleted: u64,
     /// `managed_runs` rows removed via cascade.
@@ -4784,6 +4815,15 @@ pub struct DeleteWorkspaceResult {
     /// Post-delete mirror checkpoint, if one was taken.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// `true` for a preview: `dry_run: true` in the request always wins, so
+    /// this is only ever `false` on a run that actually deleted rows. The
+    /// counts above are read directly by the same queries a confirmed delete
+    /// uses to decide what to remove — never by running the delete and
+    /// rolling it back — so `files_deleted`/`files_failed` are always empty
+    /// and `pre_checkpoint`/`checkpoint` always absent: no wiki directory was
+    /// touched, no admission webhook ran, and no purge dispatch went out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 /// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
@@ -4942,6 +4982,13 @@ async fn handle_delete_workspace(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(req): Json<DeleteWorkspaceRequest>,
 ) -> impl IntoResponse {
+    // `dry_run` always wins, exactly like `purge-project` (its handler checks
+    // `req.dry_run` before anything else regardless of any other field): a
+    // caller must never be able to combine `dry_run: true` with `force: true`
+    // and get a real delete.
+    if req.dry_run {
+        return delete_workspace_preview(&state, &req.workspace, req.force).await;
+    }
     let actor = actor_ext
         .map(|axum::Extension(a)| a)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
@@ -5013,7 +5060,7 @@ async fn delete_workspace_core(
 
     let summary = match state
         .writer
-        .delete_workspace(ws_id, force, compaction)
+        .delete_workspace(ws_id, force, compaction, ai_memory_store::PurgeMode::Commit)
         .await
     {
         Ok(s) => s,
@@ -5062,6 +5109,12 @@ async fn delete_workspace_core(
         workspace: workspace.to_string(),
         projects_deleted: summary.projects_deleted,
         pages_deleted: summary.pages_deleted,
+        sessions_deleted: summary.sessions_deleted,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        embeddings_deleted: summary.embeddings_deleted,
+        collateral_observations_deleted: summary.collateral_observations_deleted,
+        collateral_handoffs_denulled: summary.collateral_handoffs_denulled,
         workstreams_deleted: summary.workstreams_deleted,
         managed_runs_deleted: summary.managed_runs_deleted,
         workstream_ids: summary.workstream_ids,
@@ -5070,7 +5123,104 @@ async fn delete_workspace_core(
         files_failed,
         pre_checkpoint,
         checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {workspace}")),
+        dry_run: false,
     })
+}
+
+/// Preview branch of `POST /admin/delete-workspace`: reached whenever
+/// `dry_run` is true, regardless of `force`. `ai_memory_store::delete_workspace`
+/// under `PurgeMode::Preview` counts every row a confirmed delete would remove
+/// — via the same `SELECT`s the confirmed path itself uses to decide what to
+/// delete, not a separately-maintained estimate — and returns without ever
+/// issuing the `DELETE`, so there is no cascade to roll back.
+///
+/// Deliberately skipped, unlike [`delete_workspace_core`]: it never opens the
+/// blocking admission call (`admit_purge_workspace`) at all — nothing was
+/// decided yet, so there is nothing for a mirror to act on — plus on-disk
+/// directory removal (nothing was deleted) and both checkpoints (the git tree
+/// does not change). Because admission never runs, a `200` here is not a
+/// guarantee: a `Reject`-policy or scope-guard admission webhook only runs on
+/// the confirmed path and can still refuse the real delete afterward.
+///
+/// Scope resolution and the non-empty-workspace guard run exactly as the real
+/// delete's do, so an unknown workspace (404) or a non-empty workspace
+/// without `force` (409) answers identically either way.
+async fn delete_workspace_preview(
+    state: &Arc<AdminState>,
+    workspace: &str,
+    force: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ws_id = match lookup_ws_no_create(state, workspace).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let summary = match state
+        .writer
+        .delete_workspace(
+            ws_id,
+            force,
+            // A preview never deletes anything, so there is nothing to
+            // reclaim; `ops::delete_workspace` also forces `compacted: false`
+            // for `PurgeMode::Preview` regardless of this value.
+            ai_memory_store::Compaction::Skip,
+            ai_memory_store::PurgeMode::Preview,
+        )
+        .await
+    {
+        Ok(s) => s,
+        // Same conflict a confirmed delete would hit, reported the same way:
+        // the preview is a promise of what a real delete would do, and a real
+        // delete would refuse here too.
+        Err(e @ StoreError::WorkspaceNotEmpty(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{e} (pass \"force\": true alongside \"dry_run\": true to preview a \
+                         non-empty workspace)"
+                    )
+                })),
+            );
+        }
+        // A race between the `lookup_ws_no_create` above and this call (the
+        // workspace was deleted in between): the same 404 a confirmed delete
+        // would give for the same race, rather than a 500 or a 200 full of
+        // zeros.
+        Err(e @ StoreError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let report = DeleteWorkspaceResult {
+        workspace: workspace.to_string(),
+        projects_deleted: summary.projects_deleted,
+        pages_deleted: summary.pages_deleted,
+        sessions_deleted: summary.sessions_deleted,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        embeddings_deleted: summary.embeddings_deleted,
+        collateral_observations_deleted: summary.collateral_observations_deleted,
+        collateral_handoffs_denulled: summary.collateral_handoffs_denulled,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
+        compacted: false,
+        files_deleted: Vec::new(),
+        files_failed: Vec::new(),
+        pre_checkpoint: None,
+        checkpoint: None,
+        dry_run: true,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
 }
 
 /// JSON request body for `POST /admin/rename-project`.
@@ -12558,6 +12708,86 @@ mod tests {
         );
     }
 
+    /// The `delete-workspace` preview branch sits behind the same root-only
+    /// gate, reached through the same handler and route as the confirmed
+    /// path — mirrors `multiuser_purge_project_dry_run_rejects_db_user_and_anonymous`
+    /// above.
+    /// The root control case proves the gate — not the route — is what is
+    /// being tested: root reaches the handler (answered with `404`, since
+    /// this router's store has no `ghost-workspace`), while the DB user and
+    /// anonymous requests below never get that far.
+    #[tokio::test]
+    async fn multiuser_delete_workspace_dry_run_rejects_db_user_and_anonymous() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+
+        let preview_body = serde_json::json!({
+            "workspace": "ghost-workspace",
+            "force": false,
+            "dry_run": true
+        });
+
+        let root_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-workspace")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::from(serde_json::to_vec(&preview_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            root_resp.status(),
+            StatusCode::NOT_FOUND,
+            "root must reach the preview handler, not be blocked by the auth gate"
+        );
+
+        let db_user_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-workspace")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer db-user-token")
+                    .body(Body::from(serde_json::to_vec(&preview_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db_user_resp.status(),
+            StatusCode::FORBIDDEN,
+            "a dry-run preview must stay root-only for DB users in multi-user mode"
+        );
+
+        let anon_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&preview_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            anon_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a dry-run preview must require authentication in multi-user mode"
+        );
+    }
     #[tokio::test]
     async fn multiuser_operational_admin_routes_allow_root() {
         let (_tmp, router) = user_admin_test_router("root-token");

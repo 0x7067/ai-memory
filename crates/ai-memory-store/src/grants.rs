@@ -904,9 +904,14 @@ mod tests {
         w.grant_memory(f.alice, api, GrantLevel::Write, None)
             .await
             .unwrap();
-        w.delete_workspace(team, true, crate::Compaction::Skip)
-            .await
-            .unwrap();
+        w.delete_workspace(
+            team,
+            true,
+            crate::Compaction::Skip,
+            crate::PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
         assert!(all_rows(&f.store, f.alice, api).is_empty());
     }
 
@@ -972,9 +977,14 @@ mod tests {
         assert_eq!(listing[0].project, "client-renamed");
 
         // And deleting the workspace it left does not take it.
-        w.delete_workspace(f.ws, true, crate::Compaction::Skip)
-            .await
-            .unwrap();
+        w.delete_workspace(
+            f.ws,
+            true,
+            crate::Compaction::Skip,
+            crate::PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
         assert_eq!(all_rows(&f.store, f.alice, f.client).len(), 1);
     }
 
