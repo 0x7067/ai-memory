@@ -13,6 +13,7 @@ mod client_activity;
 mod fts_drift_status;
 mod fts_stopwords_config;
 mod handoff_ownership;
+mod identity_resolution;
 mod most_recently_active_scope;
 mod multi_session;
 mod pinned_pages;
