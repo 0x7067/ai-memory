@@ -62,6 +62,7 @@ pub mod path_util;
 pub mod pending_writes;
 pub mod project;
 pub mod project_registry;
+pub mod purge_preview;
 pub mod purge_project;
 pub mod purge_session;
 pub mod read_page;

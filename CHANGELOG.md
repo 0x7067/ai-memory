@@ -237,6 +237,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session-end` cannot double-close a session. (#623 follow-up, #933)
 
 ### Changed
+- `ai-memory purge-session` without `--confirm` now previews what a confirmed
+  purge would delete before refusing, the same way `purge-project` does (#945):
+  `Would purge session from <ws>/<proj>: N observations, N handoffs, N pages,
+  N auto-improve runs.` (the session id itself is never printed). The server
+  takes a new `dry_run` field on `POST /admin/purge-session` that always wins
+  over `confirm`. It only counts; no delete, wiki file removal, webhook,
+  audit row or checkpoint runs. `POST /admin/purge-session`'s confirmed
+  report also gains two new fields, always present on both the preview and
+  the confirmed response: `collateral_observations_deleted` and
+  `collateral_handoffs_denulled`, counting what the purge cascades into
+  *other* projects through this session's own id. The CLI still exits
+  non-zero without `--confirm`; against an older server, or if the preview
+  times out, it prints only the existing refusal. (#957)
 - `ai-memory purge-project` without `--confirm` now previews what a confirmed
   purge would delete before refusing: `Would purge <ws>/<proj>: N pages, N
   sessions, N observations, …`, with the same 404/409 a real purge gives.

@@ -4563,9 +4563,25 @@ pub struct PurgeSessionSummary {
     pub pages_deleted: u64,
     /// `auto_improve_runs` rows removed.
     pub auto_improve_runs_deleted: u64,
-    /// On-disk wiki paths whose rows are gone, for the caller to unlink.
+    /// On-disk wiki paths whose rows are gone, for the caller to unlink. On a
+    /// [`PurgeMode::Preview`] run these are the paths a confirmed purge
+    /// *would* remove — nothing was actually deleted, so the caller must not
+    /// unlink them.
     pub removed_paths: Vec<PagePath>,
-    /// Whether the freed bytes were reclaimed (`VACUUM` ran).
+    /// `observations` rows in a **different** project, deleted collaterally
+    /// because their `session_id` is this session
+    /// (`observations.session_id` is `ON DELETE CASCADE`, without regard to
+    /// the observation's own `project_id`) — the same shape
+    /// [`PurgeSummary::collateral_observations_deleted`] guards against, one
+    /// level down at session granularity.
+    pub collateral_observations_deleted: u64,
+    /// `handoffs` rows in a different project whose `from_session_id` or
+    /// `accepted_by_session` is set to `NULL` (not deleted — those columns
+    /// are `ON DELETE SET NULL`) because they referenced this session.
+    pub collateral_handoffs_denulled: u64,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran). Always `false`
+    /// for a [`PurgeMode::Preview`] run — nothing was deleted, so there is
+    /// nothing to reclaim.
     pub compacted: bool,
 }
 
@@ -4603,6 +4619,14 @@ pub struct PurgeSessionSummary {
 /// ownership, and removing it would destroy another session's record. Those
 /// rows keep their content and lose only the `accepted_by_session` pointer,
 /// via the existing `ON DELETE SET NULL`.
+///
+/// `mode = `[`PurgeMode::Preview`] runs every count above — including the two
+/// collateral ones — and returns without ever issuing a `DELETE`, the
+/// tombstone insert, or the audit row: the transaction so far has only ever
+/// read, so rolling it back is free. The counts are read the same way the
+/// confirmed call itself decides what to delete — not a separately
+/// maintained estimate — but they are a snapshot, not a promise: a write
+/// between the preview and a later `--confirm` can change them.
 pub fn purge_session(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
@@ -4610,6 +4634,7 @@ pub fn purge_session(
     session_id: SessionId,
     author_id: Option<ai_memory_core::UserId>,
     compaction: Compaction,
+    mode: PurgeMode,
 ) -> StoreResult<PurgeSessionSummary> {
     let wid = workspace_id.as_bytes();
     let pid = project_id.as_bytes();
@@ -4692,6 +4717,88 @@ pub fn purge_session(
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
+    // A later manual rewrite at this path is still the live wiki file, and
+    // must survive. This used to be answered by re-querying `is_latest`
+    // AFTER the `DELETE FROM pages` loop below had already run — which only
+    // works when a `DELETE` actually happens. Restructured (not a behavior
+    // fix: the two computations agree on every existing test) to answer the
+    // identical question before anything is cut, by excluding this purge's
+    // own `page_ids` from the live rows found at each path instead of
+    // re-checking `is_latest` post-delete. That lets a [`PurgeMode::Preview`]
+    // run predict the same set a [`PurgeMode::Commit`] run would actually
+    // remove, without ever issuing a `DELETE` to find out.
+    let removed_paths = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM pages \
+              WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+        )?;
+        let mut paths_to_remove = Vec::new();
+        for path in removed_paths {
+            let live_ids: Vec<Vec<u8>> = stmt
+                .query_map(
+                    rusqlite::params![&wid[..], &pid[..], path.as_str()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_live_page = live_ids.iter().any(|id| !page_ids.contains(id));
+            if !has_live_page {
+                paths_to_remove.push(path);
+            }
+        }
+        paths_to_remove
+    };
+
+    // Collateral damage in OTHER projects, the same shape [`purge_project`]
+    // guards against, one level down at session granularity:
+    // `observations.session_id` is `ON DELETE CASCADE` (V01) with no regard
+    // for the observation's own `project_id`, so an observation stamped into
+    // a sibling project by this session is deleted right along with it.
+    let collateral_observations_deleted: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM observations WHERE session_id = ?1 AND project_id != ?2",
+        rusqlite::params![&sid[..], &pid[..]],
+        |row| row.get(0),
+    )?;
+    // `handoffs.from_session_id` / `accepted_by_session` are `ON DELETE SET
+    // NULL` (V02): a handoff living in another project — authored by this
+    // session, or accepted by it — is not deleted, but loses the link back
+    // to it.
+    let collateral_handoffs_denulled: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM handoffs \
+         WHERE project_id != ?1 AND (from_session_id = ?2 OR accepted_by_session = ?2)",
+        rusqlite::params![&pid[..], &sid[..]],
+        |row| row.get(0),
+    )?;
+
+    if mode == PurgeMode::Preview {
+        // Same counts a confirmed purge would produce, read the same way it
+        // decides what to delete — via `SELECT`, never a `DELETE` rolled
+        // back. Nothing was written, so rolling back here is free.
+        let observations_deleted: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM observations \
+              WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![&sid[..], &wid[..], &pid[..]],
+            |row| row.get(0),
+        )?;
+        // Authored only. See the note above about accepted handoffs.
+        let handoffs_deleted: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM handoffs \
+              WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![&sid[..], &wid[..], &pid[..]],
+            |row| row.get(0),
+        )?;
+        tx.rollback()?;
+        return Ok(PurgeSessionSummary {
+            observations_deleted,
+            handoffs_deleted,
+            pages_deleted: page_ids.len() as u64,
+            auto_improve_runs_deleted: run_ids.len() as u64,
+            removed_paths,
+            collateral_observations_deleted,
+            collateral_handoffs_denulled,
+            compacted: false,
+        });
+    }
+
     // ---- delete, innermost first ----
 
     for run in &run_ids {
@@ -4722,25 +4829,6 @@ pub fn purge_session(
             rusqlite::params![&id[..], &wid[..], &pid[..]],
         )? as u64;
     }
-    // A later manual rewrite at this path is still the live wiki file.
-    let removed_paths = {
-        let mut stmt = tx.prepare(
-            "SELECT EXISTS(SELECT 1 FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
-             AND path = ?3 AND is_latest = 1)",
-        )?;
-        let mut paths_to_remove = Vec::new();
-        for path in removed_paths {
-            let has_live_page: bool = stmt.query_row(
-                rusqlite::params![&wid[..], &pid[..], path.as_str()],
-                |row| row.get(0),
-            )?;
-            if !has_live_page {
-                paths_to_remove.push(path);
-            }
-        }
-        paths_to_remove
-    };
-
     // Deleted explicitly rather than left to the cascade so the row count is
     // known and can be reported. Measured: this does *not* change what the
     // FTS index retains — with an external-content table the cascade already
@@ -4796,6 +4884,8 @@ pub fn purge_session(
         pages_deleted,
         auto_improve_runs_deleted,
         removed_paths,
+        collateral_observations_deleted,
+        collateral_handoffs_denulled,
         compacted: compaction == Compaction::Reclaim,
     })
 }
@@ -7130,7 +7220,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let (sid, _page) = seed_session(&mut conn, ws, proj, "target");
 
-        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
 
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM sessions"),
@@ -7174,11 +7273,36 @@ pub(crate) mod tests {
         }
         end_session(&mut conn, &sid, latest.as_ref()).unwrap();
 
-        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        let preview = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .unwrap();
+
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert_eq!(summary.pages_deleted, 3);
         // The manual version survives, but as history: nothing is latest at
         // the path any more, so its wiki file is unlinked with the summary.
         assert_eq!(summary.removed_paths, vec![PagePath::new(path).unwrap()]);
+        // The preview must have predicted the same path, without deleting
+        // anything: `removed_paths` is computed by excluding this purge's
+        // own page ids from the live rows at each path, not by re-querying
+        // `is_latest` after a `DELETE` that a preview never issues.
+        assert_eq!(preview.removed_paths, summary.removed_paths);
         let survivor: (Vec<u8>, bool) = conn
             .query_row("SELECT id, is_latest FROM pages", [], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -7201,9 +7325,32 @@ pub(crate) mod tests {
         end_session(&mut conn, &sid, Some(&latest)).unwrap();
         let manual = upsert_page(&mut conn, &page(ws, proj, &path, "manual rewrite")).unwrap();
 
-        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        let preview = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .unwrap();
+
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert_eq!(summary.pages_deleted, 2);
         assert!(summary.removed_paths.is_empty());
+        // The preview must agree: the later manual rewrite is still live at
+        // this path, so neither run reports it as removed.
+        assert_eq!(preview.removed_paths, summary.removed_paths);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 2);
         let survivor: (Vec<u8>, bool) = conn
             .query_row(
@@ -7228,7 +7375,16 @@ pub(crate) mod tests {
         upsert_page(&mut conn, &session_page(ws, proj, sid, "checkpoint 1")).unwrap();
         upsert_page(&mut conn, &session_page(ws, proj, sid, "checkpoint 2")).unwrap();
 
-        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert_eq!(summary.pages_deleted, 2);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0);
         assert_eq!(
@@ -7254,7 +7410,16 @@ pub(crate) mod tests {
         let latest = upsert_page(&mut conn, &session_page(ws, proj, sid, "new summary")).unwrap();
         end_session(&mut conn, &sid, Some(&latest)).unwrap();
 
-        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert_eq!(summary.pages_deleted, 2);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0);
     }
@@ -7267,7 +7432,16 @@ pub(crate) mod tests {
         let (target, _) = seed_session(&mut conn, ws, proj, "target");
         let (keep, keep_page) = seed_session(&mut conn, ws, proj, "keep");
 
-        purge_session(&mut conn, ws, proj, target, None, Compaction::Skip).unwrap();
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            target,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
         let survivor: Vec<u8> = conn
@@ -7297,8 +7471,16 @@ pub(crate) mod tests {
         let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
         let (sid, _) = seed_session(&mut conn, ws, proj, "target");
 
-        let err = purge_session(&mut conn, ws, other, sid, None, Compaction::Skip)
-            .expect_err("a session outside the named project must not be purgeable");
+        let err = purge_session(
+            &mut conn,
+            ws,
+            other,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect_err("a session outside the named project must not be purgeable");
         assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
 
         assert_eq!(
@@ -7318,8 +7500,16 @@ pub(crate) mod tests {
         let proj2 = get_or_create_project(&mut conn, &ws2, "scratch", None).unwrap();
         let (sid, _) = seed_session(&mut conn, ws, proj, "target");
 
-        let err = purge_session(&mut conn, ws2, proj2, sid, None, Compaction::Skip)
-            .expect_err("cross-workspace purge must be refused");
+        let err = purge_session(
+            &mut conn,
+            ws2,
+            proj2,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect_err("cross-workspace purge must be refused");
         assert!(matches!(err, StoreError::NotFound(_)));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
     }
@@ -7337,7 +7527,16 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
 
         let survived: i64 = conn
             .query_row(
@@ -7818,7 +8017,16 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let summary = purge_session(&mut conn, ws, proj, accepter, None, Compaction::Skip).unwrap();
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            accepter,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert_eq!(summary.handoffs_deleted, 0, "accepting is not authorship");
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM handoffs"),
@@ -7826,7 +8034,16 @@ pub(crate) mod tests {
             "the authoring session's handoff survives"
         );
 
-        let summary = purge_session(&mut conn, ws, proj, author, None, Compaction::Skip).unwrap();
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            author,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert_eq!(
             summary.handoffs_deleted, 1,
             "the author's handoff is removed"
@@ -7842,9 +8059,26 @@ pub(crate) mod tests {
         let (sid, _) = seed_session(&mut conn, ws, proj, "target");
         let (keep, _) = seed_session(&mut conn, ws, proj, "keep");
 
-        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
-        let err = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip)
-            .expect_err("already gone");
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        let err = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect_err("already gone");
         assert!(matches!(err, StoreError::NotFound(_)));
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM sessions"),
@@ -7867,7 +8101,16 @@ pub(crate) mod tests {
         let (sid, _) = seed_session(&mut conn, ws, proj, "target");
         let (_keep, _) = seed_session(&mut conn, ws, proj, "keep");
 
-        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
 
         let gone: i64 = conn
             .query_row(
@@ -7948,7 +8191,16 @@ pub(crate) mod tests {
         let (sid, _) = seed_session(&mut conn, ws, proj, "target");
         let (_keep, _) = seed_session(&mut conn, ws, proj, "keep");
 
-        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Reclaim).unwrap();
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Reclaim,
+            PurgeMode::Commit,
+        )
+        .unwrap();
         assert!(summary.compacted, "the summary reports that VACUUM ran");
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
@@ -7963,6 +8215,360 @@ pub(crate) mod tests {
         );
     }
 
+    /// Row counts of every table a real session purge touches, used to prove
+    /// a dry run changed nothing. `purged_sessions` and `audit_log` are
+    /// included deliberately: both are written inside the same transaction
+    /// as the delete, so a rollback must take them back out too, not just
+    /// the cascade.
+    fn session_row_snapshot(conn: &Connection) -> Vec<(&'static str, i64)> {
+        [
+            "sessions",
+            "observations",
+            "handoffs",
+            "pages",
+            "page_embeddings",
+            "auto_improve_runs",
+            "auto_improve_rejections",
+            "purged_sessions",
+            "audit_log",
+        ]
+        .iter()
+        .map(|table| {
+            (
+                *table,
+                count(conn, &format!("SELECT COUNT(*) FROM {table}")),
+            )
+        })
+        .collect()
+    }
+
+    /// A preview's counts come from the same `SELECT`s the confirmed path
+    /// uses to decide what to delete, not a separately-maintained estimate,
+    /// so a preview and the confirmed run right after it must agree exactly
+    /// (barring a write landing in between, which neither this nor a real
+    /// `--confirm`-less-then-`--confirm` operator workflow can rule out).
+    ///
+    /// Seeds one of everything `purge_session` touches — an authored
+    /// handoff, a handoff only *accepted* (which must survive and must not
+    /// count), and an auto-improve run with its own rejection row — and
+    /// compares the whole [`PurgeSessionSummary`] (`PartialEq`-derived)
+    /// rather than a hand-picked subset of fields, so a field added later
+    /// that the preview forgets to compute is caught here instead of only in
+    /// a narrower, field-by-field test.
+    #[test]
+    fn purge_session_dry_run_reports_the_same_counts_a_real_purge_would() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        // Built by hand, rather than through `seed_session`, so the session
+        // stays open long enough to accept a handoff below — an ended
+        // session cannot accept one, and `seed_session` ends it as its last
+        // step. Ended further down, once the accept has happened.
+        let sid = SessionId::new();
+        let canary_session = hook_session(sid, ws, proj, None);
+        begin_session(&mut conn, &canary_session).unwrap();
+        let mut canary_obs = hook_observation(&canary_session);
+        canary_obs.body = "obs-canary".into();
+        insert_observation(&mut conn, &canary_obs).unwrap();
+        let (other, _) = seed_session(&mut conn, ws, proj, "other-author");
+
+        // A handoff this session authored: must be deleted.
+        insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(sid),
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "authored by canary".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+
+        // A handoff authored by a DIFFERENT session and only *accepted* by
+        // this one: must survive, and must not count toward
+        // `handoffs_deleted` (accepting is not authorship).
+        let accepted_only = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(other),
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "authored by other, accepted by canary".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut claim = handoff_acceptance(accepted_only, ws, proj);
+        claim.accepting_session = Some(sid);
+        accept_handoff(&mut conn, &claim).unwrap();
+
+        // Now end the session, with its own summary page — mirroring what
+        // `seed_session` would have done, had the accept above not needed
+        // the session to still be open.
+        let canary_page = upsert_page(
+            &mut conn,
+            &page(ws, proj, "sessions/canary.md", "page-canary"),
+        )
+        .unwrap();
+        end_session(&mut conn, &sid, Some(&canary_page)).unwrap();
+
+        // An auto-improve run this session produced, plus a rejection row
+        // that references it. `purge_session` deletes rejections
+        // referencing a session's own runs explicitly, before the runs
+        // themselves, rather than relying on `source_run_id`'s
+        // `ON DELETE SET NULL` — see the `auto_improve_rejections` delete
+        // loop below.
+        let run_id = uuid::Uuid::now_v7();
+        conn.execute(
+            "INSERT INTO auto_improve_runs \
+             (id, workspace_id, project_id, session_id, proposal_actor_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, '{}', 1)",
+            rusqlite::params![
+                run_id.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes(),
+                sid.as_bytes()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_rejections \
+             (id, workspace_id, project_id, reason, normalized_fingerprint, summary, \
+              source_run_id, created_at) \
+             VALUES (?1, ?2, ?3, 'duplicate', 'fp-canary', 'rejected proposal', ?4, 1)",
+            rusqlite::params![
+                &uuid::Uuid::now_v7().as_bytes()[..],
+                ws.as_bytes(),
+                proj.as_bytes(),
+                run_id.as_bytes()
+            ],
+        )
+        .unwrap();
+
+        let preview = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a dry run must not error");
+        assert_eq!(preview.observations_deleted, 1);
+        assert_eq!(preview.pages_deleted, 1);
+        assert_eq!(
+            preview.auto_improve_runs_deleted, 1,
+            "the session's own run must be counted"
+        );
+        assert_eq!(
+            preview.handoffs_deleted, 1,
+            "only the authored handoff counts, not the accepted-only one"
+        );
+        assert_eq!(
+            preview.removed_paths,
+            vec![PagePath::new("sessions/canary.md").unwrap()]
+        );
+        assert!(!preview.compacted, "a rolled-back run never reclaims bytes");
+
+        let real = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect("the confirmed purge must still succeed after the preview");
+        assert_eq!(
+            PurgeSessionSummary {
+                compacted: false,
+                ..real
+            },
+            preview,
+            "the dry run's whole summary must match what the confirmed run actually deletes, \
+             field for field"
+        );
+
+        // The accepted-only handoff survives the confirmed purge too.
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM handoffs"),
+            1,
+            "the accepted-only handoff must survive the confirmed purge"
+        );
+    }
+
+    /// Bite check: every table a real session purge touches, the tombstone,
+    /// and the audit trail must all be identical before and after a
+    /// [`PurgeMode::Preview`] run. If `Preview` ever fell through to the
+    /// `Commit` path's `DELETE` / tombstone insert / audit insert, this is
+    /// the test that would catch it.
+    #[test]
+    fn purge_session_dry_run_changes_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (sid, _page) = seed_session(&mut conn, ws, proj, "canary");
+
+        let before = session_row_snapshot(&conn);
+
+        let preview = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a dry run must not error");
+        assert!(preview.observations_deleted >= 1);
+        assert!(preview.pages_deleted >= 1);
+
+        let after = session_row_snapshot(&conn);
+        assert_eq!(
+            before, after,
+            "a dry run must leave every table a session purge touches unchanged"
+        );
+    }
+
+    /// The same collateral shape [`purge_project`]'s preview guards against,
+    /// one level down at session granularity: purging session `sid` (which
+    /// lives in `proj`) also collaterally deletes an observation stamped
+    /// into a *different* project (`observations.session_id` is `ON DELETE
+    /// CASCADE`, V01, with no regard for the observation's own
+    /// `project_id`), and orphans (nulls the session reference of, without
+    /// deleting) a handoff that lives in that other project too
+    /// (`handoffs.from_session_id`/`accepted_by_session` are `ON DELETE SET
+    /// NULL`, V02). Neither shows up in the plain
+    /// `observations_deleted`/`handoffs_deleted` counts, which is exactly
+    /// why the two `collateral_*` fields exist.
+    #[test]
+    fn purge_session_counts_collateral_damage_in_another_project() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (sid, _page) = seed_session(&mut conn, ws, proj, "owner");
+
+        // Collateral observation: session lives in `proj`, observation is
+        // stamped into `other`.
+        let stray_observation = NewObservation {
+            session_id: sid,
+            workspace_id: ws,
+            project_id: other,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "stray".into(),
+            body: "obs-in-other-project".into(),
+            importance: 5,
+        };
+        insert_observation(&mut conn, &stray_observation).unwrap();
+
+        // Collateral handoff: lives in `other`, authored by the `proj`
+        // session.
+        insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: other,
+                from_session_id: Some(sid),
+                from_agent: ai_memory_core::AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "handoff in other project".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+
+        let preview = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .expect("a preview must not error");
+        assert_eq!(
+            preview.collateral_observations_deleted, 1,
+            "the observation in the other project must be counted as collateral"
+        );
+        assert_eq!(
+            preview.collateral_handoffs_denulled, 1,
+            "the handoff in the other project must be counted as collateral"
+        );
+        // The preview changed nothing: both rows are still exactly as
+        // seeded.
+        let obs_in_other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                rusqlite::params![&other.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_in_other, 1);
+
+        let real = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .expect("the confirmed purge must succeed");
+        assert_eq!(real.collateral_observations_deleted, 1);
+        assert_eq!(real.collateral_handoffs_denulled, 1);
+
+        // The prediction must match what the cascade actually did: the
+        // collateral observation is really gone from the other project...
+        let obs_in_other_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                rusqlite::params![&other.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            obs_in_other_after, 0,
+            "the collaterally-cascaded observation must actually be gone"
+        );
+        // ...and the handoff row itself survives (it belongs to `other`,
+        // which was never purged) but its session reference is nulled, not
+        // the row.
+        let (handoffs_in_other, from_session_id): (i64, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(from_session_id) FROM handoffs WHERE project_id = ?1",
+                rusqlite::params![&other.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            handoffs_in_other, 1,
+            "the handoff row in the other project must survive"
+        );
+        assert!(
+            from_session_id.is_none(),
+            "the handoff's from_session_id must be nulled, not the row deleted"
+        );
+    }
+
     /// A purge must be terminal. The events that produced a session can sit
     /// undelivered in a client hook spool for days (#493 measured spools with
     /// thousands), so without a tombstone the next drain recreates the session
@@ -7972,7 +8578,16 @@ pub(crate) mod tests {
     fn a_purged_session_is_not_recreated_by_late_arriving_events() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let (sid, _) = seed_session(&mut conn, ws, proj, "target");
-        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
 
         // Exactly what a spool drain delivers after the purge.
         let session = hook_session(sid, ws, proj, None);
@@ -7996,7 +8611,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
         let (sid, _) = seed_session(&mut conn, ws, proj, "target");
-        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
 
         let elsewhere = hook_session(sid, ws, other, None);
         begin_session(&mut conn, &elsewhere)
