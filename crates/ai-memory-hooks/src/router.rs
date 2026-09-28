@@ -12234,6 +12234,34 @@ mod tests {
     }
 
     #[test]
+    fn capture_protocol_shell_decisions_survive_server_reinspection() {
+        // The server never sees the client's patterns, so its direct
+        // re-inspection of a shell command must accept the client's Keep
+        // unchanged and treat the client's Drop as terminal.
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let kept = serde_json::json!({
+            "session_id": "shell-keep", "tool_name": "Bash",
+            "tool_input": { "command": "cat src/main.rs *.md" },
+            "_ai_memory_capture": capture_protocol("keep", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), kept.clone());
+        assert_eq!(inspect_capture_envelope(env).unwrap().raw, kept);
+
+        let dropped = serde_json::json!({
+            "session_id": "shell-drop", "tool_name": "Bash",
+            "tool_input": { "command": "cat docs/adr/0001.md" },
+            "tool_response": "SENTINEL_SECRET",
+            "_ai_memory_capture": capture_protocol("drop", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), dropped);
+        assert!(inspect_capture_envelope(env).is_none());
+    }
+
+    #[test]
     fn capture_protocol_invalid_file_keep_becomes_canonical_metadata_only() {
         let env = HookEnvelope::from_query_and_body(
             HookQuery {
