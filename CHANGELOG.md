@@ -70,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generic harness-run phrase and not to reuse listed titles; that wording
   is compact enough that the advertised 6000-token input floor still
   projects observation bodies instead of dropping them. (#926)
+- The web page view now links a `[[wikilink]]` on a line indented four
+  spaces that is not code. A nested list item written with four spaces
+  (`- Decisions:` then `    - see [[decisions/auth]]`) or a paragraph's
+  continuation line showed the wikilink as literal text, although the
+  engine indexed it and listed the page in the target's backlinks. The
+  preprocessor now skips exactly the code blocks and inline code the
+  renderer's parser reads as code. (#955)
 
 ## [2.4.1] - 2026-09-25
 
