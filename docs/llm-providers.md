@@ -152,14 +152,21 @@ gotchas below for why reasoning models are ineligible). Model ids follow
 OpenRouter's `provider/model` convention. There is no built-in default:
 `AI_MEMORY_LLM_MODEL` is required, as it is for every `openai-compat` endpoint.
 
-For model selection, [`llm-provider-comparison.md`](llm-provider-comparison.md)
-benchmarks five OpenRouter models against a local Ollama on the same
-consolidation fixtures. Its TL;DR recommends **`anthropic/claude-haiku-4.5`**
-as the default for most users — the most disciplined hosted model on
-restraint + classification at ~7 s per consolidation. `openai/gpt-5.4-mini` is
-the cheaper alternative (about 5x cheaper, 2x faster, mild
-over-classification). Reasoning models such as `moonshotai/kimi-k2.6` hang on
-the strict-JSON consolidation prompt and are ineligible.
+### Choosing a model
+
+For LLM selection guidance, see
+[`llm-provider-comparison.md`](llm-provider-comparison.md) — the project
+maintains its own A/B testing there on consolidation quality, latency, and
+cost. That comparison uses English consolidation fixtures and covers the
+recommended default (`anthropic/claude-haiku-4.5`), the cheaper alternative
+(`openai/gpt-5.4-mini`), and the reasoning-model ineligibility note; the
+OpenRouter subsection here defers to it rather than duplicating rankings.
+
+For workloads dominated by non-English content, community reports suggest
+that a higher-recall multilingual embedder (for example `baai/bge-m3` via
+the `openai-compat` embedder) noticeably improves retrieval quality
+relative to the built-in English-only local embedder. Configuration is in
+the embedding paragraph below.
 
 ai-memory automatically layers OpenRouter's app-attribution headers
 (`HTTP-Referer` and `X-Title`) whenever the base URL points at
@@ -186,14 +193,14 @@ export AI_MEMORY_EMBEDDING_DIM=1024
 ```
 
 `AI_MEMORY_EMBEDDING_DIM` is mandatory for openai-compat embeddings and must
-match the model. Recommended embedding models are covered in the model
-selection guide below. For English-only content the built-in local
+match the model. For English-only content the built-in local
 sentence-transformer (`AI_MEMORY_EMBEDDING_PROVIDER=local`, see
 [`local-embeddings.md`](local-embeddings.md)) is a valid alternative that
-avoids hosted egress; for any non-English content, hosted OpenRouter
-embeddings are the practical choice. The two endpoints are still independent,
-so setting `AI_MEMORY_LLM_BASE_URL` alone does not redirect embeddings — set
-`AI_MEMORY_EMBEDDING_BASE_URL` too.
+avoids hosted egress; for non-English content, a multilingual hosted model
+served through OpenRouter (`baai/bge-m3`, `intfloat/multilingual-e5-large`,
+and similar available through the same catalogue) is the practical choice.
+The two endpoints are still independent, so setting `AI_MEMORY_LLM_BASE_URL`
+alone does not redirect embeddings — set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
