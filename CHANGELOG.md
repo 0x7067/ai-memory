@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skills into Hermes Agent's `.hermes/skills` (project) or `~/.hermes/skills`
   (global) family, completing Hermes routing support alongside its lifecycle
   hooks (#933). (#942)
+- `[search.fts] stopwords` (env `AI_MEMORY_SEARCH_FTS_STOPWORDS`, CSV) makes
+  the stopword filter for bare natural-language FTS queries configurable,
+  so a non-English install can list its own function words (e.g. Portuguese
+  `de`, `que`, `em`) instead of having them match nearly every page and skew
+  the FTS side of hybrid ranking. Absent keeps today's English list, so
+  nothing changes on upgrade; `[]` disables the filter. Entries match
+  queries case-insensitively (Unicode) but keep diacritics, so list both
+  `nao` and `não` if users type both. Option A from #953, proposed by
+  @rntjr. (#956)
 - `docs/jev-reranker-adapter.md` gains a choice-contrastive variant of the
   Jev reranker adapter
   (`docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`): one

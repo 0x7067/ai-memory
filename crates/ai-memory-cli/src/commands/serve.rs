@@ -945,6 +945,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // Every reader handle below is cloned from this one, so the opt-in
     // ranking signals are set once, here, and inherited everywhere.
     store.reader.set_retrieval_tuning(config.retrieval.tuning());
+    // Same reasoning for the FTS stopword list (issue #953): resolved once
+    // from `[search.fts]` here, then shared by every cloned reader handle.
+    store
+        .reader
+        .set_fts_stopwords(config.search.fts.stopwords());
     let store = store;
 
     // One-shot legacy heal (issue #103): NULL out any project repo_path that

@@ -35,7 +35,7 @@ pub mod web_sessions;
 mod workstream;
 mod writer;
 
-pub use fts_query::prepare_fts5_query;
+pub use fts_query::{FtsStopwords, prepare_fts5_query};
 
 pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{

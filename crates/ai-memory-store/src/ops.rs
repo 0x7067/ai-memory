@@ -12756,7 +12756,8 @@ pub(crate) mod tests {
     /// Returns the matched paths (and surfaces any FTS5 syntax error as
     /// an `Err`, the way the bug originally manifested).
     fn fts_match_paths(conn: &Connection, raw: &str) -> rusqlite::Result<Vec<String>> {
-        let fts_query = crate::fts_query::prepare_fts5_query(raw);
+        let fts_query =
+            crate::fts_query::prepare_fts5_query(raw, &crate::fts_query::FtsStopwords::default());
         let mut stmt = conn.prepare(
             "SELECT pages.path \
              FROM pages_fts \

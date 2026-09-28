@@ -525,6 +525,9 @@ pub struct Config {
     /// Opt-in post-fusion ranking signals for `memory_query` (hotness boost,
     /// lexical query-intent routing). All off by default.
     pub retrieval: RetrievalSettings,
+    /// Search-path tuning that is not a ranking signal (contrast with
+    /// `retrieval`): today, only the FTS stopword list (issue #953).
+    pub search: SearchSettings,
     /// Memory-slot behaviour.
     pub slots: SlotSettings,
     /// LLM consolidation prompt limits. Defaults are sized for a model with a
@@ -961,6 +964,7 @@ impl Default for Config {
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             dream: DreamSettings::default(),
             retrieval: RetrievalSettings::default(),
+            search: SearchSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
@@ -1393,6 +1397,175 @@ impl RetrievalSettings {
     }
 }
 
+/// Upper bound on `search.fts.stopwords` list length: a stopword filter is a
+/// short function-word list (the built-in English one has ~60 entries), not
+/// a document blocklist. Rejected at load rather than silently accepted and
+/// then slow (or meaningless) at search time.
+const MAX_FTS_STOPWORDS: usize = 2000;
+/// Upper bound on a single `search.fts.stopwords` entry, in Unicode scalar
+/// values. Stopwords are short function words; a value this size is almost
+/// certainly a misconfiguration (a pasted sentence, a stray delimiter).
+const MAX_FTS_STOPWORD_LEN: usize = 64;
+
+/// `[search]` search-path tuning that is not itself a ranking signal —
+/// contrast with `[retrieval]`, which is. Today this holds only the FTS
+/// stopword list (issue #953).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchSettings {
+    /// FTS5 query-preparation tuning.
+    pub fts: FtsSettings,
+}
+
+/// `[search.fts]` bare natural-language FTS query preparation.
+///
+/// Env form: `AI_MEMORY_SEARCH_FTS_STOPWORDS` (a comma-separated string),
+/// the same convention `allowed_hosts` / `cors_allow_origins` /
+/// `auth.trusted_proxy_cidrs` use for a `Vec<String>` via
+/// `deserialize_string_or_vec`. This key does NOT go through that shared
+/// helper or the usual `__`-split figment `Env` layer, though: figment
+/// merges raw values before any deserializer runs, so a *present but blank*
+/// env var would silently replace a real `config.toml` list with nothing at
+/// the value level — there is no chance for a deserializer to treat "blank"
+/// specially after the fact. `stopwords` also carries a real meaning for
+/// "empty" (`[]` disables filtering outright) that must not be confused with
+/// "the env var happened to be unset/blank", so this key is read once in
+/// `Config::load` (see `apply_fts_stopwords_env`) and only overrides when the
+/// env var is set to a non-blank value — the same pattern
+/// `overlay_embedding_prefixes` uses for `AI_MEMORY_EMBEDDING_QUERY_PREFIX`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FtsSettings {
+    /// Words dropped from a bare (non-explicit-syntax) natural-language FTS
+    /// query before the OR-join
+    /// (`ai_memory_store::fts_query::prepare_fts5_query`).
+    ///
+    /// - **Absent** (the default, `None`): the built-in English list —
+    ///   byte-identical to every install that predates this key.
+    /// - **`[]`** (`Some(vec![])`): disables the filter entirely — every
+    ///   token, including English function words, survives the OR-join.
+    /// - **A non-empty list**: replaces the default outright with exactly
+    ///   those words (trimmed and validated by `Config::load`).
+    ///
+    /// Comparison folds full Unicode case (not ASCII-only) but never strips
+    /// diacritics — see `ai_memory_store::fts_query::FtsStopwords`'s doc
+    /// comment for the exact fold and why. In short: what matters here is
+    /// how a query is actually TYPED, not how wiki content is spelled —
+    /// content matches through the FTS index's own diacritic-folding
+    /// tokenizer regardless of this filter, but a bare query's stopword
+    /// check only ever sees the literal characters someone typed. A list
+    /// for an accented language should include every spelling a user or
+    /// agent might type, e.g. Portuguese `"e"` AND `"é"`, `"nao"` AND
+    /// `"não"`. Also note the filter matches whitespace-split raw tokens
+    /// before any punctuation handling, so an entry never matches a token
+    /// with attached punctuation (`"de,"`, `"que?"`) — the same limitation
+    /// English stopwords have always had.
+    ///
+    /// A non-English or mixed-language wiki should set this to that
+    /// language's function words, or to `[]`: left unset, only the built-in
+    /// English list is filtered, so another language's high-document-frequency
+    /// function words (`em`, `de`, `que`, `uma`, …) pass straight through the
+    /// OR-join and contaminate BM25 term-frequency scoring for every page
+    /// that happens to contain them (issue #953). Configuring this list does
+    /// not retroactively fix anything by itself — an install has to opt in.
+    pub stopwords: Option<Vec<String>>,
+}
+
+impl FtsSettings {
+    /// Store-side stopword set consumed by `ReaderPool::set_fts_stopwords`.
+    /// Assumes `Config::load` already validated `stopwords` (entry count and
+    /// length bounds) — this method does not re-validate.
+    #[must_use]
+    pub fn stopwords(&self) -> ai_memory_store::FtsStopwords {
+        match &self.stopwords {
+            None => ai_memory_store::FtsStopwords::default(),
+            Some(words) => ai_memory_store::FtsStopwords::new(words),
+        }
+    }
+
+    /// Validate and normalize `stopwords` in place: trims each entry's ends
+    /// (a hand-edited `config.toml` or a CSV env override can easily carry a
+    /// stray space) rather than rejecting it, then rejects a bound violation
+    /// or an entry with INTERNAL whitespace. A bare FTS query is tokenized
+    /// with `str::split_whitespace()` (`ai_memory_store::fts_query`), so a
+    /// multi-word entry like `"de la"` could never equal one token — it
+    /// would look configured while silently doing nothing.
+    ///
+    /// # Errors
+    /// Returns a message naming the offending bound or entry, always
+    /// prefixed `search.fts.stopwords` so the error is self-locating.
+    fn validate(&mut self) -> Result<(), String> {
+        let Some(words) = self.stopwords.as_mut() else {
+            return Ok(());
+        };
+        if words.len() > MAX_FTS_STOPWORDS {
+            return Err(format!(
+                "search.fts.stopwords must have at most {MAX_FTS_STOPWORDS} entries (got {}); \
+                 this filters function words out of bare FTS queries, not a document blocklist",
+                words.len()
+            ));
+        }
+        for word in words.iter_mut() {
+            let trimmed = word.trim();
+            if trimmed.is_empty() {
+                return Err(
+                    "search.fts.stopwords entries must not be empty or whitespace-only".to_string(),
+                );
+            }
+            if trimmed.chars().count() > MAX_FTS_STOPWORD_LEN {
+                return Err(format!(
+                    "search.fts.stopwords entry {word:?} exceeds the {MAX_FTS_STOPWORD_LEN}-\
+                     character limit (stopwords are short function words, not phrases or \
+                     sentences)"
+                ));
+            }
+            if trimmed.split_whitespace().count() > 1 {
+                return Err(format!(
+                    "search.fts.stopwords entry {word:?} contains internal whitespace; a bare \
+                     FTS query is split on whitespace before comparison, so a multi-word entry \
+                     can never match one token"
+                ));
+            }
+            if trimmed != word {
+                *word = trimmed.to_string();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse the `AI_MEMORY_SEARCH_FTS_STOPWORDS` env override into
+/// `config.search.fts.stopwords`, following the CSV-string convention
+/// `deserialize_string_or_vec` already uses for `allowed_hosts` /
+/// `cors_allow_origins` / `auth.trusted_proxy_cidrs`.
+///
+/// Not wired through the usual `__`-split figment `Env` layer +
+/// `deserialize_with`, because that layer merges RAW values across
+/// providers before any deserializer runs: a present-but-blank env var
+/// would silently replace a real `config.toml` list with nothing at the
+/// value level, before a deserializer ever got a chance to treat "blank"
+/// specially. Reading and applying it here instead, once, as data — the
+/// same pattern `overlay_embedding_prefixes` uses — lets an unset OR blank
+/// env var leave whatever `config.toml`/the default already resolved
+/// untouched, while a real comma list still overrides it. `raw` is the
+/// value already read by the caller (`Config::load`), so this stays
+/// directly unit-testable without mutating process env.
+fn apply_fts_stopwords_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    if raw.trim().is_empty() {
+        // A present-but-blank env var means "unset" here, not "disable
+        // filtering" — an empty `config.toml` `stopwords = []` is still the
+        // unambiguous way to ask for that.
+        return;
+    }
+    config.search.fts.stopwords = Some(
+        raw.split(',')
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .collect(),
+    );
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -1460,6 +1633,15 @@ impl Config {
                 })?;
             config.admission_webhooks = parsed;
         }
+        // FTS stopword list (issue #953): CSV env override, applied as data
+        // (see `apply_fts_stopwords_env`'s doc comment for why this can't go
+        // through the usual `__`-split figment `Env` layer).
+        apply_fts_stopwords_env(
+            &mut config,
+            std::env::var("AI_MEMORY_SEARCH_FTS_STOPWORDS")
+                .ok()
+                .as_deref(),
+        );
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -1538,6 +1720,14 @@ impl Config {
                 config.contradiction_band_min,
                 config.contradiction_band_max
             );
+        }
+        // FTS stopword list (issue #953): a configured list is a short
+        // function-word table, not a document blocklist or free-text field.
+        // Reject an oversized or malformed list (or normalize a trimmable
+        // one) at startup rather than shipping a slow, meaningless, or
+        // silently-inert filter into every search.
+        if let Err(message) = config.search.fts.validate() {
+            anyhow::bail!("{message}");
         }
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
@@ -2778,6 +2968,249 @@ mod tests {
                 "unexpected error for {value}: {error:#}"
             );
         }
+    }
+
+    // --- issue #953: `[search.fts]` stopword config -------------------
+
+    /// Absent `[search.fts]` resolves to `None`, which `FtsSettings::stopwords`
+    /// turns into the built-in English list — an install that never touches
+    /// this key sees byte-identical search behaviour.
+    #[test]
+    fn absent_search_fts_defaults_to_builtin_english_list() {
+        let cfg = Config::default();
+        assert_eq!(cfg.search.fts.stopwords, None);
+        assert_eq!(
+            cfg.search.fts.stopwords(),
+            ai_memory_store::FtsStopwords::default()
+        );
+    }
+
+    /// An explicit empty list parses to `Some(vec![])`, which resolves to
+    /// "no filtering" rather than being treated the same as an absent key.
+    #[test]
+    fn explicit_empty_search_fts_stopwords_disables_filtering() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[search.fts]\nstopwords = []\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.search.fts.stopwords, Some(Vec::new()));
+        assert_eq!(
+            cfg.search.fts.stopwords(),
+            ai_memory_store::FtsStopwords::none()
+        );
+    }
+
+    /// A configured list parses verbatim and resolves to exactly those
+    /// words (lowercased), replacing the default outright rather than
+    /// extending it.
+    #[test]
+    fn configured_search_fts_stopwords_list_parses_and_replaces_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[search.fts]\nstopwords = [\"O\", \"de\", \"que\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["O".to_string(), "de".to_string(), "que".to_string()])
+        );
+        let resolved = cfg.search.fts.stopwords();
+        // Replaces, not extends: an English stopword absent from the
+        // configured list is no longer filtered.
+        assert_eq!(
+            resolved,
+            ai_memory_store::FtsStopwords::new(["o", "de", "que"])
+        );
+        assert_ne!(resolved, ai_memory_store::FtsStopwords::default());
+    }
+
+    #[test]
+    fn load_rejects_oversized_search_fts_stopwords_list() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let words: Vec<String> = (0..(MAX_FTS_STOPWORDS + 1))
+            .map(|i| format!("w{i}"))
+            .collect();
+        let toml = format!(
+            "[search.fts]\nstopwords = [{}]\n",
+            words
+                .iter()
+                .map(|w| format!("{w:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::fs::write(&config_path, toml).unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("oversized stopword list must fail closed");
+        assert!(
+            error.to_string().contains("search.fts.stopwords"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_blank_search_fts_stopword_entry() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[search.fts]\nstopwords = [\"de\", \"  \"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("blank stopword entry must fail closed");
+        assert!(
+            error.to_string().contains("search.fts.stopwords"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_oversized_search_fts_stopword_entry() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let long_word = "a".repeat(MAX_FTS_STOPWORD_LEN + 1);
+        std::fs::write(
+            &config_path,
+            format!("[search.fts]\nstopwords = [{long_word:?}]\n"),
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("oversized stopword entry must fail closed");
+        assert!(
+            error.to_string().contains("search.fts.stopwords"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    // `apply_fts_stopwords_env` and `FtsSettings::validate` are pure
+    // functions specifically so the env-override and validation logic stay
+    // unit-testable without mutating process env — `std::env::set_var` is
+    // unsafe under edition 2024 and forbidden workspace-wide, since it races
+    // every other test in this crate's multi-threaded lib test binary (see
+    // `overlay_embedding_prefixes`'s doc comment above, the precedent this
+    // mirrors). `Config::load` itself only ever reads the env var once and
+    // hands it to `apply_fts_stopwords_env` as a plain `Option<&str>`.
+
+    #[test]
+    fn apply_fts_stopwords_env_ignores_absent_env() {
+        let mut cfg = Config::default();
+        apply_fts_stopwords_env(&mut cfg, None);
+        assert_eq!(cfg.search.fts.stopwords, None);
+    }
+
+    /// A present-but-blank env var must mean "unset", never "disable
+    /// filtering" — it must not clobber a real list `config.toml` already
+    /// resolved. `stopwords = []` in `config.toml` remains the unambiguous
+    /// way to disable filtering.
+    #[test]
+    fn apply_fts_stopwords_env_treats_blank_as_unset_and_does_not_clobber_config() {
+        let mut cfg = Config {
+            search: SearchSettings {
+                fts: FtsSettings {
+                    stopwords: Some(vec!["de".to_string()]),
+                },
+            },
+            ..Config::default()
+        };
+        apply_fts_stopwords_env(&mut cfg, Some(""));
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["de".to_string()]),
+            "blank env must not clobber an already-configured list"
+        );
+        apply_fts_stopwords_env(&mut cfg, Some("   "));
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["de".to_string()]),
+            "whitespace-only env must not clobber it either"
+        );
+    }
+
+    #[test]
+    fn apply_fts_stopwords_env_parses_csv_and_overrides() {
+        let mut cfg = Config::default();
+        apply_fts_stopwords_env(&mut cfg, Some("o, de , que"));
+        assert_eq!(
+            cfg.search.fts.stopwords,
+            Some(vec!["o".to_string(), "de".to_string(), "que".to_string()])
+        );
+    }
+
+    /// A CSV value that is present (non-blank as a whole string) but has no
+    /// real entries once split and trimmed still resolves to an explicit
+    /// empty list — matching `deserialize_string_or_vec`'s own filtering —
+    /// distinct from a truly blank/absent env var.
+    #[test]
+    fn apply_fts_stopwords_env_comma_only_value_yields_explicit_empty_list() {
+        let mut cfg = Config::default();
+        apply_fts_stopwords_env(&mut cfg, Some(" , , "));
+        assert_eq!(cfg.search.fts.stopwords, Some(Vec::new()));
+    }
+
+    #[test]
+    fn fts_settings_validate_accepts_none_and_explicit_empty() {
+        assert!(FtsSettings::default().validate().is_ok());
+        let mut empty = FtsSettings {
+            stopwords: Some(Vec::new()),
+        };
+        assert!(empty.validate().is_ok());
+    }
+
+    /// Ends are trimmed rather than rejected (a hand-edited `config.toml` or
+    /// CSV env value can easily carry a stray space).
+    #[test]
+    fn fts_settings_validate_trims_entry_ends_without_rejecting() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec![" de".to_string(), "que ".to_string()]),
+        };
+        fts.validate().unwrap();
+        assert_eq!(
+            fts.stopwords,
+            Some(vec!["de".to_string(), "que".to_string()])
+        );
+    }
+
+    /// An entry with INTERNAL whitespace (`"de la"`) can never equal one
+    /// `str::split_whitespace()` token, so it would look configured while
+    /// silently doing nothing — reject it instead.
+    #[test]
+    fn fts_settings_validate_rejects_internal_whitespace_entry() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec!["de la".to_string()]),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("internal whitespace"), "{err}");
+    }
+
+    #[test]
+    fn fts_settings_validate_rejects_blank_entry() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec!["  ".to_string()]),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("empty or whitespace-only"), "{err}");
+    }
+
+    #[test]
+    fn fts_settings_validate_rejects_oversized_entry() {
+        let mut fts = FtsSettings {
+            stopwords: Some(vec!["a".repeat(MAX_FTS_STOPWORD_LEN + 1)]),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("character limit"), "{err}");
+    }
+
+    #[test]
+    fn fts_settings_validate_rejects_oversized_list() {
+        let mut fts = FtsSettings {
+            stopwords: Some(
+                (0..(MAX_FTS_STOPWORDS + 1))
+                    .map(|i| format!("w{i}"))
+                    .collect(),
+            ),
+        };
+        let err = fts.validate().unwrap_err();
+        assert!(err.contains("at most"), "{err}");
     }
 
     /// `[decay.half_life_days]` parses per-tier half-lives (in days) and
