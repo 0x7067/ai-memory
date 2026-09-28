@@ -111,6 +111,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine indexed it and listed the page in the target's backlinks. The
   preprocessor now skips exactly the code blocks and inline code the
   renderer's parser reads as code. (#955)
+- A wikilink or markdown link written inside an inline code span is no
+  longer indexed as a link. The engine skipped only fenced blocks, so a
+  page showing the syntax as code (`` `[[other-project:notes/x]]` ``) got a
+  lint `broken_link` finding for a dependency it does not have, and a
+  local example listed the page in the target's backlinks, while the web
+  page rendered neither as a link. A link whose label is code
+  (`` [`foo`](foo.md) ``) is still indexed. (#968)
 
 ## [2.4.1] - 2026-09-25
 
