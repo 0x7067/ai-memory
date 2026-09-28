@@ -1775,7 +1775,8 @@ pub struct BackupAgentsArgs {
     /// Scope of assets to collect: `global`, `project`, or `both`.
     #[arg(long, default_value = "both")]
     pub scope: AgentBackupScope,
-    /// Include raw un-redacted credentials and tokens in MCP configs (sets file mode 0600 on archive).
+    /// Skip MCP-config redaction; other assets are always copied verbatim.
+    /// Sets archive mode to 0600 on Unix.
     #[arg(long)]
     pub include_secrets: bool,
     /// Preview assets that would be backed up without creating an archive.

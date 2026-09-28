@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tar::Archive;
 use tracing::info;
 
-use crate::cli::{AgentBackupScope, RestoreAgentsArgs};
+use crate::cli::{AgentBackupScope, McpClient, RestoreAgentsArgs};
 use crate::commands::backup_agents::matches_agent_filter;
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::config::Config;
@@ -102,7 +102,18 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
 
         let target_path = match entry.scope {
             AgentAssetScope::Global => {
-                if entry.agent == AgentKind::ClaudeCode
+                if entry.agent == AgentKind::ClaudeDesktop {
+                    crate::commands::install_mcp::mcp_config_path(McpClient::ClaudeDesktop)?
+                } else if entry.agent == AgentKind::OpenCode
+                    && let Some(rel) = entry.target_relative.strip_prefix(".config/opencode/")
+                {
+                    let config =
+                        crate::commands::install_mcp::mcp_config_path(McpClient::OpenCode)?;
+                    config
+                        .parent()
+                        .context("OpenCode config path has no parent directory")?
+                        .join(rel)
+                } else if entry.agent == AgentKind::ClaudeCode
                     && let Some(ref custom_dir) = claude_override
                     && let Some(rel) = entry.target_relative.strip_prefix(".claude/")
                 {
@@ -186,11 +197,17 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
 
         // Keep backup copy of pre-existing file on overwrite
         if exists {
-            let stamp = jiff::Timestamp::now().as_second();
+            let stamp = jiff::Timestamp::now().as_microsecond();
             let mut bak = target_path.as_os_str().to_owned();
             bak.push(format!(".bak-{stamp}"));
             let backup_path = PathBuf::from(bak);
-            let _ = fs::copy(&target_path, &backup_path);
+            fs::copy(&target_path, &backup_path).with_context(|| {
+                format!(
+                    "backing up {} to {}",
+                    target_path.display(),
+                    backup_path.display()
+                )
+            })?;
         }
 
         // Binary-safe atomic write

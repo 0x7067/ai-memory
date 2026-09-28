@@ -1,7 +1,7 @@
 //! `ai-memory backup-agents` — snapshot AI agent configurations,
 //! skills, plugins, and instructions into a portable archive.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
 use tracing::info;
 
-use crate::cli::{AgentBackupScope, BackupAgentsArgs};
+use crate::cli::{AgentBackupScope, BackupAgentsArgs, McpClient};
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::config::Config;
 
@@ -67,21 +67,26 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
             .with_context(|| format!("creating parent dir for {}", dest.display()))?;
     }
 
-    #[cfg(unix)]
     let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true);
+        #[cfg(unix)]
         if args.include_secrets {
+            use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
         opts.open(dest)
             .with_context(|| format!("creating output archive at {}", dest.display()))?
     };
 
-    #[cfg(not(unix))]
-    let file = File::create(dest)
-        .with_context(|| format!("creating output archive at {}", dest.display()))?;
+    #[cfg(unix)]
+    if args.include_secrets {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing output archive {}", dest.display()))?;
+    }
+    file.set_len(0)
+        .with_context(|| format!("truncating output archive {}", dest.display()))?;
 
     let count = build_archive(file, &discovered, args.include_secrets, &home)?;
 
@@ -97,7 +102,7 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
 
     if args.include_secrets {
         eprintln!(
-            "⚠️  Warning: Secrets were included without sanitization. Archive permissions set to 0600."
+            "⚠️  Warning: Secrets were included without sanitization. Archive mode is 0600 on Unix; protect the file on other platforms."
         );
     }
 
@@ -215,38 +220,23 @@ pub fn discover_assets(
         }
     }
 
-    // Claude Desktop
+    // Reuse the installer path so platform-specific Claude Desktop configs
+    // are backed up and restored at the same location.
     if filter_agent(AgentKind::ClaudeDesktop) && want_global {
-        #[cfg(target_os = "macos")]
-        let desktop_cfg = home
-            .join("Library")
-            .join("Application Support")
-            .join("Claude")
-            .join("claude_desktop_config.json");
-        #[cfg(target_os = "windows")]
-        let desktop_cfg = dirs::config_dir()
-            .map(|d| d.join("Claude").join("claude_desktop_config.json"))
-            .unwrap_or_else(|| {
-                home.join("AppData")
-                    .join("Roaming")
-                    .join("Claude")
-                    .join("claude_desktop_config.json")
-            });
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let desktop_cfg = home
-            .join(".config")
-            .join("Claude")
-            .join("claude_desktop_config.json");
-
-        push_if_file(
-            &mut assets,
-            AgentKind::ClaudeDesktop,
-            AgentAssetKind::McpConfig,
-            AgentAssetScope::Global,
-            desktop_cfg,
-            ".claude/claude_desktop_config.json",
-            "claude-desktop/claude_desktop_config.json",
-        );
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let desktop_cfg =
+                crate::commands::install_mcp::mcp_config_path(McpClient::ClaudeDesktop)?;
+            push_if_file(
+                &mut assets,
+                AgentKind::ClaudeDesktop,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                desktop_cfg,
+                ".claude/claude_desktop_config.json",
+                "claude-desktop/claude_desktop_config.json",
+            );
+        }
     }
 
     // 2. OpenAI Codex CLI
@@ -458,13 +448,18 @@ pub fn discover_assets(
     // 5. OpenCode (v1 / v2)
     if filter_agent(AgentKind::OpenCode) {
         if want_global {
-            let opencode_dir = home.join(".config").join("opencode");
+            let opencode_config =
+                crate::commands::install_mcp::mcp_config_path(McpClient::OpenCode)?;
+            let opencode_dir = opencode_config
+                .parent()
+                .map(Path::to_path_buf)
+                .context("OpenCode config path has no parent directory")?;
             push_if_file(
                 &mut assets,
                 AgentKind::OpenCode,
                 AgentAssetKind::McpConfig,
                 AgentAssetScope::Global,
-                opencode_dir.join("opencode.json"),
+                opencode_config,
                 ".config/opencode/opencode.json",
                 "opencode/opencode.json",
             );

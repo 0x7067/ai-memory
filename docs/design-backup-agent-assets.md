@@ -26,6 +26,12 @@ Currently:
 | **OpenClaw** | `~/.openclaw/config.json` | — | `~/.openclaw/extensions/` | — |
 | **VS Code Copilot** | `.vscode/mcp.json` | — | Extensions | Copilot instructions |
 
+Claude Desktop config paths use the same platform-aware resolver as
+`install-mcp`, including packaged Windows installs. OpenCode uses
+`%USERPROFILE%\.config\opencode` on Windows too, as its
+[official troubleshooting guide](https://dev.opencode.ai/docs/troubleshooting/)
+documents.
+
 ---
 
 ## 3. Architecture & CLI Design
@@ -47,7 +53,7 @@ ai-memory backup-agents --agents claude,codex,antigravity --scope both -o backup
 ai-memory backup-agents -o backup.tar.gz --include-secrets
 
 # Dry-run inspection of an archive before restoring
-ai-memory restore-agents -i backup.tar.gz --dry-run
+ai-memory restore-agents -i backup.tar.gz
 
 # Apply restoration atomically
 ai-memory restore-agents -i backup.tar.gz --apply
@@ -101,14 +107,15 @@ Stored in the root of the generated tarball:
 ## 5. Security & Invariants
 
 1. **Secret Redaction:**
-   - By default, known tokens, bearer headers, and environment keys (`*_TOKEN`, `*_KEY`, `*_SECRET`) in MCP configs are sanitized using `ai-memory-hooks::sanitizer`.
-   - Passing `--include-secrets` bypasses redaction; the resulting `.tar.gz` is created with `0600` permissions and a warning is logged.
+   - By default, known tokens, bearer headers, and environment keys (`*_TOKEN`, `*_KEY`, `*_SECRET`) in UTF-8 MCP config files are sanitized using `ai-memory-hooks::sanitizer`.
+   - Skills, plugins, and instruction files are copied verbatim and may contain secrets.
+   - Passing `--include-secrets` bypasses MCP redaction; on Unix the archive is set to mode `0600` before writing, and a warning is logged.
 2. **Symlink Safety:**
    - Archives do not traverse or include external symlinks (`follow_symlinks(false)`).
 3. **Path Traversal Protection:**
-   - Restoring validates that every target path resolves strictly inside the intended destination directory (`home_dir()` or project cwd).
+   - Restoring rejects traversal and permits only allowlisted agent destinations. Claude Desktop uses the same platform-specific path resolver as `install-mcp`.
 4. **Atomic Restores:**
-   - Target files are written using temporary files + rename + sync (`apply_atomic`), avoiding partial or corrupted configurations.
+   - Target files are written using temporary files + rename + sync (`ai_memory_wiki::write_atomic`), avoiding partial or corrupted configurations.
    - Non-managed custom files are never overwritten without explicit `--force`.
 
 ---

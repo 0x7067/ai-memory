@@ -1,7 +1,7 @@
 //! Integration tests for `ai-memory backup-agents` and `ai-memory restore-agents`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
@@ -36,7 +36,27 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("KIMI_CODE_HOME")
         .env_remove("KIRO_HOME");
+    #[cfg(windows)]
     command
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"));
+    command
+}
+
+fn claude_desktop_config_in(home: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(home.join("AppData/Roaming/Claude/claude_desktop_config.json"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = home;
+        None
+    }
 }
 
 #[test]
@@ -74,6 +94,16 @@ fn backup_and_restore_agents_round_trip() {
     let agents_md = project.path().join("AGENTS.md");
     fs::write(&agents_md, "# Project Rules\nCodex rules").unwrap();
 
+    let opencode_config = home.path().join(".config/opencode/opencode.json");
+    fs::create_dir_all(opencode_config.parent().unwrap()).unwrap();
+    fs::write(&opencode_config, r#"{"mcp":{}}"#).unwrap();
+
+    let desktop_config = claude_desktop_config_in(home.path());
+    if let Some(path) = &desktop_config {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, r#"{"mcpServers":{"desktop":{}}}"#).unwrap();
+    }
+
     // Antigravity / Gemini
     let agy_mcp = home.path().join(".gemini/config/mcp_config.json");
     fs::create_dir_all(agy_mcp.parent().unwrap()).unwrap();
@@ -84,6 +114,7 @@ fn backup_and_restore_agents_round_trip() {
     .unwrap();
 
     let backup_tar = project.path().join("backup.tar.gz");
+    fs::write(&backup_tar, "previous archive").unwrap();
 
     // 2. Run backup-agents
     let output = command_with_env(home.path(), project.path())
@@ -101,6 +132,15 @@ fn backup_and_restore_agents_round_trip() {
         "backup-agents failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&backup_tar).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "archives containing secrets must be private before writing"
+        );
+    }
     assert!(backup_tar.exists(), "backup tarball was not created");
 
     // 3. Restore into clean sandbox
@@ -168,6 +208,19 @@ fn backup_and_restore_agents_round_trip() {
         restored_agy,
         r#"{"mcpServers":{"agy":{"url":"http://127.0.0.1"}}}"#
     );
+    assert!(
+        restore_home
+            .path()
+            .join(".config/opencode/opencode.json")
+            .exists()
+    );
+    if desktop_config.is_some() {
+        assert!(
+            claude_desktop_config_in(restore_home.path())
+                .unwrap()
+                .exists()
+        );
+    }
 }
 
 #[test]
@@ -541,4 +594,62 @@ fn backup_and_restore_kebab_case_agent_filter() {
 
     assert!(restore_home.path().join(".claude/settings.json").exists());
     assert!(!restore_home.path().join(".codex/config.toml").exists());
+}
+
+#[test]
+fn restore_agents_force_keeps_previous_file_backup() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = home.path().join(".claude/settings.json");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "restored config").unwrap();
+
+    let archive = project.path().join("backup.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            archive.to_str().unwrap(),
+            "--agents",
+            "claude-code",
+            "--include-secrets",
+        ])
+        .output()
+        .unwrap();
+    assert!(backup.status.success());
+
+    let restore_home = tempfile::tempdir().unwrap();
+    let restore_project = tempfile::tempdir().unwrap();
+    let existing = restore_home.path().join(".claude/settings.json");
+    fs::create_dir_all(existing.parent().unwrap()).unwrap();
+    fs::write(&existing, "previous config").unwrap();
+
+    let restore = command_with_env(restore_home.path(), restore_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--apply",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(fs::read(&existing).unwrap(), b"restored config");
+
+    let backup_path = fs::read_dir(existing.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("settings.json.bak-"))
+        })
+        .expect("overwrite must keep a backup copy");
+    assert_eq!(fs::read(backup_path).unwrap(), b"previous config");
 }
