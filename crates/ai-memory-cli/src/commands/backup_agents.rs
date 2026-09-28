@@ -67,20 +67,23 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
             .with_context(|| format!("creating parent dir for {}", dest.display()))?;
     }
 
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        if args.include_secrets {
+            opts.mode(0o600);
+        }
+        opts.open(dest)
+            .with_context(|| format!("creating output archive at {}", dest.display()))?
+    };
+
+    #[cfg(not(unix))]
     let file = File::create(dest)
         .with_context(|| format!("creating output archive at {}", dest.display()))?;
 
     let count = build_archive(file, &discovered, args.include_secrets, &home)?;
-
-    #[cfg(unix)]
-    if args.include_secrets {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(dest) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = fs::set_permissions(dest, perms);
-        }
-    }
 
     let size = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
     info!(path = %dest.display(), bytes = size, count, "agent assets backup written");
@@ -140,11 +143,7 @@ pub fn discover_assets(
         let Some(filter) = &args.agents else {
             return true;
         };
-        let agent_str = format!("{agent:?}").to_lowercase();
-        filter.iter().any(|f| {
-            let fl = f.trim().to_lowercase();
-            agent_str.contains(&fl) || fl.contains(&agent_str)
-        })
+        matches_agent_filter(agent, filter)
     };
 
     // 1. Claude Code / Desktop
@@ -214,6 +213,40 @@ pub fn discover_assets(
                 "project/CLAUDE.md",
             );
         }
+    }
+
+    // Claude Desktop
+    if filter_agent(AgentKind::ClaudeDesktop) && want_global {
+        #[cfg(target_os = "macos")]
+        let desktop_cfg = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude_desktop_config.json");
+        #[cfg(target_os = "windows")]
+        let desktop_cfg = dirs::config_dir()
+            .map(|d| d.join("Claude").join("claude_desktop_config.json"))
+            .unwrap_or_else(|| {
+                home.join("AppData")
+                    .join("Roaming")
+                    .join("Claude")
+                    .join("claude_desktop_config.json")
+            });
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let desktop_cfg = home
+            .join(".config")
+            .join("Claude")
+            .join("claude_desktop_config.json");
+
+        push_if_file(
+            &mut assets,
+            AgentKind::ClaudeDesktop,
+            AgentAssetKind::McpConfig,
+            AgentAssetScope::Global,
+            desktop_cfg,
+            ".claude/claude_desktop_config.json",
+            "claude-desktop/claude_desktop_config.json",
+        );
     }
 
     // 2. OpenAI Codex CLI
@@ -288,10 +321,10 @@ pub fn discover_assets(
         }
     }
 
-    // 3. Antigravity CLI / Gemini CLI
-    if filter_agent(AgentKind::AntigravityCli) || filter_agent(AgentKind::GeminiCli) {
+    // 3. Antigravity CLI
+    if filter_agent(AgentKind::AntigravityCli) {
+        let gemini_dir = home.join(".gemini");
         if want_global {
-            let gemini_dir = home.join(".gemini");
             push_if_file(
                 &mut assets,
                 AgentKind::AntigravityCli,
@@ -300,15 +333,6 @@ pub fn discover_assets(
                 gemini_dir.join("config").join("mcp_config.json"),
                 ".gemini/config/mcp_config.json",
                 "antigravity/mcp_config.json",
-            );
-            push_if_file(
-                &mut assets,
-                AgentKind::GeminiCli,
-                AgentAssetKind::McpConfig,
-                AgentAssetScope::Global,
-                gemini_dir.join("settings.json"),
-                ".gemini/settings.json",
-                "gemini/settings.json",
             );
             push_if_file(
                 &mut assets,
@@ -330,15 +354,6 @@ pub fn discover_assets(
             )?;
             collect_dir_assets(
                 &mut assets,
-                AgentKind::GeminiCli,
-                AgentAssetKind::Skill,
-                AgentAssetScope::Global,
-                &gemini_dir.join("skills"),
-                ".gemini/skills",
-                "gemini/skills",
-            )?;
-            collect_dir_assets(
-                &mut assets,
                 AgentKind::AntigravityCli,
                 AgentAssetKind::Plugin,
                 AgentAssetScope::Global,
@@ -357,6 +372,33 @@ pub fn discover_assets(
                 ".gemini/skills",
                 "project/gemini/skills",
             )?;
+        }
+    }
+
+    // 4. Gemini CLI
+    if filter_agent(AgentKind::GeminiCli) {
+        let gemini_dir = home.join(".gemini");
+        if want_global {
+            push_if_file(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                gemini_dir.join("settings.json"),
+                ".gemini/settings.json",
+                "gemini/settings.json",
+            );
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::GeminiCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &gemini_dir.join("skills"),
+                ".gemini/skills",
+                "gemini/skills",
+            )?;
+        }
+        if want_project {
             push_if_file(
                 &mut assets,
                 AgentKind::GeminiCli,
@@ -608,7 +650,30 @@ pub fn discover_assets(
         );
     }
 
-    // 11. VS Code / Copilot
+    // 11. Kimi Code
+    if filter_agent(AgentKind::KimiCode) && want_global {
+        let kimi_dir = home.join(".kimi");
+        push_if_file(
+            &mut assets,
+            AgentKind::KimiCode,
+            AgentAssetKind::McpConfig,
+            AgentAssetScope::Global,
+            kimi_dir.join("mcp.json"),
+            ".kimi/mcp.json",
+            "kimi/mcp.json",
+        );
+        collect_dir_assets(
+            &mut assets,
+            AgentKind::KimiCode,
+            AgentAssetKind::Skill,
+            AgentAssetScope::Global,
+            &kimi_dir.join("skills"),
+            ".kimi/skills",
+            "kimi/skills",
+        )?;
+    }
+
+    // 12. VS Code / Copilot
     if want_project {
         push_if_file(
             &mut assets,
@@ -762,13 +827,14 @@ fn build_archive(
         });
     }
 
+    let any_sanitized = entries.iter().any(|e| e.sanitized);
     let manifest = AgentBackupManifest::new(
         HostInfo {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             home_dir: Some(home.display().to_string()),
         },
-        !include_secrets,
+        any_sanitized,
         entries,
     );
 
@@ -805,4 +871,27 @@ fn human_bytes(n: u64) -> String {
     } else {
         format!("{value:.2} {}", UNITS[unit])
     }
+}
+
+/// Match an agent against a list of filter strings, handling kebab-case, snake_case, and aliases.
+pub(crate) fn matches_agent_filter(agent: AgentKind, filter_list: &[String]) -> bool {
+    let wire = agent.as_str();
+    let wire_compact = wire.replace(['-', '_'], "");
+    filter_list.iter().any(|f| {
+        let fl = f.trim().to_lowercase();
+        if fl.is_empty() {
+            return false;
+        }
+        let parsed = AgentKind::from_wire(&fl);
+        if parsed == agent && parsed != AgentKind::Other {
+            return true;
+        }
+        let fl_compact = fl.replace(['-', '_'], "");
+        wire == fl
+            || wire.contains(&fl)
+            || fl.contains(wire)
+            || wire_compact == fl_compact
+            || wire_compact.contains(&fl_compact)
+            || fl_compact.contains(&wire_compact)
+    })
 }

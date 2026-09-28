@@ -322,3 +322,223 @@ fn restore_agents_rejects_path_traversal() {
     let err = String::from_utf8_lossy(&restore.stderr);
     assert!(err.contains("dangerous") || err.contains("traversal") || err.contains("malformed"));
 }
+
+#[test]
+fn restore_agents_rejects_unauthorized_destination_path() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let evil_tar = project.path().join("evil_target.tar.gz");
+    {
+        let file = std::fs::File::create(&evil_tar).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar = tar::Builder::new(enc);
+
+        let manifest = r#"{
+            "version": 1,
+            "created_at": "2026-09-28T00:00:00Z",
+            "host": { "os": "macos", "arch": "aarch64" },
+            "sanitized": true,
+            "entries": [{
+                "agent": "claude-code",
+                "asset_kind": "mcp-config",
+                "scope": "project",
+                "archive_path": "payload.txt",
+                "target_relative": ".git/hooks/pre-commit"
+            }]
+        }"#;
+
+        let mut h_m = tar::Header::new_gnu();
+        h_m.set_size(manifest.len() as u64);
+        h_m.set_cksum();
+        tar.append_data(&mut h_m, "manifest.json", std::io::Cursor::new(manifest))
+            .unwrap();
+
+        let evil_body = "#!/bin/sh\necho malicious";
+        let mut h_b = tar::Header::new_gnu();
+        h_b.set_size(evil_body.len() as u64);
+        h_b.set_cksum();
+        tar.append_data(&mut h_b, "payload.txt", std::io::Cursor::new(evil_body))
+            .unwrap();
+
+        tar.finish().unwrap();
+    }
+
+    let restore = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            evil_tar.to_str().unwrap(),
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !restore.status.success(),
+        "must reject unauthorized destination path"
+    );
+    let err = String::from_utf8_lossy(&restore.stderr);
+    assert!(err.contains("unauthorized path"));
+}
+
+#[test]
+fn restore_agents_binary_safe_preserves_raw_bytes() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let plugin_dir = home.path().join(".claude/plugins/test-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let binary_bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x80, 0xC0, 0xDF, 0x80];
+    let binary_file = plugin_dir.join("asset.bin");
+    fs::write(&binary_file, &binary_bytes).unwrap();
+
+    let backup_tar = project.path().join("binary_test.tar.gz");
+
+    let backup = command_with_env(home.path(), project.path())
+        .args(["backup-agents", "-o", backup_tar.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(backup.status.success());
+
+    let restore_home = tempfile::tempdir().unwrap();
+    let restore_project = tempfile::tempdir().unwrap();
+
+    let restore = command_with_env(restore_home.path(), restore_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            backup_tar.to_str().unwrap(),
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+
+    let restored_bin = fs::read(
+        restore_home
+            .path()
+            .join(".claude/plugins/test-plugin/asset.bin"),
+    )
+    .unwrap();
+    assert_eq!(
+        restored_bin, binary_bytes,
+        "binary bytes must be preserved exactly"
+    );
+}
+
+#[test]
+fn restore_agents_verifies_sha256_integrity() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let tampered_tar = project.path().join("tampered.tar.gz");
+    {
+        let file = std::fs::File::create(&tampered_tar).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar = tar::Builder::new(enc);
+
+        let manifest = r#"{
+            "version": 1,
+            "created_at": "2026-09-28T00:00:00Z",
+            "host": { "os": "macos", "arch": "aarch64" },
+            "sanitized": true,
+            "entries": [{
+                "agent": "claude-code",
+                "asset_kind": "instruction",
+                "scope": "project",
+                "archive_path": "project/CLAUDE.md",
+                "target_relative": "CLAUDE.md",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            }]
+        }"#;
+
+        let mut h_m = tar::Header::new_gnu();
+        h_m.set_size(manifest.len() as u64);
+        h_m.set_cksum();
+        tar.append_data(&mut h_m, "manifest.json", std::io::Cursor::new(manifest))
+            .unwrap();
+
+        let body = "tampered instruction content";
+        let mut h_b = tar::Header::new_gnu();
+        h_b.set_size(body.len() as u64);
+        h_b.set_cksum();
+        tar.append_data(&mut h_b, "project/CLAUDE.md", std::io::Cursor::new(body))
+            .unwrap();
+
+        tar.finish().unwrap();
+    }
+
+    let restore = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            tampered_tar.to_str().unwrap(),
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !restore.status.success(),
+        "must fail on SHA-256 integrity mismatch"
+    );
+    let err = String::from_utf8_lossy(&restore.stderr);
+    assert!(err.contains("integrity mismatch") || err.contains("SHA-256"));
+}
+
+#[test]
+fn backup_and_restore_kebab_case_agent_filter() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let claude_settings = home.path().join(".claude/settings.json");
+    fs::create_dir_all(claude_settings.parent().unwrap()).unwrap();
+    fs::write(&claude_settings, r#"{"mcpServers":{"claude":{}}}"#).unwrap();
+
+    let codex_config = home.path().join(".codex/config.toml");
+    fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+    fs::write(&codex_config, "[mcp_servers.codex]\n").unwrap();
+
+    let backup_tar = project.path().join("kebab_filter.tar.gz");
+
+    // Filter by kebab-case wire string "claude-code"
+    let backup_res = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            backup_tar.to_str().unwrap(),
+            "--agents",
+            "claude-code",
+        ])
+        .output()
+        .unwrap();
+    assert!(backup_res.status.success());
+
+    let restore_home = tempfile::tempdir().unwrap();
+    let restore_project = tempfile::tempdir().unwrap();
+
+    let restore_res = command_with_env(restore_home.path(), restore_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            backup_tar.to_str().unwrap(),
+            "--agents",
+            "claude-code",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(restore_res.status.success());
+
+    assert!(restore_home.path().join(".claude/settings.json").exists());
+    assert!(!restore_home.path().join(".codex/config.toml").exists());
+}

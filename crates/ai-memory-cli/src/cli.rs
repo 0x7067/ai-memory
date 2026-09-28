@@ -1817,6 +1817,9 @@ pub struct RestoreAgentsArgs {
     /// Optional comma-separated list of agents to restore. Defaults to all present in archive.
     #[arg(long, value_delimiter = ',')]
     pub agents: Option<Vec<String>>,
+    /// Scope of assets to restore: `global`, `project`, or `both`.
+    #[arg(long, default_value = "both")]
+    pub scope: AgentBackupScope,
     /// Actually write restored files to disk (default is dry-run inspection).
     #[arg(long)]
     pub apply: bool,
