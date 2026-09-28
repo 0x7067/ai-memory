@@ -118,17 +118,38 @@ Studio. There is no dedicated `openrouter` provider name, and setting
 Select it by pointing the compat base URL at OpenRouter and supplying its
 `sk-or-v1-...` key through `LLM_API_KEY`:
 
-```bash
-export AI_MEMORY_LLM_PROVIDER=openai-compat
-export AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
-export AI_MEMORY_LLM_MODEL=anthropic/claude-haiku-4.5
-export LLM_API_KEY=sk-or-v1-...
-ai-memory llm-test --provider openai-compat --model anthropic/claude-haiku-4.5 --prompt "Reply with OK"
+A minimal working env-file (drop into `~/.config/ai-memory/openrouter.env`
+or the Docker `--env-file` argument):
+
+```env
+LLM_API_KEY=sk-or-v1-...
+
+AI_MEMORY_LLM_PROVIDER=openai-compat
+AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
+AI_MEMORY_LLM_MODEL=deepseek/deepseek-v4-flash
+AI_MEMORY_LLM_COMPAT_STRICT=true
 ```
 
+Then verify:
+
+```bash
+ai-memory llm-test --provider openai-compat \
+    --model deepseek/deepseek-v4-flash --prompt "Reply with OK"
+```
+
+`AI_MEMORY_LLM_COMPAT_STRICT=true` sends OpenAI-style
+`response_format=json_schema` for every structured call. Modern hosted
+gateways honour it; some model backends (DeepSeek among them) otherwise wrap
+their JSON output in markdown fences that ai-memory's tolerant parser has to
+strip, which occasionally drops a field. Setting it to `true` at the
+env-file level is safer for consolidation reliability. Turn it off
+(`AI_MEMORY_LLM_COMPAT_STRICT=false`) only for a specific model backend that
+explicitly rejects the schema-constrained shape.
+
 The `docker/.env.production.example` file in the repo ships with an OpenRouter
-setup pre-filled (with `moonshotai/kimi-k2.6` as the sample model). Model ids
-follow OpenRouter's `provider/model` convention. There is no built-in default:
+setup pre-filled (with `moonshotai/kimi-k2.6` as the sample model — see the
+gotchas below for why reasoning models are ineligible). Model ids follow
+OpenRouter's `provider/model` convention. There is no built-in default:
 `AI_MEMORY_LLM_MODEL` is required, as it is for every `openai-compat` endpoint.
 
 For model selection, [`llm-provider-comparison.md`](llm-provider-comparison.md)
