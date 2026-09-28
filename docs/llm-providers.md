@@ -51,6 +51,7 @@ Recommended defaults:
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
 | `opencode` | `claude-sonnet-4-6` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
 | `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
 the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
@@ -107,6 +108,56 @@ export AI_MEMORY_LLM_PROVIDER=opencode
 export AI_MEMORY_LLM_MODEL=mimo-v2.5
 ai-memory llm-test --provider opencode --model mimo-v2.5 --prompt "Reply with OK"
 ```
+
+<a id="openrouter"></a>
+[OpenRouter](https://openrouter.ai) is used through the generic `openai-compat`
+provider — the same wiring as Atlas Cloud, OrcaRouter, Ollama, vLLM, and LM
+Studio. There is no dedicated `openrouter` provider name, and setting
+`AI_MEMORY_LLM_PROVIDER=openrouter` fails at startup with
+`AI_MEMORY_LLM_PROVIDER=openrouter is not one of anthropic|openai|gemini|openai-compat|...`.
+Select it by pointing the compat base URL at OpenRouter and supplying its
+`sk-or-v1-...` key through `LLM_API_KEY`:
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=openai-compat
+export AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
+export AI_MEMORY_LLM_MODEL=anthropic/claude-haiku-4.5
+export LLM_API_KEY=sk-or-v1-...
+ai-memory llm-test --provider openai-compat --model anthropic/claude-haiku-4.5 --prompt "Reply with OK"
+```
+
+The `docker/.env.production.example` file in the repo ships with an OpenRouter
+setup pre-filled (with `moonshotai/kimi-k2.6` as the sample model). Model ids
+follow OpenRouter's `provider/model` convention. There is no built-in default:
+`AI_MEMORY_LLM_MODEL` is required, as it is for every `openai-compat` endpoint.
+
+For model selection, [`llm-provider-comparison.md`](llm-provider-comparison.md)
+benchmarks five OpenRouter models against a local Ollama on the same
+consolidation fixtures. Its TL;DR recommends **`anthropic/claude-haiku-4.5`**
+as the default for most users — the most disciplined hosted model on
+restraint + classification at ~7 s per consolidation. `openai/gpt-5.4-mini` is
+the cheaper alternative (about 5x cheaper, 2x faster, mild
+over-classification). Reasoning models such as `moonshotai/kimi-k2.6` hang on
+the strict-JSON consolidation prompt and are ineligible.
+
+ai-memory automatically layers OpenRouter's app-attribution headers
+(`HTTP-Referer` and `X-Title`) whenever the base URL points at
+`openrouter.ai`, so ai-memory traffic is credited on OpenRouter's app
+leaderboard. `AI_MEMORY_LLM_HEADERS=HTTP-Referer=https://example.com,X-Title=my-app`
+overrides them per operator. `AI_MEMORY_LLM_REASONING_EFFORT` is honoured on
+this path: OpenRouter hosts receive `reasoning: { effort, exclude: true }`.
+
+OpenRouter is a chat gateway; it does not serve first-class embeddings. Either
+run a local sentence-transformer
+(`AI_MEMORY_EMBEDDING_PROVIDER=local`, see
+[`local-embeddings.md`](local-embeddings.md)), or route the OpenAI-shaped
+embedding client at OpenRouter with
+`AI_MEMORY_EMBEDDING_PROVIDER=openai` +
+`AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` + a dedicated
+`EMBEDDING_API_KEY` (documented in
+[`install.md#llm-provider-tiers`](install.md#llm-provider-tiers)). The two
+endpoints are independent, so setting `AI_MEMORY_LLM_BASE_URL` alone does not
+redirect embeddings.
 
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
