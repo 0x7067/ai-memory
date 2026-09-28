@@ -189,3 +189,32 @@ for the two bypass classes above:
 - a **ship-inert test**: an empty grants table, and a `restricted` project with zero
   grants, both still admit root and the creator; a caller on an `open` project is
   unaffected.
+
+## Identity routing (slice 4, #925 — resolved: always-on)
+
+Authorization is only sound if two unrelated checkouts that happen to share a
+folder basename (`~/work/api` and `~/clients/acme/api`) resolve to **different**
+projects — otherwise one grant silently covers both. Slice 4 routes captures by
+**repository identity** (the normalized git remote) instead of folder name:
+
+- A new `V70` migration adds `projects.identity` / `identity_source`
+  (`NOT NULL DEFAULT ''`) with a **partial** unique index
+  `(workspace_id, identity) WHERE identity <> ''` and **no backfill** (a
+  backfill on `lower(name)` would fail a workspace holding both `API` and `api`).
+- Identity is derived by `git2::Repository::discover` (config read only) and
+  normalized **lexically** (scheme split, credential strip, `.git`/slash tidy) —
+  never `fs::canonicalize`. Credentials in a remote URL are stripped client-side
+  and never sent; the server re-validates any wire `identity` (`accept_wire_identity`).
+- Resolution order is **explicit scope > declared `project` > git-remote identity
+  > folder name**; a non-git directory falls back to the folder-name behavior
+  (fail-closed, no new collision).
+- The same normalization runs at all four capture front doors — native
+  `ai-memory hook`, the shell bundle, the PowerShell bundle, and the generated
+  TypeScript integrations — checked by a shared-fixture parity test so they
+  cannot drift.
+
+**Decision (resolved):** this is **always-on** in 2.5.0, not gated behind a
+flag. Opt-in would leave the same-basename grant hole open for anyone who did
+not opt in, defeating the authorization slices. The trade-off — that an upgrading
+install's captures re-bucket by repository identity (two same-name repos split; one
+repo opened from two folders converges) — is documented in the CHANGELOG.
