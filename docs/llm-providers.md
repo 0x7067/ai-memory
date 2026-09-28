@@ -175,13 +175,14 @@ leaderboard. `AI_MEMORY_LLM_HEADERS=HTTP-Referer=https://example.com,X-Title=my-
 overrides them per operator. `AI_MEMORY_LLM_REASONING_EFFORT` is honoured on
 this path: OpenRouter hosts receive `reasoning: { effort, exclude: true }`.
 
-OpenRouter also serves OpenAI-compatible **embedding** models — the default
-`/api/v1/models` listing filters them out, but they exist and answer the same
-`/v1/embeddings` shape as any openai-compat endpoint. List them with
-`curl "https://openrouter.ai/api/v1/models?category=embedding"` or the
-"Embeddings" filter in the OpenRouter web UI. Configure the embedder through
-the openai-compat path — not the openai path, which has an OpenAI-specific
-key precedence chain:
+OpenRouter's LLM/completions API is what ai-memory uses above. It does **not**
+reliably expose an OpenAI-compatible `/v1/embeddings` endpoint — historically it
+has not — so do not assume an OpenRouter base URL works for the embedder. If a
+given deployment of OpenRouter does offer an embeddings endpoint, verify it
+answers the standard `/v1/embeddings` shape (`curl` the endpoint directly)
+before relying on it. When it does, configure the embedder through the
+openai-compat path — not the openai path, which has an OpenAI-specific key
+precedence chain:
 
 ```bash
 export AI_MEMORY_EMBEDDING_PROVIDER=openai-compat
@@ -197,8 +198,8 @@ match the model. For English-only content the built-in local
 sentence-transformer (`AI_MEMORY_EMBEDDING_PROVIDER=local`, see
 [`local-embeddings.md`](local-embeddings.md)) is a valid alternative that
 avoids hosted egress; for non-English content, a multilingual hosted model
-served through OpenRouter (`baai/bge-m3`, `intfloat/multilingual-e5-large`,
-and similar available through the same catalogue) is the practical choice.
+(`baai/bge-m3`, `intfloat/multilingual-e5-large`, or similar) served by any
+provider that exposes a real `/v1/embeddings` endpoint is the practical choice.
 The two endpoints are still independent, so setting `AI_MEMORY_LLM_BASE_URL`
 alone does not redirect embeddings — set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 
