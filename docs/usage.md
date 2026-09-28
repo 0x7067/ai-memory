@@ -234,7 +234,8 @@ exists, both when both exist, or creates `CLAUDE.md` when neither exists. Use
 instruction target unless you override it: `CLAUDE.md` implies
 `.claude/skills`, `AGENTS.md` implies `.agents/skills`, and both files imply
 both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
-install under its `.grok/skills` root.
+install under its `.grok/skills` root; for Hermes Agent, `--skills-agent hermes`
+installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
 `CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code loads
@@ -252,6 +253,7 @@ ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
+ai-memory install-skills --scope global --agent hermes
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```

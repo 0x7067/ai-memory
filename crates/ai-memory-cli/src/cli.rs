@@ -1423,6 +1423,8 @@ pub enum InstallSkillsAgent {
     Devin,
     /// Grok Build CLI's `.grok/skills` directory.
     Grok,
+    /// Hermes Agent's `.hermes/skills` directory.
+    Hermes,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }

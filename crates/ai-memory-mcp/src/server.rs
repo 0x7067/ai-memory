@@ -372,7 +372,7 @@ should be proposed from a completed session, or at explicit wrap-up \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
   slim markered snippet (`markered_block`), filename hints, \
   `managed_skills` payloads, `target_hints` for `.claude/skills`, \
-  `.agents/skills`, `.devin/skills`, `.grok/skills`, and Devin's Windows global \
+  `.agents/skills`, `.devin/skills`, `.grok/skills`, `.hermes/skills`, and Devin's Windows global \
   `%APPDATA%\\devin\\skills` root, and overwrite guidance. Use your own Write/Edit \
   tool to replace only the ai-memory marker block in the rules file, \
   then write each managed skill under the selected skill root. Only \
@@ -5199,7 +5199,7 @@ impl AiMemoryServer {
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
         `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, \
-        `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. \
+        `.hermes/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. \
         Use when the user asks to install or refresh ai-memory routing in this project. \
         Pass `compact: true` to return the compact routing block that delegates \
         to installed Agent Skills, or when refreshing a file that already uses the compact snippet. \
@@ -5260,7 +5260,8 @@ impl AiMemoryServer {
                     "claude_code": ".claude/skills",
                     "agents": ".agents/skills",
                     "devin": ".devin/skills",
-                    "grok": ".grok/skills"
+                    "grok": ".grok/skills",
+                    "hermes": ".hermes/skills"
                 },
                 "global": {
                     "claude_code": "~/.claude/skills",
@@ -5269,7 +5270,8 @@ impl AiMemoryServer {
                         "windows": "%APPDATA%\\devin\\skills",
                         "non_windows": "~/.devin/skills"
                     },
-                    "grok": "$GROK_HOME/skills (default: ~/.grok/skills)"
+                    "grok": "$GROK_HOME/skills (default: ~/.grok/skills)",
+                    "hermes": "~/.hermes/skills"
                 }
             },
             "overwrite_guidance": {
@@ -7598,6 +7600,18 @@ mod tests {
                 .as_str()
                 .unwrap(),
             ".grok/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["project"]["hermes"]
+                .as_str()
+                .unwrap(),
+            ".hermes/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["hermes"]
+                .as_str()
+                .unwrap(),
+            "~/.hermes/skills"
         );
         assert_eq!(
             response["target_hints"]["global"]["claude_code"]

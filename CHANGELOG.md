@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `install-skills --agent hermes` (and the `hermes` entry in
+  `memory_install_self_routing`'s `target_hints`) installs the managed routing
+  skills into Hermes Agent's `.hermes/skills` (project) or `~/.hermes/skills`
+  (global) family, completing Hermes routing support alongside its lifecycle
+  hooks (#933). (#942)
 - `docs/jev-reranker-adapter.md` gains a choice-contrastive variant of the
   Jev reranker adapter
   (`docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`): one
