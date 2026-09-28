@@ -86,8 +86,14 @@ def jev_rerank(payload):
         desc = (c.get("title") or f"candidate {n}")[:120]
         lines.append(f"{n}. {desc} — {c['text'][:160]}")
         criteria[f"c{n}"] = desc
+    # Pool v3 on the 35B backend: this wording beat "most relevant" 0.828 -> 0.879
+    # hit@1 (5 fixed, 0 broken). Relevance stays the raw choice probability.
     questions = {"best": {"type": "choice",
-                          "instructions": "Which candidate document is most relevant to answering the user query?",
+                          "instructions": (
+                              "Which candidate directly answers the user query? "
+                              "Choose the specific page that contains the answer. "
+                              "Do not choose an index, catalog, or summary page if a more specific page answers the query."
+                          ),
                           "criteria": criteria}}
     body = {"model": JEV_MODEL, "state": "\n".join(lines), "questions": questions}
     t0 = time.perf_counter()

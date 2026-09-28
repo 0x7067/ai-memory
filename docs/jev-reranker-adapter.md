@@ -138,9 +138,13 @@ of magnitude under any hosted reasoning model.
 
 [`jev_rerank_shim_choice.py`](examples/jev-reranker-adapter/jev_rerank_shim_choice.py)
 flips the question shape: instead of one rubric `score` per candidate, it
-asks a single `choice` question over the whole candidate list ("which
-document is most relevant?") and maps each candidate's choice probability
-directly to `relevance`.
+asks a single `choice` question over the whole candidate list and maps each
+candidate's choice probability directly to `relevance`. The production
+wording asks which specific page contains the answer, and tells the model
+not to pick an index, catalog, or summary when a more specific page answers.
+On a 30-candidate pool that wording moved the 35B from 0.828 to 0.879 hit@1
+(5 fixed, 0 broken) versus "which document is most relevant?". The table
+below is the earlier choice-versus-rubric comparison, not that wording test.
 
 That is deliberately the substitution the caveat below used to warn about.
 It is sound here because the reranker's consumer is **sort-only**: the
