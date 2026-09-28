@@ -15,13 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shipped, and `docker/.env.production.example` already ships an OpenRouter
   default, but the provider-facing doc mentioned OpenRouter only inside the
   generic `openai-compat` row. The new subsection covers a full working
-  env-file, the `openai-compat` embedder path for OpenRouter's hidden-but-
-  supported embedding models (`baai/bge-m3`,
-  `intfloat/multilingual-e5-large`), a pointer to
+  env-file, the `openai-compat` embedder path (with a note to verify any
+  provider's `/v1/embeddings` endpoint before relying on it), a pointer to
   `docs/llm-provider-comparison.md` for model selection, and a security /
   gotchas block (auth-token requirement for non-loopback binds, env-file
   hygiene, cheap-model consolidation drift, `:free`-tier shared-pool
   limits, reasoning-model incompatibility). (#949)
+- `docs/backup.md` documents the remote-git-mirror backup pattern for a
+  single-user install: what to include, what to exclude (derived SQLite index,
+  models cache, logs, secrets), how to schedule with a `systemd --user` timer,
+  how to restore, and the security posture per `SECURITY.md`, including a
+  "what ends up in your wiki" section that names the exposure (sanitized
+  prompts, tool I/O, page bodies) and lists encrypted-archive alternatives
+  (`age`, `restic`, `borg`, `git-crypt`) for cases where a private mirror
+  repo is not enough. A worked example ships under `docs/examples/backup/`
+  (snapshot script, `.service` and `.timer` unit files, `.gitignore` for
+  the mirror repo). Pointers added from `docs/deploy.md#backups`,
+  `docs/airgapped-install.md`, and the README docs table. The on-box
+  `ai-memory backup --to <tarball>` command
+  (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
 ### Fixed
 - `memory_query` now returns `global_scope_hits` (standing `_global` user/team
