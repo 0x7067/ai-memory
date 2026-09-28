@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `[capture] ignore_paths` now covers shell commands. Shell tools (`Bash`,
+  `shell`, `execute_bash`, `terminal`, …) were classified as non-file and always
+  kept, so `cat docs/adr/*.md` stored the ignored file's full text in the
+  observation body. The native `ai-memory hook` now splits the command line
+  lexically and drops the event when an argument, resolved from the event's
+  `cwd`, matches an ignored pattern or is a glob that can reach one. Variables,
+  command substitution and commands that name no path are not followed. The
+  generated OpenCode, OMP, Pi and OpenClaw integrations are unchanged. The
+  marker-file reference also documents excluding large tool results that Claude
+  Code saves and re-reads from `~/.claude/projects/**/tool-results/**`. (#946)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the
