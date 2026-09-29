@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
 ### Fixed
+- `observations.title` is now sanitized before it is truncated, not after.
+  `title_hint` used to be cut to 80 chars in `ai-memory-hooks::payload`
+  *before* the sanitizer ever ran, so a secret straddling that cutoff was
+  often left as a fragment too short to match a built-in or `[sanitize]
+  extra_patterns` rule — landing in the title, its FTS index, and every
+  surface that renders titles (session pages, briefings, handoffs, search)
+  unredacted, even though the same observation's body was correctly scrubbed
+  first. `title_hint` extraction now keeps the full first line untruncated;
+  `Sanitized::new` scrubs the title and only then applies the 80-char display
+  cap (`ai_memory_core::sanitize::truncate_for_title`), mirroring the order
+  the body already used. (#982)
 - The `/web` page view keeps a leading H1 that is not the page title. It
   dropped the body's first H1 whatever it said, as a duplicate of the title
   in the header, but a frontmatter `title:` outranks the H1 and a setext H1
