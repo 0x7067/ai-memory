@@ -33,8 +33,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::capture_policy::{
-    CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource, PolicyState,
-    ToolFamily, metadata_only_body, tool_observation_outcome, valid_call_id,
+    CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource,
+    ExtractionState, PolicyState, ToolFamily, metadata_only_body, tool_observation_outcome,
+    valid_call_id,
 };
 use crate::log;
 use crate::payload::{
@@ -994,13 +995,18 @@ fn metadata_only_protocol_envelope(
 }
 
 /// An invalid marker also strips shell commands, which it cannot prove miss
-/// every ignored path; an active policy decides them outright (keep/drop).
+/// every ignored path; an active policy decides them outright (keep/drop). A
+/// stripped shell body has no paths and its command is always read, so any
+/// other path count or extraction state is not what a client produces.
 const fn metadata_protocol_is_legal(protocol: &CaptureProtocol) -> bool {
-    matches!(
-        (protocol.policy_state(), protocol.tool_family()),
-        (PolicyState::Active | PolicyState::Invalid, ToolFamily::File)
-            | (PolicyState::Invalid, ToolFamily::NonFile)
-    )
+    match (protocol.policy_state(), protocol.tool_family()) {
+        (PolicyState::Active | PolicyState::Invalid, ToolFamily::File) => true,
+        (PolicyState::Invalid, ToolFamily::NonFile) => {
+            protocol.path_count() == 0
+                && matches!(protocol.extraction_state(), ExtractionState::Extracted)
+        }
+        _ => false,
+    }
 }
 
 fn valid_metadata_call_id(value: &serde_json::Value) -> bool {
@@ -12327,6 +12333,33 @@ mod tests {
             inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), search.clone()))
                 .unwrap();
         assert_eq!(env.raw, search);
+    }
+
+    // A stripped non-file body has no paths and is always extracted, so a
+    // metadata-only claim with anything else cannot come from a real client.
+    #[test]
+    fn capture_protocol_invalid_shell_metadata_claim_must_be_canonical() {
+        let admit = |path_count: u16, extraction: &str| {
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "shell-claim", "cwd": "/repo",
+                    "tool_family": "non-file", "tool_name": "non-file",
+                    "_ai_memory_capture": capture_protocol(
+                        "metadata-only", "invalid", "non-file", path_count, extraction),
+                }),
+            ))
+            .is_some()
+        };
+        assert!(admit(0, "extracted"), "control: what a real client sends");
+        assert!(!admit(60_000, "extracted"), "invented path count");
+        assert!(!admit(1, "extracted"), "non-file bodies carry no paths");
+        assert!(!admit(0, "missing-or-malformed"), "file-only extraction");
+        assert!(!admit(0, "not-applicable"), "search-only extraction");
     }
 
     // Review of #973, finding 1: an unparseable marker only made File events
