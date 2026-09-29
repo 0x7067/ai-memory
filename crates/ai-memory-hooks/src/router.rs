@@ -891,11 +891,11 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
 
     let Some(protocol) = CaptureProtocol::parse(raw_protocol) else {
         // A new/malformed marker must not make a recognized file operation
-        // less private. Mark the replacement invalid: an inactive/keep
-        // protocol would falsely describe the server's privacy fallback.
-        // Non-file legacy payloads retain their old behavior.
+        // or shell command less private. Mark the replacement invalid: an
+        // inactive/keep protocol would falsely describe the server's privacy
+        // fallback. Other tools retain their old behavior.
         let decision = direct(PolicyState::Invalid);
-        if decision.protocol().tool_family() == ToolFamily::File {
+        if decision.protocol().disposition() == CaptureDisposition::MetadataOnly {
             return Some(metadata_envelope(env, &decision, None));
         }
         return Some(env);
@@ -12327,6 +12327,41 @@ mod tests {
             inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), search.clone()))
                 .unwrap();
         assert_eq!(env.raw, search);
+    }
+
+    // Review of #973, finding 1: an unparseable marker only made File events
+    // metadata-only, so a shell event kept its command and output.
+    #[test]
+    fn capture_protocol_unparseable_marker_strips_shell_events() {
+        for marker in [
+            serde_json::json!("garbage"),
+            serde_json::json!({"version": 99}),
+            {
+                let mut future = capture_protocol("keep", "invalid", "non-file", 0, "extracted");
+                future["version"] = serde_json::json!(2);
+                future
+            },
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "shell-unparseable", "cwd": "/repo",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "cat docs/adr/secret.md" },
+                    "tool_response": "SENTINEL_SECRET",
+                    "_ai_memory_capture": marker,
+                }),
+            );
+            let stored = inspect_capture_envelope(env).map(|env| env.raw.to_string());
+            assert!(
+                stored.is_none_or(|stored| !stored.contains("SENTINEL_SECRET")),
+                "shell output survived an unparseable marker"
+            );
+        }
     }
 
     #[test]

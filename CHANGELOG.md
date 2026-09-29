@@ -75,10 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notes/x.md"]`) apart and let one element's stray quote hide the elements
   after it; each element now counts whole and is split on its own. An invalid
   `.ai-memory.toml` now makes a shell command metadata-only, like a file tool,
-  instead of keeping its command and output. Applies to the native hook and
-  the generated plugins; the server accepts the new metadata-only shell form,
-  so upgrade it together with them (an older server drops such an event).
-  (#973)
+  instead of keeping its command and output, including one whose command is
+  missing or unparseable (`web_search` runs nothing and is still kept), and the
+  server now does the same when it cannot parse the client's capture marker. A
+  long `bash -lc "<script>"` element is read only as words, not also as one
+  path, so it can no longer exhaust the match budget and drop an innocuous
+  event. Applies to the native hook and the generated plugins; the server
+  accepts the new metadata-only shell form, so upgrade it together with them
+  (an older server drops such an event). (#973)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the
