@@ -83,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing while the observation itself was still captured. Grok now shares the
   Claude Code tool mapping, so tool family, outcome and output land in the
   body. (#931)
+- `ai-memory serve --web-ui-dir` no longer panics at startup when the
+  custom SPA's `index.html` starts with a UTF-8 BOM, or has any other
+  non-ASCII text before `<head>`. The `<base href>` injection scanned the
+  page a byte at a time and sliced inside the multi-byte character
+  ("byte index 1 is not a char boundary"); it now steps a whole
+  character. (#969)
 - `ai-memory bootstrap` on a repository small enough for one chunk no longer
   asks the provider for 64K output tokens. The output cap was keyed on the
   number of chunks, so the only chunk of a small repo got the one-shot cap
