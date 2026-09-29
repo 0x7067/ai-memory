@@ -887,7 +887,7 @@ async fn handle_export_okf(
         Ok(ids) => ids,
         Err((status, body)) => return (status, body).into_response(),
     };
-    match build_okf_bundle_file(&state, ids.0, ids.1).await {
+    match build_okf_bundle_file(&state, ids.0, ids.1, q.project.trim()).await {
         Ok(file) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/gzip")
@@ -914,6 +914,7 @@ async fn build_okf_bundle_file(
     state: &AdminState,
     ws: ai_memory_core::WorkspaceId,
     proj: ai_memory_core::ProjectId,
+    project_name: &str,
 ) -> anyhow::Result<tokio::fs::File> {
     let bundle_dir = state
         .data_dir
@@ -993,8 +994,9 @@ async fn build_okf_bundle_file(
             .iter()
             .map(|f| format!("- [{f}/]({f}/)\n"))
             .collect();
-        let index =
-            format!("---\nokf_version: \"0.2\"\n---\n\n# Bundle index — concept files by directory\n\n{listing}");
+        let index = format!(
+            "---\nokf_version: \"0.2\"\n---\n\n# Bundle index — concept files by directory\n\n{listing}"
+        );
         let mut header = tar::Header::new_gnu();
         header.set_size(index.len() as u64);
         header.set_mode(0o644);
@@ -1003,7 +1005,7 @@ async fn build_okf_bundle_file(
         for (path, raw) in files {
             let rel = path.strip_prefix(&bundle_dir).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
-            let bytes = augment_page_for_export(&raw, &rel_str)?;
+            let bytes = augment_page_for_export(&raw, &rel_str, project_name)?;
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
@@ -1019,10 +1021,15 @@ async fn build_okf_bundle_file(
 }
 
 /// Export-only augmentation of one wiki page's bytes for the OKF bundle:
-/// backfills `title`/`description` when derivable (issue #960 item 2).
+/// backfills `title`/`description` when derivable and rewrites local
+/// wikilinks to bundle-relative Markdown links (issue #960 items 2 and 3).
 /// Never touches the on-disk wiki file — the caller tars the returned
 /// bytes instead of the source file.
-fn augment_page_for_export(raw: &str, rel_path: &str) -> anyhow::Result<Vec<u8>> {
+fn augment_page_for_export(
+    raw: &str,
+    rel_path: &str,
+    project_name: &str,
+) -> anyhow::Result<Vec<u8>> {
     let page_path = ai_memory_core::PagePath::new(rel_path.to_string())?;
     let mut md = ai_memory_wiki::parse(raw)?;
 
@@ -1066,11 +1073,10 @@ fn augment_page_for_export(raw: &str, rel_path: &str) -> anyhow::Result<Vec<u8>>
         map.insert("title".into(), serde_json::Value::String(title));
     }
     if let Some(description) = description {
-        map.insert(
-            "description".into(),
-            serde_json::Value::String(description),
-        );
+        map.insert("description".into(), serde_json::Value::String(description));
     }
+
+    md.body = ai_memory_wiki::rewrite_local_wikilinks(&md.body, &page_path, project_name);
 
     Ok(ai_memory_wiki::emit(&md)?.into_bytes())
 }
@@ -8619,7 +8625,14 @@ mod tests {
     #[tokio::test]
     async fn export_okf_index_has_no_prose_outside_the_list() {
         let (_tmp, router) = read_page_test_router();
-        post_write_page(&router, "default", "scratch", "gotchas/build.md", "watch out").await;
+        post_write_page(
+            &router,
+            "default",
+            "scratch",
+            "gotchas/build.md",
+            "watch out",
+        )
+        .await;
 
         let resp = router
             .clone()
@@ -8747,6 +8760,70 @@ mod tests {
         let on_disk = std::fs::read_to_string(proj_dir.join("concepts/no-title.md")).unwrap();
         let on_disk_fm = ai_memory_wiki::parse(&on_disk).unwrap().frontmatter;
         assert!(on_disk_fm.get("title").is_none(), "{on_disk_fm:?}");
+    }
+
+    /// Issue #960 item 3: a generic OKF consumer has no idea what
+    /// `[[decisions/b.md]]` means. Local wikilinks become bundle-relative
+    /// Markdown links at export; a cross-project wikilink has no Markdown
+    /// equivalent and ships untouched.
+    #[tokio::test]
+    async fn export_okf_rewrites_local_wikilinks_to_relative_markdown_links() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/seed.md", "seed").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::create_dir_all(proj_dir.join("concepts")).unwrap();
+        std::fs::create_dir_all(proj_dir.join("decisions")).unwrap();
+        std::fs::write(
+            proj_dir.join("decisions/b.md"),
+            "---\ntype: Decision\n---\n\nB.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_dir.join("concepts/a.md"),
+            "---\ntype: Concept\n---\n\nSee [[decisions/b.md]] and [[other-project:x.md]].\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let mut a_body = String::new();
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().display().to_string() == "concepts/a.md" {
+                use std::io::Read as _;
+                entry.read_to_string(&mut a_body).unwrap();
+            }
+        }
+        let parsed = ai_memory_wiki::parse(&a_body).unwrap();
+        assert!(
+            parsed.body.contains("[decisions/b.md](../decisions/b.md)"),
+            "{}",
+            parsed.body
+        );
+        assert!(
+            parsed.body.contains("[[other-project:x.md]]"),
+            "cross-project wikilink must ship untouched: {}",
+            parsed.body
+        );
+
+        // Never mutated on disk.
+        let on_disk = std::fs::read_to_string(proj_dir.join("concepts/a.md")).unwrap();
+        assert!(on_disk.contains("[[decisions/b.md]]"));
     }
 
     /// Post-audit regression: the things a REAL deployment's tree holds

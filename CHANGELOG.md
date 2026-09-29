@@ -170,6 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing, so a generic OKF consumer sees both §4.1-recommended keys. The
   backfill only ever changes the bundle's copy, never the on-disk wiki file.
   (#960)
+- `export-okf` now rewrites a page's local `[[wikilink]]`s to bundle-relative
+  standard Markdown links, since a generic OKF consumer has no idea what
+  `[[decisions/b.md]]` means. A cross-project or cross-workspace wikilink has
+  no Markdown equivalent and ships untouched, as literal `[[...]]` text.
+  (#960)
 
 ## [2.4.1] - 2026-09-25
 
