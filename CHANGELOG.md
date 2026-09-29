@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory backup --to <tarball>` command
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
+### Changed
+- Documented Cheaper Inference as an endpoint for the existing `openai-compat`
+  provider.
+
 ### Fixed
 - `observations.title` is now sanitized before it is truncated, not after.
   `title_hint` used to be cut to 80 chars in `ai-memory-hooks::payload`
