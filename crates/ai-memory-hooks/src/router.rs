@@ -12161,6 +12161,70 @@ mod tests {
         }
     }
 
+    /// Regression for #980: a secret straddling the old 80-char `title_hint`
+    /// cutoff survived in `observations.title` unredacted, because
+    /// `payload::truncate_for_title` used to cut the prompt to 80 chars
+    /// *before* the sanitizer ever ran — often leaving too short a fragment
+    /// to match a pattern (built-in or `[sanitize] extra_patterns`). The fix
+    /// removed truncation from `title_hint` construction entirely; the
+    /// 80-char cap now runs in `Sanitized::new`, after `Sanitizer::scrub`.
+    ///
+    /// Before the fix: the stored title contains a raw, unmatched fragment of
+    /// the secret and no `[REDACTED:…]` marker at all, because the sanitizer
+    /// only ever saw the truncated 8-character prefix `SECRETZZ` — too short
+    /// for the `{20,}`-length pattern below. After the fix: the full secret
+    /// reaches the sanitizer first, gets replaced with the marker, and the
+    /// (much shorter) redacted title is what gets capped at 80 chars.
+    #[tokio::test]
+    async fn issue_980_user_prompt_title_is_sanitized_before_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let prompt = format!("{} {secret}", "x".repeat(70));
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "prompt": prompt,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let obs = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::UserPrompt)
+            .expect("user prompt observation was recorded");
+
+        assert!(
+            !obs.title.contains(&secret),
+            "full raw secret leaked into title: {:?}",
+            obs.title
+        );
+        assert!(
+            obs.title.contains("REDACT"),
+            "title carries no trace of redaction \u{2014} the sanitizer never \
+             saw enough of the secret to match it: {:?}",
+            obs.title
+        );
+        assert!(
+            obs.title.chars().count() <= 80,
+            "title exceeded the 80-char display cap: {:?}",
+            obs.title
+        );
+    }
+
     #[test]
     fn codex_native_patch_capture_backstop_discards_unproven_output() {
         for protocol in [
