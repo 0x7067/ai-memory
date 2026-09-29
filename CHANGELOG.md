@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [2.4.2] - 2026-09-29
+
+### Changed
+- Documented Cheaper Inference as an endpoint for the existing `openai-compat`
+  provider. (#981)
 - `docs/llm-providers.md` now has a dedicated OpenRouter subsection and a
   matching row in the recommended-defaults table. The wiring
   (`openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1`)
@@ -35,7 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory backup --to <tarball>` command
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
+
 ### Fixed
+- `observations.title` is now sanitized before it is truncated, not after.
+  `title_hint` used to be cut to 80 chars in `ai-memory-hooks::payload`
+  *before* the sanitizer ever ran, so a secret straddling that cutoff was
+  often left as a fragment too short to match a built-in or `[sanitize]
+  extra_patterns` rule — landing in the title, its FTS index, and every
+  surface that renders titles (session pages, briefings, handoffs, search)
+  unredacted, even though the same observation's body was correctly scrubbed
+  first. `title_hint` extraction now keeps the full first line untruncated;
+  `Sanitized::new` scrubs the title and only then applies the 80-char display
+  cap (`ai_memory_core::sanitize::truncate_for_title`), mirroring the order
+  the body already used. (#982)
 - The `/web` page view keeps a leading H1 that is not the page title. It
   dropped the body's first H1 whatever it said, as a duplicate of the title
   in the header, but a frontmatter `title:` outranks the H1 and a setext H1
@@ -162,6 +178,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local example listed the page in the target's backlinks, while the web
   page rendered neither as a link. A link whose label is code
   (`` [`foo`](foo.md) ``) is still indexed. (#968)
+- `export-okf`'s generated `index.md` no longer has a prose sentence outside
+  its list structure. Some strict OKF v0.2 validators read §11.3 as
+  rejecting it. (#979)
+- `export-okf` now backfills a `title` (derived, same as `derive_title`) and
+  a `description` (from `summary`, else `abstract`) on an exported page when
+  missing, so a generic OKF consumer sees both §4.1-recommended keys. The
+  backfill only ever changes the bundle's copy, never the on-disk wiki file.
+  (#979)
+- `export-okf` now rewrites a page's local `[[wikilink]]`s to bundle-relative
+  standard Markdown links, since a generic OKF consumer has no idea what
+  `[[decisions/b.md]]` means. A cross-project or cross-workspace wikilink has
+  no Markdown equivalent and ships untouched, as literal `[[...]]` text.
+  (#979)
+- `sources[].author` in conformed frontmatter is now `process:<agent>`
+  (e.g. `process:claude-code`) instead of a bare agent name, matching the
+  OKF actor grammar's `process:<id>` form for automated processes (#979).
+  This changes the default `sources[].author` value written for every page
+  from now on; already-written pages are not retroactively rewritten.
+
 
 ## [2.4.1] - 2026-09-25
 
@@ -6711,7 +6746,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...HEAD
+[2.4.2]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.4.0
 [2.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.2

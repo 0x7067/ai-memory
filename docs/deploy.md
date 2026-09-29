@@ -450,7 +450,10 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
 - **Provider failures**: `ai-memory status` reports passive LLM and
   embedding health from the last real provider call. A fresh process
   reports `unknown` until the server actually uses that role; it does
-  not probe providers or spend tokens for health reporting.
+  not probe providers or spend tokens for health reporting. If provider
+  calls fail with `invalid peer certificate: UnknownIssuer` behind a
+  TLS-inspecting firewall or antivirus, see
+  [https-via-proxy.md](https-via-proxy.md#outbound-llm-calls-fail-behind-a-tls-inspecting-firewall).
 - **Container restart loop**: check
   `docker logs ai-memory` - the `ai-memory starting` line at the top
   reports the resolved config; a missing required env var (e.g.
