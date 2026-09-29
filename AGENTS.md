@@ -310,7 +310,10 @@ no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
-  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
+  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`,
+  `scripts/check-nix-packaging.sh` (Nix flake output).
+- `.github/workflows/nix.yml` matrix covers `x86_64-linux` + `aarch64-darwin`;
+  NixOS module eval is Linux-only.
 - CI additionally runs `cargo build --release --bin ai-memory` on
   Linux/macOS, a Docker image smoke test, `cargo audit` (with the ignores
   listed in `ci.yml`), and differential gitleaks scanning.

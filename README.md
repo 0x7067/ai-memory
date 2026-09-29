@@ -349,6 +349,60 @@ Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 and only what it installed. Install commands are idempotent and write
 timestamped backups next to any file they touch.
 
+### NixOS
+
+This flake ships a NixOS module (`nixosModules.default`) with a
+`systemd.services.ai-memory` unit. Isolation matches the packaged FHS unit:
+a dedicated `ai-memory` system user (`nologin`, no linger) plus the same
+systemd sandbox (`ProtectSystem = "strict"`, empty capability sets,
+`MemoryDenyWriteExecute`, `RestrictAddressFamilies`, and the rest — see
+[`nix/systemd-sandbox.nix`](nix/systemd-sandbox.nix)).
+
+```nix
+{
+  inputs.ai-memory.url = "github:akitaonrails/ai-memory";
+
+  outputs = { nixpkgs, ai-memory, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ai-memory.nixosModules.default
+        {
+          services.ai-memory = {
+            enable = true;
+            # enableWeb = true;  # off by default — the web UI is opt-in
+            settings = {
+              allowed_hosts = [ "localhost" "127.0.0.1" "::1" "homelab.example" ];
+              log_level = "info";
+            };
+            # Loopback (default): secrets optional; missing env file is tolerated.
+            # Non-loopback: set one of ageSecret, sopsSecret, or environmentFile.
+            # ageSecret = "ai-memory-env";  # config.age.secrets.<name> (agenix)
+            # sopsSecret = "ai-memory/env"; # config.sops.secrets.<name> (sops-nix)
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Declarative non-secret config lives in `services.ai-memory.settings` (typed
+options mirroring `config.toml`, plus `freeformType` for forward-compat keys).
+The module renders a generated TOML file and passes `--config`. Top-level
+`bind`, `port`, and `enableWeb` win over duplicate settings keys.
+
+Secrets such as `AI_MEMORY_AUTH_TOKEN` never go in `settings` or the Nix
+store. Use `ageSecret` / `sopsSecret` (consume `config.age` / `config.sops`
+when the host imports agenix or sops-nix) or `environmentFile` as an escape
+hatch. Non-loopback binds require one of those sources; loopback may omit
+them and tolerates a missing env file (systemd `EnvironmentFile=-…`). Put TLS
+in front of a LAN/WAN bind — see [`docs/https-via-proxy.md`](docs/https-via-proxy.md).
+
+All options and defaults are in [`nix/nixos-module.nix`](nix/nixos-module.nix).
+Entirely opt-in — `nix build`, `nix run`, `nix develop`, and the CLI are
+unchanged if you don't import it.
+
 ## Everyday use
 
 Day to day, you mostly do not think about ai-memory. Hooks capture

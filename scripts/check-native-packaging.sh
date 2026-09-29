@@ -184,12 +184,34 @@ main() {
     "${TMP_ROOT}/usr/lib/systemd/system/ai-memory-user-parse-test.service"
   systemd-analyze --root="${TMP_ROOT}" verify ai-memory-user-parse-test.service
 
-  log "Checking expected native paths and modes"
+  log "Checking expected native paths, sandbox, and modes"
   assert_contains packaging/systemd/ai-memory.service "--data-dir /var/lib/ai-memory"
   assert_contains packaging/systemd/ai-memory.service "--config /etc/ai-memory/config.toml"
   assert_contains packaging/systemd/ai-memory.service "EnvironmentFile=-/etc/ai-memory/env"
   assert_contains packaging/systemd/ai-memory.service "StateDirectory=ai-memory"
   assert_contains packaging/systemd/ai-memory.service "ReadWritePaths=/var/lib/ai-memory"
+  for sandbox_key in \
+    "CapabilityBoundingSet=" \
+    "AmbientCapabilities=" \
+    "MemoryDenyWriteExecute=true" \
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" \
+    "RestrictNamespaces=true" \
+    "RestrictRealtime=true" \
+    "RestrictSUIDSGID=true" \
+    "LockPersonality=true" \
+    "PrivateDevices=true" \
+    "RemoveIPC=true" \
+    "ProtectKernelTunables=true" \
+    "ProtectKernelModules=true" \
+    "ProtectKernelLogs=true" \
+    "ProtectControlGroups=true" \
+    "ProtectClock=true" \
+    "ProtectHostname=true" \
+    "SystemCallArchitectures=native" \
+    "UMask=0077"; do
+    assert_contains packaging/systemd/ai-memory.service "${sandbox_key}"
+    assert_contains packaging/systemd/ai-memory-user.service "${sandbox_key}"
+  done
   assert_contains packaging/systemd/ai-memory-user.service "--data-dir %h/.local/share/ai-memory"
   assert_contains packaging/systemd/ai-memory-user.service "--config %h/.config/ai-memory/config.toml"
   assert_contains packaging/systemd/ai-memory-user.service "EnvironmentFile=-%h/.config/ai-memory/env"

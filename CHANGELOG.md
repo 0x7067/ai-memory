@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `.github/workflows/nix.yml` now builds the flake on `x86_64-linux` and
+  `aarch64-darwin` with `scripts/check-nix-packaging.sh` artifact smoke tests
+  (binary, hooks, config template, `nix run`); NixOS module eval stays on the
+  Linux leg only. (#NNN)
+
+### Added
+- A NixOS module (`nix/nixos-module.nix`, exposed as `nixosModules.default`)
+  so NixOS hosts can run `services.ai-memory.enable = true` as a hardened
+  systemd service — dedicated `ai-memory` system user (`nologin`, gated by
+  `createUser`) plus a shared systemd sandbox applied to both NixOS and the
+  packaged FHS units (`nix/systemd-sandbox.nix`). Typed
+  `services.ai-memory.settings` renders declarative `config.toml`; secrets use
+  `ageSecret`, `sopsSecret`, or `environmentFile` (required for non-loopback
+  binds). The web UI defaults off (`enableWeb = false`, matching the CLI
+  flag's own default rather than the packaged unit's hardcoded
+  `--enable-web`). `flake.nix` adds eval checks for sandbox keys, settings →
+  `--config`, and agenix/sops wiring. The existing `flake.nix`
+  package/devShell/CLI build is unchanged. (#NNN)
+
 ### Fixed
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /

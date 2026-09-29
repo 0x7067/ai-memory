@@ -44,18 +44,147 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       flake-utils,
       rust-overlay,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
+    let
+      linuxPkgs = import nixpkgs {
+        system = "x86_64-linux";
+        overlays = [ (import rust-overlay) ];
+      };
+      inherit (linuxPkgs) lib;
+
+      sandboxModule = import ./nix/systemd-sandbox.nix { inherit lib; };
+
+      # Eval-only NixOS module smoke tests. Kept at the top level under
+      # checks.x86_64-linux only — the eval always targets x86_64-linux, so
+      # duplicating these under eachDefaultSystem would add noise on Darwin.
+      ageSopsStub =
+        { lib, ... }:
+        {
+          options.age.secrets = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.submodule {
+              options.path = lib.mkOption { type = lib.types.path; };
+            });
+            default = { };
+          };
+          options.sops.secrets = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.submodule {
+              options.path = lib.mkOption { type = lib.types.path; };
+            });
+            default = { };
+          };
+          config.age.secrets.ai-memory-env.path = "/run/agenix/ai-memory-env";
+          config.sops.secrets."ai-memory/env".path = "/run/secrets/ai-memory/env";
+        };
+
+      mkNixos = extra: nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          self.nixosModules.default
+          ageSopsStub
+          extra
+        ];
+      };
+
+      # enableWeb defaults to false, so the enabled-smoke config sets
+      # it explicitly to true — this exercises the --enable-web
+      # wiring, it isn't asserting what the default is.
+      enabled = mkNixos { services.ai-memory = { enable = true; enableWeb = true; }; };
+      disabled = mkNixos { services.ai-memory.enable = false; };
+      withSettings = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          settings.allowed_hosts = [
+            "localhost"
+            "127.0.0.1"
+            "::1"
+          ];
+          settings.log_level = "info";
+        };
+      };
+      withAge = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          bind = "0.0.0.0";
+          ageSecret = "ai-memory-env";
+        };
+      };
+      withSops = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          bind = "0.0.0.0";
+          sopsSecret = "ai-memory/env";
+        };
+      };
+      loopbackEnvFile = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          environmentFile = "/run/ai-memory/env";
+        };
+      };
+      nonLoopbackNoSecrets = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          bind = "0.0.0.0";
+        };
+      };
+      failingAssertions =
+        lib.filter (a: !a.assertion) nonLoopbackNoSecrets.config.assertions;
+
+      enabledSc = enabled.config.systemd.services.ai-memory.serviceConfig;
+      execStart = enabledSc.ExecStart;
+      settingsExec =
+        withSettings.config.systemd.services.ai-memory.serviceConfig.ExecStart;
+
+      nixosChecks = {
+        nixos-module-eval =
+          assert lib.hasInfix "--enable-web" execStart;
+          assert lib.hasInfix "--bind 127.0.0.1:49374" execStart;
+          assert !(disabled.config.systemd.services ? ai-memory);
+          assert enabledSc.MemoryDenyWriteExecute == true;
+          assert enabledSc.RestrictNamespaces == true;
+          assert enabledSc.UMask == "0077";
+          assert enabledSc.CapabilityBoundingSet == [ ];
+          assert enabledSc.NoNewPrivileges == true;
+          assert enabledSc.PrivateTmp == true;
+          assert enabledSc.ProtectHome == true;
+          assert enabledSc.ProtectSystem == "strict";
+          assert lib.hasInfix "--config" settingsExec;
+          assert withAge.config.systemd.services.ai-memory.serviceConfig.EnvironmentFile
+            == "/run/agenix/ai-memory-env";
+          assert withSops.config.systemd.services.ai-memory.serviceConfig.EnvironmentFile
+            == "/run/secrets/ai-memory/env";
+          assert loopbackEnvFile.config.systemd.services.ai-memory.serviceConfig.EnvironmentFile
+            == "-/run/ai-memory/env";
+          assert failingAssertions != [ ];
+          assert lib.any (a: lib.hasInfix "non-loopback bind requires" a.message)
+            failingAssertions;
+          linuxPkgs.runCommand "ai-memory-nixos-module-eval" { } "touch $out";
+
+        nixos-sandbox-parity =
+          let
+            sandboxKeys = lib.attrNames sandboxModule.aiMemorySystemSandbox;
+            enabledSandboxKeys = lib.attrNames (
+              lib.filterAttrs (name: _: lib.elem name sandboxKeys) enabledSc
+            );
+          in
+          assert lib.sort lib.lessThanStr sandboxKeys
+            == lib.sort lib.lessThanStr enabledSandboxKeys;
+          linuxPkgs.runCommand "ai-memory-nixos-sandbox-parity" { } "touch $out";
+      };
+    in
+    (flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
+        inherit (pkgs) lib;
 
         # Read the same toolchain file the project pins for every other CI
         # path — rust-toolchain.toml says `channel = "1.95"`.
@@ -142,5 +271,19 @@
           '';
         };
       }
-    );
+    ))
+    // {
+      # Additive: a NixOS host can run `services.ai-memory.enable = true` to
+      # get this binary as a hardened systemd service (see
+      # nix/nixos-module.nix). Merged at the top level, not inside
+      # eachDefaultSystem, because NixOS modules are not system-scoped.
+      nixosModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/nixos-module.nix ];
+          config.services.ai-memory.package = lib.mkDefault self.packages.${pkgs.system}.default;
+        };
+
+      checks.x86_64-linux = nixosChecks;
+    };
 }
