@@ -1156,6 +1156,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();

@@ -43,6 +43,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
         trusted_proxy_identity: false,
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         db_path,
     };
     (state, store)

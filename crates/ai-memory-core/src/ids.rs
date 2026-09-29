@@ -82,9 +82,12 @@ id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
 
 impl SessionId {
-    /// The stored id for a harness's own session id: the id itself when it is
-    /// a UUID, otherwise a deterministic v5 UUID of it, so hook POSTs and later
-    /// lookups by native id share one key.
+    /// Resolve a harness-native session id to the `SessionId` the store keys
+    /// on: a UUID native id is used as-is (canonicalized); any other string
+    /// (Codex, OpenCode, ...) is hashed to a deterministic UUID v5, so hook
+    /// POSTs and later lookups by native id share one key. The hook router and
+    /// any offline tool that matches transcripts by native id (e.g.
+    /// `ai-memory repair-backfill-timestamps`) must agree on this one rule.
     #[must_use]
     pub fn from_native(raw: &str) -> Self {
         Self::from_str(raw)
@@ -103,20 +106,6 @@ id_newtype!(pub ApiCredentialId, "Identifier for one native `aim_` API credentia
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
 id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
-
-impl SessionId {
-    /// Resolve a harness-native session id to the `SessionId` the store keys
-    /// on: a UUID native id is used as-is (canonicalized); any other string
-    /// (Codex, OpenCode, ...) is hashed to a deterministic UUID v5. The hook
-    /// router and any offline tool that matches transcripts by native id
-    /// (e.g. `ai-memory repair-backfill-timestamps`) must agree on this one
-    /// rule to end up with the same key.
-    #[must_use]
-    pub fn from_native(raw: &str) -> Self {
-        raw.parse::<Self>()
-            .unwrap_or_else(|_| Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
-    }
-}
 
 /// Relative path of a page within the wiki tree.
 ///
