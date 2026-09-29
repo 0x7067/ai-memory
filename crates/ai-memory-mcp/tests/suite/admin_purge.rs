@@ -112,6 +112,7 @@ async fn seed_ended_session_summary(
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: session_id,
             workspace_id: ws,
             project_id: proj,
@@ -211,6 +212,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: proj,
@@ -225,6 +227,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id: sid,
                         workspace_id: ws,
                         project_id: proj,

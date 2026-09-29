@@ -130,7 +130,10 @@ fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
         return format!("Session {session_id}");
     }
     for obs in observations {
-        if obs.kind == ObservationKind::SessionStart {
+        // The router titles an untitled lifecycle event with its kind name
+        // (`stop`, `session-end`): a string every such page would share, and
+        // what this loop reached once tool-family labels were skipped (#895).
+        if obs.kind == ObservationKind::SessionStart || obs.title == obs.kind.as_str() {
             continue;
         }
         // A `tool <family>` label is a partition of the calls, not a title:
@@ -761,6 +764,32 @@ mod tests {
     /// is a partition of the calls, so the fallback loop must skip it and fall
     /// through to the session's own identity, never surface "tool non-file" as
     /// the page title (#895).
+    /// The shape a real SessionEnd synthesises from: the router stores the
+    /// kind name as the title of a lifecycle event that carries none
+    /// (`title_hint.unwrap_or(kind)`), so once the tool labels are skipped the
+    /// fallback reached `stop`, or `session-end` when no Stop was captured.
+    #[test]
+    fn a_labels_only_session_does_not_fall_through_to_a_lifecycle_literal() {
+        let sid = test_session_id();
+        let with_stop = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+            obs(ObservationKind::PreToolUse, "tool non-file"),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+            obs(ObservationKind::Stop, ObservationKind::Stop.as_str()),
+            obs(
+                ObservationKind::SessionEnd,
+                ObservationKind::SessionEnd.as_str(),
+            ),
+        ];
+        assert_eq!(derive_title(&with_stop, sid), format!("Session {sid}"));
+        let without_stop: Vec<_> = with_stop
+            .into_iter()
+            .filter(|o| o.kind != ObservationKind::Stop)
+            .collect();
+        assert_eq!(derive_title(&without_stop, sid), format!("Session {sid}"));
+    }
+
     #[test]
     fn a_model_id_on_session_start_never_becomes_the_title() {
         let sid = test_session_id();

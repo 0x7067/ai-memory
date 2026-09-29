@@ -1485,6 +1485,7 @@ async fn fetch_and_accept_handoff_at(
     let receiving_session = if handoff.is_some() {
         match accepting_session {
             Some(id) => Some(NewSession {
+                occurred_at: None,
                 id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2926,6 +2927,7 @@ async fn process_authorized(
             agent_kind: env.agent,
             cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
             actor_user: owner_stamp.clone(),
+            occurred_at: env.occurred_at_micros(),
         };
         let kind = env.event.to_observation_kind();
         let raw_obs = NewObservation {
@@ -2941,6 +2943,7 @@ async fn process_authorized(
                 .unwrap_or_else(|| kind.as_str().to_string()),
             body: env.body_excerpt.clone().unwrap_or_default(),
             importance: importance_for(env.event),
+            occurred_at: env.occurred_at_micros(),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -3155,7 +3158,7 @@ async fn process_authorized(
         if is_ephemeral_session(&observations) {
             let outcome = state
                 .writer
-                .end_admitted_lifecycle_only_session(admitted.clone())
+                .end_admitted_lifecycle_only_session(admitted.clone(), env.occurred_at_micros())
                 .await?;
             match outcome {
                 ai_memory_store::LifecycleOnlyEndOutcome::Ended { reopened_handoff } => {
@@ -3301,13 +3304,22 @@ async fn process_authorized(
                 Some(handoff) => Some(
                     state
                         .writer
-                        .end_admitted_session_with_handoff(admitted.clone(), Some(page_id), handoff)
+                        .end_admitted_session_with_handoff(
+                            admitted.clone(),
+                            Some(page_id),
+                            handoff,
+                            env.occurred_at_micros(),
+                        )
                         .await?,
                 ),
                 None => {
                     state
                         .writer
-                        .end_admitted_session(admitted.clone(), Some(page_id))
+                        .end_admitted_session(
+                            admitted.clone(),
+                            Some(page_id),
+                            env.occurred_at_micros(),
+                        )
                         .await?;
                     None
                 }
@@ -4647,6 +4659,7 @@ mod tests {
         state
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: state.workspace_id,
                 project_id: state.project_id,
@@ -4661,6 +4674,7 @@ mod tests {
             .insert_observation_ingest(
                 Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: state.workspace_id,
                         project_id: state.project_id,
@@ -5830,6 +5844,7 @@ mod tests {
         let pending_obs = || {
             Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -8479,6 +8494,7 @@ mod tests {
                     .insert_observation_ingest(
                         Sanitized::new(
                             NewObservation {
+                                occurred_at: None,
                                 session_id,
                                 workspace_id: state.workspace_id,
                                 project_id: state.project_id,
@@ -10012,6 +10028,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: state.workspace_id,
                     project_id,
@@ -10112,6 +10129,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: state.workspace_id,
                     project_id,
@@ -11384,6 +11402,7 @@ mod tests {
         state
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: state.workspace_id,
                 project_id: target,
@@ -11523,6 +11542,7 @@ mod tests {
         let pending_observation = || {
             Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,
@@ -12016,6 +12036,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id: state.workspace_id,
                     project_id: state.project_id,
@@ -14013,6 +14034,34 @@ mod tests {
     }
 
     #[test]
+    fn capture_protocol_shell_decisions_survive_server_reinspection() {
+        // The server never sees the client's patterns, so its direct
+        // re-inspection of a shell command must accept the client's Keep
+        // unchanged and treat the client's Drop as terminal.
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let kept = serde_json::json!({
+            "session_id": "shell-keep", "tool_name": "Bash",
+            "tool_input": { "command": "cat src/main.rs *.md" },
+            "_ai_memory_capture": capture_protocol("keep", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), kept.clone());
+        assert_eq!(inspect_capture_envelope(env).unwrap().raw, kept);
+
+        let dropped = serde_json::json!({
+            "session_id": "shell-drop", "tool_name": "Bash",
+            "tool_input": { "command": "cat docs/adr/0001.md" },
+            "tool_response": "SENTINEL_SECRET",
+            "_ai_memory_capture": capture_protocol("drop", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), dropped);
+        assert!(inspect_capture_envelope(env).is_none());
+    }
+
+    #[test]
     fn capture_protocol_invalid_file_keep_becomes_canonical_metadata_only() {
         let env = HookEnvelope::from_query_and_body(
             HookQuery {
@@ -14965,5 +15014,111 @@ mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// End-to-end proof that a client-supplied `occurred_at` reaches every
+    /// timestamp column it is supposed to via the real `/hook` ingest path
+    /// (`process_authorized` -> `admit_hook_session_event` for the session
+    /// row, `insert_observation*` for the observation), not just the
+    /// lower-level store functions those handlers call. `admit_hook_session_event`
+    /// creates the `sessions` row on its own INSERT, separate from
+    /// `begin_session_row`, so this is the path a real backfilled
+    /// session-start actually takes.
+    #[tokio::test]
+    async fn hook_occurred_at_stamps_session_and_observation_times_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = "occurred-at-e2e";
+        let start_at = "2025-09-10T12:00:00Z";
+        let prompt_at = "2025-09-10T12:01:00Z";
+        let end_at = "2025-09-10T12:05:00Z";
+        let envelope = |event: &str, occurred_at: &str, prompt: Option<&str>| {
+            let mut body = serde_json::json!({
+                "session_id": session,
+                "occurred_at": occurred_at,
+            });
+            if let Some(prompt) = prompt {
+                body["prompt"] = serde_json::json!(prompt);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        process(
+            &state,
+            envelope("session-start", start_at, None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            envelope("user-prompt-submit", prompt_at, Some("backfilled prompt")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            envelope("session-end", end_at, None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id = resolve_native_session_id(session);
+        let summary = state
+            .reader
+            .session_summary_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .expect("session row exists");
+        let expected_start = start_at.parse::<jiff::Timestamp>().unwrap().to_string();
+        let expected_end = end_at.parse::<jiff::Timestamp>().unwrap().to_string();
+        assert_eq!(
+            summary.started_at, expected_start,
+            "started_at must come from the session-start event's occurred_at, \
+             not import time (admit_hook_session_event's own INSERT)"
+        );
+        assert_eq!(
+            summary.ended_at.as_deref(),
+            Some(expected_end.as_str()),
+            "ended_at must come from the session-end event's occurred_at"
+        );
+        assert!(
+            summary.started_at <= expected_end,
+            "a backfilled session must not end before it starts"
+        );
+
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let prompt_obs = observations
+            .iter()
+            .find(|o| o.body == "backfilled prompt")
+            .expect("the user-prompt observation was recorded");
+        let expected_prompt_at = prompt_at.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(
+            prompt_obs.created_at, expected_prompt_at,
+            "created_at must come from the observation's own occurred_at"
+        );
     }
 }

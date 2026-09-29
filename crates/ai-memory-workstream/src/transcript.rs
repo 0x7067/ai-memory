@@ -291,9 +291,10 @@ pub fn native_session_in_checkout(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     let mut statement = connection.prepare(&format!(
-        "SELECT 1 FROM {table} WHERE id = ?1 AND directory = ?2"
+        "SELECT 1 FROM {table} WHERE id = ?1 AND directory IN (?2, ?3)"
     ))?;
-    Ok(statement.exists(params![native_session_id, cwd.to_string_lossy()])?)
+    let (native, forward) = opencode_directories(cwd);
+    Ok(statement.exists(params![native_session_id, native, forward])?)
 }
 
 /// Check whether one exact native session still exists in the harness's
@@ -4699,7 +4700,8 @@ mod tests {
 
     // OpenCode records `C:/Users/me/repo`; the checkout path is
     // `C:\Users\me\repo`. Both the v1 and v2 stores are found from the native
-    // spelling, and a sibling directory still is not.
+    // spelling, a session is recognised as this checkout's, and a sibling
+    // directory still is not.
     #[cfg(windows)]
     #[test]
     fn opencode_stores_match_forward_slash_directories_on_windows() {
@@ -4741,6 +4743,16 @@ mod tests {
                 .map(|s| s.native_session_id.as_str())
                 .collect();
             assert_eq!(ids, ["mine"], "{table}");
+            let harness = if table == "session" {
+                ManagedHarness::OpenCode
+            } else {
+                ManagedHarness::OpenCode2
+            };
+            let in_checkout = |id: &str| {
+                native_session_in_checkout(harness, temp.path(), &cwd, Some(&db_root), id).unwrap()
+            };
+            assert!(in_checkout("mine"), "{table}");
+            assert!(!in_checkout("sibling"), "{table}");
         }
     }
 

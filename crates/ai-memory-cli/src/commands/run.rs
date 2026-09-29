@@ -2729,7 +2729,10 @@ mod tests {
         rollout("prepared", "prepared", &cwd);
         rollout("nested", "nested", &temp.path().join("other-checkout"));
         rollout("concurrent", "concurrent-newer", &cwd);
-        let plan = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        let mut plan = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        // The plan reads the process environment: a developer's CODEX_HOME
+        // would send discovery away from the rollouts planted under `temp`.
+        plan.session_dir = None;
         let status = |linked: bool, native: &str| ManagedRunStatus {
             run_id: ManagedRunId::new(),
             workstream_id: WorkstreamId::new(),
@@ -2805,13 +2808,18 @@ mod tests {
         )
         .unwrap();
 
-        let utility = build_launch_plan(
+        let mut utility = build_launch_plan(
             ManagedHarness::Codex,
             None,
             vec![OsString::from("--version")],
             None,
         )
         .unwrap();
+        // Both plans read the process environment. With a developer's
+        // CODEX_HOME set, discovery would look away from the rollout planted
+        // under `temp`, and the `is_none()` below would pass for that reason
+        // instead of the passthrough one.
+        utility.session_dir = None;
         assert_eq!(utility.mode, LaunchMode::Passthrough);
         assert!(
             resolve_native_session_after_run(
@@ -2827,7 +2835,8 @@ mod tests {
             .is_none()
         );
 
-        let session = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        let mut session = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        session.session_dir = None;
         assert_eq!(
             resolve_native_session_after_run(
                 &session,

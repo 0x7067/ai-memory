@@ -21,6 +21,7 @@ use anyhow::Result;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -96,6 +97,9 @@ fn resolve_file_appender(
 ///   operator can restore the external MCP SDK's per-request info logs
 ///   through `log_level` (e.g. `info,rmcp=info`) without setting `RUST_LOG`.
 ///   Left at info, `rmcp` alone is ~half the default server log (#894).
+///   A target directive also beats a *quieter* global level, so the cap is
+///   left out when `log_level` is already `warn` or quieter: it may only
+///   lower rmcp, never re-enable warnings an `error`/`off` level silenced.
 /// - `tracing_appender=warn` stays **appended**, so it is the strongest and
 ///   cannot be lowered through `log_level`. That guard is invariant #15: the
 ///   appender must never log at its own level or it feeds itself (the loop
@@ -103,7 +107,16 @@ fn resolve_file_appender(
 ///
 /// `RUST_LOG` (`EnvFilter::try_from_default_env`) still overrides all of this.
 fn default_filter(log_level: &str) -> String {
-    format!("rmcp=warn,{log_level},tracing_appender=warn")
+    // The last bare level in the list is the global one EnvFilter applies.
+    let global = log_level
+        .split(',')
+        .filter_map(|directive| directive.trim().parse::<LevelFilter>().ok())
+        .next_back();
+    if global.is_some_and(|level| level <= LevelFilter::WARN) {
+        format!("{log_level},tracing_appender=warn")
+    } else {
+        format!("rmcp=warn,{log_level},tracing_appender=warn")
+    }
 }
 
 /// Initialise the global tracing subscriber.
@@ -193,6 +206,26 @@ mod tests {
             effective_level("info,rmcp=info", "tracing_appender").as_deref(),
             Some("warn"),
             "restoring rmcp must not disturb the appender guard"
+        );
+    }
+
+    #[test]
+    fn a_quieter_log_level_is_not_overridden_for_rmcp() {
+        // (d) A target directive beats the global level whichever is louder,
+        // so a prepended `rmcp=warn` under `log_level = "error"` or `"off"`
+        // would re-enable the SDK's warnings the operator had silenced. The
+        // cap may only lower rmcp: here it must carry no directive at all.
+        for quieter in ["warn", "error", "off", "debug,error"] {
+            assert_eq!(
+                effective_level(quieter, "rmcp"),
+                None,
+                "log_level {quieter:?} must govern rmcp itself"
+            );
+        }
+        assert_eq!(
+            effective_level("off,rmcp=info", "rmcp").as_deref(),
+            Some("info"),
+            "an explicit rmcp directive still wins"
         );
     }
 

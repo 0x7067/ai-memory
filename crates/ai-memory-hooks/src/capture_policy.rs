@@ -166,7 +166,14 @@ pub(crate) fn tool_observation_metadata(
         // camelCase — all captured live (engine v0.16.5, #512).
         // Native Codex 0.154 uses these same top-level fields, including
         // `tool_use_id` on both sides of a tool call.
-        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Codex | AgentKind::Zcode => (
+        // Grok Build CLI posts Claude Code's snake_case aliases
+        // (`tool_name` / `tool_input` / `tool_use_id`) on its tool hooks
+        // alongside camelCase, so it shares this mapping (#931).
+        AgentKind::ClaudeCode
+        | AgentKind::CommandCode
+        | AgentKind::Codex
+        | AgentKind::Grok
+        | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -174,7 +181,9 @@ pub(crate) fn tool_observation_metadata(
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
-        AgentKind::Pi => (
+        // The Pi extension is generated from the OMP one (`build_pi_extension`),
+        // so both post the same `tool` / `callID` / `args` payload.
+        AgentKind::Pi | AgentKind::Omp => (
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
@@ -209,6 +218,7 @@ pub(crate) fn tool_observation_metadata(
                         AgentKind::ClaudeCode
                             | AgentKind::CommandCode
                             | AgentKind::Codex
+                            | AgentKind::Grok
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
                             | AgentKind::Pool
@@ -230,7 +240,7 @@ pub(crate) fn tool_observation_metadata(
 /// Extracts an outcome only where the adapter protocol proves its meaning.
 pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOutcome {
     match agent {
-        AgentKind::Pi => match raw.get("isError").and_then(Value::as_bool) {
+        AgentKind::Pi | AgentKind::Omp => match raw.get("isError").and_then(Value::as_bool) {
             Some(true) => ToolOutcome::Error,
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,
@@ -371,6 +381,7 @@ impl CaptureProtocol {
 pub struct CapturePolicy {
     state: PolicyState,
     patterns: Vec<CompiledPattern>,
+    home: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +389,19 @@ struct CompiledPattern {
     path: String,
     flavor: Flavor,
     directory_base: Option<String>,
+    /// Whole segments before the first glob; a matching path must start here.
+    literal_prefix: String,
+}
+impl CompiledPattern {
+    /// Upper bound on `glob_match` steps for one candidate, directory glob included.
+    fn match_cost(&self, candidate: &str) -> usize {
+        let pattern = self.path.chars().count()
+            + self
+                .directory_base
+                .as_deref()
+                .map_or(0, |base| base.chars().count());
+        pattern.saturating_mul(candidate.chars().count())
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flavor {
@@ -421,6 +445,7 @@ impl CapturePolicy {
                 return Self {
                     state: PolicyState::Invalid,
                     patterns: Vec::new(),
+                    home: None,
                 };
             }
             CaptureSource::Parsed(config) => config,
@@ -433,10 +458,12 @@ impl CapturePolicy {
             Ok(patterns) => Self {
                 state: PolicyState::Active,
                 patterns,
+                home: home_dir.and_then(|dir| normalize_root(dir).ok()),
             },
             Err(()) => Self {
                 state: PolicyState::Invalid,
                 patterns: Vec::new(),
+                home: None,
             },
         }
     }
@@ -444,6 +471,7 @@ impl CapturePolicy {
         Self {
             state: PolicyState::Inactive,
             patterns: Vec::new(),
+            home: None,
         }
     }
     /// Evaluates every policy state using only direct fixture-backed schemas.
@@ -484,6 +512,22 @@ impl CapturePolicy {
                         ),
                     },
                 },
+                // A shell command has no path field, but its arguments can
+                // still name an ignored file whose content lands in the
+                // output (`cat docs/adr/*.md`). An exhausted match budget
+                // fails closed like an unprovable file candidate.
+                ToolFamily::NonFile => match extracted.command.as_deref().map(|command| {
+                    let base = match extracted.workdir.as_deref() {
+                        Some(dir) if is_absolute(dir) => dir.to_owned(),
+                        // `join` would turn an unusable cwd into `/dir`.
+                        Some(dir) if is_absolute(cwd) => join(cwd, dir),
+                        _ => cwd.to_owned(),
+                    };
+                    self.match_command(command, &base)
+                }) {
+                    Some(Ok(true) | Err(())) => (CaptureDisposition::Drop, extracted.state),
+                    Some(Ok(false)) | None => (CaptureDisposition::Keep, extracted.state),
+                },
                 _ => (CaptureDisposition::Keep, extracted.state),
             },
         };
@@ -516,13 +560,7 @@ impl CapturePolicy {
                 .filter(|pattern| pattern.flavor == candidate.flavor)
             {
                 work = work
-                    .checked_add(
-                        pattern
-                            .path
-                            .chars()
-                            .count()
-                            .saturating_mul(candidate.path.chars().count()),
-                    )
+                    .checked_add(pattern.match_cost(&candidate.path))
                     .ok_or(())?;
                 if work > MAX_MATCH_WORK {
                     return Err(());
@@ -534,6 +572,58 @@ impl CapturePolicy {
                     pattern.flavor == Flavor::Windows,
                 ) {
                     return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+    /// Lexically matches every path-like shell argument. Nothing is expanded
+    /// or executed: variables, command substitution, and `cd` are not
+    /// followed, so this narrows the leak rather than closing every alias.
+    fn match_command(&self, command: &str, cwd: &str) -> Result<bool, ()> {
+        let mut work = 0_usize;
+        for word in shell_words(command) {
+            for argument in shell_arguments(&word) {
+                let expanded = match (argument.strip_prefix("~/"), self.home.as_deref()) {
+                    (Some(rest), Some(home)) => join(home, rest),
+                    _ => argument.to_owned(),
+                };
+                // Not a usable path (drive-relative, oversized, bad cwd).
+                let Some(candidate) = normalize_candidate(&expanded, cwd) else {
+                    continue;
+                };
+                let insensitive = candidate.flavor == Flavor::Windows;
+                let is_glob = candidate.path.contains(['*', '?']);
+                for pattern in self
+                    .patterns
+                    .iter()
+                    .filter(|pattern| pattern.flavor == candidate.flavor)
+                {
+                    // Linear and bounded by the command itself; only the
+                    // quadratic matches below are charged to the budget.
+                    let under_prefix =
+                        starts_with_chars(&candidate.path, &pattern.literal_prefix, insensitive);
+                    if !under_prefix && !is_glob {
+                        continue;
+                    }
+                    work = work
+                        .checked_add(pattern.match_cost(&candidate.path))
+                        .ok_or(())?;
+                    if work > MAX_MATCH_WORK {
+                        return Err(());
+                    }
+                    if (under_prefix
+                        && glob_match(
+                            &pattern.path,
+                            &candidate.path,
+                            pattern.directory_base.as_deref(),
+                            insensitive,
+                        ))
+                        || (is_glob
+                            && glob_reaches(&candidate.path, &pattern.literal_prefix, insensitive))
+                    {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -568,6 +658,8 @@ pub fn metadata_only_body(
 struct Extracted {
     family: ToolFamily,
     paths: Option<Vec<String>>,
+    command: Option<String>,
+    workdir: Option<String>,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -623,6 +715,16 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
     let paths = (family == ToolFamily::File)
         .then(|| args.and_then(|value| extract_paths(name, value)))
         .flatten();
+    let command = (family == ToolFamily::NonFile)
+        .then(|| args.and_then(shell_command))
+        .flatten();
+    // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
+    // when given, so relative arguments resolve from there.
+    let workdir = command
+        .as_ref()
+        .and_then(|_| args?.get("workdir")?.as_str())
+        .filter(|dir| !dir.trim().is_empty())
+        .map(str::to_owned);
     let state = if family == ToolFamily::File && paths.is_none() {
         ExtractionState::MissingOrMalformed
     } else {
@@ -648,6 +750,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
     Extracted {
         family,
         paths,
+        command,
+        workdir,
         call_id,
         state,
     }
@@ -679,7 +783,7 @@ fn family(name: &str) -> ToolFamily {
         "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
         | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
-        "bash" | "shell" | "shell_command" | "execute" | "run_command" | "web_search"
+        "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
         | "terminal" | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
@@ -777,6 +881,79 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
+/// The command line of a shell tool. Argument vectors (Codex exec) are
+/// joined so a `bash -lc "<script>"` element is tokenized like any script.
+fn shell_command(args: &Value) -> Option<String> {
+    match args.get("command").or_else(|| args.get("cmd"))? {
+        Value::String(command) => Some(command.clone()),
+        Value::Array(items) => items
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .map(|items| items.join(" ")),
+        _ => None,
+    }
+}
+
+/// Splits a command line into words the way a POSIX shell would before
+/// expansion: quotes group, and whitespace and control/redirection operators
+/// separate. A backslash escapes only a character the shell treats specially,
+/// so Windows paths (`docs\adr\x.md`) keep their separators.
+fn shell_words(command: &str) -> Vec<String> {
+    let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')');
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('"'), '\\') if matches!(chars.peek(), Some('"' | '\\')) => {
+                word.extend(chars.next());
+            }
+            (Some(_), _) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\')
+                if chars.peek().is_some_and(|next| {
+                    next.is_whitespace() || is_operator(*next) || matches!(next, '\'' | '"' | '\\')
+                }) =>
+            {
+                word.extend(chars.next());
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() || is_operator(c) => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Path-like values carried by one shell word: the word itself unless it is
+/// a flag, plus the value of a `--flag=value` or `NAME=value` word.
+fn shell_arguments(word: &str) -> impl Iterator<Item = &str> {
+    let whole = (!word.starts_with('-')).then_some(word);
+    let value = word.split_once('=').map(|(_, value)| value);
+    whole
+        .into_iter()
+        .chain(value)
+        .filter(|argument| !argument.trim().is_empty())
+}
+
 #[derive(Clone)]
 struct Normalized {
     path: String,
@@ -838,6 +1015,7 @@ fn compile(
             let flavor = flavor_of(&expanded);
             let path = normalize_segments(&expanded).ok_or(())?;
             Ok(CompiledPattern {
+                literal_prefix: literal_prefix(&path).into(),
                 directory_base: path.strip_suffix("/**").map(|base| {
                     if base.is_empty() {
                         "/".into()
@@ -941,13 +1119,13 @@ fn glob_match(
     directory_base: Option<&str>,
     insensitive: bool,
 ) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let candidate: Vec<char> = candidate.chars().collect();
-    if directory_base
-        .is_some_and(|base| equal_chars(&base.chars().collect::<Vec<_>>(), &candidate, insensitive))
-    {
+    // `dir/**` also names `dir` itself, and `dir` may hold globs
+    // (`docs/a?r/**`), exactly as in the generated TypeScript.
+    if directory_base.is_some_and(|base| glob_match(base, candidate, None, insensitive)) {
         return true;
     }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let candidate: Vec<char> = candidate.chars().collect();
     let mut previous = vec![false; pattern.len() + 1];
     previous[0] = true;
     for index in 1..=pattern.len() {
@@ -974,12 +1152,50 @@ fn glob_match(
     }
     previous[pattern.len()]
 }
-fn equal_chars(left: &[char], right: &[char], insensitive: bool) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(&a, &b)| char_equal(a, b, insensitive))
+/// The whole leading segments of a normalized pattern that contain no glob.
+fn literal_prefix(path: &str) -> &str {
+    let Some(glob) = path.find(['*', '?']) else {
+        return path;
+    };
+    let Some(slash) = path[..glob].rfind('/') else {
+        return "";
+    };
+    let head = &path[..=slash];
+    // Keep the root separator of `/`, `C:/`; drop it everywhere else.
+    match head.strip_suffix('/') {
+        Some(trimmed) if !trimmed.is_empty() && !trimmed.ends_with(':') => trimmed,
+        _ => head,
+    }
+}
+fn starts_with_chars(path: &str, prefix: &str, insensitive: bool) -> bool {
+    let mut path = path.chars();
+    prefix.chars().all(|expected| {
+        path.next()
+            .is_some_and(|c| char_equal(expected, c, insensitive))
+    })
+}
+/// Whether a shell glob can expand to `prefix` itself or to a path below it.
+/// Only the glob's first segments, as many as `prefix` has, are compared:
+/// `docs/*/x.md` reaches `docs/adr`, while `*.md` in the parent never can.
+fn glob_reaches(glob: &str, prefix: &str, insensitive: bool) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
+    if depth == 0 {
+        return true;
+    }
+    let mut seen = 0;
+    let mut offset = 0;
+    for part in glob.split('/') {
+        offset += part.len();
+        if !part.is_empty() {
+            seen += 1;
+            if seen == depth {
+                return glob_match(&glob[..offset], prefix, None, insensitive);
+            }
+        }
+        offset += 1;
+    }
+    false
 }
 fn char_equal(left: char, right: char, insensitive: bool) -> bool {
     if insensitive && left.is_ascii() && right.is_ascii() {
@@ -1520,6 +1736,192 @@ mod tests {
             PolicyState::Invalid
         );
     }
+    fn shell_policy() -> CapturePolicy {
+        CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into(), "~/notes/**".into()],
+            }),
+            "/repo",
+            Some("/home/me"),
+        )
+    }
+    fn bash(command: &str) -> Value {
+        json!({"tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "call-1"})
+    }
+
+    /// The drop/keep tables live in the shared fixture so the generated
+    /// TypeScript matcher runs the very same vectors (#961).
+    #[test]
+    fn shell_fixture_vectors() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
+        let shell = &fixture["shell"];
+        let ignore_paths = shell["ignore_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pattern| pattern.as_str().unwrap().to_owned())
+            .collect();
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig { ignore_paths }),
+            "/repo",
+            Some("/home/me"),
+        );
+        for vector in shell["vectors"].as_array().unwrap() {
+            let payload = vector
+                .get("payload")
+                .cloned()
+                .unwrap_or_else(|| json!({"tool": "bash", "args": {"command": vector["command"]}}));
+            let payload: Value =
+                serde_json::from_str(&payload.to_string().replace("{root}", "/repo")).unwrap();
+            let cwd = vector["cwd"]
+                .as_str()
+                .map_or_else(|| "/repo".to_owned(), |sub| format!("/repo/{sub}"));
+            let decision = policy.inspect(AgentKind::OpenCode, &payload, &cwd);
+            let protocol = decision.protocol();
+            assert_eq!(
+                serde_json::to_value(protocol.disposition()).unwrap(),
+                vector["disposition"],
+                "vector: {vector}"
+            );
+            assert_eq!(
+                protocol.tool_family(),
+                ToolFamily::NonFile,
+                "vector: {vector}"
+            );
+            // Unchanged protocol fields keep old and new servers agreeing.
+            assert_eq!(protocol.path_count(), 0);
+            assert_eq!(protocol.extraction_state(), ExtractionState::Extracted);
+        }
+    }
+
+    #[test]
+    fn shell_tool_shapes_of_every_adapter_honor_exclusions() {
+        let policy = shell_policy();
+        for (agent, raw) in [
+            (AgentKind::ClaudeCode, bash("cat docs/adr/x.md")),
+            (
+                AgentKind::Codex,
+                json!({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "cat docs/adr/x.md"]}}),
+            ),
+            (
+                AgentKind::Codex,
+                json!({"tool_name": "exec_command", "tool_input": {"cmd": "cat docs/adr/x.md"}}),
+            ),
+            (
+                AgentKind::KiroCli,
+                json!({"tool_name": "execute_bash", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            (
+                AgentKind::Hermes,
+                json!({"tool_name": "terminal", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            (
+                AgentKind::OpenCode,
+                json!({"tool": "bash", "args": {"command": "cat docs/adr/x.md"}}),
+            ),
+            (
+                AgentKind::OpenClaw,
+                json!({"tool": "exec", "args": {"command": "cat 0001.md", "workdir": "docs/adr"}}),
+            ),
+            (
+                AgentKind::Devin,
+                json!({"tool_name": "exec", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+        ] {
+            let decision = policy.inspect(agent, &raw, "/repo");
+            if decision.protocol().tool_family() == ToolFamily::NonFile {
+                assert_eq!(
+                    decision.protocol().disposition(),
+                    CaptureDisposition::Drop,
+                    "raw: {raw}"
+                );
+            } else {
+                // `exec_command` is not a recognized shell tool name; it keeps
+                // today's unknown-tool behavior rather than guessing.
+                assert_eq!(raw["tool_name"], "exec_command", "raw: {raw}");
+                assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
+            }
+        }
+    }
+
+    #[test]
+    fn shell_matching_needs_an_active_policy_and_fails_closed_on_budget() {
+        let raw = bash("cat docs/adr/x.md");
+        let inactive = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
+        assert_eq!(
+            inactive
+                .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        let invalid = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        assert_eq!(
+            invalid
+                .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        // Without a home directory `~/` is left literal and cannot match.
+        let homeless = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        assert_eq!(
+            homeless
+                .inspect(AgentKind::ClaudeCode, &bash("cat ~/notes/x.md"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        let costly = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/**/?".repeat(100)],
+            }),
+            "/repo",
+            None,
+        );
+        let long = format!("cat {}", vec!["docs/x".repeat(400); 8].join(" "));
+        assert_eq!(
+            costly
+                .inspect(AgentKind::ClaudeCode, &bash(&long), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+    }
+
+    #[test]
+    fn shell_words_follow_posix_quoting_and_keep_windows_separators() {
+        assert_eq!(
+            shell_words(r#"a 'b c' "d \"e\"" f\ g h|i>j;k&&(l) C:\docs\adr\x.md"#),
+            [
+                "a",
+                "b c",
+                "d \"e\"",
+                "f g",
+                "h",
+                "i",
+                "j",
+                "k",
+                "l",
+                r"C:\docs\adr\x.md"
+            ]
+        );
+        assert_eq!(literal_prefix("/repo/docs/adr/**"), "/repo/docs/adr");
+        assert_eq!(literal_prefix("/**"), "/");
+        assert_eq!(literal_prefix("C:/*.md"), "C:/");
+        assert_eq!(literal_prefix("/repo/secret.txt"), "/repo/secret.txt");
+        assert!(glob_reaches("/repo/docs/*/x.md", "/repo/docs/adr", false));
+        assert!(!glob_reaches("/repo/*.md", "/repo/docs/adr", false));
+        assert!(glob_reaches("C:/Docs/*", "C:/docs/adr", true));
+    }
+
     #[test]
     fn metadata_rewrite_strips_all_sentinels_and_has_exact_protocol_keys() {
         let policy = CapturePolicy::resolve(
