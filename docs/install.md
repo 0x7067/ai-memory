@@ -1900,7 +1900,7 @@ Replace the model with another current OrcaRouter model id (same
 `deepseek/deepseek-v4-flash`) when needed.
 
 [Cheaper Inference](https://cheaperinference.com) is an OpenAI-compatible LLM
-gateway. Each model costs 15–60% less than the list price of its lab. It uses
+gateway that advertises models below each lab's list price. It uses
 the same provider; no dedicated ai-memory provider is needed.
 Pass its API key through the generic compatibility credential:
 
