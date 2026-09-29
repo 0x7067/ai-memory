@@ -61,6 +61,16 @@ impl ManagedHarness {
         }
     }
 
+    /// Whether the harness has no native session-end hook, so its sessions
+    /// stay open until `ai-memory finalize-session` runs (docs/support-matrix.md).
+    #[must_use]
+    pub const fn lacks_session_end_hook(self) -> bool {
+        matches!(
+            self,
+            Self::CommandCode | Self::Kiro | Self::KiroV3 | Self::Antigravity
+        )
+    }
+
     /// Core agent kind used on the wire and in storage.
     #[must_use]
     pub const fn agent_kind(self) -> AgentKind {
@@ -3182,5 +3192,36 @@ mod tests {
             ManagedHarness::Antigravity,
             &[OsString::from("-i"), OsString::from("start here")]
         ));
+    }
+
+    #[test]
+    fn only_harnesses_without_a_session_end_hook_need_finalizing() {
+        let hookless = [
+            ManagedHarness::CommandCode,
+            ManagedHarness::Kiro,
+            ManagedHarness::KiroV3,
+            ManagedHarness::Antigravity,
+        ];
+        for harness in [
+            ManagedHarness::Claude,
+            ManagedHarness::Codex,
+            ManagedHarness::OpenCode,
+            ManagedHarness::OpenCode2,
+            ManagedHarness::Pi,
+            ManagedHarness::Crush,
+            ManagedHarness::Omp,
+            ManagedHarness::Kimi,
+            ManagedHarness::Grok,
+        ]
+        .into_iter()
+        .chain(hookless)
+        {
+            assert_eq!(
+                harness.lacks_session_end_hook(),
+                hookless.contains(&harness),
+                "{}",
+                harness.as_str()
+            );
+        }
     }
 }

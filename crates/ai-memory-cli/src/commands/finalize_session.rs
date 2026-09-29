@@ -52,6 +52,18 @@ struct FinalizeSessionReport {
 /// Returns an error if the configured server cannot list the scope's open
 /// sessions or rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
+    let (workspace, project, finalized) = finalize(config, &args).await?;
+    let agent = args.agent;
+    print_report(args, workspace, project, agent, finalized)
+}
+
+/// Finalizes the sessions `args` selects (open ones, plus the exact ended
+/// session with `reopen`) and returns the scope and the ids it sent a
+/// session-end for, without printing; `ai-memory run` reports on its own.
+pub(crate) async fn finalize(
+    config: &Config,
+    args: &FinalizeSessionArgs,
+) -> Result<(String, String, Vec<String>)> {
     let agent = args.agent;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
@@ -68,7 +80,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     )
     .await?;
     if sessions.is_empty() {
-        return print_report(args, workspace, project, agent, Vec::new());
+        return Ok((workspace, project, Vec::new()));
     }
 
     let client = reqwest::Client::new();
@@ -95,7 +107,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     // agent session would inherit the closed id.
     super::hook::clear_session_id(&config.data_dir, agent);
 
-    print_report(args, workspace, project, agent, finalized)
+    Ok((workspace, project, finalized))
 }
 
 /// List open sessions for the scope + agent via the server. An unknown
