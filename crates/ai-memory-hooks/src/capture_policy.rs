@@ -16,8 +16,7 @@ pub const MAX_CANDIDATE_PATH_CHARS: usize = 4_096;
 pub const MAX_CAPTURE_CANDIDATES: usize = 32;
 /// Maximum aggregate pattern-by-candidate scalar comparisons per inspection.
 pub const MAX_MATCH_WORK: usize = 1_000_000;
-/// Longest argv element kept whole as a path candidate when it also splits
-/// into several words; longer ones are scripts (`bash -lc "<script>"`).
+/// Longest argv element kept whole as a path; longer ones are scripts.
 const MAX_ARGV_PATH_CHARS: usize = 256;
 const MAX_CALL_ID_CHARS: usize = 128;
 const CAPTURE_PROTOCOL_VERSION: u8 = 1;
@@ -484,8 +483,8 @@ impl CapturePolicy {
         let (disposition, extraction) = match self.state {
             PolicyState::Inactive => (CaptureDisposition::Keep, extracted.state),
             // A broken marker cannot prove a shell command's arguments miss
-            // every ignored path, so it fails closed like a file tool, even
-            // when the command itself is missing or unparseable.
+            // every ignored path, so it fails closed like a file tool, readable
+            // or not.
             PolicyState::Invalid if extracted.family == ToolFamily::File || extracted.shell => {
                 (CaptureDisposition::MetadataOnly, extracted.state)
             }
@@ -666,7 +665,7 @@ struct Extracted<'a> {
     paths: Option<Vec<String>>,
     /// A shell tool's command, not yet split into words.
     command: Option<ShellCommand<'a>>,
-    /// A command-running tool, whether or not its command could be read.
+    /// A command-running tool, even when its command is unreadable.
     /// `web_search` is non-file but runs nothing.
     shell: bool,
     workdir: Option<String>,
@@ -893,20 +892,18 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// A shell tool's command as the tool gave it. Reading it only validates its
-/// shape; the words are split on demand by [`ShellCommand::words`], because
-/// `extract` runs for every tool event and most never need them.
+/// A shell tool's command as given, split into words on demand: `extract` runs
+/// for every tool event and most never need them.
 enum ShellCommand<'a> {
     Line(&'a str),
     Argv(Vec<&'a str>),
 }
 
 impl ShellCommand<'_> {
-    /// The words of the command. An argument vector (Codex exec) is already
-    /// split: each element is one word as given (`private notes/x.md`), and is
-    /// also tokenized on its own so a `bash -lc "<script>"` element is read
-    /// like any script. Joining the elements instead would re-split paths with
-    /// spaces and let one element's stray quote swallow the rest.
+    /// An argument vector (Codex exec) keeps each element as one word
+    /// (`private notes/x.md`) and also tokenizes it, so a `bash -lc "<script>"`
+    /// element is read like any script. Joining the elements instead would
+    /// re-split paths with spaces and let one stray quote swallow the rest.
     fn words(&self) -> Vec<String> {
         match self {
             Self::Line(command) => shell_words(command),
@@ -914,9 +911,7 @@ impl ShellCommand<'_> {
                 let mut words = Vec::new();
                 for item in items {
                     let tokens = shell_words(item);
-                    // Whitespace in a long element means a script, not a path;
-                    // its tokens are checked below. Keeping the blob whole
-                    // would charge it, quadratically, against every pattern.
+                    // Kept whole, a long script would exhaust the match budget.
                     if (tokens.len() != 1 || tokens[0] != *item)
                         && item.chars().count() <= MAX_ARGV_PATH_CHARS
                     {
@@ -2027,9 +2022,6 @@ mod tests {
             ]
         );
     }
-    // Review of #973, finding 2: the fail-closed rule under an invalid marker
-    // keys on a *parsed* command, so a shell call whose command cannot be
-    // parsed is still kept whole.
     #[test]
     fn invalid_marker_strips_shell_calls_with_unparseable_commands() {
         let policy = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
@@ -2056,9 +2048,6 @@ mod tests {
         }
     }
 
-    // Review of #973, finding 3: an argv element is pushed whole, so a
-    // `bash -lc "<script>"` blob becomes one glob-bearing path candidate that
-    // is charged against every pattern and can blow the match budget.
     #[test]
     fn long_bash_lc_script_in_argv_is_not_dropped_by_the_match_budget() {
         let ignore_paths = (0..40).map(|i| format!("/repo/private{i}/**")).collect();
@@ -2070,8 +2059,7 @@ mod tests {
         assert_eq!(policy.state, PolicyState::Active);
         let script = format!("{}ls a?.rs", "echo x; ".repeat(350));
         assert!(script.chars().count() < MAX_CANDIDATE_PATH_CHARS);
-        // Control: the same script as one command string is tokenized into
-        // short words and is kept.
+        // Control: as a string, the script splits into short words.
         let as_string = json!({"tool_name":"shell","tool_input":{"command": script}});
         assert_eq!(
             policy
@@ -2091,9 +2079,6 @@ mod tests {
             "innocuous script silently dropped by the match budget"
         );
     }
-    // Reading a shell call's command must not tokenize it: `extract` runs for
-    // every tool event, including the common case with no `[capture]` policy,
-    // where the words are never used. Splitting is a separate, explicit step.
     #[test]
     fn shell_command_borrows_the_command_and_splits_only_on_request() {
         let line = json!({"command": "cat 'private notes/x.md' | head"});
@@ -2106,8 +2091,6 @@ mod tests {
             ["cat", "private notes/x.md", "head"]
         );
 
-        // An argv element stays whole (a path with spaces) and is also split
-        // on its own; a long one is a script and is only split.
         let argv = json!({"cmd": ["cat", "private notes/x.md"]});
         assert_eq!(
             shell_command(&argv).unwrap().words(),
@@ -2119,7 +2102,6 @@ mod tests {
         assert!(!words.contains(&script), "a long script is not one path");
         assert_eq!(words.last().map(String::as_str), Some("ls"));
 
-        // Unreadable commands stay unreadable.
         for args in [
             json!({"command": 7}),
             json!({"command": ["cat", 7]}),

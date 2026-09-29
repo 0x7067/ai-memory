@@ -891,10 +891,10 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
     let direct = |state| capture_inspector(state, cwd).inspect(env.agent, &env.raw, cwd);
 
     let Some(protocol) = CaptureProtocol::parse(raw_protocol) else {
-        // A new/malformed marker must not make a recognized file operation
-        // or shell command less private. Mark the replacement invalid: an
+        // A new/malformed marker must not make a file operation or shell
+        // command less private. Mark the replacement invalid: an
         // inactive/keep protocol would falsely describe the server's privacy
-        // fallback. Other tools retain their old behavior.
+        // fallback.
         let decision = direct(PolicyState::Invalid);
         if decision.protocol().disposition() == CaptureDisposition::MetadataOnly {
             return Some(metadata_envelope(env, &decision, None));
@@ -995,9 +995,8 @@ fn metadata_only_protocol_envelope(
 }
 
 /// An invalid marker also strips shell commands, which it cannot prove miss
-/// every ignored path; an active policy decides them outright (keep/drop). A
-/// stripped shell body has no paths and its command is always read, so any
-/// other path count or extraction state is not what a client produces.
+/// every ignored path; an active policy decides them outright (keep/drop).
+/// A stripped shell body carries no paths and an extracted command.
 const fn metadata_protocol_is_legal(protocol: &CaptureProtocol) -> bool {
     match (protocol.policy_state(), protocol.tool_family()) {
         (PolicyState::Active | PolicyState::Invalid, ToolFamily::File) => true,
@@ -12335,8 +12334,6 @@ mod tests {
         assert_eq!(env.raw, search);
     }
 
-    // A stripped non-file body has no paths and is always extracted, so a
-    // metadata-only claim with anything else cannot come from a real client.
     #[test]
     fn capture_protocol_invalid_shell_metadata_claim_must_be_canonical() {
         let admit = |path_count: u16, extraction: &str| {
@@ -12362,8 +12359,6 @@ mod tests {
         assert!(!admit(0, "not-applicable"), "search-only extraction");
     }
 
-    // Review of #973, finding 1: an unparseable marker only made File events
-    // metadata-only, so a shell event kept its command and output.
     #[test]
     fn capture_protocol_unparseable_marker_strips_shell_events() {
         for marker in [

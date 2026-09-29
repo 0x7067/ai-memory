@@ -275,8 +275,7 @@ function captureStartsWith(path: string, prefix: string, insensitive: boolean): 
 function captureGlobReaches(glob: string, prefix: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const target = prefix.replace(/\/+$/, ""); const depth = target.split("/").filter(Boolean).length; if (!depth) return true; let seen = 0; let offset = 0; for (const part of glob.split("/")) { offset += part.length; if (part && ++seen === depth) return captureGlob(glob.slice(0, offset), target, insensitive, budget); offset++; } return false; }
 // An argv element is one word as given and is also tokenized on its own
 // (`bash -lc "<script>"`); joining elements would re-split paths with spaces.
-// A long element that splits is a script, not a path: keeping it whole would
-// charge it, quadratically, against every pattern.
+// Elements over 256 chars are scripts, so only their tokens count.
 function captureShellCommand(args: Record<string, unknown> | undefined): string | string[] | undefined { if (!args || typeof args !== "object" || Array.isArray(args)) return undefined; const value = "command" in args ? args.command : args.cmd; if (typeof value === "string") return value; if (Array.isArray(value) && value.every((x) => typeof x === "string")) return value as string[]; return undefined; }
 // Split only when a policy is active: this runs for every tool event.
 function captureShellWordList(command: string | string[]): string[] { if (typeof command === "string") return captureShellWords(command); return command.flatMap((item) => { const tokens = captureShellWords(item); return tokens.length === 1 && tokens[0] === item || [...item].length > 256 ? tokens : [item, ...tokens]; }); }
@@ -2152,9 +2151,7 @@ const shellInvalid = capturePolicy({{ ...bash(`cat ${{privatePath}}`), output: p
 check(shellInvalid.disposition === "metadata-only" && shellInvalid.protocol?.policy_state === "invalid" && shellInvalid.protocol?.tool_family === "non-file", "shell-invalid-metadata-only");
 for (const forbidden of [privatePath, privateBody]) check(!JSON.stringify(shellInvalid.payload).includes(forbidden), "shell-invalid-redaction");
 expectDecision({{ tool: "web_search", args: {{ query: "docs/adr" }} }}, marker('[capture'), "keep", "non-file", "extracted", 0, "invalid-commandless-non-file-keep");
-// A shell call whose command cannot be read still fails closed under a broken marker.
 expectDecision({{ tool: "bash", args: {{ command: 7 }} }}, marker('[capture'), "metadata-only", "non-file", "extracted", 0, "invalid-unparseable-shell-metadata-only");
-// A long `bash -lc` script is tokenized, not charged whole against every pattern.
 const argvScript = "echo x; ".repeat(350) + "ls a?.rs";
 const manyPatterns = marker(`[capture]\nignore_paths = [${{Array.from({{ length: 40 }}, (_, i) => `"private${{i}}/**"`).join(",")}}]\n`);
 expectDecision({{ tool: "shell", args: {{ command: ["bash", "-lc", argvScript] }} }}, manyPatterns, "keep", "non-file", "extracted", 0, "argv-script-not-budget-dropped");
