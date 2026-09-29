@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Native tool output resolution for Antigravity CLI lifecycle hooks
+  (`post-tool-use`). Command stdout (`run_command`), file views (`view_file`),
+  search results (`find_by_name`, `grep_search`, `search_web`), and task
+  management outputs are now read directly from
+  `.system_generated/steps/<stepIdx>/output.txt` and populated into observation
+  excerpts. Code modification capture via `write_to_file` and
+  `replace_file_content` remains preserved from invocation arguments. (#966)
 - The watcher's reconcile pass can now optionally tombstone a wiki page whose
   file has disappeared from disk, closing part of the gap left by #929 (the
   watcher only reconciled create/modify events, so a deleted file stayed
