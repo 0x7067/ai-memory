@@ -70,6 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dir/**` as covering `dir` itself when `dir` holds a glob (`docs/a?r/**`), as
   the generated plugins already did. Refresh or reinstall generated plugins to
   pick it up. (#948)
+- Shell-command `ignore_paths` matching no longer joins an argument vector
+  before splitting it, which broke a path with spaces (`["cat", "private
+  notes/x.md"]`) apart and let one element's stray quote hide the elements
+  after it; each element now counts whole and is split on its own. An invalid
+  `.ai-memory.toml` now makes a shell command metadata-only, like a file tool,
+  instead of keeping its command and output. Applies to the native hook and
+  the generated plugins; the server accepts the new metadata-only shell form,
+  so upgrade it together with them (an older server drops such an event).
+  (#PR)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the

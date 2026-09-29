@@ -993,10 +993,13 @@ fn metadata_only_protocol_envelope(
     Some(env)
 }
 
+/// An invalid marker also strips shell commands, which it cannot prove miss
+/// every ignored path; an active policy decides them outright (keep/drop).
 const fn metadata_protocol_is_legal(protocol: &CaptureProtocol) -> bool {
     matches!(
         (protocol.policy_state(), protocol.tool_family()),
         (PolicyState::Active | PolicyState::Invalid, ToolFamily::File)
+            | (PolicyState::Invalid, ToolFamily::NonFile)
     )
 }
 
@@ -12259,6 +12262,71 @@ mod tests {
         });
         let env = HookEnvelope::from_query_and_body(query(), dropped);
         assert!(inspect_capture_envelope(env).is_none());
+    }
+
+    #[test]
+    fn capture_protocol_invalid_marker_shell_is_metadata_only() {
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let stripped = |state: &str| {
+            serde_json::json!({
+                "session_id": "shell-invalid", "cwd": "/repo",
+                "tool_family": "non-file", "tool_name": "non-file",
+                "_ai_memory_capture": capture_protocol("metadata-only", state, "non-file", 0, "extracted"),
+            })
+        };
+        // What a current client sends under a broken marker is accepted.
+        let env = inspect_capture_envelope(HookEnvelope::from_query_and_body(
+            query(),
+            stripped("invalid"),
+        ))
+        .unwrap();
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        assert_eq!(env.raw["tool_family"], "non-file");
+
+        // An active policy decides a shell call outright, so a metadata-only
+        // claim for one is impossible and refused.
+        assert!(
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(
+                query(),
+                stripped("active")
+            ))
+            .is_none()
+        );
+
+        // An older client that still keeps the command under a broken marker
+        // is stripped by the server's own re-inspection.
+        let kept = serde_json::json!({
+            "session_id": "shell-invalid-keep", "tool_name": "Bash",
+            "tool_input": { "command": "cat /PRIVATE_PATH_SENTINEL/x.md" },
+            "tool_response": "SENTINEL_SECRET",
+            "_ai_memory_capture": capture_protocol("keep", "invalid", "non-file", 0, "extracted"),
+        });
+        let env =
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), kept)).unwrap();
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        let stored = serde_json::to_string(&env).unwrap();
+        assert!(!stored.contains("SENTINEL"), "{stored}");
+
+        // Control: a non-file tool with no command keeps its body.
+        let search = serde_json::json!({
+            "session_id": "web-search-invalid", "tool_name": "web_search",
+            "tool_input": { "query": "docs" },
+            "_ai_memory_capture": capture_protocol("keep", "invalid", "non-file", 0, "extracted"),
+        });
+        let env =
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), search.clone()))
+                .unwrap();
+        assert_eq!(env.raw, search);
     }
 
     #[test]

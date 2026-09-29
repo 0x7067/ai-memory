@@ -480,7 +480,11 @@ impl CapturePolicy {
         let extracted = extract(agent, raw);
         let (disposition, extraction) = match self.state {
             PolicyState::Inactive => (CaptureDisposition::Keep, extracted.state),
-            PolicyState::Invalid if extracted.family == ToolFamily::File => {
+            // A broken marker cannot prove a shell command's arguments miss
+            // every ignored path, so it fails closed like a file tool.
+            PolicyState::Invalid
+                if extracted.family == ToolFamily::File || extracted.command.is_some() =>
+            {
                 (CaptureDisposition::MetadataOnly, extracted.state)
             }
             PolicyState::Invalid => (CaptureDisposition::Keep, extracted.state),
@@ -516,14 +520,14 @@ impl CapturePolicy {
                 // still name an ignored file whose content lands in the
                 // output (`cat docs/adr/*.md`). An exhausted match budget
                 // fails closed like an unprovable file candidate.
-                ToolFamily::NonFile => match extracted.command.as_deref().map(|command| {
+                ToolFamily::NonFile => match extracted.command.as_deref().map(|words| {
                     let base = match extracted.workdir.as_deref() {
                         Some(dir) if is_absolute(dir) => dir.to_owned(),
                         // `join` would turn an unusable cwd into `/dir`.
                         Some(dir) if is_absolute(cwd) => join(cwd, dir),
                         _ => cwd.to_owned(),
                     };
-                    self.match_command(command, &base)
+                    self.match_command(words, &base)
                 }) {
                     Some(Ok(true) | Err(())) => (CaptureDisposition::Drop, extracted.state),
                     Some(Ok(false)) | None => (CaptureDisposition::Keep, extracted.state),
@@ -580,10 +584,10 @@ impl CapturePolicy {
     /// Lexically matches every path-like shell argument. Nothing is expanded
     /// or executed: variables, command substitution, and `cd` are not
     /// followed, so this narrows the leak rather than closing every alias.
-    fn match_command(&self, command: &str, cwd: &str) -> Result<bool, ()> {
+    fn match_command(&self, words: &[String], cwd: &str) -> Result<bool, ()> {
         let mut work = 0_usize;
-        for word in shell_words(command) {
-            for argument in shell_arguments(&word) {
+        for word in words {
+            for argument in shell_arguments(word) {
                 let expanded = match (argument.strip_prefix("~/"), self.home.as_deref()) {
                     (Some(rest), Some(home)) => join(home, rest),
                     _ => argument.to_owned(),
@@ -658,7 +662,8 @@ pub fn metadata_only_body(
 struct Extracted {
     family: ToolFamily,
     paths: Option<Vec<String>>,
-    command: Option<String>,
+    /// A shell tool's command, already split into words.
+    command: Option<Vec<String>>,
     workdir: Option<String>,
     call_id: Option<String>,
     state: ExtractionState,
@@ -881,16 +886,29 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// The command line of a shell tool. Argument vectors (Codex exec) are
-/// joined so a `bash -lc "<script>"` element is tokenized like any script.
-fn shell_command(args: &Value) -> Option<String> {
+/// The words of a shell tool's command. An argument vector (Codex exec) is
+/// already split: each element is one word as given (`private notes/x.md`),
+/// and is also tokenized on its own so a `bash -lc "<script>"` element is read
+/// like any script. Joining the elements instead would re-split paths with
+/// spaces and let one element's stray quote swallow the rest.
+fn shell_command(args: &Value) -> Option<Vec<String>> {
     match args.get("command").or_else(|| args.get("cmd"))? {
-        Value::String(command) => Some(command.clone()),
-        Value::Array(items) => items
-            .iter()
-            .map(Value::as_str)
-            .collect::<Option<Vec<_>>>()
-            .map(|items| items.join(" ")),
+        Value::String(command) => Some(shell_words(command)),
+        Value::Array(items) => {
+            let items = items
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?;
+            let mut words = Vec::new();
+            for item in items {
+                let tokens = shell_words(item);
+                if tokens.len() != 1 || tokens[0] != item {
+                    words.push(item.to_owned());
+                }
+                words.extend(tokens);
+            }
+            Some(words)
+        }
         _ => None,
     }
 }
@@ -1846,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_matching_needs_an_active_policy_and_fails_closed_on_budget() {
+    fn shell_matching_is_off_when_inactive_and_fails_closed_when_invalid_or_over_budget() {
         let raw = bash("cat docs/adr/x.md");
         let inactive = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
         assert_eq!(
@@ -1856,10 +1874,23 @@ mod tests {
                 .disposition(),
             CaptureDisposition::Keep
         );
+        // A broken marker strips a shell call like a file call, but a
+        // non-file tool with no command (`web_search`) keeps its body.
         let invalid = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        let decision = invalid.inspect(AgentKind::ClaudeCode, &raw, "/repo");
+        assert_eq!(
+            decision.protocol().disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+        let body = metadata_only_body(Some("s"), Some("/repo"), &decision).to_string();
+        assert!(!body.contains("docs/adr"), "{body}");
         assert_eq!(
             invalid
-                .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                .inspect(
+                    AgentKind::ClaudeCode,
+                    &json!({"tool_name": "web_search", "tool_input": {"query": "docs/adr"}}),
+                    "/repo"
+                )
                 .protocol()
                 .disposition(),
             CaptureDisposition::Keep
