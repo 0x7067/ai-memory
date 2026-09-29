@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of keeping its command and output. Applies to the native hook and
   the generated plugins; the server accepts the new metadata-only shell form,
   so upgrade it together with them (an older server drops such an event).
-  (#PR)
+  (#973)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the
