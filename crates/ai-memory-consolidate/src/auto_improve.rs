@@ -1511,6 +1511,11 @@ pub(crate) fn validate_response(
 fn normalize_proposal(proposal: &mut AutoImproveProposal, warnings: &mut Vec<String>) {
     normalize_kind(proposal, warnings);
 
+    // Server-owned: set when a patch is materialized. The schema still shows
+    // it to the model, and a model-supplied non-hash value on a full-page
+    // proposal would reach staging and fail the whole run on `hex_to_sha256`.
+    proposal.expected_base_body_sha256 = None;
+
     let original_edit_mode = proposal.edit_mode.clone();
     proposal.edit_mode = normalize_edit_mode(&original_edit_mode);
     if !original_edit_mode.trim().is_empty() && proposal.edit_mode != original_edit_mode {
@@ -3329,6 +3334,29 @@ mod tests {
         let (accepted, rejected, _) = validate_response(raw, &cfg(), &ExistingPageIndex::default());
         assert!(accepted.is_empty());
         assert_eq!(rejected[0].reason, "unsupported_edit_mode");
+    }
+
+    /// Once `"full"` stopped being rejected, the same `gpt-oss-20b` runs
+    /// failed at staging with `invalid expected_base_body_sha256: expected 64
+    /// hex chars`: the model filled in a field only the server can compute.
+    #[test]
+    fn a_model_supplied_base_sha_is_dropped_from_full_page_proposals() {
+        for supplied in ["", "null", "abc123", "N/A"] {
+            let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+            candidate.expected_base_body_sha256 = Some(supplied.into());
+            let raw = AutoImproveLlmResponse {
+                summary: "ok".into(),
+                proposals: vec![candidate],
+                rejected_candidates: Vec::new(),
+            };
+            let (accepted, rejected, _) =
+                validate_response(raw, &cfg(), &ExistingPageIndex::default());
+            assert!(rejected.is_empty(), "{supplied:?}: got {rejected:?}");
+            assert_eq!(
+                accepted[0].expected_base_body_sha256, None,
+                "{supplied:?} must not survive to staging"
+            );
+        }
     }
 
     #[test]

@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `["full_page", "patch"]`, and normalisation folds `full`, `full-page` and
   `Full Page` into `full_page` (with a warning) for providers without
   constrained decoding. Unknown modes still fail validation.
+- Auto-improve no longer aborts a whole run when the model fills in
+  `expected_base_body_sha256`. The field is computed by the server when a
+  patch is materialized, but the schema shows it to the model, and a
+  non-hash value on a full-page proposal reached staging and failed
+  `hex_to_sha256` with `invalid expected_base_body_sha256: expected 64 hex
+  chars` (HTTP 500 from `/admin/auto-improve`), discarding every other
+  proposal in the run. Normalisation now drops any model-supplied value; the
+  patch path still sets it from the materialized target.
 
 ## [2.4.2] - 2026-09-29
 
