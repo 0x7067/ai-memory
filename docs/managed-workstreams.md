@@ -73,6 +73,18 @@ ai-memory run kiro --v3
 ai-memory run
 ```
 
+After an interactive managed session exits successfully, `ai-memory run` offers
+the installed harnesses, a way to run the current harness again, and quit.
+Choosing another harness keeps the same workstream selected, so its saved
+context remains available to the next run. The prompt defaults to quit. It
+appears only when stdin, stdout, and stderr are terminals, the managed launch
+was a session, and `--executable` was not used; utility commands, failed or
+interrupted exits, and non-interactive launches do not prompt. A switch or
+re-run does not replay the previous harness's native arguments, which may be
+specific to that CLI; wrapper settings such as `--workspace`, `--project`,
+`--yolo`, `--no-autowire`, `--env`, and `--env-file` remain in effect. The
+initial `--fresh` choice applies only to the first launch.
+
 Everything after the harness name is native argv except the wrapper-owned exact
 flags `--yolo` and `--fresh`. No `--` separator is needed, and ai-memory does
 not maintain a second copy of each harness's option schema. Other wrapper
