@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Conformance to CommonMark §4.5 and §4.7 in wiki markdown link extraction,
+  code-fence tracking, and web relative link resolution:
+  - Code fence tracking in `extract_links` and `rewrite_local_wikilinks` now
+    matches the opening delimiter glyph (`` ` `` vs `~`) and length per
+    CommonMark §4.5 via `CodeFence::step`, preventing inner fences of different
+    glyph or shorter length from prematurely toggling fence state.
+  - Markdown link destination parsing in `extract_links` now conforms to
+    CommonMark §4.7: balanced parentheses in bare destinations are preserved
+    instead of truncating at the first `)` (e.g. `[doc](notes/foo_(1).md)` is
+    now correctly indexed), pointy-bracketed destinations (`<...>`) are supported,
+    and optional trailing link titles are properly stepped over.
+  - Wikilink export rewrite in `rewrite_local_wikilinks` now wraps destinations
+    containing spaces in pointy brackets (`[label](<../path with space.md>)`),
+    ensuring standard CommonMark conformance and OKF v0.2 interoperability.
+  - The `/web` reader's `scope_relative_link` now strips pointy brackets and
+    leading `./` prefixes (e.g. `[doc](./notes/foo.md)`), resolving to valid
+    `PagePath`s without failing path segment validation.
+
 ## [2.4.2] - 2026-09-29
 
 ### Changed

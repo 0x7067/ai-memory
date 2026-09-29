@@ -60,7 +60,10 @@ fn options() -> Options {
 /// relative — the same convention `[[wikilinks]]` use — which is what the
 /// OKF bundle-index page and generated cross-references rely on (#603).
 fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> CowStr<'a> {
-    let trimmed = dest.trim();
+    let mut trimmed = dest.trim();
+    if let Some(stripped) = trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        trimmed = stripped.trim();
+    }
     // Leave anchors, absolute paths, network paths, and any scheme
     // (http:, mailto:, javascript:, …) to safe_url.
     if trimmed.is_empty()
@@ -85,8 +88,11 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
     if path_part.is_empty() || path_part.contains("..") {
         return dest; // don't rewrite traversal; safe_url/router will reject
     }
-    let path_part = path_part.trim_end_matches('/');
-    if path_part.is_empty() {
+    let mut path_part = path_part.trim_end_matches('/');
+    while let Some(rest) = path_part.strip_prefix("./") {
+        path_part = rest;
+    }
+    if path_part.is_empty() || path_part == "." {
         return dest;
     }
     CowStr::Boxed(
@@ -800,5 +806,22 @@ mod tests {
                 "{raw} must stay literal, got: {html}"
             );
         }
+    }
+
+    #[test]
+    fn relative_link_with_leading_dot_slash_resolves() {
+        let html = render(
+            "[doc](./notes/foo.md) and [pointy](<./notes/bar.md>)",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md""#),
+            "leading ./ must be stripped: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/bar.md""#),
+            "pointy brackets and leading ./ must resolve: {html}"
+        );
     }
 }
