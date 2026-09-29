@@ -165,6 +165,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `export-okf`'s generated `index.md` no longer has a prose sentence outside
   its list structure. Some strict OKF v0.2 validators read §11.3 as
   rejecting it. (#960)
+- `export-okf` now backfills a `title` (derived, same as `derive_title`) and
+  a `description` (from `summary`, else `abstract`) on an exported page when
+  missing, so a generic OKF consumer sees both §4.1-recommended keys. The
+  backfill only ever changes the bundle's copy, never the on-disk wiki file.
+  (#960)
 
 ## [2.4.1] - 2026-09-25
 
