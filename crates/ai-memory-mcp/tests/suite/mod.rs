@@ -17,6 +17,7 @@ mod admin_purge;
 mod admin_read_page;
 mod admin_reclaim_ledger_versions;
 mod admin_rename;
+mod admin_repair_session_times;
 mod admin_status_search;
 mod admin_write_page;
 mod agent_messages_briefing;

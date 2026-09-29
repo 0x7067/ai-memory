@@ -563,7 +563,7 @@ upgrade              auth                 user
 completions          handoffs             purge-session
 compact              api-key              export-okf
 message              doctor               backfill
-project              reclaim-ledger-versions
+project              reclaim-ledger-versions               repair-backfill-timestamps
 ```
 
 Run `ai-memory --help` for the full tree.

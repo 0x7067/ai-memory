@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory repair-backfill-timestamps [--project] [--workspace] [--confirm]
+  [--json]` and `POST /admin/repair-session-times` correct
+  `sessions.started_at`/`ended_at` for sessions an older `backfill` imported
+  before it carried the transcript's own event time, which flattened every
+  imported session onto the import day. Only rewrites a row whose
+  `started_at` actually postdates the candidate's own transcript end (a
+  correctly hook-captured session, or a re-run, is a no-op); refuses
+  out-of-scope, unchanged, negative, inverted, or future-dated candidates;
+  never closes a still-open session; and records an `audit_log` row on
+  apply. Dry-run by default. (#921)
 - Native tool output resolution for Antigravity CLI lifecycle hooks
   (`post-tool-use`). Command stdout (`run_command`), file views (`view_file`),
   search results (`find_by_name`, `grep_search`, `search_web`), and task
