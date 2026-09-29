@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirmation, and the PowerShell `rm` deny) and forces
   `--settings '{"permissions":{"defaultMode":"bypassPermissions","ask":[]}}'`;
   it is a no-op for every other harness. See
-  `docs/design-yolo-safety-ai-jail.md`. (#983)
+  `docs/design-yolo-safety-ai-jail.md`. (#994)
 - `ai-memory repair-backfill-timestamps [--project] [--workspace] [--confirm]
   [--json]` and `POST /admin/repair-session-times` correct
   `sessions.started_at`/`ended_at` for sessions an older `backfill` imported
