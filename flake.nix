@@ -172,8 +172,8 @@
               lib.filterAttrs (name: _: lib.elem name sandboxKeys) enabledSc
             );
           in
-          assert lib.sort lib.lessThanStr sandboxKeys
-            == lib.sort lib.lessThanStr enabledSandboxKeys;
+          assert lib.sort builtins.lessThan sandboxKeys
+            == lib.sort builtins.lessThan enabledSandboxKeys;
           linuxPkgs.runCommand "ai-memory-nixos-sandbox-parity" { } "touch $out";
       };
     in
