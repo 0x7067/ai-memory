@@ -45,7 +45,10 @@ fn command_with_home(home: &Path) -> Command {
         .env_remove("KIRO_HOME")
         // Keep Claude installer/removal tests inside their temp HOME unless a
         // test explicitly opts into a relocated config root.
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        // A host-level PI_CODING_AGENT_DIR would send the pi/omp extension
+        // uninstall to the developer's real agent dir instead of the sandbox.
+        .env_remove("PI_CODING_AGENT_DIR");
     command
 }
 

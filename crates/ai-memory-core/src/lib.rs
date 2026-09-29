@@ -68,15 +68,15 @@ pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
     PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
-    normalize_entity,
+    normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{
     COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,
     full_block,
 };
 pub use sanitize::{
-    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
-    truncate_utf8_bytes_head_tail,
+    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_for_title,
+    truncate_utf8_bytes, truncate_utf8_bytes_head_tail,
 };
 pub use slots::{
     SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,

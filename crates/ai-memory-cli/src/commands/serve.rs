@@ -609,6 +609,33 @@ fn validate_http_exposure(
     );
 }
 
+/// The operator-facing banner for an exposure that is not [`HttpExposure::Safe`].
+///
+/// Returned as text rather than printed so a test can assert it, and printed at
+/// the call site with `eprintln!` rather than only `tracing::warn!`: the tracing
+/// stderr layer sits behind `EnvFilter`, so `RUST_LOG=error` — or
+/// `log_level = "error"` in the config, which feeds the same filter — silences a
+/// warning whose whole job is to say the server is reachable from the network
+/// without a credential. A security notice a log level can switch off is not a
+/// notice. The structured `tracing::warn!` stays for log collectors.
+fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<String> {
+    match exposure {
+        HttpExposure::Safe => None,
+        HttpExposure::InsecureByOverride => Some(format!(
+            "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION because \
+             --allow-insecure-no-auth was supplied. Anyone who can reach this address can call \
+             destructive MCP tools."
+        )),
+        HttpExposure::UndeterminedInContainer => Some(format!(
+            "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION. Inside a \
+             container the bind address cannot show whether this port reaches the network - the \
+             host publish spec decides. Published with `-p 127.0.0.1:49374:49374` you are fine; \
+             published on 0.0.0.0 or a LAN address, anyone on the network can call destructive \
+             MCP tools. Run `ai-memory generate-auth-token` and set AI_MEMORY_AUTH_TOKEN."
+        )),
+    }
+}
+
 /// Validate the trusted proxy's least-privilege credential and optional stable
 /// root identity before binding the server.
 fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
@@ -1041,6 +1068,17 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
         Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
+    }
+    // Pages conformed by an older build carry a date-only OKF `stale_after`
+    // copied from `expires_at`; repair them in place. Idempotent; non-fatal.
+    match wiki.repair_date_only_stale_after().await {
+        Ok((0, 0)) => {}
+        Ok((rows, files)) => tracing::info!(
+            rows,
+            files,
+            "repaired date-only OKF stale_after on existing pages"
+        ),
+        Err(e) => tracing::warn!(error = %e, "OKF stale_after repair failed (non-fatal)"),
     }
     let baseline_checkpoint = wiki.ensure_upgrade_baseline_checkpoint();
     match classify_baseline_checkpoint(&baseline_checkpoint) {
@@ -1530,6 +1568,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 body_limit_mb = MAX_BODY_BYTES / 1024 / 1024,
                 "MCP HTTP server ready (POST /mcp, POST /hook, Ctrl-C to stop)",
             );
+            // Unconditional: see `exposure_banner` for why this does not ride
+            // on the tracing filter.
+            if let Some(banner) = exposure_banner(exposure, local_addr) {
+                eprintln!("{banner}");
+            }
             if exposure == HttpExposure::InsecureByOverride {
                 tracing::warn!(
                     %local_addr,
@@ -3004,6 +3047,49 @@ mod tests {
         );
     }
 
+    /// The exposure notice must not be something a log level can switch off.
+    /// `exposure_banner` is printed with `eprintln!`, outside the tracing
+    /// `EnvFilter`, so `RUST_LOG=error` or `log_level = "error"` cannot hide
+    /// that the server is reachable without a credential.
+    #[test]
+    fn every_unsafe_exposure_produces_an_operator_banner() {
+        let addr: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        assert_eq!(exposure_banner(HttpExposure::Safe, addr), None);
+
+        let override_banner = exposure_banner(HttpExposure::InsecureByOverride, addr)
+            .expect("an unauthenticated override must be announced");
+        assert!(override_banner.contains("NO AUTHENTICATION"));
+        assert!(override_banner.contains("0.0.0.0:49374"));
+        assert!(override_banner.contains("--allow-insecure-no-auth"));
+
+        let container_banner = exposure_banner(HttpExposure::UndeterminedInContainer, addr)
+            .expect("an unauthenticated container bind must be announced");
+        assert!(container_banner.contains("NO AUTHENTICATION"));
+        assert!(container_banner.contains("0.0.0.0:49374"));
+        // The remedy has to be in the text: the operator reading this on a
+        // terminal has no log collector to go digging in.
+        assert!(container_banner.contains("AI_MEMORY_AUTH_TOKEN"));
+    }
+
+    /// The Quick Start shape from #407 is exactly the one #902 reports as
+    /// silently exposed, so the two must agree: still not refused, but now
+    /// unconditionally announced.
+    #[test]
+    fn the_quick_start_container_bind_is_announced_not_refused() {
+        let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        let exposure = validate_http_exposure(quick_start, false, false, false, false, true)
+            .expect("must not refuse");
+        assert_eq!(exposure, HttpExposure::UndeterminedInContainer);
+        assert!(exposure_banner(exposure, quick_start).is_some());
+
+        // With a token configured there is nothing to announce.
+        let authed = validate_http_exposure(quick_start, true, false, false, false, true)
+            .expect("auth is fine");
+        assert_eq!(exposure_banner(authed, quick_start), None);
+    }
+
     /// Regression for #407. The published image binds `0.0.0.0` because that
     /// is the only way `-p` publishing works, so the host-side rule above
     /// refused every container started from the documented Quick Start and
@@ -3644,6 +3730,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id: worked_in,
@@ -3657,6 +3744,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id: worked_in,
@@ -3745,6 +3833,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id: elsewhere,
@@ -3758,6 +3847,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id: elsewhere,
@@ -3807,6 +3897,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id,
@@ -3820,6 +3911,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,

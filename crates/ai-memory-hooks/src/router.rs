@@ -33,8 +33,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::capture_policy::{
-    CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource, PolicyState,
-    ToolFamily, metadata_only_body, tool_observation_outcome, valid_call_id,
+    CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource,
+    ExtractionState, PolicyState, ToolFamily, metadata_only_body, tool_observation_outcome,
+    valid_call_id,
 };
 use crate::log;
 use crate::payload::{
@@ -890,12 +891,12 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
     let direct = |state| capture_inspector(state, cwd).inspect(env.agent, &env.raw, cwd);
 
     let Some(protocol) = CaptureProtocol::parse(raw_protocol) else {
-        // A new/malformed marker must not make a recognized file operation
-        // less private. Mark the replacement invalid: an inactive/keep
-        // protocol would falsely describe the server's privacy fallback.
-        // Non-file legacy payloads retain their old behavior.
+        // A new/malformed marker must not make a file operation or shell
+        // command less private. Mark the replacement invalid: an
+        // inactive/keep protocol would falsely describe the server's privacy
+        // fallback.
         let decision = direct(PolicyState::Invalid);
-        if decision.protocol().tool_family() == ToolFamily::File {
+        if decision.protocol().disposition() == CaptureDisposition::MetadataOnly {
             return Some(metadata_envelope(env, &decision, None));
         }
         return Some(env);
@@ -993,11 +994,18 @@ fn metadata_only_protocol_envelope(
     Some(env)
 }
 
+/// An invalid marker also strips shell commands, which it cannot prove miss
+/// every ignored path; an active policy decides them outright (keep/drop).
+/// A stripped shell body carries no paths and an extracted command.
 const fn metadata_protocol_is_legal(protocol: &CaptureProtocol) -> bool {
-    matches!(
-        (protocol.policy_state(), protocol.tool_family()),
-        (PolicyState::Active | PolicyState::Invalid, ToolFamily::File)
-    )
+    match (protocol.policy_state(), protocol.tool_family()) {
+        (PolicyState::Active | PolicyState::Invalid, ToolFamily::File) => true,
+        (PolicyState::Invalid, ToolFamily::NonFile) => {
+            protocol.path_count() == 0
+                && matches!(protocol.extraction_state(), ExtractionState::Extracted)
+        }
+        _ => false,
+    }
 }
 
 fn valid_metadata_call_id(value: &serde_json::Value) -> bool {
@@ -1353,6 +1361,7 @@ async fn fetch_and_accept_handoff(
     let receiving_session = if handoff.is_some() {
         match accepting_session {
             Some(id) => Some(NewSession {
+                occurred_at: None,
                 id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2653,6 +2662,7 @@ async fn process_authorized(
             agent_kind: env.agent,
             cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
             actor_user: owner_stamp.clone(),
+            occurred_at: env.occurred_at_micros(),
         };
         let kind = env.event.to_observation_kind();
         let raw_obs = NewObservation {
@@ -2668,6 +2678,7 @@ async fn process_authorized(
                 .unwrap_or_else(|| kind.as_str().to_string()),
             body: env.body_excerpt.clone().unwrap_or_default(),
             importance: importance_for(env.event),
+            occurred_at: env.occurred_at_micros(),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -2853,7 +2864,7 @@ async fn process_authorized(
         if is_ephemeral_session(&observations) {
             let outcome = state
                 .writer
-                .end_admitted_lifecycle_only_session(admitted.clone())
+                .end_admitted_lifecycle_only_session(admitted.clone(), env.occurred_at_micros())
                 .await?;
             match outcome {
                 ai_memory_store::LifecycleOnlyEndOutcome::Ended { reopened_handoff } => {
@@ -2982,13 +2993,18 @@ async fn process_authorized(
             Some(handoff) => Some(
                 state
                     .writer
-                    .end_admitted_session_with_handoff(admitted.clone(), Some(page_id), handoff)
+                    .end_admitted_session_with_handoff(
+                        admitted.clone(),
+                        Some(page_id),
+                        handoff,
+                        env.occurred_at_micros(),
+                    )
                     .await?,
             ),
             None => {
                 state
                     .writer
-                    .end_admitted_session(admitted.clone(), Some(page_id))
+                    .end_admitted_session(admitted.clone(), Some(page_id), env.occurred_at_micros())
                     .await?;
                 None
             }
@@ -3136,7 +3152,14 @@ fn build_auto_handoff(
                     prompts.push(text.to_string());
                 }
             }
-            ObservationKind::PostToolUse | ObservationKind::PreToolUse if !obs.title.is_empty() => {
+            // Skip `tool <family>` / bare-`<family>` labels: a family is a
+            // partition of the calls, not a name for a tool, so "Tools used:
+            // tool file, tool non-file" tells the receiver nothing. Only a
+            // harness's own tool name is worth listing.
+            ObservationKind::PostToolUse | ObservationKind::PreToolUse
+                if !obs.title.is_empty()
+                    && crate::payload::tool_family_from_title(&obs.title).is_none() =>
+            {
                 tools.insert(obs.title.as_str());
             }
             _ => {}
@@ -3222,10 +3245,12 @@ fn derive_open_questions(
     // abnormally while working in the tree.
     //
     // The signal is the tool *family*, not the tool name. A PostToolUse
-    // observation's title is `canonical_tool_name(tool_family)`, which is
-    // only ever "file" / "search-list" / "non-file" / "unknown" — the
-    // reserved protocol deliberately carries no raw tool names. Matching
-    // "edit"/"write"/"patch" against that title can never succeed.
+    // observation's title carries the family in one of two spellings: the
+    // majority path (every closed-tool agent) writes `safe_tool_title`'s
+    // `"tool file"` / `"tool non-file"` / …, while the reserved-protocol
+    // path writes the bare `canonical_tool_name` form `"file"` / …. Both
+    // must match here, and `tool_family_from_title` recognises both; a raw
+    // tool name ("edit"/"write"/"patch") is neither and correctly does not.
     //
     // That same closed schema means read and write are indistinguishable:
     // `ToolFamily::File` covers both, and `ToolOutcome` is only
@@ -3233,7 +3258,8 @@ fn derive_open_questions(
     // made — only that the session touched files and then ended without a
     // normal Stop, which is worth telling the receiver either way.
     if let Some(tool) = last_tool {
-        let touched_files = tool.title == canonical_tool_name(ToolFamily::File);
+        let touched_files =
+            crate::payload::tool_family_from_title(&tool.title) == Some(ToolFamily::File);
         if touched_files && last_stop.is_none() {
             return vec![
                 "Session ended without a normal stop while working with files".into(),
@@ -3768,6 +3794,7 @@ mod tests {
         state
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: state.workspace_id,
                 project_id: state.project_id,
@@ -3782,6 +3809,7 @@ mod tests {
             .insert_observation_ingest(
                 Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: state.workspace_id,
                         project_id: state.project_id,
@@ -4951,6 +4979,7 @@ mod tests {
         let pending_obs = || {
             Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -7539,6 +7568,7 @@ mod tests {
                     .insert_observation_ingest(
                         Sanitized::new(
                             NewObservation {
+                                occurred_at: None,
                                 session_id,
                                 workspace_id: state.workspace_id,
                                 project_id: state.project_id,
@@ -8380,6 +8410,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: state.workspace_id,
                     project_id,
@@ -8480,6 +8511,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: state.workspace_id,
                     project_id,
@@ -9622,6 +9654,7 @@ mod tests {
         state
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: state.workspace_id,
                 project_id: target,
@@ -9761,6 +9794,7 @@ mod tests {
         let pending_observation = || {
             Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,
@@ -10250,6 +10284,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id: state.workspace_id,
                     project_id: state.project_id,
@@ -12126,6 +12161,70 @@ mod tests {
         }
     }
 
+    /// Regression for #980: a secret straddling the old 80-char `title_hint`
+    /// cutoff survived in `observations.title` unredacted, because
+    /// `payload::truncate_for_title` used to cut the prompt to 80 chars
+    /// *before* the sanitizer ever ran — often leaving too short a fragment
+    /// to match a pattern (built-in or `[sanitize] extra_patterns`). The fix
+    /// removed truncation from `title_hint` construction entirely; the
+    /// 80-char cap now runs in `Sanitized::new`, after `Sanitizer::scrub`.
+    ///
+    /// Before the fix: the stored title contains a raw, unmatched fragment of
+    /// the secret and no `[REDACTED:…]` marker at all, because the sanitizer
+    /// only ever saw the truncated 8-character prefix `SECRETZZ` — too short
+    /// for the `{20,}`-length pattern below. After the fix: the full secret
+    /// reaches the sanitizer first, gets replaced with the marker, and the
+    /// (much shorter) redacted title is what gets capped at 80 chars.
+    #[tokio::test]
+    async fn issue_980_user_prompt_title_is_sanitized_before_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let prompt = format!("{} {secret}", "x".repeat(70));
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "prompt": prompt,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let obs = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::UserPrompt)
+            .expect("user prompt observation was recorded");
+
+        assert!(
+            !obs.title.contains(&secret),
+            "full raw secret leaked into title: {:?}",
+            obs.title
+        );
+        assert!(
+            obs.title.contains("REDACT"),
+            "title carries no trace of redaction \u{2014} the sanitizer never \
+             saw enough of the secret to match it: {:?}",
+            obs.title
+        );
+        assert!(
+            obs.title.chars().count() <= 80,
+            "title exceeded the 80-char display cap: {:?}",
+            obs.title
+        );
+    }
+
     #[test]
     fn codex_native_patch_capture_backstop_discards_unproven_output() {
         for protocol in [
@@ -12204,6 +12303,157 @@ mod tests {
             raw.clone(),
         );
         assert_eq!(inspect_capture_envelope(env).unwrap().raw, raw);
+    }
+
+    #[test]
+    fn capture_protocol_shell_decisions_survive_server_reinspection() {
+        // The server never sees the client's patterns, so its direct
+        // re-inspection of a shell command must accept the client's Keep
+        // unchanged and treat the client's Drop as terminal.
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let kept = serde_json::json!({
+            "session_id": "shell-keep", "tool_name": "Bash",
+            "tool_input": { "command": "cat src/main.rs *.md" },
+            "_ai_memory_capture": capture_protocol("keep", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), kept.clone());
+        assert_eq!(inspect_capture_envelope(env).unwrap().raw, kept);
+
+        let dropped = serde_json::json!({
+            "session_id": "shell-drop", "tool_name": "Bash",
+            "tool_input": { "command": "cat docs/adr/0001.md" },
+            "tool_response": "SENTINEL_SECRET",
+            "_ai_memory_capture": capture_protocol("drop", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), dropped);
+        assert!(inspect_capture_envelope(env).is_none());
+    }
+
+    #[test]
+    fn capture_protocol_invalid_marker_shell_is_metadata_only() {
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let stripped = |state: &str| {
+            serde_json::json!({
+                "session_id": "shell-invalid", "cwd": "/repo",
+                "tool_family": "non-file", "tool_name": "non-file",
+                "_ai_memory_capture": capture_protocol("metadata-only", state, "non-file", 0, "extracted"),
+            })
+        };
+        // What a current client sends under a broken marker is accepted.
+        let env = inspect_capture_envelope(HookEnvelope::from_query_and_body(
+            query(),
+            stripped("invalid"),
+        ))
+        .unwrap();
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        assert_eq!(env.raw["tool_family"], "non-file");
+
+        // An active policy decides a shell call outright, so a metadata-only
+        // claim for one is impossible and refused.
+        assert!(
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(
+                query(),
+                stripped("active")
+            ))
+            .is_none()
+        );
+
+        // An older client that still keeps the command under a broken marker
+        // is stripped by the server's own re-inspection.
+        let kept = serde_json::json!({
+            "session_id": "shell-invalid-keep", "tool_name": "Bash",
+            "tool_input": { "command": "cat /PRIVATE_PATH_SENTINEL/x.md" },
+            "tool_response": "SENTINEL_SECRET",
+            "_ai_memory_capture": capture_protocol("keep", "invalid", "non-file", 0, "extracted"),
+        });
+        let env =
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), kept)).unwrap();
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        let stored = serde_json::to_string(&env).unwrap();
+        assert!(!stored.contains("SENTINEL"), "{stored}");
+
+        // Control: a non-file tool with no command keeps its body.
+        let search = serde_json::json!({
+            "session_id": "web-search-invalid", "tool_name": "web_search",
+            "tool_input": { "query": "docs" },
+            "_ai_memory_capture": capture_protocol("keep", "invalid", "non-file", 0, "extracted"),
+        });
+        let env =
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), search.clone()))
+                .unwrap();
+        assert_eq!(env.raw, search);
+    }
+
+    #[test]
+    fn capture_protocol_invalid_shell_metadata_claim_must_be_canonical() {
+        let admit = |path_count: u16, extraction: &str| {
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "shell-claim", "cwd": "/repo",
+                    "tool_family": "non-file", "tool_name": "non-file",
+                    "_ai_memory_capture": capture_protocol(
+                        "metadata-only", "invalid", "non-file", path_count, extraction),
+                }),
+            ))
+            .is_some()
+        };
+        assert!(admit(0, "extracted"), "control: what a real client sends");
+        assert!(!admit(60_000, "extracted"), "invented path count");
+        assert!(!admit(1, "extracted"), "non-file bodies carry no paths");
+        assert!(!admit(0, "missing-or-malformed"), "file-only extraction");
+        assert!(!admit(0, "not-applicable"), "search-only extraction");
+    }
+
+    #[test]
+    fn capture_protocol_unparseable_marker_strips_shell_events() {
+        for marker in [
+            serde_json::json!("garbage"),
+            serde_json::json!({"version": 99}),
+            {
+                let mut future = capture_protocol("keep", "invalid", "non-file", 0, "extracted");
+                future["version"] = serde_json::json!(2);
+                future
+            },
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "shell-unparseable", "cwd": "/repo",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "cat docs/adr/secret.md" },
+                    "tool_response": "SENTINEL_SECRET",
+                    "_ai_memory_capture": marker,
+                }),
+            );
+            let stored = inspect_capture_envelope(env).map(|env| env.raw.to_string());
+            assert!(
+                stored.is_none_or(|stored| !stored.contains("SENTINEL_SECRET")),
+                "shell output survived an unparseable marker"
+            );
+        }
     }
 
     #[test]
@@ -12949,6 +13199,29 @@ mod tests {
         assert!(q[1].contains("working tree"), "got: {q:?}");
     }
 
+    /// The same file-activity heuristic, but for the *majority* spelling: every
+    /// closed-tool agent stores `safe_tool_title`'s `"tool file"`, not the bare
+    /// `canonical_tool_name` `"file"` of the reserved-protocol path. Before
+    /// #895 this spelling never matched, so the heuristic was dead for almost
+    /// every real session.
+    #[test]
+    fn open_questions_detects_abnormal_exit_after_prefixed_file_activity() {
+        let obs = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            // No Stop observation — session ended mid-task.
+        ];
+        let last = Some("fix the bug".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 2, "got: {q:?}");
+        assert!(q[0].contains("without a normal stop"), "got: {q:?}");
+        assert!(q[1].contains("working tree"), "got: {q:?}");
+    }
+
     /// Guard against the regression this heuristic already had once: only
     /// titles the ingest path can actually produce may drive it, so a raw
     /// tool name must NOT trigger the file branch.
@@ -12966,6 +13239,66 @@ mod tests {
                  drive the file heuristic; got: {q:?}"
             );
         }
+    }
+
+    /// An automatic handoff built only from closed-tool observations (whose
+    /// titles are `safe_tool_title`'s `"tool file"` / `"tool non-file"` family
+    /// labels) must NOT emit a `Tools used:` line: a family is a partition of
+    /// the calls, not a name for a tool, so the label leaks nothing useful into
+    /// the handoff. A real tool name still produces the line (#895).
+    #[test]
+    fn auto_handoff_omits_tool_family_labels_from_tools_used() {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file",
+                "tool_family: non-file\noutcome: success",
+            ),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &observations,
+            None,
+        );
+        assert!(
+            handoff
+                .next_steps
+                .iter()
+                .all(|s| !s.starts_with("Tools used:")),
+            "family labels must not surface as a Tools used line; got: {:?}",
+            handoff.next_steps
+        );
+
+        // Control: a real harness tool name still produces the line.
+        let with_real_tool = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(ObservationKind::PostToolUse, "Edit", "edited main.rs"),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &with_real_tool,
+            None,
+        );
+        assert!(
+            handoff.next_steps.iter().any(|s| s == "Tools used: Edit"),
+            "a real tool name must still be listed; got: {:?}",
+            handoff.next_steps
+        );
     }
 
     /// A search/list tool is file-adjacent but not file activity; it must
@@ -13072,5 +13405,111 @@ mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// End-to-end proof that a client-supplied `occurred_at` reaches every
+    /// timestamp column it is supposed to via the real `/hook` ingest path
+    /// (`process_authorized` -> `admit_hook_session_event` for the session
+    /// row, `insert_observation*` for the observation), not just the
+    /// lower-level store functions those handlers call. `admit_hook_session_event`
+    /// creates the `sessions` row on its own INSERT, separate from
+    /// `begin_session_row`, so this is the path a real backfilled
+    /// session-start actually takes.
+    #[tokio::test]
+    async fn hook_occurred_at_stamps_session_and_observation_times_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = "occurred-at-e2e";
+        let start_at = "2025-09-10T12:00:00Z";
+        let prompt_at = "2025-09-10T12:01:00Z";
+        let end_at = "2025-09-10T12:05:00Z";
+        let envelope = |event: &str, occurred_at: &str, prompt: Option<&str>| {
+            let mut body = serde_json::json!({
+                "session_id": session,
+                "occurred_at": occurred_at,
+            });
+            if let Some(prompt) = prompt {
+                body["prompt"] = serde_json::json!(prompt);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        process(
+            &state,
+            envelope("session-start", start_at, None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            envelope("user-prompt-submit", prompt_at, Some("backfilled prompt")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            envelope("session-end", end_at, None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id = resolve_native_session_id(session);
+        let summary = state
+            .reader
+            .session_summary_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .expect("session row exists");
+        let expected_start = start_at.parse::<jiff::Timestamp>().unwrap().to_string();
+        let expected_end = end_at.parse::<jiff::Timestamp>().unwrap().to_string();
+        assert_eq!(
+            summary.started_at, expected_start,
+            "started_at must come from the session-start event's occurred_at, \
+             not import time (admit_hook_session_event's own INSERT)"
+        );
+        assert_eq!(
+            summary.ended_at.as_deref(),
+            Some(expected_end.as_str()),
+            "ended_at must come from the session-end event's occurred_at"
+        );
+        assert!(
+            summary.started_at <= expected_end,
+            "a backfilled session must not end before it starts"
+        );
+
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let prompt_obs = observations
+            .iter()
+            .find(|o| o.body == "backfilled prompt")
+            .expect("the user-prompt observation was recorded");
+        let expected_prompt_at = prompt_at.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(
+            prompt_obs.created_at, expected_prompt_at,
+            "created_at must come from the observation's own occurred_at"
+        );
     }
 }

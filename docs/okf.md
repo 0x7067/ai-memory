@@ -52,13 +52,13 @@ families. Summary of what conformance requires:
 | OKF key | ai-memory source |
 |---|---|
 | `type` (required) | derived from path family + existing frontmatter: `sessions/` → `Session Summary`, `_rules/` → `Rule`, `gotchas/` → `Gotcha`, `decisions/` → `Decision`, `procedures/` → `Procedure`, `concepts/` → `Concept`, `notes/` → `Note`, `runbooks/` → `Runbook`, `_slots/` → `Invariant`/`State` (from `slot_kind`), `_lint/` → `Lint Report`, `_pending/` → `Pending Note`; `kind:` frontmatter (`fact`/`note`/`procedure`/`decision`) wins over the path default when present |
-| `title` | already written by every producer |
-| `description` | existing `summary` field, when present |
+| `title` | not written by `conform_frontmatter` on the general write path — only an explicit `title:` frontmatter value survives there. `export-okf` backfills a missing/empty `title` at export time from `derive_title` (H1 heading, else path stem); the on-disk wiki file is never touched |
+| `description` | `conform_frontmatter` fills it from `summary` at write time, when present. `export-okf` additionally falls back to `abstract` when `summary` is absent, but only in the exported copy — a page with neither at write time still has no `description` until it is exported |
 | `tags` | already written |
 | `generated.by` | actor convention: `process:ai-memory/<version>` for the zero-LLM consolidator and system writers; `<provider-model>` (e.g. `openai-compat/qwen3:32b`) for LLM-written pages; `human:<user>` for wiki edits attributed via the watcher |
 | `generated.at` | the page version's `updated_at` |
-| `sources` | session provenance: pages already stamped with `session_id`/`agent` get `[{resource: "ai-memory://session/<uuid>", author: "<agent>"}]` |
-| `stale_after` | existing `expires_at` (TTL), when present |
+| `sources` | session provenance: pages already stamped with `session_id`/`agent` get `[{resource: "ai-memory://session/<uuid>", author: "process:<agent>"}]` — the `process:<id>` actor form (§5.1), since a per-harness semantic version isn't honestly derivable |
+| `stale_after` | existing `expires_at` (TTL), when present: an RFC 3339 value verbatim, a bare `YYYY-MM-DD` as the end of that day in UTC (`2026-10-01T23:59:59.999999Z`), since OKF timestamps carry an explicit offset |
 | `status` | `deprecated` when TTL-expired but retained; otherwise omitted (spec default `stable`) |
 
 Extension fields kept verbatim (unknown keys are conformant): `tier`,
@@ -123,6 +123,26 @@ Order is fixed; each step gates the next:
 Rollback: restore the archive (blunt, no git knowledge needed), or the
 pre-migration git checkpoint + `reindex` (surgical).
 
+### Repairs to already-migrated stores
+
+A conformance bug found after a store migrated is repaired by an
+idempotent startup pass, not by a new `WikiMigration`: a registered
+migration name makes every older binary refuse the wiki
+(`NewerWikiFormat`), a format-generation step a patch fix should not
+force. The pass follows the
+migration's no-churn rules (row in place, same version, `updated_at` and
+`generated.at` untouched, body untouched, one git commit) and is a no-op
+once the store is clean. `conform_frontmatter` applies the same repair,
+so any later rewrite of an affected page (a restore, a hand edit, a
+`reindex`) heals it too.
+
+- **Date-only `stale_after`.** Builds before the fix copied a bare
+  `expires_at` date into `stale_after` verbatim. `serve` rewrites a
+  `stale_after` that equals its date-only `expires_at` to the instant the
+  TTL names (`2026-10-01` → `2026-10-01T23:59:59.999999Z`); a
+  `stale_after` that differs from `expires_at` was not derived by
+  ai-memory and is left alone.
+
 ## Tests (each with a control that must fail on a broken build)
 
 - Round-trip: page → OKF file on disk → parsed back identical.
@@ -139,5 +159,10 @@ pre-migration git checkpoint + `reindex` (surgical).
   the export). Import has no dedicated command by design: the format is
   native, so unpacking a bundle's concept files into a project's wiki
   directory and letting the watcher (or `reindex`) ingest them IS the
-  import path.
+  import path. Overwriting an already-imported concept file gets its new
+  version embedded the same way a brand-new file does — no manual
+  `ai-memory embed` needed. Deleting one does not yet remove it from the
+  index: the watcher only reconciles create/modify events, so a deleted
+  concept file still needs an explicit `ai-memory delete-page` (tracked in
+  #929).
 - Retrieval regression: LongMemEval baseline re-run; no material drop.
