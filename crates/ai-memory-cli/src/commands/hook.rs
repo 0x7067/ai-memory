@@ -34,7 +34,7 @@ use super::hook_capture::{
 };
 use super::hook_drain_process;
 use super::hook_spool;
-use super::path_util::strip_windows_verbatim_prefix;
+use super::path_util::{home_dir, strip_windows_verbatim_prefix};
 
 // All drain/handoff timings default to the current short values and can be
 // overridden by whole-minute env vars for very high-latency or large-backlog
@@ -621,6 +621,15 @@ where
         false
     };
     if ai_memory_hooks::cap_lifecycle_body_for_client(&mut json, hook_event) {
+        payload = serde_json::to_string(&json)?;
+    }
+    if agent_kind == AgentKind::AntigravityCli
+        && ai_memory_hooks::enrich_antigravity_step_output(
+            &mut json,
+            hook_event,
+            home_dir().as_deref(),
+        )
+    {
         payload = serde_json::to_string(&json)?;
     }
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
@@ -2593,6 +2602,67 @@ mod tests {
             capture_assistant: false,
             capture_mode: None,
         }
+    }
+
+    #[tokio::test]
+    async fn antigravity_post_tool_use_spools_enriched_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact_dir = tmp.path().join("brain").join("conv-123");
+        let step_dir = artifact_dir
+            .join(".system_generated")
+            .join("steps")
+            .join("7");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(
+            step_dir.join("output.txt"),
+            "npm test passed with 0 errors\n",
+        )
+        .unwrap();
+
+        let data_dir = tmp.path().join("data");
+        let raw = serde_json::json!({
+            "conversationId": "conv-123",
+            "workspacePaths": [tmp.path().to_str().unwrap()],
+            "toolCall": {
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "npm test"
+                }
+            },
+            "stepIdx": 7,
+            "artifactDirectoryPath": artifact_dir.to_str().unwrap()
+        });
+
+        let mut stdout = Vec::new();
+        let args = HookArgs {
+            event: "post-tool-use".into(),
+            agent: "antigravity-cli".into(),
+            server_url: "http://127.0.0.1:41399".into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        };
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let spooled = read_spooled_entries(&hook_spool::spool_dir(&data_dir));
+        assert_eq!(spooled.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&spooled[0].body).unwrap();
+        assert_eq!(
+            body.get("tool_response")
+                .and_then(serde_json::Value::as_str),
+            Some("npm test passed with 0 errors")
+        );
     }
 
     fn kimi_hook_args(event: &str, server_url: &str) -> HookArgs {
