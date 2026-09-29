@@ -296,7 +296,12 @@ pub struct AutoImproveProposal {
     #[serde(default, alias = "body", alias = "markdown", alias = "content")]
     pub body_markdown: String,
     /// `full_page` (default) or `patch`.
+    ///
+    /// Advertised as an enum for the same reason as `operation`; still a
+    /// `String` so an unconstrained provider's `"full"` reaches
+    /// [`normalize_edit_mode`] instead of failing to deserialise.
     #[serde(default = "default_edit_mode")]
+    #[schemars(extend("enum" = ["full_page", "patch"]))]
     pub edit_mode: String,
     /// Patch edits for existing _rules/ or procedures/ pages.
     #[serde(default)]
@@ -357,6 +362,26 @@ fn normalize_operation(raw: &str) -> String {
 
 fn default_edit_mode() -> String {
     "full_page".into()
+}
+
+/// Map the ways a model spells the two supported edit modes onto their
+/// canonical form.
+///
+/// Same narrow policy as [`normalize_operation`]: the system prompt says
+/// "Full-page proposals", and models answer `"full"`. Unknown values are left
+/// untouched so they still fail validation.
+fn normalize_edit_mode(raw: &str) -> String {
+    let squashed: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .collect();
+    match squashed.as_str() {
+        "" | "fullpage" | "full" => default_edit_mode(),
+        "patch" => "patch".into(),
+        _ => raw.to_string(),
+    }
 }
 
 /// A candidate the reviewer or validator rejected.
@@ -1486,8 +1511,13 @@ pub(crate) fn validate_response(
 fn normalize_proposal(proposal: &mut AutoImproveProposal, warnings: &mut Vec<String>) {
     normalize_kind(proposal, warnings);
 
-    if proposal.edit_mode.trim().is_empty() {
-        proposal.edit_mode = default_edit_mode();
+    let original_edit_mode = proposal.edit_mode.clone();
+    proposal.edit_mode = normalize_edit_mode(&original_edit_mode);
+    if !original_edit_mode.trim().is_empty() && proposal.edit_mode != original_edit_mode {
+        warnings.push(format!(
+            "proposal {} edit_mode normalized from {:?} to {:?}",
+            proposal.path, original_edit_mode, proposal.edit_mode
+        ));
     }
     if proposal.edit_mode == "patch" {
         return;
@@ -3264,6 +3294,43 @@ mod tests {
         );
     }
 
+    /// Same shape as #458 on the neighbouring field: `gpt-oss-20b` via LM
+    /// Studio answered `"edit_mode": "full"` for every candidate, so every run
+    /// ended with zero accepted proposals and only `unsupported_edit_mode`
+    /// rejections.
+    #[test]
+    fn a_proposal_saying_full_is_accepted_as_full_page() {
+        let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+        candidate.edit_mode = "full".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![candidate],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(rejected.is_empty(), "got {rejected:?}");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].edit_mode, "full_page");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("edit_mode normalized from \"full\"")),
+            "normalisation should be reported, got {warnings:?}"
+        );
+
+        let mut unknown = proposal("gotchas/thing.md", "gotcha", 0.91);
+        unknown.edit_mode = "rewrite".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![unknown],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _) = validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected[0].reason, "unsupported_edit_mode");
+    }
+
     #[test]
     fn patch_to_missing_or_non_context_target_rejects() {
         let raw = AutoImproveLlmResponse {
@@ -3671,5 +3738,66 @@ mod operation_normalization_tests {
             serde_json::from_value(serde_json::json!({ "operation": "create" }))
                 .expect("must not fail to parse; normalisation happens in validation");
         assert_eq!(parsed.operation, "create");
+    }
+}
+
+#[cfg(test)]
+mod edit_mode_normalization_tests {
+    use super::*;
+
+    #[test]
+    fn the_spellings_models_actually_emit_are_accepted() {
+        for raw in [
+            "full_page",
+            "full",
+            "Full",
+            "full-page",
+            "Full Page",
+            "FULLPAGE",
+            "",
+            "  ",
+        ] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                "full_page",
+                "{raw:?} means full page and must normalise"
+            );
+        }
+        for raw in ["patch", "PATCH", " Patch "] {
+            assert_eq!(normalize_edit_mode(raw), "patch", "{raw:?} must normalise");
+        }
+    }
+
+    #[test]
+    fn unknown_edit_modes_are_left_to_fail() {
+        for raw in ["rewrite", "replace", "append", "diff", "delete"] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                raw,
+                "{raw:?} is not a supported mode and must keep failing validation"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_constrains_edit_mode_to_the_supported_values() {
+        let schema = schemars::schema_for!(AutoImproveProposal);
+        let value = serde_json::to_value(&schema).expect("schema serialises");
+        let variants = value
+            .pointer("/properties/edit_mode/enum")
+            .and_then(|e| e.as_array())
+            .expect("edit_mode carries an enum constraint");
+        assert_eq!(
+            variants,
+            &vec![serde_json::json!("full_page"), serde_json::json!("patch")]
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_edit_mode_still_deserialises() {
+        let parsed: AutoImproveProposal =
+            serde_json::from_value(serde_json::json!({ "edit_mode": "full" }))
+                .expect("must not fail to parse; normalisation happens before validation");
+        assert_eq!(parsed.edit_mode, "full");
     }
 }
