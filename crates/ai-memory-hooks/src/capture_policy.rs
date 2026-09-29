@@ -16,6 +16,8 @@ pub const MAX_CANDIDATE_PATH_CHARS: usize = 4_096;
 pub const MAX_CAPTURE_CANDIDATES: usize = 32;
 /// Maximum aggregate pattern-by-candidate scalar comparisons per inspection.
 pub const MAX_MATCH_WORK: usize = 1_000_000;
+/// Longest argv element kept whole as a path; longer ones are scripts.
+const MAX_ARGV_PATH_CHARS: usize = 256;
 const MAX_CALL_ID_CHARS: usize = 128;
 const CAPTURE_PROTOCOL_VERSION: u8 = 1;
 
@@ -480,7 +482,10 @@ impl CapturePolicy {
         let extracted = extract(agent, raw);
         let (disposition, extraction) = match self.state {
             PolicyState::Inactive => (CaptureDisposition::Keep, extracted.state),
-            PolicyState::Invalid if extracted.family == ToolFamily::File => {
+            // A broken marker cannot prove a shell command's arguments miss
+            // every ignored path, so it fails closed like a file tool, readable
+            // or not.
+            PolicyState::Invalid if extracted.family == ToolFamily::File || extracted.shell => {
                 (CaptureDisposition::MetadataOnly, extracted.state)
             }
             PolicyState::Invalid => (CaptureDisposition::Keep, extracted.state),
@@ -516,14 +521,14 @@ impl CapturePolicy {
                 // still name an ignored file whose content lands in the
                 // output (`cat docs/adr/*.md`). An exhausted match budget
                 // fails closed like an unprovable file candidate.
-                ToolFamily::NonFile => match extracted.command.as_deref().map(|command| {
+                ToolFamily::NonFile => match extracted.command.as_ref().map(|command| {
                     let base = match extracted.workdir.as_deref() {
                         Some(dir) if is_absolute(dir) => dir.to_owned(),
                         // `join` would turn an unusable cwd into `/dir`.
                         Some(dir) if is_absolute(cwd) => join(cwd, dir),
                         _ => cwd.to_owned(),
                     };
-                    self.match_command(command, &base)
+                    self.match_command(&command.words(), &base)
                 }) {
                     Some(Ok(true) | Err(())) => (CaptureDisposition::Drop, extracted.state),
                     Some(Ok(false)) | None => (CaptureDisposition::Keep, extracted.state),
@@ -580,10 +585,10 @@ impl CapturePolicy {
     /// Lexically matches every path-like shell argument. Nothing is expanded
     /// or executed: variables, command substitution, and `cd` are not
     /// followed, so this narrows the leak rather than closing every alias.
-    fn match_command(&self, command: &str, cwd: &str) -> Result<bool, ()> {
+    fn match_command(&self, words: &[String], cwd: &str) -> Result<bool, ()> {
         let mut work = 0_usize;
-        for word in shell_words(command) {
-            for argument in shell_arguments(&word) {
+        for word in words {
+            for argument in shell_arguments(word) {
                 let expanded = match (argument.strip_prefix("~/"), self.home.as_deref()) {
                     (Some(rest), Some(home)) => join(home, rest),
                     _ => argument.to_owned(),
@@ -655,16 +660,20 @@ pub fn metadata_only_body(
 }
 
 #[derive(Default)]
-struct Extracted {
+struct Extracted<'a> {
     family: ToolFamily,
     paths: Option<Vec<String>>,
-    command: Option<String>,
+    /// A shell tool's command, not yet split into words.
+    command: Option<ShellCommand<'a>>,
+    /// A command-running tool, even when its command is unreadable.
+    /// `web_search` is non-file but runs nothing.
+    shell: bool,
     workdir: Option<String>,
     call_id: Option<String>,
     state: ExtractionState,
 }
 
-fn extract(agent: AgentKind, raw: &Value) -> Extracted {
+fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     let Some(object) = raw.as_object() else {
         return Extracted::default();
     };
@@ -720,6 +729,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         .flatten();
     // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
     // when given, so relative arguments resolve from there.
+    let shell = family == ToolFamily::NonFile && !name.eq_ignore_ascii_case("web_search");
     let workdir = command
         .as_ref()
         .and_then(|_| args?.get("workdir")?.as_str())
@@ -751,6 +761,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         family,
         paths,
         command,
+        shell,
         workdir,
         call_id,
         state,
@@ -881,16 +892,47 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// The command line of a shell tool. Argument vectors (Codex exec) are
-/// joined so a `bash -lc "<script>"` element is tokenized like any script.
-fn shell_command(args: &Value) -> Option<String> {
+/// A shell tool's command as given, split into words on demand: `extract` runs
+/// for every tool event and most never need them.
+enum ShellCommand<'a> {
+    Line(&'a str),
+    Argv(Vec<&'a str>),
+}
+
+impl ShellCommand<'_> {
+    /// An argument vector (Codex exec) keeps each element as one word
+    /// (`private notes/x.md`) and also tokenizes it, so a `bash -lc "<script>"`
+    /// element is read like any script. Joining the elements instead would
+    /// re-split paths with spaces and let one stray quote swallow the rest.
+    fn words(&self) -> Vec<String> {
+        match self {
+            Self::Line(command) => shell_words(command),
+            Self::Argv(items) => {
+                let mut words = Vec::new();
+                for item in items {
+                    let tokens = shell_words(item);
+                    // Kept whole, a long script would exhaust the match budget.
+                    if (tokens.len() != 1 || tokens[0] != *item)
+                        && item.chars().count() <= MAX_ARGV_PATH_CHARS
+                    {
+                        words.push((*item).to_owned());
+                    }
+                    words.extend(tokens);
+                }
+                words
+            }
+        }
+    }
+}
+
+fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
     match args.get("command").or_else(|| args.get("cmd"))? {
-        Value::String(command) => Some(command.clone()),
+        Value::String(command) => Some(ShellCommand::Line(command)),
         Value::Array(items) => items
             .iter()
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()
-            .map(|items| items.join(" ")),
+            .map(ShellCommand::Argv),
         _ => None,
     }
 }
@@ -1846,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_matching_needs_an_active_policy_and_fails_closed_on_budget() {
+    fn shell_matching_is_off_when_inactive_and_fails_closed_when_invalid_or_over_budget() {
         let raw = bash("cat docs/adr/x.md");
         let inactive = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
         assert_eq!(
@@ -1856,10 +1898,23 @@ mod tests {
                 .disposition(),
             CaptureDisposition::Keep
         );
+        // A broken marker strips a shell call like a file call, but a
+        // non-file tool with no command (`web_search`) keeps its body.
         let invalid = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        let decision = invalid.inspect(AgentKind::ClaudeCode, &raw, "/repo");
+        assert_eq!(
+            decision.protocol().disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+        let body = metadata_only_body(Some("s"), Some("/repo"), &decision).to_string();
+        assert!(!body.contains("docs/adr"), "{body}");
         assert_eq!(
             invalid
-                .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                .inspect(
+                    AgentKind::ClaudeCode,
+                    &json!({"tool_name": "web_search", "tool_input": {"query": "docs/adr"}}),
+                    "/repo"
+                )
                 .protocol()
                 .disposition(),
             CaptureDisposition::Keep
@@ -1966,5 +2021,93 @@ mod tests {
                 "extraction_state"
             ]
         );
+    }
+    #[test]
+    fn invalid_marker_strips_shell_calls_with_unparseable_commands() {
+        let policy = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        for (agent, payload) in [
+            (
+                AgentKind::ClaudeCode,
+                json!({"tool_name":"Bash","tool_input":{"command":7}}),
+            ),
+            (
+                AgentKind::Codex,
+                json!({"tool_name":"shell","tool_input":{"command":["cat", 7]}}),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                json!({"tool_name":"Bash","tool_input":{"cmd_line":"cat secret/x.md"}}),
+            ),
+        ] {
+            let decision = policy.inspect(agent, &payload, "/repo");
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::MetadataOnly,
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_bash_lc_script_in_argv_is_not_dropped_by_the_match_budget() {
+        let ignore_paths = (0..40).map(|i| format!("/repo/private{i}/**")).collect();
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig { ignore_paths }),
+            "/repo",
+            None,
+        );
+        assert_eq!(policy.state, PolicyState::Active);
+        let script = format!("{}ls a?.rs", "echo x; ".repeat(350));
+        assert!(script.chars().count() < MAX_CANDIDATE_PATH_CHARS);
+        // Control: as a string, the script splits into short words.
+        let as_string = json!({"tool_name":"shell","tool_input":{"command": script}});
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &as_string, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "control"
+        );
+        let as_argv = json!({"tool_name":"shell","tool_input":{"command":["bash","-lc",script]}});
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &as_argv, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "innocuous script silently dropped by the match budget"
+        );
+    }
+    #[test]
+    fn shell_command_borrows_the_command_and_splits_only_on_request() {
+        let line = json!({"command": "cat 'private notes/x.md' | head"});
+        let Some(ShellCommand::Line(borrowed)) = shell_command(&line) else {
+            panic!("a string command is kept as a line");
+        };
+        assert!(std::ptr::eq(borrowed, line["command"].as_str().unwrap()));
+        assert_eq!(
+            ShellCommand::Line(borrowed).words(),
+            ["cat", "private notes/x.md", "head"]
+        );
+
+        let argv = json!({"cmd": ["cat", "private notes/x.md"]});
+        assert_eq!(
+            shell_command(&argv).unwrap().words(),
+            ["cat", "private notes/x.md", "private", "notes/x.md"]
+        );
+        let script = format!("echo {}; ls", "x ".repeat(MAX_ARGV_PATH_CHARS));
+        let argv = json!({"command": ["bash", "-lc", script]});
+        let words = shell_command(&argv).unwrap().words();
+        assert!(!words.contains(&script), "a long script is not one path");
+        assert_eq!(words.last().map(String::as_str), Some("ls"));
+
+        for args in [
+            json!({"command": 7}),
+            json!({"command": ["cat", 7]}),
+            json!({"cmd_line": "cat x"}),
+        ] {
+            assert!(shell_command(&args).is_none(), "{args}");
+        }
     }
 }

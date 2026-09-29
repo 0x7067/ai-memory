@@ -238,7 +238,10 @@ retain current behavior.
 Recognized shell tools (`Bash`, `shell`, `exec`, `execute_bash`, `terminal`, …)
 have no path field, so the command line is split into words lexically, the way
 a POSIX shell quotes and separates them, without expanding or running anything.
-Each argument that is not a flag, plus the value of a `--flag=value` or
+A command given as an argument vector keeps each element as one word (a path
+with spaces stays whole, up to 256 characters) and also splits each element on
+its own, so a `bash -lc "<script>"` script is read like any command line. Each
+argument that is not a flag, plus the value of a `--flag=value` or
 `NAME=value` word, is resolved like a file-tool path: from the tool's own
 `workdir` argument when it has one, otherwise from the event's `cwd`. If
 one matches a pattern, the whole event is **dropped**, exactly like a matching
@@ -247,7 +250,11 @@ reach a pattern's directory: `cat docs/*/0001.md` is dropped under
 `docs/adr/**`, `cat *.md` at the repository root is not. A command that exceeds
 the match budget is dropped. Variables, command substitution, `cd` state, and
 commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
-their output is still captured. Excluding content before transport
+their output is still captured. An invalid policy makes a shell command
+**metadata-only**, like a file tool, because a broken marker cannot prove its
+arguments miss every ignored path; this holds even when the command cannot be
+read. An older server drops that metadata-only shell event, so upgrade the
+server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
 
