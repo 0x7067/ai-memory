@@ -8,23 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Conformance to CommonMark §4.5 and §4.7 in wiki markdown link extraction,
-  code-fence tracking, and web relative link resolution:
-  - Code fence tracking in `extract_links` and `rewrite_local_wikilinks` now
-    matches the opening delimiter glyph (`` ` `` vs `~`) and length per
-    CommonMark §4.5 via `CodeFence::step`, preventing inner fences of different
-    glyph or shorter length from prematurely toggling fence state.
-  - Markdown link destination parsing in `extract_links` now conforms to
-    CommonMark §4.7: balanced parentheses in bare destinations are preserved
-    instead of truncating at the first `)` (e.g. `[doc](notes/foo_(1).md)` is
-    now correctly indexed), pointy-bracketed destinations (`<...>`) are supported,
-    and optional trailing link titles are properly stepped over.
-  - Wikilink export rewrite in `rewrite_local_wikilinks` now wraps destinations
-    containing spaces in pointy brackets (`[label](<../path with space.md>)`),
-    ensuring standard CommonMark conformance and OKF v0.2 interoperability.
-  - The `/web` reader's `scope_relative_link` now strips pointy brackets and
-    leading `./` prefixes (e.g. `[doc](./notes/foo.md)`), resolving to valid
-    `PagePath`s without failing path segment validation.
+- Wiki link extraction and the wikilink export now follow CommonMark for code
+  fences and link destinations: a fence closes only on the same glyph and at
+  least the opening length (so a ```` ``` ```` line inside `~~~` or a four-tick
+  fence no longer ends it), and a backtick line whose info string holds a
+  backtick is text, not a fence that hides the rest of the page from the link
+  index. `[doc](notes/foo_(1).md)` keeps its balanced parentheses, `<...>`
+  destinations and trailing titles are parsed (a `)` or link inside a title is
+  no longer read as part of the link), and a destination scan is bounded so a
+  line of unclosed `[a](` cannot stall a page write. (#985)
+- `[[wikilinks]]` exported as Markdown links now write a `<...>` destination
+  whenever a bare one cannot hold the path (a space, a control character, or an
+  unbalanced parenthesis), so an exported bundle indexes back to the page it
+  was written from. A path that cannot be written either way keeps its
+  `[[wikilink]]`. (#985)
+- The `/web` reader resolves `[doc](./notes/foo.md)` to the page instead of a
+  `p/./notes/foo.md` route that 404s. (#985)
 
 ## [2.4.2] - 2026-09-29
 

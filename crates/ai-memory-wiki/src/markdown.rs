@@ -127,15 +127,6 @@ pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath
 /// own project. Collected in a `BTreeSet` so output is deduped + stable.
 type LinkKey = (Option<String>, Option<String>, String);
 
-/// Extract internal wiki links from a markdown body.
-///
-/// Supports `[[wiki links]]`, `[[wiki links|labels]]`, cross-project
-/// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, and
-/// ordinary markdown links such as `[label](../decisions/foo.md#anchor)`.
-/// External URLs, anchors, images, and non-markdown assets are ignored, and
-/// so is anything inside a fenced block or an inline code span, which the
-/// page shows as code rather than as a link.
-/// Returned values are normalised to wiki-root-relative [`LinkTarget`]s.
 /// Active code fence delimiter and its opening run length (CommonMark §4.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CodeFence {
@@ -148,30 +139,40 @@ impl CodeFence {
     ///
     /// Returns `(updated_fence_state, line_is_code_or_fence)`.
     fn step(current: Option<Self>, line: &str) -> (Option<Self>, bool) {
+        let in_fence = current.is_some();
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let glyph = trimmed.chars().next().unwrap();
-            let count = trimmed.chars().take_while(|&c| c == glyph).count();
-            match current {
-                None => (Some(CodeFence { glyph, len: count }), true),
-                Some(fence) => {
-                    if fence.glyph == glyph
-                        && count >= fence.len
-                        && trimmed[count..].trim().is_empty()
-                    {
-                        (None, true)
-                    } else {
-                        (Some(fence), true)
-                    }
-                }
+        let glyph = match trimmed.chars().next() {
+            Some(c @ ('`' | '~')) => c,
+            _ => return (current, in_fence),
+        };
+        let count = trimmed.chars().take_while(|&c| c == glyph).count();
+        if count < 3 {
+            return (current, in_fence);
+        }
+        let info = &trimmed[count..];
+        match current {
+            // A backtick fence's info string cannot contain a backtick, so
+            // ```` ```code``` text ```` is a paragraph with an inline span,
+            // not a fence that would swallow the rest of the page.
+            None if glyph == '`' && info.contains('`') => (None, false),
+            None => (Some(CodeFence { glyph, len: count }), true),
+            Some(fence) if fence.glyph == glyph && count >= fence.len && info.trim().is_empty() => {
+                (None, true)
             }
-        } else {
-            let in_fence = current.is_some();
-            (current, in_fence)
+            Some(fence) => (Some(fence), true),
         }
     }
 }
 
+/// Extract internal wiki links from a markdown body.
+///
+/// Supports `[[wiki links]]`, `[[wiki links|labels]]`, cross-project
+/// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, and
+/// ordinary markdown links such as `[label](../decisions/foo.md#anchor)`.
+/// External URLs, anchors, images, and non-markdown assets are ignored, and
+/// so is anything inside a fenced block or an inline code span, which the
+/// page shows as code rather than as a link.
+/// Returned values are normalised to wiki-root-relative [`LinkTarget`]s.
 #[must_use]
 pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
     let mut out: BTreeSet<LinkKey> = BTreeSet::new();
@@ -493,18 +494,14 @@ fn rewrite_wikilinks_in_segment(
             return;
         };
         let raw = &after_start[..end];
-        match resolve_local_wikilink(raw, page_path, own_project) {
-            Some((href, label)) => {
+        let resolved = resolve_local_wikilink(raw, page_path, own_project)
+            .and_then(|(href, label)| Some((markdown_destination(&href)?, label)));
+        match resolved {
+            Some((destination, label)) => {
                 out.push('[');
                 out.push_str(&escape_markdown_link_label(&label));
                 out.push_str("](");
-                if href.contains(' ') {
-                    out.push('<');
-                    out.push_str(&href);
-                    out.push('>');
-                } else {
-                    out.push_str(&href);
-                }
+                out.push_str(&destination);
                 out.push(')');
             }
             None => {
@@ -575,6 +572,38 @@ fn relative_href(page_dir: &[&str], target: &str) -> String {
     parts.join("/")
 }
 
+/// `href` as a Markdown link destination, or `None` when it has none.
+///
+/// A bare destination cannot hold a space or control character, cannot
+/// start with `<`, and needs balanced parentheses; anything else goes
+/// inside `<…>` (CommonMark §4.7). A `<` or `>` in a destination that
+/// needs the brackets can only be written with a backslash escape that
+/// [`extract_links`] does not read back, so that target keeps its literal
+/// `[[wikilink]]` rather than export a link that indexes elsewhere.
+fn markdown_destination(href: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut bare = !href.starts_with('<');
+    for c in href.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => match depth.checked_sub(1) {
+                Some(open) => depth = open,
+                None => bare = false,
+            },
+            ' ' => bare = false,
+            c if c.is_ascii_control() => bare = false,
+            _ => {}
+        }
+    }
+    if bare && depth == 0 {
+        return Some(href.to_string());
+    }
+    if href.contains(['<', '>']) {
+        return None;
+    }
+    Some(format!("<{href}>"))
+}
+
 /// Escape characters that would prematurely close a Markdown link label
 /// (`[<label>](<href>)`): brackets, the backslash, and parentheses — an
 /// unescaped `)` inside the label closes the link early.
@@ -635,37 +664,95 @@ fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<L
     }
 }
 
+/// Longest destination (title included) worth scanning. A page path cannot
+/// exceed the filesystem's limits, and an unbounded scan made a line of
+/// `[a](` repeated quadratic on the page-write path.
+const MAX_LINK_DESTINATION_BYTES: usize = 512;
+
+/// How many whitespace runs in a bare destination are tried as the start of a
+/// title before the rest is read as part of the destination.
+const MAX_TITLE_PROBES: usize = 8;
+
 /// Parse a CommonMark link destination immediately following the opening `(`
-/// of `[label](<destination>)` or `[label](destination)` (CommonMark §4.7).
+/// of `[label](<destination>)` or `[label](destination)` (CommonMark §4.7),
+/// stepping over an optional title.
 ///
 /// Returns `(destination_str, closing_paren_byte_offset)`.
+///
+/// Two deliberate departures from the spec: a bare destination may hold
+/// whitespace when no title follows it (`[x](my page.md)`), which is what
+/// earlier versions indexed and what the wikilink export used to emit; and
+/// the scan gives up after [`MAX_LINK_DESTINATION_BYTES`].
 fn parse_link_destination(rest: &str) -> Option<(&str, usize)> {
+    let rest = &rest[..rest.floor_char_boundary(MAX_LINK_DESTINATION_BYTES)];
     let trimmed = rest.trim_start();
     let leading = rest.len() - trimmed.len();
     if let Some(after_lt) = trimmed.strip_prefix('<') {
         let rel_gt = after_lt.find('>')?;
         let after_gt = &after_lt[rel_gt + 1..];
-        let rel_paren = after_gt.find(')')?;
-        let paren = leading + 1 + rel_gt + 1 + rel_paren;
-        Some((&after_lt[..rel_gt], paren))
+        let rel_paren = closing_paren_after_destination(after_gt)?;
+        Some((&after_lt[..rel_gt], leading + 1 + rel_gt + 1 + rel_paren))
     } else {
-        let mut depth = 1;
-        let mut dest_end = None;
-        for (i, b) in trimmed.char_indices() {
-            if b == '(' {
-                depth += 1;
-            } else if b == ')' {
-                depth -= 1;
-                if depth == 0 {
-                    let end = dest_end.unwrap_or(i);
-                    return Some((&trimmed[..end], leading + i));
+        let mut depth = 0usize;
+        let mut probes = 0;
+        let mut prev_ws = false;
+        for (i, c) in trimmed.char_indices() {
+            let ws = c.is_ascii_whitespace();
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => return Some((trimmed[..i].trim_end(), leading + i)),
+                ')' => depth -= 1,
+                _ if ws && !prev_ws && depth == 0 && probes < MAX_TITLE_PROBES => {
+                    if let Some(close) = closing_paren_after_destination(&trimmed[i..]) {
+                        return Some((&trimmed[..i], leading + i + close));
+                    }
+                    probes += 1;
                 }
-            } else if b.is_ascii_whitespace() && depth == 1 && dest_end.is_none() {
-                dest_end = Some(i);
+                _ => {}
             }
+            prev_ws = ws;
         }
         None
     }
+}
+
+/// Byte offset in `tail` of the `)` that closes a link whose destination
+/// ended just before `tail`: optional whitespace, then optionally a title
+/// (`"…"`, `'…'` or `(…)`, separated from the destination by whitespace),
+/// then the `)`. `None` when `tail` is anything else, so a `)` or a link
+/// inside a title is never taken for the end of the link.
+fn closing_paren_after_destination(tail: &str) -> Option<usize> {
+    let body = tail.trim_start();
+    let lead = tail.len() - body.len();
+    let mut chars = body.char_indices();
+    let (_, first) = chars.next()?;
+    if first == ')' {
+        return Some(lead);
+    }
+    let closer = match first {
+        _ if lead == 0 => return None,
+        '"' => '"',
+        '\'' => '\'',
+        '(' => ')',
+        _ => return None,
+    };
+    let mut escaped = false;
+    for (i, c) in chars {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == closer {
+            let after = &body[i + 1..];
+            let rest = after.trim_start();
+            return rest
+                .starts_with(')')
+                .then(|| lead + i + 1 + (after.len() - rest.len()));
+        } else if first == '(' && c == '(' {
+            return None; // an unescaped `(` cannot appear in a `(…)` title
+        }
+    }
+    None
 }
 
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
@@ -1222,5 +1309,139 @@ mod tests {
         // Without spaces, no pointy brackets needed
         let plain = rewrite_local_wikilinks("See [[decisions/b.md]].", &path, "proj");
         assert_eq!(plain, "See [decisions/b.md](../decisions/b.md).");
+    }
+
+    /// Link paths `md` yields when it sits at the wiki root, sorted.
+    fn linked(md: &str) -> Vec<String> {
+        let root = PagePath::new("here.md").unwrap();
+        extract_links(md, &root)
+            .into_iter()
+            .map(|l| l.path.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn extract_links_keeps_whitespace_in_bare_destinations() {
+        // Earlier scans indexed these and the wikilink export used to emit
+        // the first form; cutting at the space aimed them at `decisions/my.md`.
+        assert_eq!(
+            linked("[d](decisions/my decision.md) [e](notes/a b/c d.md)"),
+            ["decisions/my decision.md", "notes/a b/c d.md"]
+        );
+        assert_eq!(
+            linked("[f](notes/my file (1).md)"),
+            ["notes/my file (1).md"]
+        );
+        assert_eq!(
+            linked("[g](notes/my page.md \"a title\")"),
+            ["notes/my page.md"]
+        );
+        assert_eq!(linked("[h](b.md )"), ["b.md"]);
+    }
+
+    #[test]
+    fn extract_links_steps_over_titles_holding_parens_and_links() {
+        // A `)` or a link inside a title is not the end of the link, nor a link.
+        assert_eq!(linked("[a](<b.md> \"t (c) [d](e.md)\")"), ["b.md"]);
+        assert_eq!(linked("[a](c.md \"x :) [d](e.md)\")"), ["c.md"]);
+        assert_eq!(linked("[a](f.md \"x (y\")"), ["f.md"]);
+        assert_eq!(
+            linked("[a](g.md 'single') [b](h.md (paren title))"),
+            ["g.md", "h.md"]
+        );
+    }
+
+    #[test]
+    fn extract_links_rejects_pointy_destination_followed_by_junk() {
+        assert!(linked("[a](<b.md>zzz)").is_empty());
+        // A title must be separated from the destination by whitespace.
+        assert!(linked("[a](<b.md>\"t\")").is_empty());
+        assert_eq!(linked("[a](<b.md> \"t\")"), ["b.md"]);
+    }
+
+    #[test]
+    fn extract_links_stays_linear_on_unclosed_destinations() {
+        // Each `](` used to rescan the rest of the line for a `)` that never
+        // comes: 256 KiB of `[a](` took seconds in release, minutes in debug,
+        // on the page-write path. The bound keeps it to a fraction of a second.
+        let root = PagePath::new("here.md").unwrap();
+        let started = std::time::Instant::now();
+        for unit in ["[a](", "[a](<x>"] {
+            let line = unit.repeat(256 * 1024 / unit.len());
+            assert!(extract_links(&line, &root).is_empty());
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "destination scan is no longer linear: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn extract_links_bounds_destination_length_without_splitting_characters() {
+        // Straddle the scan window with 1- and 2-byte characters: cutting
+        // inside a character must not panic.
+        for n in 250..262 {
+            let _ = linked(&format!("[a]({}.md)", "é".repeat(n)));
+            let _ = linked(&format!("[a](a{}.md)", "é".repeat(n)));
+        }
+        assert!(linked(&format!("[a]({}.md)", "x".repeat(600))).is_empty());
+        assert_eq!(linked(&format!("[a]({}.md)", "x".repeat(200))).len(), 1);
+    }
+
+    #[test]
+    fn backtick_fence_info_string_cannot_contain_backticks() {
+        // Not a fence: a paragraph opening with an inline code span.
+        let md =
+            "```code``` intro [[a/b.md]]\n[[c/d.md]]\n```\n[[e/f.md]]\n```\nafter [[g/h.md]]\n";
+        assert_eq!(linked(md), ["a/b.md", "c/d.md", "g/h.md"]);
+
+        let path = PagePath::new("concepts/a.md").unwrap();
+        let rewritten = rewrite_local_wikilinks(md, &path, "proj");
+        assert!(rewritten.contains("[a/b.md](../a/b.md)"), "{rewritten}");
+        assert!(rewritten.contains("[[e/f.md]]"), "{rewritten}");
+
+        // A tilde fence may carry backticks in its info string.
+        assert!(linked("~~~ a`b\n[[x.md]]\n~~~\n").is_empty());
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_wraps_each_destination_a_bare_link_cannot_hold() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        for target in [
+            "notes/foo_(1).md",
+            "notes/a).md",
+            "notes/a(b.md",
+            "notes/a\tb.md",
+            "notes/a b).md",
+            "notes/(x) y.md",
+        ] {
+            let rewritten = rewrite_local_wikilinks(&format!("See [[{target}]]."), &path, "proj");
+            assert_eq!(
+                extract_links(&rewritten, &path)
+                    .iter()
+                    .map(|l| l.path.as_str())
+                    .collect::<Vec<_>>(),
+                [target],
+                "{rewritten:?} must index back to the page it was written from"
+            );
+        }
+        // Balanced parentheses need no brackets; unbalanced ones do.
+        let balanced = rewrite_local_wikilinks("[[notes/foo_(1).md]]", &path, "proj");
+        assert!(balanced.ends_with("](../notes/foo_(1).md)"), "{balanced}");
+        let unbalanced = rewrite_local_wikilinks("[[notes/a).md]]", &path, "proj");
+        assert!(unbalanced.ends_with("](<../notes/a).md>)"), "{unbalanced}");
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_keeps_targets_it_cannot_express_as_a_link() {
+        // `<` or `>` in a destination that needs the brackets would need a
+        // backslash escape the extractor does not read back.
+        let path = PagePath::new("concepts/a.md").unwrap();
+        let body = "See [[notes/a>b c.md]].";
+        assert_eq!(rewrite_local_wikilinks(body, &path, "proj"), body);
+        // Without whitespace or parens a bare destination holds them fine.
+        let bare = rewrite_local_wikilinks("[[notes/a>b.md]]", &path, "proj");
+        assert!(bare.ends_with("](../notes/a>b.md)"), "{bare}");
     }
 }
