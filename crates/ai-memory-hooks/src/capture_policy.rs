@@ -522,14 +522,14 @@ impl CapturePolicy {
                 // still name an ignored file whose content lands in the
                 // output (`cat docs/adr/*.md`). An exhausted match budget
                 // fails closed like an unprovable file candidate.
-                ToolFamily::NonFile => match extracted.command.as_deref().map(|words| {
+                ToolFamily::NonFile => match extracted.command.as_ref().map(|command| {
                     let base = match extracted.workdir.as_deref() {
                         Some(dir) if is_absolute(dir) => dir.to_owned(),
                         // `join` would turn an unusable cwd into `/dir`.
                         Some(dir) if is_absolute(cwd) => join(cwd, dir),
                         _ => cwd.to_owned(),
                     };
-                    self.match_command(words, &base)
+                    self.match_command(&command.words(), &base)
                 }) {
                     Some(Ok(true) | Err(())) => (CaptureDisposition::Drop, extracted.state),
                     Some(Ok(false)) | None => (CaptureDisposition::Keep, extracted.state),
@@ -661,11 +661,11 @@ pub fn metadata_only_body(
 }
 
 #[derive(Default)]
-struct Extracted {
+struct Extracted<'a> {
     family: ToolFamily,
     paths: Option<Vec<String>>,
-    /// A shell tool's command, already split into words.
-    command: Option<Vec<String>>,
+    /// A shell tool's command, not yet split into words.
+    command: Option<ShellCommand<'a>>,
     /// A command-running tool, whether or not its command could be read.
     /// `web_search` is non-file but runs nothing.
     shell: bool,
@@ -674,7 +674,7 @@ struct Extracted {
     state: ExtractionState,
 }
 
-fn extract(agent: AgentKind, raw: &Value) -> Extracted {
+fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     let Some(object) = raw.as_object() else {
         return Extracted::default();
     };
@@ -893,34 +893,51 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// The words of a shell tool's command. An argument vector (Codex exec) is
-/// already split: each element is one word as given (`private notes/x.md`),
-/// and is also tokenized on its own so a `bash -lc "<script>"` element is read
-/// like any script. Joining the elements instead would re-split paths with
-/// spaces and let one element's stray quote swallow the rest.
-fn shell_command(args: &Value) -> Option<Vec<String>> {
-    match args.get("command").or_else(|| args.get("cmd"))? {
-        Value::String(command) => Some(shell_words(command)),
-        Value::Array(items) => {
-            let items = items
-                .iter()
-                .map(Value::as_str)
-                .collect::<Option<Vec<_>>>()?;
-            let mut words = Vec::new();
-            for item in items {
-                let tokens = shell_words(item);
-                // Whitespace in a long element means a script, not a path;
-                // its tokens are checked below. Keeping the blob whole would
-                // charge it, quadratically, against every pattern.
-                if (tokens.len() != 1 || tokens[0] != item)
-                    && item.chars().count() <= MAX_ARGV_PATH_CHARS
-                {
-                    words.push(item.to_owned());
+/// A shell tool's command as the tool gave it. Reading it only validates its
+/// shape; the words are split on demand by [`ShellCommand::words`], because
+/// `extract` runs for every tool event and most never need them.
+enum ShellCommand<'a> {
+    Line(&'a str),
+    Argv(Vec<&'a str>),
+}
+
+impl ShellCommand<'_> {
+    /// The words of the command. An argument vector (Codex exec) is already
+    /// split: each element is one word as given (`private notes/x.md`), and is
+    /// also tokenized on its own so a `bash -lc "<script>"` element is read
+    /// like any script. Joining the elements instead would re-split paths with
+    /// spaces and let one element's stray quote swallow the rest.
+    fn words(&self) -> Vec<String> {
+        match self {
+            Self::Line(command) => shell_words(command),
+            Self::Argv(items) => {
+                let mut words = Vec::new();
+                for item in items {
+                    let tokens = shell_words(item);
+                    // Whitespace in a long element means a script, not a path;
+                    // its tokens are checked below. Keeping the blob whole
+                    // would charge it, quadratically, against every pattern.
+                    if (tokens.len() != 1 || tokens[0] != *item)
+                        && item.chars().count() <= MAX_ARGV_PATH_CHARS
+                    {
+                        words.push((*item).to_owned());
+                    }
+                    words.extend(tokens);
                 }
-                words.extend(tokens);
+                words
             }
-            Some(words)
         }
+    }
+}
+
+fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
+    match args.get("command").or_else(|| args.get("cmd"))? {
+        Value::String(command) => Some(ShellCommand::Line(command)),
+        Value::Array(items) => items
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .map(ShellCommand::Argv),
         _ => None,
     }
 }
@@ -2073,5 +2090,42 @@ mod tests {
             CaptureDisposition::Keep,
             "innocuous script silently dropped by the match budget"
         );
+    }
+    // Reading a shell call's command must not tokenize it: `extract` runs for
+    // every tool event, including the common case with no `[capture]` policy,
+    // where the words are never used. Splitting is a separate, explicit step.
+    #[test]
+    fn shell_command_borrows_the_command_and_splits_only_on_request() {
+        let line = json!({"command": "cat 'private notes/x.md' | head"});
+        let Some(ShellCommand::Line(borrowed)) = shell_command(&line) else {
+            panic!("a string command is kept as a line");
+        };
+        assert!(std::ptr::eq(borrowed, line["command"].as_str().unwrap()));
+        assert_eq!(
+            ShellCommand::Line(borrowed).words(),
+            ["cat", "private notes/x.md", "head"]
+        );
+
+        // An argv element stays whole (a path with spaces) and is also split
+        // on its own; a long one is a script and is only split.
+        let argv = json!({"cmd": ["cat", "private notes/x.md"]});
+        assert_eq!(
+            shell_command(&argv).unwrap().words(),
+            ["cat", "private notes/x.md", "private", "notes/x.md"]
+        );
+        let script = format!("echo {}; ls", "x ".repeat(MAX_ARGV_PATH_CHARS));
+        let argv = json!({"command": ["bash", "-lc", script]});
+        let words = shell_command(&argv).unwrap().words();
+        assert!(!words.contains(&script), "a long script is not one path");
+        assert_eq!(words.last().map(String::as_str), Some("ls"));
+
+        // Unreadable commands stay unreadable.
+        for args in [
+            json!({"command": 7}),
+            json!({"command": ["cat", 7]}),
+            json!({"cmd_line": "cat x"}),
+        ] {
+            assert!(shell_command(&args).is_none(), "{args}");
+        }
     }
 }
