@@ -982,15 +982,16 @@ async fn build_okf_bundle_file(
         let mut tar = tar::Builder::new(encoder);
         tar.mode(tar::HeaderMode::Deterministic);
         tar.follow_symlinks(false);
-        // Fresh bundle-root index.md: okf_version + full listing.
+        // Fresh bundle-root index.md: okf_version + full listing, with no
+        // prose outside the list structure (some strict OKF validators
+        // read §11.3 as rejecting a stray sentence — issue #960 item 1).
         families.sort();
         let listing: String = families
             .iter()
             .map(|f| format!("- [{f}/]({f}/)\n"))
             .collect();
-        let index = format!(
-            "---\nokf_version: \"0.2\"\n---\n\n# Bundle index\n\nConcept files live in these directories:\n\n{listing}"
-        );
+        let index =
+            format!("---\nokf_version: \"0.2\"\n---\n\n# Bundle index — concept files by directory\n\n{listing}");
         let mut header = tar::Header::new_gnu();
         header.set_size(index.len() as u64);
         header.set_mode(0o644);
@@ -8543,6 +8544,51 @@ mod tests {
         let fm = ai_memory_wiki::parse(&page_body).unwrap().frontmatter;
         assert!(ai_memory_core::okf::is_conformant(&fm));
         assert_eq!(fm["type"], "Gotcha");
+    }
+
+    /// Issue #960 item 1: strict OKF validators read §11.3 ("follows the
+    /// structure in §8") as rejecting prose outside the list structure. The
+    /// generated `index.md` body, once its heading line is stripped, must
+    /// consist only of blank lines and `- [...]` list entries.
+    #[tokio::test]
+    async fn export_okf_index_has_no_prose_outside_the_list() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "gotchas/build.md", "watch out").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let mut index_body = String::new();
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().display().to_string() == "index.md" {
+                use std::io::Read as _;
+                entry.read_to_string(&mut index_body).unwrap();
+            }
+        }
+        let parsed = ai_memory_wiki::parse(&index_body).unwrap();
+        for line in parsed.body.lines() {
+            let trimmed = line.trim();
+            assert!(
+                trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("- "),
+                "prose line outside the list structure: {line:?}\nfull body: {}",
+                parsed.body
+            );
+        }
     }
 
     /// Post-audit regression: the things a REAL deployment's tree holds

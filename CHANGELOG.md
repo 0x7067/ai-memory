@@ -162,6 +162,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local example listed the page in the target's backlinks, while the web
   page rendered neither as a link. A link whose label is code
   (`` [`foo`](foo.md) ``) is still indexed. (#968)
+- `export-okf`'s generated `index.md` no longer has a prose sentence outside
+  its list structure. Some strict OKF v0.2 validators read §11.3 as
+  rejecting it. (#960)
 
 ## [2.4.1] - 2026-09-25
 
