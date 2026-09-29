@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [2.4.2] - 2026-09-29
+
+### Changed
+- Documented Cheaper Inference as an endpoint for the existing `openai-compat`
+  provider. (#981)
 - `docs/llm-providers.md` now has a dedicated OpenRouter subsection and a
   matching row in the recommended-defaults table. The wiring
   (`openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1`)
@@ -35,9 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory backup --to <tarball>` command
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
-### Changed
-- Documented Cheaper Inference as an endpoint for the existing `openai-compat`
-  provider.
 
 ### Fixed
 - `observations.title` is now sanitized before it is truncated, not after.
@@ -195,6 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OKF actor grammar's `process:<id>` form for automated processes (#979).
   This changes the default `sources[].author` value written for every page
   from now on; already-written pages are not retroactively rewritten.
+
 
 ## [2.4.1] - 2026-09-25
 
@@ -6744,7 +6746,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...HEAD
+[2.4.2]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.4.0
 [2.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.2
