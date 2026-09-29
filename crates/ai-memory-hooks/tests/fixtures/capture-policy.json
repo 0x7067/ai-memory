@@ -47,7 +47,7 @@
   ],
   "shell": {
     "note": "Shell-tool vectors run by both matchers. `{root}` is the marker directory, `cwd` is relative to it, and `command` is shorthand for a `bash` payload.",
-    "ignore_paths": ["docs/adr/**","~/notes/**","docs/n?tes/**","C:/Secret/**"],
+    "ignore_paths": ["docs/adr/**","~/notes/**","docs/n?tes/**","C:/Secret/**","private notes/**"],
     "vectors": [
       {"command":"cat docs/adr/0001.md","disposition":"drop"},
       {"command":"cat ./docs/adr/0001.md","disposition":"drop"},
@@ -84,6 +84,12 @@
       {"command":"ls C:/Pub*","disposition":"keep"},
       {"payload":{"tool":"shell","args":{"command":["bash","-lc","cat docs/adr/x.md"]}},"disposition":"drop"},
       {"payload":{"tool":"run_command","args":{"cmd":"cat docs/adr/x.md"}},"disposition":"drop"},
+      {"command":"cat 'private notes/x.md'","disposition":"drop"},
+      {"command":"cat private notes/x.md","disposition":"keep"},
+      {"payload":{"tool":"shell","args":{"command":["cat","private notes/x.md"]}},"disposition":"drop"},
+      {"payload":{"tool":"shell","args":{"command":["cat","it's/x","docs/adr/x.md"]}},"disposition":"drop"},
+      {"payload":{"tool":"shell","args":{"command":["bash","-lc","cat 'private notes/x.md'"]}},"disposition":"drop"},
+      {"payload":{"tool":"shell","args":{"command":["cat","private","notes/x.md"]}},"disposition":"keep"},
       {"payload":{"tool":"bash","args":{"command":7}},"disposition":"keep"},
       {"payload":{"tool":"exec","args":{"command":"cat docs/adr/x.md"}},"disposition":"drop"},
       {"payload":{"tool":"shell_command","args":{"command":"cat docs/adr/x.md"}},"disposition":"drop"},

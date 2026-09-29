@@ -94,55 +94,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/admin/pending-writes/{id}/approve|reject` routes with the session cookie
   and the CSRF header, so admission, audit, and attribution stay the same.
   `ai-memory-web` adds no write route. (#855)
-- Inert per-project-authorization schema and the `authorize_project` choke
-  point (first slice of #708). A new `project_grants` table
-  (`(workspace, project, user) -> read|write`) and a `projects.access_mode`
-  column (`open` | `restricted`, default `open`) are added additively — every
-  existing project stays `open`, so there is no behaviour change. The typed
-  `authorize_project` gate (consulted by `ScopeResolver` read/write resolution
-  and, as defense in depth, by the writer actor) short-circuits `open`
-  projects and single-user/loopback deployments to ALLOW, and degrades to open
-  when grants cannot be read (never a lockout). A `restricted` project with
-  zero grants still admits root and the creator. Because nothing sets
-  `restricted` yet, this is a pure pass-through; enforcing `restricted` across
-  the unscoped-read and raw-id bypass classes plus the root-only management
-  surface (setting `restricted`, issuing grants) follow in a later slice. (#708)
-- Per-project authorization is enforced (third slice of #708, completing
-  [`design-per-project-authz.md`](docs/design-per-project-authz.md)). A
-  `restricted` project admits root, its creator and grant holders; `open`, the
-  default and what every existing project stays after upgrading, admits any
-  authenticated user exactly as before. Every surface attaches the choke point
-  for database users — MCP tools, hook routes and captures, the web UI and
-  `/api/v1` — and read-shaped tools that mutate (delete, feedback, sweep, lint,
-  auto-improve, handoff accept/cancel, message pop/cancel) need `write`.
-  Unscoped reads — search, listings, the graph and the workspace overview —
-  leave out projects a user may not read, filtered in the query before
-  `LIMIT`; managed-run, workstream and session-id entry points authorize the
-  project the id resolves to. A refusal is a 403 naming the project and the
-  level needed, never an empty result. Installs with no database users, and
-  the root token, are never checked. (#708)
-- `projects.created_by` (V69) records the database user whose call created a
-  project, and the choke point derives "creator" from it, so a creator keeps
-  their project if it is later restricted, without a grant. Projects that
-  predate it have no recorded creator. (#708)
-- Root-only management of access and grants:
-  `ai-memory project access --workspace W --project P --mode open|restricted`
-  (`POST /admin/projects/access`) — restricting names the page authors it now
-  refuses and grants nobody automatically;
-  `ai-memory user grant --user U --workspace W --project P --level read|write`,
-  `ai-memory user revoke …`, `ai-memory user grants [--user U]` and
-  `ai-memory project grants --workspace W --project P`
-  (`POST /admin/users/{username}/grant|revoke`,
-  `GET /admin/users/{username}/grants`, `GET /admin/projects/grants`). Every
-  grant, level change and revoke is recorded in `audit_log`
-  (`grant_access` / `revoke_access`). (#708)
-- `[auth] new_projects_restricted` (`AI_MEMORY_AUTH__NEW_PROJECTS_RESTRICTED`),
-  default `false`: when set, every project created from then on starts
-  `restricted`. The reserved `scratch` project and the global preferences scope
-  always start open; the global scope cannot be restricted. (#708)
-- Cross-project messages respect access: sending into a restricted project's
-  inbox, popping it and cancelling its outbox need `write` on it; listing needs
-  `read`. (#708)
 - Native `ai-memory upgrade` for GitHub-release installs (Linux/macOS
   tarballs and Windows x86_64 zip): downloads the matching release archive,
   verifies the `.sha256` sidecar, replaces the on-disk binary (and a sibling
@@ -234,15 +185,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (not bare JSON 401), forms call existing `POST /auth/login` /
   `/auth/password` / `/auth/logout`, and `--web-ui-dir` custom SPAs stay
   unchanged. (#811)
-- `[consolidation] input_token_safety_margin` (float, default `0.8`, validated
-  to `(0.0, 1.0]`) scales the approximate char-count input budget. The
-  `max_input_tokens` budget uses a flat chars-per-token heuristic that
-  under-budgets denser corpora — pt-BR text and source code tokenize at fewer
-  chars per token than English and could overshoot a provider's real input
-  limit by ~40%. The default tightens the common case modestly while leaving
-  such corpora headroom; lower it further for a mostly non-English or code
-  corpus. `max_input_tokens` is now documented as an approximate heuristic in
-  the config reference. (#884)
 - `docs/jev-reranker-adapter.md` documents a stdlib-only adapter
   (`docs/examples/jev-reranker-adapter/jev_rerank_shim.py`) that serves the
   `AI_MEMORY_RERANKER=llm` request leg from a Jev `/v1/systemone` judge
@@ -268,25 +210,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope, keeps one open baton per live session (refreshed in place, audited as
   `refresh_handoff`), and never touches a session that already ended. Child
   sessions neither claim startup context nor publish batons. (#865)
-- `install-hooks --agent opencode2 --capture-assistant` extends the
-  assistant/Stop capture double opt-in to OpenCode 2: the plugin forwards the
-  last completed assistant text through the native hook's sanitizer before it
-  reaches the spool or the wire. The captured excerpt continues the work in
-  the next session's automatic handoff; it is not rendered into the
-  git-tracked session page. (#865)
-- `install-hooks --agent hermes` (alias `hermes-agent`) and
-  `setup-agent --agent hermes` for **Hermes Agent** (Nous Research). Hermes
-  splits a configured hook `command` with `shlex.split` and runs it with **no
-  shell**, with the event JSON on stdin, so the generated block invokes the
-  native `hook` subcommand directly — the same shape Zero and ZCode use, and no
-  `.sh`/`.ps1` bundle is staged. Two events are wired, `pre_tool_call` and
-  `post_tool_call`, whose payload (`tool_name` / `tool_input`) is the envelope
-  the router already mapped for `agent=hermes`; this is what finally gives
-  Hermes sessions tool observations. `~/.hermes/config.yaml` is printed, never
-  written: it is YAML the operator also edits, and Hermes gates user hooks
-  behind its own acceptance prompt (`hooks_auto_accept`). Session lifecycle
-  stays with the ai-memory memory-provider plugin, so a hook-driven
-  `session-end` cannot double-close a session. (#623 follow-up, #933)
 - `docs/llm-providers.md` now has a dedicated OpenRouter subsection and a
   matching row in the recommended-defaults table. The wiring
   (`openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1`)
@@ -314,6 +237,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory backup --to <tarball>` command
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
+
 ### Changed
 - `ai-memory purge-session` without `--confirm` now previews what a confirmed
   purge would delete before refusing, the same way `purge-project` does (#945):
@@ -339,17 +263,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows in *other* workspaces reached through this workspace's sessions.
   `merge-workspace` is unaffected. There is no CLI subcommand, so this is
   HTTP-only. (#963)
-- `ai-memory purge-project` without `--confirm` now previews what a confirmed
-  purge would delete before refusing: `Would purge <ws>/<proj>: N pages, N
-  sessions, N observations, …`, with the same 404/409 a real purge gives.
-  Before, the counts only appeared after the rows were gone. The server takes
-  a new `dry_run` field on `POST /admin/purge-project` that always wins over
-  `confirm`. It only counts; no delete, wiki removal, webhook, audit row or
-  checkpoint runs. The preview and the confirmed report also count what the
-  purge cascades into *other* projects through this project's sessions
-  (`collateral_observations_deleted`, `collateral_handoffs_denulled`). The
-  CLI still exits non-zero without `--confirm`; against an older server, or
-  if the preview times out, it prints only the existing refusal. (#945)
 - Captures from a checkout with no declared `project` and a git remote now route
   by the repository's identity — the normalised `upstream` remote, else `origin`
   — instead of the folder name (`projects.identity`, V70). Two unrelated
@@ -363,10 +276,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook client (native, shell, PowerShell, TypeScript) resolves the identity
   host-side and sends it as `identity` / `identity_src`; credentials in a remote
   URL never leave the machine. (#708)
-- A capture into a project its author may not write is dropped server-side
-  and counted as `dropped_unauthorized` in status, never stored. The native
-  hook client treats a 403 from the server as final and drops the event
-  instead of retrying it. (#708)
 - Grok Build CLI shows a pending handoff, and an opted-in `[briefing]`, as
   `PostToolUse` `additionalContext` on the first tool of a session.
   `SessionStart` and `UserPromptSubmit` still do not accept the handoff (Grok
@@ -397,83 +306,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"info,rmcp=info"` or `"debug"`) or `RUST_LOG`; the `tracing_appender=warn`
   feedback-loop guard stays non-overridable. (#894)
 
+- Documented Cheaper Inference as an endpoint for the existing `openai-compat`
+  provider. (#981)
+
+
 ### Fixed
 - A Kiro v3 resume that falls back to the default session store drops
   `KIRO_HOME` from the child, but auto-wire still installed hooks and MCP
   under `KIRO_HOME`; it now wires the default home that resume reads. (#820)
-- `ai-memory run` auto-wired only the first config home per agent and
-  version: its sentinel ignored where hooks and MCP were installed, so a second
-  account (another exported `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) was
-  skipped. The sentinel now also keys on the resolved hook and MCP config
-  paths. The Codex MCP entry ignored `CODEX_HOME`: `install-mcp` and auto-wire
-  now write `$CODEX_HOME/config.toml`, matching `hooks.json`; `uninstall`
-  sweeps the legacy `~/.codex/config.toml` too, and `install-hooks` still
-  infers the server URL and token from it until the entry is rewritten. (#820)
-- Corrected OMP's install and session paths for named profiles. Hooks and
-  `mcp.json` now use the profile's agent directory and ignore
-  `PI_CODING_AGENT_DIR`. Profile selection follows `--profile`, then
-  `OMP_PROFILE`, then the legacy `PI_PROFILE`. Names are trimmed and
-  validated; empty environment values, whitespace-only names and `default`
-  select the default profile. Returning to the default profile also drops
-  an agent directory inherited from a named parent profile.
-  `PI_CONFIG_DIR` changes the `.omp` root relative to the user's home.
-  On Linux and macOS, `run omp`, `backfill` and `doctor` read sessions from
-  `$XDG_DATA_HOME/omp/sessions` (or `omp/profiles/<name>/sessions` under
-  `$XDG_DATA_HOME`) when the corresponding OMP directory exists and the agent
-  directory has not been relocated. `run omp` also honors
-  `PI_CODING_AGENT_SESSION_DIR` and a leading native `--profile`.
-  Uninstall checks the active and default profiles plus the legacy `.omp`
-  locations, and an invalid OMP profile no longer stops cleanup for other
-  agents. (#820)
-- A whitespace-only `KIMI_CODE_HOME`, `KIRO_HOME` or `GROK_HOME` pointed
-  installs at a blank-named directory under the working directory, and a
-  whitespace-only relocation variable did the same for `ai-memory run`'s
-  native session import. Blank now counts as unset everywhere, as it already
-  did for the `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `PI_CODING_AGENT_DIR`
-  installers, and `ai-memory run` drops such a value from the harness it
-  launches so the harness uses its default home as well. Crush's managed
-  context likewise read a whitespace-only `CRUSH_GLOBAL_CONFIG` or
-  `XDG_CONFIG_HOME` as a directory, and now falls back to the default global
-  config. (#820)
 - Native `ai-memory upgrade` no longer refuses every Linux install by probing
   the running executable for write (Linux `ETXTBSY`); it only requires the
   parent directory to be writable for rename-based replace. (#802)
-- A managed Crush launch with a context packet dropped the `CRUSH.md` and
-  `AGENTS.md` Crush loads by default: Crush only adds them while
-  `global_context_paths` is empty, and the packet filled it. The launcher now
-  adds them first when the user's config lists none, and no longer refuses to
-  start over a global `crush.json` Crush accepts (an empty file, `null`, or
-  `null` options), read from the path cleaned as Crush cleans it. The global
-  `crushrc` beside that config, which Crush stopped reading once the config
-  dir moved, is now sourced from its own directory as well. (#820)
-- Two fresh managed Crush launches on one store could import each other's
-  transcript: Crush has no hooks to link its session, and after exit `ai-memory
-  run` took the newest session there. A fresh launch now claims only the one
-  top-level session created while it ran and imports nothing, with a warning,
-  when another launch created one too; its title and sub-agent sessions are no
-  longer taken for the conversation, and in a data directory outside the
-  project only a session that edited a file in the project is claimed. (#820)
-- `ai-memory run crush`, `backfill` and `doctor` looked for Crush sessions only
-  in `<cwd>/.crush/crush.db`, so a launch from a project subdirectory, or a
-  project whose Crush config sets `options.data_directory`, imported nothing.
-  They now find the store as Crush does: `options.data_directory` from Crush's
-  JSON configs, else the closest `.crush` up to the git worktree root (not one
-  directly in the home), else `<cwd>/.crush`. (#820)
-- Native `ai-memory upgrade` accepts release archives whose entries are
-  `./`-prefixed (`tar -C … -czf … .` as in `release.yml`), instead of
-  rejecting `Component::CurDir` as an unsafe path. (#802)
-- `ai-memory uninstall` left `ai-memory run`'s auto-wire sentinels in
-  `<data_dir>/autowire-state/`, so after the hooks were removed the next
-  managed launch of that harness on the same binary version skipped wiring and
-  captured nothing. Removing hooks or MCP (a full uninstall, `--only hooks` or
-  `--only mcp`) now deletes every sentinel and lists them in the dry-run plan.
-  `--only mcp`, `--only instructions` and `--only skills` also no longer delete
-  the stored hook bearer that the still-installed hooks read. (#820)
-- Native `ai-memory upgrade` treats Linuxbrew (`/home/linuxbrew/.linuxbrew/`)
-  as package-managed and refuses self-replace there. (#802)
-- Native `ai-memory upgrade` container refusal now uses the shared
-  `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
-  `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
 - Parallel OpenCode 2 sessions in one directory no longer receive each
   other's context. Each completed turn's checkpoint retired the automatic
   handoffs of every other live session there, and the next session to start
@@ -530,15 +373,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run` after an upgrade, silently disabling `[auto_scope] per_session` for their
   MCP calls. Auto-wire now detects an existing session-aware bridge and keeps
   it. (#888)
-- After a managed launch, `ai-memory run` imported the newest native session
-  in the checkout even when a hook in the launched harness had linked the
-  run's own session, so a concurrent launch in the same checkout could hand it
-  another transcript. The server now records when a session is linked during
-  a run (schema migration V67, adding `managed_runs.native_session_linked_at`)
-  and reports it in the run status, and the launcher imports that session
-  when this checkout's store holds it (a process the child starts inherits
-  the run id; OpenCode is checked by the session's recorded directory). An
-  older server reports no link and keeps the previous behavior. (#820)
 - On Windows, OpenCode 1 and 2 sessions are found again from their checkout:
   OpenCode records a session's directory with forward slashes
   (`C:/Users/me/repo`), so matching only the backslash checkout path found
@@ -568,9 +402,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block now keeps its shell options and `SSL_CERT_FILE` inside its subshell and
   propagates a failure explicitly, so user hook commands after it keep their
   own semantics and a failing test run still blocks the push. (#824)
-- Isolated the pre-push test process from Git's repository environment and
-  global/system configuration so fixture commands use their own repositories.
-  Existing installations need to run `scripts/install-git-hooks.sh` again. (#824)
 - A Windows service running as `LocalSystem` over a user-owned data
   directory no longer breaks the wiki git history silently. libgit2's
   dubious-ownership guard (CVE-2022-24765) fails every wiki commit with
@@ -637,26 +468,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   60s; `AI_MEMORY_TCP_KEEPALIVE_SECS=0` disables keepalive). This closes the
   half-open-socket half of the fd leak; the rmcp session-table half was
   already fixed in 2.4.0 by the rmcp 2.x bump. (#792)
-- `ai-memory bootstrap` no longer returns a 500 when the LLM emits a page
-  path containing a Windows-illegal character (e.g. a `:` copied verbatim
-  from a conventional-commit subject like `build(sandbox): orchestrate`).
-  Such a path passed the deliberately tolerant `PagePath::new` and only
-  failed later at `ensure_portable` inside the atomic wiki write batch,
-  which aborted every page in the run, not just the offending one. Bad
-  paths are now sanitized (illegal characters replaced with `-`, directory
-  shape preserved) before validation, so the run and its other pages
-  survive; a path `ensure_portable` still rejects after sanitizing is
-  skipped with a warning instead of failing the batch. (#847)
-- Per-session consolidation (`consolidate_session_multi`) had the same
-  Windows-illegal-path defect as `ai-memory bootstrap` (#847): an
-  LLM-produced page path containing a character like `:` passed the
-  deliberately tolerant `PagePath::new` and only failed later at
-  `ensure_portable` inside the atomic wiki write batch, losing every other
-  page from that session's consolidation run. The path is now sanitized
-  the same way bootstrap's is, consistently across rule-routing, per-user
-  slot placement, and the session-anchor comparison, before validation;
-  a path `ensure_portable` still rejects after sanitizing is skipped with
-  a warning instead of failing the batch. (#848)
 - The Windows release checksum (`ai-memory-windows-x86_64.zip.sha256`) is now
   written with a LF terminator instead of CRLF. `Out-File`'s Windows line
   ending made `sha256sum -c` fail with `No such file or directory` — the CR
@@ -689,10 +500,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foreign-scope end and stranded the session open forever. It now ends the
   session when owner and agent match and the event comes from the session's
   own (normalized) cwd; a different cwd, operator or agent is still refused. (#865)
-- Generated TypeScript integrations no longer overwrite each other's spooled
-  events written in the same millisecond, and a host that tears its capture
-  state down cancels still-pending deliveries after the drain budget instead
-  of waiting out each request's timeout. (#865)
 - Shell hooks on macOS no longer corrupt non-ASCII characters in the query
   string. `/bin/sh` there is bash 3.2, which sign-extends bytes >= 0x80, so
   `ai_memory_url_encode` sent `é` as `%FFFFFFFFFFFFFFC3%FFFFFFFFFFFFFFA9`
@@ -782,6 +589,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine indexed it and listed the page in the target's backlinks. The
   preprocessor now skips exactly the code blocks and inline code the
   renderer's parser reads as code. (#955)
+
+- `observations.title` is now sanitized before it is truncated, not after.
+  `title_hint` used to be cut to 80 chars in `ai-memory-hooks::payload`
+  *before* the sanitizer ever ran, so a secret straddling that cutoff was
+  often left as a fragment too short to match a built-in or `[sanitize]
+  extra_patterns` rule — landing in the title, its FTS index, and every
+  surface that renders titles (session pages, briefings, handoffs, search)
+  unredacted, even though the same observation's body was correctly scrubbed
+  first. `title_hint` extraction now keeps the full first line untruncated;
+  `Sanitized::new` scrubs the title and only then applies the 80-char display
+  cap (`ai_memory_core::sanitize::truncate_for_title`), mirroring the order
+  the body already used. (#982)
+- The `/web` page view keeps a leading H1 that is not the page title. It
+  dropped the body's first H1 whatever it said, as a duplicate of the title
+  in the header, but a frontmatter `title:` outranks the H1 and a setext H1
+  never names the page, so a heading like `# Token refresh after sleep`
+  under `title: Auth decisions` vanished from the rendered page. An H1 that
+  repeats the title is still dropped. (#967)
+- Shell-command `ignore_paths` matching no longer joins an argument vector
+  before splitting it, which broke a path with spaces (`["cat", "private
+  notes/x.md"]`) apart and let one element's stray quote hide the elements
+  after it; each element now counts whole and is split on its own. An invalid
+  `.ai-memory.toml` now makes a shell command metadata-only, like a file tool,
+  instead of keeping its command and output, including one whose command is
+  missing or unparseable (`web_search` runs nothing and is still kept), and the
+  server now does the same when it cannot parse the client's capture marker. A
+  long `bash -lc "<script>"` element is read only as words, not also as one
+  path, so it can no longer exhaust the match budget and drop an innocuous
+  event. Applies to the native hook and the generated plugins; the server
+  accepts the new metadata-only shell form, so upgrade it together with them
+  (an older server drops such an event). (#973)
+- `ai-memory-importer omc-wiki` now reads the frontmatter of a page saved
+  with CRLF line endings or a UTF-8 BOM, as a wiki checked out on Windows
+  with `core.autocrlf=true` is. It missed the fence, so the page's kind,
+  tier, tags and pin were dropped and the YAML block was imported as the
+  top of the body; the fence check now matches the wiki's own parser.
+  (#970)
+- `ai-memory serve --web-ui-dir` no longer panics at startup when the
+  custom SPA's `index.html` starts with a UTF-8 BOM, or has any other
+  non-ASCII text before `<head>`. The `<base href>` injection scanned the
+  page a byte at a time and sliced inside the multi-byte character
+  ("byte index 1 is not a char boundary"); it now steps a whole
+  character. (#969)
+- The `/api/v1` single-page route's `ETag` now covers the whole JSON it
+  returns. It hashed only the markdown body and author, so pinning a page,
+  a frontmatter edit, or a new backlink changed the response without
+  changing the tag, and a client revalidating with `If-None-Match` got
+  `304` and kept the stale page. (#971)
+- A wikilink or markdown link written inside an inline code span is no
+  longer indexed as a link. The engine skipped only fenced blocks, so a
+  page showing the syntax as code (`` `[[other-project:notes/x]]` ``) got a
+  lint `broken_link` finding for a dependency it does not have, and a
+  local example listed the page in the target's backlinks, while the web
+  page rendered neither as a link. A link whose label is code
+  (`` [`foo`](foo.md) ``) is still indexed. (#968)
+- `export-okf`'s generated `index.md` no longer has a prose sentence outside
+  its list structure. Some strict OKF v0.2 validators read §11.3 as
+  rejecting it. (#979)
 
 ## [2.4.1] - 2026-09-25
 
