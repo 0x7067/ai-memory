@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `[consolidation] input_token_safety_margin` (float, default `0.8`, validated
+  to `(0.0, 1.0]`) scales the approximate char-count input budget. The
+  `max_input_tokens` budget uses a flat chars-per-token heuristic that
+  under-budgets denser corpora — pt-BR text and source code tokenize at fewer
+  chars per token than English and could overshoot a provider's real input
+  limit by ~40%. The default tightens the common case modestly while leaving
+  such corpora headroom; lower it further for a mostly non-English or code
+  corpus. `max_input_tokens` is now documented as an approximate heuristic in
+  the config reference. (#884)
 - `install-skills --agent hermes` (and the `hermes` entry in
   `memory_install_self_routing`'s `target_hints`) installs the managed routing
   skills into Hermes Agent's `.hermes/skills` (project) or `~/.hermes/skills`

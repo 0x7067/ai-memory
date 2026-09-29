@@ -723,9 +723,17 @@ per_user = false                  # shared + own slots in agent context
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000
+                                   # a flat chars-per-token heuristic, so it
+                                   # UNDER-budgets denser corpora: pt-BR prose
+                                   # and source code tokenize at fewer chars per
+                                   # token than English and can overshoot the
+                                   # provider's real limit by ~40% — lower this
+                                   # (or input_token_safety_margin) for such a corpus
 max_output_tokens = 32000          # provider generation limit; min 1000
                                    # their sum must fit the model context window;
                                    # leave headroom for tokenizer variance
+input_token_safety_margin = 0.8    # scales the char budget, (0.0, 1.0]; the
+                                   # 0.8 default buys pt-BR/code headroom
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review
