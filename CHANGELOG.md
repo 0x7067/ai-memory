@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
 ### Fixed
+- Codex `exec_command` is now recognized as a shell tool by the capture
+  policy, so `ignore_paths` and the invalid-marker fail-closed stripping
+  apply to it. Previously, this Codex tool name bypassed the shell-command
+  path inspection, allowing commands that name an ignored path to be
+  captured. String and argv `cmd` forms, relative paths under `workdir`,
+  and malformed commands under an invalid marker now follow the existing
+  shell policy. (#974)
 - The `/web` page view keeps a leading H1 that is not the page title. It
   dropped the body's first H1 whatever it said, as a duplicate of the title
   in the header, but a frontmatter `title:` outranks the H1 and a setext H1

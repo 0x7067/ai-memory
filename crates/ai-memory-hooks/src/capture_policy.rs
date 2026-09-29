@@ -795,7 +795,7 @@ fn family(name: &str) -> ToolFamily {
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
         | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
         "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
-        | "terminal" | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
+        | "terminal" | "execute_bash" | "execute_cmd" | "exec_command" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -1872,19 +1872,97 @@ mod tests {
             ),
         ] {
             let decision = policy.inspect(agent, &raw, "/repo");
-            if decision.protocol().tool_family() == ToolFamily::NonFile {
-                assert_eq!(
-                    decision.protocol().disposition(),
-                    CaptureDisposition::Drop,
-                    "raw: {raw}"
-                );
-            } else {
-                // `exec_command` is not a recognized shell tool name; it keeps
-                // today's unknown-tool behavior rather than guessing.
-                assert_eq!(raw["tool_name"], "exec_command", "raw: {raw}");
-                assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
-            }
+            assert_eq!(
+                decision.protocol().tool_family(),
+                ToolFamily::NonFile,
+                "raw: {raw}",
+            );
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "raw: {raw}",
+            );
         }
+    }
+
+    #[test]
+    fn codex_exec_command_honors_ignored_paths() {
+        let policy = shell_policy();
+        // Regression for #974: Codex `exec_command` previously fell through
+        // to `ToolFamily::Unknown`, so the ignore_paths gate never matched
+        // the command line and the event kept flowing to the server. A
+        // command line that names an ignored path must be dropped locally,
+        // exactly like Claude `Bash` and Codex `shell`.
+        let ignored = json!({
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "cat docs/adr/x.md"},
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &ignored, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop,
+            "exec_command on an ignored path should be dropped",
+        );
+        // Legitimate control: the same shape against a path that is not
+        // ignored must still be captured, so the privacy gate does not
+        // become a blanket blackout for shell tools we now classify as
+        // recognized.
+        let allowed = json!({
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "cat src/lib.rs"},
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &allowed, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "exec_command on an allowed path should still be captured",
+        );
+    }
+
+    #[test]
+    fn codex_exec_command_array_form_honors_ignored_paths() {
+        let policy = shell_policy();
+        // Codex often wraps scripts as `["bash", "-lc", "..."]`; the argv
+        // form must be parsed the same way `shell` already is (#974).
+        let argv = json!({
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": ["bash", "-lc", "cat docs/adr/x.md"]},
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &argv, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop,
+            "exec_command argv form on an ignored path should be dropped",
+        );
+    }
+
+    #[test]
+    fn codex_exec_command_with_workdir_resolves_relative_ignored_paths() {
+        let policy = shell_policy();
+        // Codex `exec_command` carries its own `workdir`; relative
+        // arguments must be anchored to it, like OpenClaw `exec` and the
+        // other NonFile tools that already honour `workdir`.
+        let payload = json!({
+            "tool_name": "exec_command",
+            "tool_input": {
+                "cmd": "cat 0001.md",
+                "workdir": "docs/adr",
+            },
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &payload, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop,
+            "exec_command with workdir + relative ignored path should be dropped",
+        );
     }
 
     #[test]
@@ -2038,6 +2116,18 @@ mod tests {
                 AgentKind::ClaudeCode,
                 json!({"tool_name":"Bash","tool_input":{"cmd_line":"cat secret/x.md"}}),
             ),
+            (
+                AgentKind::Codex,
+                json!({"tool_name":"exec_command","tool_input":{"cmd":7}}),
+            ),
+            (
+                AgentKind::Codex,
+                json!({"tool_name":"exec_command","tool_input":{"cmd":["cat", 7]}}),
+            ),
+            (
+                AgentKind::Codex,
+                json!({"tool_name":"exec_command","tool_input":{}}),
+            ),
         ] {
             let decision = policy.inspect(agent, &payload, "/repo");
             assert_eq!(
@@ -2045,6 +2135,36 @@ mod tests {
                 CaptureDisposition::MetadataOnly,
                 "{payload}"
             );
+        }
+    }
+
+    #[test]
+    fn invalid_marker_does_not_leak_codex_exec_command_body() {
+        // Security-boundary assertion for #974: even when a Codex
+        // `exec_command` payload cannot be parsed into a command line, the
+        // metadata-only body must never carry the raw argument. The fixed
+        // key set in `metadata_only_body` (session_id, cwd, tool_family,
+        // tool_name, tool_call_id, _ai_memory_capture) is the contract; if a
+        // future refactor widens it for shell tools, this test bites.
+        let policy = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        for payload in [
+            json!({"tool_name": "exec_command", "tool_input": {"cmd": 7}}),
+            json!({"tool_name": "exec_command", "tool_input": {"cmd": ["cat", 7]}}),
+            json!({"tool_name": "exec_command", "tool_input": {}}),
+            json!({"tool_name": "exec_command", "tool_input": {"cmd": "cat secret/x.md"}}),
+        ] {
+            let decision = policy.inspect(AgentKind::Codex, &payload, "/repo");
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::MetadataOnly,
+                "exec_command under an invalid marker must be metadata-only: {payload}",
+            );
+            let body =
+                serde_json::to_string(&metadata_only_body(Some("s"), Some("/repo"), &decision))
+                    .unwrap();
+            assert!(!body.contains("cat"), "command body leaked: {body}");
+            assert!(!body.contains("secret"), "path-like body leaked: {body}");
+            assert!(!body.contains("\"cmd\""), "raw cmd key leaked: {body}");
         }
     }
 

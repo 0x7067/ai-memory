@@ -235,9 +235,10 @@ That form contains only bounded routing/tool/decision metadata, never paths,
 patterns, arguments, output, errors, titles, or nested payload. Unknown tools
 retain current behavior.
 
-Recognized shell tools (`Bash`, `shell`, `exec`, `execute_bash`, `terminal`, …)
-have no path field, so the command line is split into words lexically, the way
-a POSIX shell quotes and separates them, without expanding or running anything.
+Recognized shell tools (`Bash`, `shell`, `exec`, `exec_command`, `execute_bash`,
+`terminal`, …) have no path field, so the command line is split into words
+lexically, the way a POSIX shell quotes and separates them, without expanding
+or running anything.
 A command given as an argument vector keeps each element as one word (a path
 with spaces stays whole, up to 256 characters) and also splits each element on
 its own, so a `bash -lc "<script>"` script is read like any command line. Each
