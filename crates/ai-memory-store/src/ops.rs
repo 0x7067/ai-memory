@@ -7235,6 +7235,8 @@ pub(crate) mod tests {
             title: "stray".into(),
             body: "obs-stray-in-doomed-project".into(),
             importance: 5,
+
+            occurred_at: None,
         };
         insert_observation(&mut conn, &stray).unwrap();
 
@@ -7340,6 +7342,8 @@ pub(crate) mod tests {
             title: "stray".into(),
             body: "obs-in-other-project".into(),
             importance: 5,
+
+            occurred_at: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -7674,6 +7678,8 @@ pub(crate) mod tests {
             title: "collateral".into(),
             body: "obs-collateral".into(),
             importance: 5,
+
+            occurred_at: None,
         };
         insert_observation(&mut conn, &collateral_obs).unwrap();
 
@@ -9099,6 +9105,8 @@ pub(crate) mod tests {
             title: "stray".into(),
             body: "obs-in-other-project".into(),
             importance: 5,
+
+            occurred_at: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -14312,7 +14320,7 @@ pub(crate) mod tests {
                         "{case}"
                     );
                     assert_eq!(landed, vec![proj.as_bytes().to_vec()], "{case}");
-                    end_admitted_session(&mut conn, &admitted, None).unwrap();
+                    end_admitted_session(&mut conn, &admitted, None, None).unwrap();
                     let ended: Option<i64> = conn
                         .query_row(
                             "SELECT ended_at FROM sessions WHERE id = ?1",

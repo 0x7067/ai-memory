@@ -463,6 +463,8 @@ async fn purge_session_dry_run_reports_the_same_counts_the_confirmed_purge_will(
                 title: "obs".into(),
                 body: "obs body".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -777,6 +779,8 @@ async fn purge_session_confirm_true_and_dry_run_true_still_only_previews() {
                 title: "obs".into(),
                 body: "obs body".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -866,6 +870,8 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -884,6 +890,8 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
                 title: "collateral".into(),
                 body: "collateral body".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1536,6 +1544,8 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -1553,6 +1563,8 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
                 title: "stray".into(),
                 body: "stray body".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1674,6 +1686,8 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -1692,6 +1706,8 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
                 title: "collateral".into(),
                 body: "collateral body".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))

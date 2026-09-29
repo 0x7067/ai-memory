@@ -2429,6 +2429,7 @@ mod tests {
             &"x".repeat(50_000),
             Some(&"preference ".repeat(500)),
             tightened,
+            &[],
         );
         assert!(
             estimated_input_chars::<ConsolidatedPage>(&request) <= tightened.max_input_chars,

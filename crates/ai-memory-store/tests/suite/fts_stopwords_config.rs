@@ -280,6 +280,8 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -298,6 +300,8 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
                 title: "deploy-observation".into(),
                 body: "run the deploy steps carefully before every release".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &sanitizer,
         ))
@@ -316,6 +320,8 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
                 title: "noise-observation".into(),
                 body: noisy_de_body(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &sanitizer,
         ))

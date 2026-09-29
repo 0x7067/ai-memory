@@ -636,6 +636,8 @@ async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
                     title: "prompt".into(),
                     body: summary.into(),
                     importance: 5,
+
+                    occurred_at: None,
                 },
                 &Sanitizer::builtin(),
             ))

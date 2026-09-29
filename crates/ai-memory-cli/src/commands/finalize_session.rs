@@ -432,6 +432,8 @@ mod tests {
                 agent_kind: AgentKind::AntigravityCli,
                 cwd: Some(std::path::PathBuf::from("/tmp/target")),
                 actor_user: None,
+
+                occurred_at: None,
             })
             .await
             .unwrap();

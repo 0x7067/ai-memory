@@ -2043,6 +2043,8 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -2059,6 +2061,8 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
                 title: "obs".into(),
                 body: "obs body".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2398,6 +2402,8 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -2416,6 +2422,8 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
                 title: "collateral".into(),
                 body: "collateral body".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2523,6 +2531,8 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -2539,6 +2549,8 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 title: "a-own".into(),
                 body: "a's own observation".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2607,6 +2619,8 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+
+            occurred_at: None,
         })
         .await
         .unwrap();
@@ -2623,6 +2637,8 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 title: "b-own".into(),
                 body: "b's own observation".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2661,6 +2677,8 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 title: "cross".into(),
                 body: "stamped into a by b's session".into(),
                 importance: 5,
+
+                occurred_at: None,
             },
             &Sanitizer::builtin(),
         ))

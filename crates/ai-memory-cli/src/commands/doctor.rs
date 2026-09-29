@@ -27,9 +27,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use ai_memory_core::AgentKind;
-use ai_memory_workstream::{
-    LaunchRoots, ManagedHarness, build_launch_plan_with_env, list_native_sessions,
-};
+use ai_memory_workstream::{ManagedHarness, build_launch_plan, list_native_sessions};
 
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
