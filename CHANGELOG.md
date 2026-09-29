@@ -89,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event. Applies to the native hook and the generated plugins; the server
   accepts the new metadata-only shell form, so upgrade it together with them
   (an older server drops such an event). (#973)
+- `ai-memory-importer omc-wiki` now reads the frontmatter of a page saved
+  with CRLF line endings or a UTF-8 BOM, as a wiki checked out on Windows
+  with `core.autocrlf=true` is. It missed the fence, so the page's kind,
+  tier, tags and pin were dropped and the YAML block was imported as the
+  top of the body; the fence check now matches the wiki's own parser.
+  (#970)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the
