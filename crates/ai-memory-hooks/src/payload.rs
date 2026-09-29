@@ -457,7 +457,7 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
@@ -556,6 +556,9 @@ impl HookEnvelope {
         } else {
             None
         };
+        if agent == AgentKind::AntigravityCli {
+            crate::antigravity::enrich_antigravity_step_output(&mut raw, event, None);
+        }
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
@@ -2952,6 +2955,69 @@ mod tests {
             }),
         );
         assert!(notification.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn antigravity_post_tool_use_extracts_output_txt_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("42");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "cargo test: 10 passed\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "cargo test"}
+                },
+                "stepIdx": 42,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("tool_family: non-file"));
+        assert!(body.contains("cargo test: 10 passed"));
+    }
+
+    #[test]
+    fn antigravity_post_tool_use_preserves_edit_tool_code_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir.path().join(".system_generated").join("steps").join("1");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "Created file test.rs\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "TargetFile": "/workspace/test.rs",
+                        "CodeContent": "fn preserved_code() {}"
+                    }
+                },
+                "stepIdx": 1,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("fn preserved_code() {}"));
+        assert!(!body.contains("Created file test.rs"));
     }
 
     #[test]
