@@ -27,3 +27,4 @@ mod routing_skills;
 mod serve_shutdown;
 mod shutdown_signals;
 mod upgrade_e2e;
+mod yolo_ai_jail;

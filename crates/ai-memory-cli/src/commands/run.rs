@@ -12,14 +12,16 @@ use ai_memory_core::{
     PrepareManagedRunResponse, SessionId,
 };
 use ai_memory_workstream::{
-    AmbiguousNativeSession, ExportedTranscript, LaunchMode, LaunchPlan, LaunchRoots,
-    ManagedHarness, NativeSessionCandidate, allows_native_session_adoption, apply_yolo,
+    AmbiguousNativeSession, ExportedTranscript, FORWARDED_ENV_NAMES, LaunchMode, LaunchPlan,
+    LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_on_path,
+    allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
     build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
-    discover_native_session, export_transcript, has_native_session_selector, inspect_repository,
-    kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
-    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
-    list_native_sessions, native_session_exists, native_session_in_checkout, omp_profile_flag,
-    omp_profile_flag_env, store_override_vars, wait_for_transcript_flush,
+    discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
+    inspect_repository, kiro_explicit_session_id, kiro_harness_from_source_cursor,
+    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
+    kiro_v3_resume_uses_default_store, list_native_sessions, native_session_exists,
+    native_session_in_checkout, omp_profile_flag, omp_profile_flag_env, store_override_vars,
+    wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -115,9 +117,10 @@ pub(super) async fn run_from_with_wiring(
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
+    let yolo_requested = args.yolo || trailing_yolo;
     let force_fresh = args.fresh || trailing_fresh;
     let no_autowire = args.no_autowire || trailing_no_autowire;
-    let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
+    let mut run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
         .context("resolving --env/--env-file for the managed run")?;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
@@ -242,6 +245,20 @@ pub(super) async fn run_from_with_wiring(
         resolved_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
+    // Warn, and offer ai-jail, before any further native-session work — a
+    // yolo re-exec under ai-jail must forward the original argv, not the
+    // resolved launch plan, and restarting cleanly under ai-jail before
+    // session adoption/linking begins keeps that linking simple (#16: this
+    // sits around session-identity resolution, not inside it).
+    acquired_try!(
+        confirm_yolo_and_maybe_reexec(
+            yolo_requested,
+            &endpoint,
+            &run_path,
+            &interrupted_before_spawn,
+        )
+        .await
+    );
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
         harness,
@@ -351,7 +368,7 @@ pub(super) async fn run_from_with_wiring(
             ),
         }
     }
-    if args.yolo || trailing_yolo {
+    if yolo_requested {
         // Kiro's official dangerous mode exists on the v2 engine only
         // (`--trust-all-tools`); the v3 engine replaced it with
         // permissions.yaml and documents no CLI equivalent, so the wrapper
@@ -365,6 +382,19 @@ pub(super) async fn run_from_with_wiring(
             );
         }
         apply_yolo(harness, &mut plan.args);
+    }
+    // Claude-only "true yolo": opt-in, independent of `--yolo` (see
+    // `docs/design-yolo-safety-ai-jail.md` §4). Applied to the same
+    // env/args the child command is built from below.
+    if args.true_yolo || config.claude_true_yolo {
+        if harness == ManagedHarness::Claude {
+            apply_claude_true_yolo(harness, &mut run_env, &mut plan.args);
+        } else if args.true_yolo {
+            eprintln!(
+                "ai-memory: --true-yolo only affects the Claude harness; ignoring it for {}",
+                harness.as_str()
+            );
+        }
     }
     let remove_kiro_home = if harness == ManagedHarness::KiroV3
         && let Some(native_session_id) = plan.expected_session_id.as_deref()
@@ -778,6 +808,159 @@ async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &
             "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
         );
     }
+}
+
+/// Whether a `--yolo` launch should warn (and offer ai-jail) before spawning
+/// the agent: `--yolo` was actually requested, both `stdin` and `stderr` are
+/// real terminals (mirrors the native-session-picker gate), and we are not
+/// already running inside ai-jail. `jailed` failing open to `false` (see
+/// [`ai_memory_workstream::inside_ai_jail`]) means an undetectable sandbox
+/// still shows the warning rather than silently skipping it.
+fn should_prompt_yolo(yolo: bool, stdin_tty: bool, stderr_tty: bool, jailed: bool) -> bool {
+    yolo && stdin_tty && stderr_tty && !jailed
+}
+
+/// A confirmation line's yes/no verdict: `Enter`/empty, `y`, or `yes`
+/// (case-insensitive) proceed; only an explicit `n`/`no` declines. Anything
+/// else also proceeds — this is a `[Y/n]` prompt, not a strict allowlist.
+fn yolo_decision(confirmed_line: &str) -> bool {
+    !matches!(
+        confirmed_line.trim().to_ascii_lowercase().as_str(),
+        "n" | "no"
+    )
+}
+
+/// The two yes/no answers `read_yolo_confirmation` can return: whether to
+/// proceed with `--yolo` at all, and, only when ai-jail is offered, whether
+/// to re-exec under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YoloConfirmation {
+    proceed: bool,
+    jail: bool,
+}
+
+/// Print the `--yolo` warning (docs/design-yolo-safety-ai-jail.md §1), and
+/// the ai-jail offer when available (§2), then read the confirming line(s).
+/// `input`/`output` are injected so the wording and default-yes semantics
+/// are unit-tested without a real terminal.
+fn read_yolo_confirmation(
+    ai_jail_available: bool,
+    input: &mut impl io::BufRead,
+    output: &mut impl io::Write,
+) -> io::Result<YoloConfirmation> {
+    writeln!(
+        output,
+        "⚠  --yolo runs every tool call with no confirmation. An agent can delete"
+    )?;
+    writeln!(
+        output,
+        "   files, run any command, and reach the network unsupervised."
+    )?;
+    write!(output, "   Proceed? [Y/n] ")?;
+    output.flush()?;
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    if !yolo_decision(&line) {
+        return Ok(YoloConfirmation {
+            proceed: false,
+            jail: false,
+        });
+    }
+    if !ai_jail_available {
+        return Ok(YoloConfirmation {
+            proceed: true,
+            jail: false,
+        });
+    }
+    write!(
+        output,
+        "ai-jail is installed. Re-run this session inside it? [Y/n] "
+    )?;
+    output.flush()?;
+    let mut jail_line = String::new();
+    input.read_line(&mut jail_line)?;
+    Ok(YoloConfirmation {
+        proceed: true,
+        jail: yolo_decision(&jail_line),
+    })
+}
+
+/// The interactive `--yolo` gate (docs/design-yolo-safety-ai-jail.md). A
+/// no-op outside a real TTY, when `--yolo` was not requested, or when already
+/// inside ai-jail. On confirmation it either returns (unjailed, or the user
+/// declined the ai-jail offer) or, on accepting the offer, cancels this
+/// process's already-prepared managed run and re-execs the original
+/// invocation under `ai-jail` — which never returns on success.
+async fn confirm_yolo_and_maybe_reexec(
+    yolo_requested: bool,
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    interrupted: &CancellationToken,
+) -> Result<()> {
+    let jailed = inside_ai_jail_here();
+    if !should_prompt_yolo(
+        yolo_requested,
+        io::stdin().is_terminal(),
+        io::stderr().is_terminal(),
+        jailed,
+    ) {
+        return Ok(());
+    }
+    if interrupted.is_cancelled() {
+        return Err(anyhow!("managed run interrupted before the agent started"));
+    }
+    let ai_jail_available = ai_jail_on_path();
+    let confirmation = tokio::task::spawn_blocking(move || {
+        let stdin = io::stdin();
+        let mut stderr = io::stderr();
+        read_yolo_confirmation(ai_jail_available, &mut stdin.lock(), &mut stderr)
+    })
+    .await
+    .context("waiting for the --yolo confirmation")?
+    .context("reading the --yolo confirmation from stdin")?;
+    if !confirmation.proceed {
+        return Err(anyhow!("aborted: --yolo not confirmed"));
+    }
+    if !confirmation.jail {
+        return Ok(());
+    }
+    // The re-exec replaces this process (or, off Unix, this process exits
+    // once the child does), so its own prepared lease must be released here
+    // rather than left to the 90s orphan timeout — the jailed re-run opens
+    // its own workstream cleanly.
+    cancel_managed_run_after_failure(endpoint, run_path).await;
+    let exe = std::env::current_exe()
+        .context("resolving the current executable for the ai-jail re-exec")?;
+    let forwarded: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let present: Vec<&str> = FORWARDED_ENV_NAMES
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    // `--agent-state` is a bare toggle: enable it so the harness's own login
+    // state survives ai-jail's ephemeral private home (ai-jail derives the
+    // per-harness state location from the wrapped `run <harness>` it parses).
+    let jail_args = build_ai_jail_invocation(&exe, &forwarded, &present, true);
+    reexec_under_ai_jail(&jail_args)
+}
+
+/// Replace this process with `ai-jail <jail_args>` on Unix (never returns on
+/// success); elsewhere, spawn it, wait, and exit with its status (also never
+/// returns).
+#[cfg(unix)]
+fn reexec_under_ai_jail(jail_args: &[OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let error = std::process::Command::new("ai-jail").args(jail_args).exec();
+    Err(anyhow!("{error}")).context("re-executing under ai-jail")
+}
+
+#[cfg(not(unix))]
+fn reexec_under_ai_jail(jail_args: &[OsString]) -> Result<()> {
+    let status = std::process::Command::new("ai-jail")
+        .args(jail_args)
+        .status()
+        .context("spawning ai-jail")?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// The session this run can prove is its own: the one it launched or resumed,
@@ -1813,6 +1996,101 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
 
+    #[test]
+    fn should_prompt_yolo_requires_yolo_and_both_ttys_and_not_jailed() {
+        assert!(should_prompt_yolo(true, true, true, false));
+        assert!(
+            !should_prompt_yolo(false, true, true, false),
+            "no prompt when --yolo was not requested"
+        );
+        assert!(
+            !should_prompt_yolo(true, false, true, false),
+            "no prompt when stdin is not a TTY"
+        );
+        assert!(
+            !should_prompt_yolo(true, true, false, false),
+            "no prompt when stderr is not a TTY"
+        );
+        assert!(
+            !should_prompt_yolo(true, true, true, true),
+            "no prompt when already inside ai-jail"
+        );
+    }
+
+    #[test]
+    fn yolo_decision_defaults_to_proceed() {
+        assert!(yolo_decision(""), "empty line (bare Enter) proceeds");
+        assert!(yolo_decision("\n"));
+        assert!(yolo_decision("y"));
+        assert!(yolo_decision("Y"));
+        assert!(yolo_decision("yes"));
+        assert!(yolo_decision("YES"));
+        assert!(
+            yolo_decision("whatever"),
+            "an unrecognized line still proceeds (default yes)"
+        );
+    }
+
+    #[test]
+    fn yolo_decision_declines_only_on_explicit_no() {
+        assert!(!yolo_decision("n"));
+        assert!(!yolo_decision("N"));
+        assert!(!yolo_decision("no"));
+        assert!(!yolo_decision("NO\n"));
+    }
+
+    #[test]
+    fn read_yolo_confirmation_default_enter_proceeds_without_jail_offer() {
+        let mut input = Cursor::new(b"\n".to_vec());
+        let mut output = Vec::new();
+        let confirmation = read_yolo_confirmation(false, &mut input, &mut output).unwrap();
+        assert_eq!(
+            confirmation,
+            YoloConfirmation {
+                proceed: true,
+                jail: false
+            }
+        );
+        let printed = String::from_utf8(output).unwrap();
+        assert!(printed.contains("Proceed? [Y/n]"));
+        assert!(!printed.contains("ai-jail is installed"));
+    }
+
+    #[test]
+    fn read_yolo_confirmation_decline_aborts_before_the_jail_offer() {
+        let mut input = Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::new();
+        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        assert_eq!(
+            confirmation,
+            YoloConfirmation {
+                proceed: false,
+                jail: false
+            }
+        );
+        let printed = String::from_utf8(output).unwrap();
+        assert!(
+            !printed.contains("ai-jail is installed"),
+            "declining --yolo must never reach the ai-jail offer"
+        );
+    }
+
+    #[test]
+    fn read_yolo_confirmation_offers_ai_jail_and_reads_its_answer() {
+        let mut input = Cursor::new(b"\nn\n".to_vec());
+        let mut output = Vec::new();
+        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        assert_eq!(
+            confirmation,
+            YoloConfirmation {
+                proceed: true,
+                jail: false
+            }
+        );
+        let printed = String::from_utf8(output).unwrap();
+        assert!(printed.contains("ai-jail is installed. Re-run this session inside it? [Y/n]"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn native_session_choice_interrupt_does_not_wait_for_input() {
         let interrupted = CancellationToken::new();
@@ -2686,6 +2964,7 @@ mod tests {
             new_workstream: None,
             executable: Some(script.clone()),
             yolo: false,
+            true_yolo: false,
             fresh: false,
             no_autowire: true,
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
@@ -3171,6 +3450,7 @@ mod tests {
             new_workstream: None,
             executable: Some(script.clone()),
             yolo: false,
+            true_yolo: false,
             fresh: false,
             no_autowire: false,
             env: Vec::new(),
@@ -3323,6 +3603,7 @@ mod tests {
             new_workstream: None,
             executable: Some(executable),
             yolo: false,
+            true_yolo: false,
             fresh: false,
             no_autowire: false,
             env,
