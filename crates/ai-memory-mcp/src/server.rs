@@ -258,7 +258,7 @@ developer, user, and canonical project instructions.\n\
   before you see your first prompt; if a block starting with \
   '📥 ai-memory: pending handoff' is anywhere in your context, \
   THAT is the handoff — answer from it directly, don't re-call \
-  this tool (it'll return null because handoffs are single-use). \
+  this tool (it'll return no handoff because handoffs are single-use). \
   When no prepended block is visible, inspect with memory_handoff_list \
   first, then pass the listed `handoff_id` to claim that exact row; \
   omitting `handoff_id` still claims the latest eligible open handoff. \
@@ -1253,6 +1253,22 @@ struct HandoffAcceptArgs {
     /// the latest eligible open handoff. Omit to keep the latest-open behavior.
     #[serde(default)]
     handoff_id: Option<String>,
+}
+
+/// Why `memory_handoff_accept` did or did not return a handoff. `handoff: null`
+/// alone meant both "nothing to claim" and "your own SessionStart already
+/// claimed it", which only a paragraph of tool description told apart (#920).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HandoffAcceptStatus {
+    /// This call claimed the handoff it returns.
+    Claimed,
+    /// The calling session's own SessionStart claimed it, so it is already in
+    /// that session's context. Reported only when the request carries the
+    /// session id the hook claimed under.
+    ConsumedByHook,
+    /// Nothing is left for this caller to claim.
+    NonePending,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -4549,17 +4565,16 @@ impl AiMemoryServer {
         '📥 ai-memory: pending handoff from previous session' anywhere \
         in your context, that IS the handoff. \
         \
-        A subsequent call to this tool will return `{ \"handoff\": null }` \
-        because the hook already consumed it. Do NOT interpret null as \
-        'no handoff exists' — check your context for the prepended block \
-        first, and answer the user from there. Call this tool only when \
-        you BOTH don't see a prepended block AND the user explicitly asks \
-        for a handoff (e.g. a hook script ran with no stdout capture). \
-        Prefer memory_handoff_list first in that case, then pass the listed \
-        `handoff_id` here to claim that exact row. Omitting `handoff_id` \
-        claims the latest eligible open handoff. \
-        \
-        Returns the handoff body only when THIS call wins the claim.")]
+        `status`: `claimed` (THIS call won it; see `handoff`), \
+        `consumed_by_hook` (your SessionStart took it; answer from that \
+        block), `none_pending` (nothing to claim, or a hook took it for a \
+        client that does not forward its session id: do NOT answer 'no \
+        handoff exists' before checking your context). Call this tool \
+        only when you BOTH don't see a prepended block AND the user \
+        explicitly asks for a handoff (e.g. a hook script ran with no \
+        stdout capture). Prefer memory_handoff_list first in that case, \
+        then pass the listed `handoff_id` here to claim that exact row. \
+        Omitting `handoff_id` claims the latest eligible open handoff.")]
     async fn memory_handoff_accept(
         &self,
         Parameters(args): Parameters<HandoffAcceptArgs>,
@@ -4595,10 +4610,13 @@ impl AiMemoryServer {
             .handoff_id
             .as_deref()
             .map(str::trim)
-            .filter(|id| !id.is_empty());
-        let handoff = if let Some(id) = requested_id {
-            let handoff_id = HandoffId::from_str(id)
-                .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                HandoffId::from_str(id)
+                    .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))
+            })
+            .transpose()?;
+        let handoff = if let Some(handoff_id) = requested_id {
             self.reader
                 .handoff_by_id_in_scope(ws, proj, handoff_id, owner_filter.clone())
                 .await
@@ -4611,7 +4629,10 @@ impl AiMemoryServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
         match handoff {
-            None => ok_json(&serde_json::json!({ "handoff": null })),
+            None => {
+                self.unclaimed_handoff(ws, proj, &aps_actor, requested_id, owner_filter)
+                    .await
+            }
             Some(h) => {
                 // Admission is asked here, not before the lookup: the routine
                 // outcome of this tool is `{"handoff": null}` — the tool's own
@@ -4641,19 +4662,64 @@ impl AiMemoryServer {
                         accepting_agent: AgentKind::Other,
                         accepting_session: None,
                         accepting_user: actor_user.clone(),
-                        owner_filter,
+                        owner_filter: owner_filter.clone(),
                         receiving_cwd,
                     })
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 if claimed {
                     self.notify_operation_observers(admission.as_ref());
-                    ok_json(&serde_json::json!({ "handoff": h }))
+                    ok_json(&serde_json::json!({
+                        "handoff": h,
+                        "status": HandoffAcceptStatus::Claimed,
+                    }))
                 } else {
-                    ok_json(&serde_json::json!({ "handoff": null }))
+                    // The racing claimant may be this session's own SessionStart.
+                    self.unclaimed_handoff(ws, proj, &aps_actor, requested_id, owner_filter)
+                        .await
                 }
             }
         }
+    }
+
+    /// `memory_handoff_accept`'s answer when this call claimed nothing.
+    ///
+    /// `consumed_by_hook` needs proof that the caller's own session took the
+    /// baton at SessionStart: the session id the hook claimed under, which only
+    /// a session-aware client forwards. Without it the answer is `none_pending`
+    /// rather than a guess from some other session's claim, since pointing an
+    /// agent at a block that is not in its context is the failure the status
+    /// exists to remove. A requested `handoff_id` counts only when it is the
+    /// row the session took.
+    async fn unclaimed_handoff(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        actor: &ai_memory_core::ActorKey,
+        requested: Option<HandoffId>,
+        owner_filter: ai_memory_core::OwnerFilter,
+    ) -> Result<CallToolResult, McpError> {
+        let claimed_at_start = match actor.session_id.as_deref() {
+            Some(native) => self
+                .reader
+                .handoff_claimed_by_live_session(
+                    workspace_id,
+                    project_id,
+                    SessionId::from_native(native),
+                    owner_filter,
+                )
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            None => None,
+        };
+        let status = match (claimed_at_start, requested) {
+            (Some(claimed), Some(requested)) if claimed != requested => {
+                HandoffAcceptStatus::NonePending
+            }
+            (Some(_), _) => HandoffAcceptStatus::ConsumedByHook,
+            (None, _) => HandoffAcceptStatus::NonePending,
+        };
+        ok_json(&serde_json::json!({ "handoff": null, "status": status }))
     }
 
     /// Cancel a mistaken open handoff by exact id.
@@ -13015,6 +13081,7 @@ mod tests {
             .unwrap();
         assert!(accept_text.contains("left mid-refactor"));
         assert!(accept_text.contains("what max channel size?"));
+        assert!(accept_text.contains("\"status\": \"claimed\""));
 
         // Second accept returns null (handoff is now accepted).
         let again = server
@@ -13037,6 +13104,8 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(again_text.contains("\"handoff\": null"));
+        // Taken by this server's own MCP call, not by a SessionStart hook.
+        assert!(again_text.contains("\"status\": \"none_pending\""));
     }
 
     /// `Handoff` is grouped internally into `HandoffScope`/`HandoffOrigin`/
@@ -14904,6 +14973,113 @@ mod tests {
         assert!(
             text.contains("\"handoff\": null"),
             "expected handoff=null in: {text}",
+        );
+        assert!(
+            text.contains("\"status\": \"none_pending\""),
+            "expected status=none_pending in: {text}",
+        );
+    }
+
+    /// A requested `handoff_id` that some other caller took must not be
+    /// reported as `consumed_by_hook` just because this session's SessionStart
+    /// took a different baton: the agent would look for the wrong block.
+    #[tokio::test]
+    async fn memory_handoff_accept_by_id_reports_the_hook_only_for_its_own_row() {
+        let (_tmp, store, server, ws, pj) = setup_server().await;
+        let insert = |summary: &str| NewHandoff {
+            workspace_id: ws,
+            project_id: pj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: summary.into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        };
+        let by_hook = store
+            .writer
+            .insert_handoff(insert("taken at session start"))
+            .await
+            .unwrap();
+        let by_other = store
+            .writer
+            .insert_handoff(insert("taken by another caller"))
+            .await
+            .unwrap();
+
+        let session = SessionId::from_native("claude-session-1");
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: pj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for (handoff_id, accepting_session) in [(by_hook, Some(session)), (by_other, None)] {
+            let claimed = store
+                .writer
+                .accept_handoff(ai_memory_core::HandoffAcceptance {
+                    handoff_id,
+                    workspace_id: ws,
+                    project_id: pj,
+                    accepting_agent: AgentKind::ClaudeCode,
+                    accepting_session,
+                    accepting_user: None,
+                    owner_filter: ai_memory_core::OwnerFilter::Unattributed,
+                    receiving_cwd: None,
+                })
+                .await
+                .unwrap();
+            assert!(claimed);
+        }
+
+        let status_for = |handoff_id: Option<HandoffId>| {
+            let server = server.clone();
+            async move {
+                let mut parts = test_parts_default();
+                parts.headers.insert(
+                    "x-memory-actor-session-id",
+                    axum::http::HeaderValue::from_static("claude-session-1"),
+                );
+                let result = server
+                    .memory_handoff_accept(
+                        Parameters(HandoffAcceptArgs {
+                            cwd: None,
+                            project: None,
+                            workspace: None,
+                            any_owner: None,
+                            handoff_id: handoff_id.map(|id| id.to_string()),
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+                    .unwrap();
+                let text = result
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(value["handoff"].is_null(), "nothing is open: {text}");
+                value["status"].as_str().unwrap().to_owned()
+            }
+        };
+        assert_eq!(status_for(Some(by_hook)).await, "consumed_by_hook");
+        assert_eq!(status_for(None).await, "consumed_by_hook");
+        assert_eq!(
+            status_for(Some(by_other)).await,
+            "none_pending",
+            "the row this session asked for went to another caller",
         );
     }
 

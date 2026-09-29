@@ -45,6 +45,15 @@ session never calls one, call `memory_handoff_list` then
 `memory_handoff_accept` with the listed `handoff_id`. Zero should do that
 on resume. Listing does not claim the row.
 
+`memory_handoff_accept` says why it returned no handoff. Its `status` is
+`claimed` when the call took one, `consumed_by_hook` when the calling
+session's own SessionStart already did (the handoff is in that session's
+context), and `none_pending` when nothing is left to claim. Only a client that
+forwards its session id on MCP calls can be told `consumed_by_hook`: Claude
+Code through `install-mcp --session-aware`, or OpenCode 2. Any other client
+gets `none_pending` after the hook consumed the handoff, so its agent still
+checks its context for the delivered block first.
+
 On a server that distinguishes operators, handoffs belong to their creator by
 default: the next session for that operator sees their own plus deliberately
 shared rows, never a teammate's. Use `shared: true` on
