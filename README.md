@@ -134,7 +134,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | Muse Code | MCP-only |
-| Hermes Agent | Community |
+| Hermes Agent | Supported |
 | LLM/auth providers | Supported |
 | Embedding providers | Supported |
 

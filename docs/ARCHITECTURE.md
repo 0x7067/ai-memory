@@ -687,6 +687,26 @@ claude_true_yolo = false           # opt-in: on a Claude `ai-memory run --yolo`,
                                    # Claude-only, no-op for every other harness. Also
                                    # `--true-yolo`. See
                                    # docs/design-yolo-safety-ai-jail.md.
+release_base_url = ""              # override the GitHub releases base URL that `ai-memory
+                                   # upgrade` checks and downloads from (#801). Empty =
+                                   # https://github.com/akitaonrails/ai-memory/releases.
+                                   # For hermetic tests / mirrors, not day-to-day installs.
+                                   # Env: AI_MEMORY_RELEASE_BASE_URL.
+
+[maintenance]                      # scheduled server jobs (run outside hook latency)
+enabled = true                     # master switch for the scheduled jobs below
+forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence persists
+                                   # across restarts; overdue work starts after a bounded delay
+lint_interval_secs = 86400         # rule-based wiki lint; 0 disables (same persistence)
+embedding_backfill_interval_secs = 0  # embedding backfill; 0 = off (may call a paid provider)
+reconcile_tombstones_deleted_pages = false
+                                   # opt-in (#929/#964): the 30s reconcile pass soft-tombstones
+                                   # (is_latest=0 + superseded_at — never a filesystem write) an
+                                   # OKF-imported content page whose file has been missing on
+                                   # two consecutive passes, behind a circuit breaker and with
+                                   # session pages excluded. OFF = byte-identical to pre-2.5
+                                   # behavior (deletions still need `ai-memory delete-page`).
+                                   # Docs: docs/okf.md, docs/install.md.
 
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively (fallback λ)
