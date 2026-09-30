@@ -238,6 +238,8 @@ retain current behavior.
 Recognized shell tools (`Bash`, `shell`, `exec`, `execute_bash`, `terminal`, …)
 have no path field, so the command line is split into words lexically, the way
 a POSIX shell quotes and separates them, without expanding or running anything.
+Codex shell calls, including its `exec_command` path, reach hooks as `Bash`
+with the command in `tool_input.command`.
 A command given as an argument vector keeps each element as one word (a path
 with spaces stays whole, up to 256 characters) and also splits each element on
 its own, so a `bash -lc "<script>"` script is read like any command line. Each

@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `install-hooks --apply --as-user <user> --auth-token <key>` no longer fails
+  with `--as-user '<user>' requires --auth-token` when the token was supplied.
+  The guard was handed the *rendered* credential, which is deliberately `None`
+  on the #552 secure path (the token is persisted under the data dir for the
+  hooks to read), so the recommended multi-user install command in
+  `docs/users.md` and `install-hooks --help` bailed on every native install
+  while reporting the token as absent. It now validates the resolved token.
+  `install-hooks` without `--as-user` was unaffected, and `--as-user` with no
+  token anywhere still bails. (#993)
+- Wiki link extraction and the wikilink export now follow CommonMark for code
+  fences and link destinations: a fence closes only on the same glyph and at
+  least the opening length (so a ```` ``` ```` line inside `~~~` or a four-tick
+  fence no longer ends it), and a backtick line whose info string holds a
+  backtick is text, not a fence that hides the rest of the page from the link
+  index. `[doc](notes/foo_(1).md)` keeps its balanced parentheses, `<...>`
+  destinations and trailing titles are parsed (a `)` or link inside a title is
+  no longer read as part of the link), and a destination scan is bounded so a
+  line of unclosed `[a](` cannot stall a page write. (#985)
+- `[[wikilinks]]` exported as Markdown links now write a `<...>` destination
+  whenever a bare one cannot hold the path (a space, a control character, or an
+  unbalanced parenthesis), so an exported bundle indexes back to the page it
+  was written from. A path that cannot be written either way keeps its
+  `[[wikilink]]`. (#985)
+- The `/web` reader resolves `[doc](./notes/foo.md)` to the page instead of a
+  `p/./notes/foo.md` route that 404s. (#985)
+- `[routing] mid_session = "sticky"` was silently disabled for every
+  marker-covered install. `workspace` is a required `.ai-memory.toml` key, so
+  the host hook forwards `&workspace=…` on every event under any marker's
+  tree — including events that never left the session's own workspace — and
+  `overrides_permit_sticky` (`ai-memory-hooks::router`) disqualified
+  stickiness on that presence alone, before the project-provenance logic
+  (`project_src=repo-root` vs. `marker`) ever ran. A mid-session `cd` into a
+  sibling checkout therefore always rescoped under a marker, exactly as if
+  `sticky` were unset, while the identical scenario outside any marker's tree
+  (`workspace_override` naturally `None`) worked as documented — the entire
+  difference between the two cases this bug reports as "identical except for
+  being under `$HOME`". `find_session_scope` now runs before the sticky-permit
+  gate, and a `workspace_override` is resolved once against the session's own
+  workspace (`workspace_override_is_rescope`, via the existing no-create
+  `lookup_existing_workspace` — no new lookup mechanism): the SAME workspace
+  is not a rescope and falls through to the existing project-provenance logic
+  unchanged; a genuinely DIFFERENT or unresolvable workspace still fails
+  closed and disqualifies sticky, exactly as before. (#984)
+- Auto-improve no longer rejects every proposal from a model that spells the
+  full-page edit mode as `"full"`. `edit_mode` had the same shape #458 fixed
+  for `operation`: a free-form string validated by exact match, no schema
+  constraint, and a system prompt that says "Full-page proposals" without the
+  literal value. `gpt-oss-20b` via LM Studio answered `"full"` for every
+  candidate, so runs finished with zero accepted proposals and only
+  `unsupported_edit_mode` rejections. The schema now advertises
+  `["full_page", "patch"]`, and normalisation folds `full`, `full-page` and
+  `Full Page` into `full_page` (with a warning) for providers without
+  constrained decoding. Unknown modes still fail validation. (#991)
+- Auto-improve no longer aborts a whole run when the model fills in
+  `expected_base_body_sha256`. The field is computed by the server when a
+  patch is materialized, but the schema shows it to the model, and a
+  non-hash value on a full-page proposal reached staging and failed
+  `hex_to_sha256` with `invalid expected_base_body_sha256: expected 64 hex
+  chars` (HTTP 500 from `/admin/auto-improve`), discarding every other
+  proposal in the run. Normalisation now drops any model-supplied value; the
+  patch path still sets it from the materialized target. (#991)
+
 ## [2.4.2] - 2026-09-29
 
 ### Changed

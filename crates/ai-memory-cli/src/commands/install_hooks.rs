@@ -454,7 +454,13 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     // to. Mismatch between `--as-user` and the actual token's owner is
     // the operator's concern; we don't reach back to the server to
     // verify (keeps install-hooks offline-capable).
-    validate_as_user(args.as_user.as_deref(), auth)?;
+    //
+    // Validate against the resolved token, not the rendered one. `auth` is
+    // deliberately `None` on the #552 secure path — the token was persisted
+    // under the data dir for the hooks to read — so passing it here made
+    // `--apply --as-user X --auth-token T` bail on the very combination
+    // docs/users.md recommends, with a message saying the token was absent.
+    validate_as_user(args.as_user.as_deref(), auth_token_owned.as_deref())?;
     if let Some(user) = args.as_user.as_deref().filter(|s| !s.trim().is_empty()) {
         eprintln!("[ai-memory] hooks installing for user: {user}");
     }
@@ -7993,6 +7999,53 @@ model = "gpt-5"
                 .unwrap()
                 .contains("SEKRIT-BEARER-552"),
             "the curl header file must carry it too"
+        );
+    }
+
+    /// #993 regression guard: `--apply --as-user X --auth-token T` is the
+    /// command docs/users.md tells operators to run, and it failed on every
+    /// native install. The guard was handed the rendered credential, which is
+    /// `None` precisely when the token was persisted (#552), so it reported the
+    /// token as missing while the token sat under the data dir. The unit tests
+    /// on `validate_as_user` itself could not see it — the wiring was wrong,
+    /// not the function.
+    #[test]
+    fn apply_with_as_user_succeeds_when_the_token_is_persisted() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("ALICE-KEY-993".to_string()),
+            as_user: Some("alice".to_string()),
+            config_file: Some(settings.clone()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        // The whole point of the fix: persisting the token must not turn a
+        // present `--auth-token` into an "absent" one for the `--as-user` guard.
+        run(&config, args).expect("install-hooks --apply --as-user with a token must succeed");
+
+        // And the attribution it promised is real: the token is on disk for the
+        // hooks, and still absent from the agent's own config.
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+            Some("ALICE-KEY-993"),
+            "alice's key must be persisted where the hook reads it"
+        );
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            !rendered.contains("ALICE-KEY-993"),
+            "the bearer must not reach the agent config: {rendered}"
         );
     }
 
