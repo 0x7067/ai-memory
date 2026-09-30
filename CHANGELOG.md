@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while reporting the token as absent. It now validates the resolved token.
   `install-hooks` without `--as-user` was unaffected, and `--as-user` with no
   token anywhere still bails. (#993)
+- Wiki link extraction and the wikilink export now follow CommonMark for code
+  fences and link destinations: a fence closes only on the same glyph and at
+  least the opening length (so a ```` ``` ```` line inside `~~~` or a four-tick
+  fence no longer ends it), and a backtick line whose info string holds a
+  backtick is text, not a fence that hides the rest of the page from the link
+  index. `[doc](notes/foo_(1).md)` keeps its balanced parentheses, `<...>`
+  destinations and trailing titles are parsed (a `)` or link inside a title is
+  no longer read as part of the link), and a destination scan is bounded so a
+  line of unclosed `[a](` cannot stall a page write. (#985)
+- `[[wikilinks]]` exported as Markdown links now write a `<...>` destination
+  whenever a bare one cannot hold the path (a space, a control character, or an
+  unbalanced parenthesis), so an exported bundle indexes back to the page it
+  was written from. A path that cannot be written either way keeps its
+  `[[wikilink]]`. (#985)
+- The `/web` reader resolves `[doc](./notes/foo.md)` to the page instead of a
+  `p/./notes/foo.md` route that 404s. (#985)
 
 ## [2.4.2] - 2026-09-29
 
