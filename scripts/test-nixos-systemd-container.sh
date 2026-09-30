@@ -10,6 +10,11 @@
 #   - a marker under /var/lib/ai-memory survives systemctl restart
 #   - optional: the same marker survives a recreate with a named volume
 #
+# Boot race: right after /init, /run/current-system/sw/bin is not linked yet.
+# wait_for_exec_ready polls until systemctl is executable (stderr quiet during
+# that window). Early OCI "systemctl: not found in $PATH" lines are boot lag,
+# not a unit failure — they must not appear once readiness is explicit.
+#
 # Non-goals (do not extend this script for them):
 #   - A→B flake/package upgrade or SQLite-wiki migration matrices
 #   - Exhaustive settings-options.nix key coverage
@@ -94,6 +99,21 @@ cleanup() {
   fi
 }
 
+# Activation links /run/current-system a few seconds after /init. Until then,
+# docker exec with NIXOS_PATH fails with OCI "executable file not found".
+# Poll quietly; fail hard if PATH never appears.
+wait_for_exec_ready() {
+  local i
+  for i in $(seq 1 120); do
+    if ctr_exec test -x /run/current-system/sw/bin/systemctl >/dev/null 2>&1; then
+      log "PATH ready (systemctl executable)"
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "timed out waiting for /run/current-system/sw/bin/systemctl (activation PATH never appeared)"
+}
+
 wait_for_http() {
   local url="$1"
   local i
@@ -148,6 +168,8 @@ assert_marker() {
 }
 
 smoke_once() {
+  wait_for_exec_ready
+
   log "Waiting for ai-memory unit"
   wait_for_active
   ctr_exec systemctl is-active ai-memory
@@ -210,6 +232,7 @@ main() {
     "${ENGINE}" volume create "${VOLUME_NAME}" >/dev/null
 
     run_container -v "${VOLUME_NAME}:${DATA_DIR}"
+    wait_for_exec_ready
     wait_for_active
     wait_for_http "${HEALTH_URL}"
     write_marker
@@ -217,6 +240,7 @@ main() {
     log "Remounting volume and checking marker survival"
     "${ENGINE}" rm -f "${CONTAINER_NAME}" >/dev/null
     run_container -v "${VOLUME_NAME}:${DATA_DIR}"
+    wait_for_exec_ready
     wait_for_active
     wait_for_http "${HEALTH_URL}"
     assert_marker
