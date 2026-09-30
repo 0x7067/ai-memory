@@ -1722,6 +1722,16 @@ pub struct BackfillArgs {
     /// been attempted for this checkout. Not for interactive use.
     #[arg(long, hide = true)]
     pub auto: bool,
+    /// Internal: deliver to the server the spawning hook is installed
+    /// against, instead of the configured one. Set by the SessionStart
+    /// trigger so the backfill cannot depend on the agent's environment.
+    #[arg(long, hide = true, conflicts_with = "server_profile")]
+    pub server_url: Option<String>,
+    /// Internal: deliver to this registered server profile (#992), with the
+    /// profile's own stored token. Set by the SessionStart trigger when the
+    /// repository's marker selects a profile.
+    #[arg(long, hide = true)]
+    pub server_profile: Option<String>,
 }
 
 /// Arguments for `repair-backfill-timestamps`.

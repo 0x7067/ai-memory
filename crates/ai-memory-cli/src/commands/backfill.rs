@@ -145,6 +145,41 @@ fn write_sentinel(data_dir: &Path, cwd: &Path) {
     let _ = std::fs::write(&path, b"");
 }
 
+/// The server this backfill delivers to.
+///
+/// A SessionStart-spawned run names the hook's own target: a server profile
+/// (#992), whose stored token is the only credential it will present, or the
+/// install-time hook URL, authenticated exactly like the hook's own events to
+/// it: the persisted hook token, then OIDC. The config/env bearer is never
+/// used there, because it may belong to a different server than the one the
+/// hook is installed against. A manual run keeps resolving from config.
+async fn backfill_endpoint(
+    config: &Config,
+    args: &crate::cli::BackfillArgs,
+) -> Result<ServerEndpoint> {
+    if let Some(raw) = args.server_profile.as_deref() {
+        let name = crate::server_profiles::ProfileName::parse(raw)
+            .with_context(|| format!("`{raw}` is not a valid server profile name"))?;
+        let profile = crate::server_profiles::lookup(&config.data_dir, &name)
+            .map_err(|r| anyhow::anyhow!("server profile `{name}` was refused ({})", r.as_str()))?;
+        return Ok(ServerEndpoint::for_hook_target(
+            profile.url,
+            Some(profile.token),
+        ));
+    }
+    if let Some(url) = args.server_url.as_deref() {
+        let static_token = crate::config::read_hook_auth_token(&config.data_dir);
+        let token = super::hook_spool::resolve_bearer(
+            &reqwest::Client::new(),
+            &config.data_dir,
+            static_token.as_deref(),
+        )
+        .await;
+        return Ok(ServerEndpoint::for_hook_target(url.to_owned(), token));
+    }
+    Ok(ServerEndpoint::from_config_resolving_auth(config).await)
+}
+
 /// Run the backfill.
 ///
 /// # Errors
@@ -168,7 +203,7 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let home = run::native_home(config).context("locating the local harness session stores")?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = backfill_endpoint(config, &args).await?;
 
     let mut report = BackfillReport {
         workspace: workspace.clone(),
@@ -998,6 +1033,70 @@ mod tests {
         assert!(only.is_empty(), "no session matches the filter: {only:?}");
     }
 
+    fn spawned_args(
+        server_url: Option<&str>,
+        server_profile: Option<&str>,
+    ) -> crate::cli::BackfillArgs {
+        crate::cli::BackfillArgs {
+            workspace: None,
+            project: None,
+            session: None,
+            force: false,
+            dry_run: false,
+            max_sessions: 25,
+            json: false,
+            quiet: true,
+            auto: true,
+            server_url: server_url.map(str::to_owned),
+            server_profile: server_profile.map(str::to_owned),
+        }
+    }
+
+    /// #992: a SessionStart-spawned backfill presents only the credential the
+    /// hook itself uses for that server — never the config/env bearer, which
+    /// may belong to another server entirely.
+    #[tokio::test]
+    async fn a_spawned_backfill_authenticates_like_the_hook_that_spawned_it() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data_dir.path().to_path_buf();
+        config.auth.bearer_token = Some("CONFIG-SERVER-TOKEN".into());
+
+        let url = "https://hook.example/wiki";
+        let endpoint = backfill_endpoint(&config, &spawned_args(Some(url), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoint.auth_token, None,
+            "no hook token: nothing, not config's"
+        );
+        assert_eq!(endpoint.url, "https://hook.example");
+        assert_eq!(endpoint.base_path, "/wiki");
+
+        crate::config::store_hook_auth_token(data_dir.path(), "HOOK-TOKEN").unwrap();
+        let endpoint = backfill_endpoint(&config, &spawned_args(Some(url), None))
+            .await
+            .unwrap();
+        assert_eq!(endpoint.auth_token.as_deref(), Some("HOOK-TOKEN"));
+
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(data_dir.path(), &name, "https://b.example", &[], Some("B"))
+            .unwrap();
+        let endpoint = backfill_endpoint(&config, &spawned_args(None, Some("team-b")))
+            .await
+            .unwrap();
+        assert_eq!(endpoint.url, "https://b.example");
+        assert_eq!(endpoint.auth_token.as_deref(), Some("B"));
+        assert!(
+            backfill_endpoint(&config, &spawned_args(None, Some("nobody")))
+                .await
+                .is_err(),
+            "an unregistered profile is refused, not replaced by config"
+        );
+    }
+
     /// The automatic path must honor the `backfill_on_start` opt-out: it records
     /// the attempt (so it never re-spawns) and returns without contacting the
     /// server at all.
@@ -1013,18 +1112,7 @@ mod tests {
         // must return before we ever build the endpoint.
         config.server_url = "http://127.0.0.1:9".to_string();
 
-        let args = crate::cli::BackfillArgs {
-            workspace: None,
-            project: None,
-            session: None,
-            force: false,
-            dry_run: false,
-            max_sessions: 25,
-            json: false,
-            quiet: true,
-            auto: true,
-        };
-        run(&config, args)
+        run(&config, spawned_args(None, None))
             .await
             .expect("opted-out auto run must succeed without contacting the server");
 
