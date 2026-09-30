@@ -4041,7 +4041,13 @@ impl AiMemoryServer {
             let depth = args.related_depth.unwrap_or(1);
             Some(
                 self.reader
-                    .related_walk(ws, proj, page_path.to_string(), depth)
+                    .related_walk(
+                        ws,
+                        proj,
+                        page_path.to_string(),
+                        depth,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?,
             )
