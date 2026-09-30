@@ -33,6 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[[wikilink]]`. (#985)
 - The `/web` reader resolves `[doc](./notes/foo.md)` to the page instead of a
   `p/./notes/foo.md` route that 404s. (#985)
+- `[routing] mid_session = "sticky"` was silently disabled for every
+  marker-covered install. `workspace` is a required `.ai-memory.toml` key, so
+  the host hook forwards `&workspace=…` on every event under any marker's
+  tree — including events that never left the session's own workspace — and
+  `overrides_permit_sticky` (`ai-memory-hooks::router`) disqualified
+  stickiness on that presence alone, before the project-provenance logic
+  (`project_src=repo-root` vs. `marker`) ever ran. A mid-session `cd` into a
+  sibling checkout therefore always rescoped under a marker, exactly as if
+  `sticky` were unset, while the identical scenario outside any marker's tree
+  (`workspace_override` naturally `None`) worked as documented — the entire
+  difference between the two cases this bug reports as "identical except for
+  being under `$HOME`". `find_session_scope` now runs before the sticky-permit
+  gate, and a `workspace_override` is resolved once against the session's own
+  workspace (`workspace_override_is_rescope`, via the existing no-create
+  `lookup_existing_workspace` — no new lookup mechanism): the SAME workspace
+  is not a rescope and falls through to the existing project-provenance logic
+  unchanged; a genuinely DIFFERENT or unresolvable workspace still fails
+  closed and disqualifies sticky, exactly as before. (#984)
 
 ## [2.4.2] - 2026-09-29
 
