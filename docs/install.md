@@ -1972,6 +1972,22 @@ another current Cheaper Inference model id (e.g. `claude-haiku-4.5` or
 `deepseek-v4-flash`) when needed. Cheaper Inference serves chat models only
 and has no embeddings endpoint; configure embeddings separately.
 
+[API Route](https://www.api-route.com/) also uses the existing
+`openai-compat` provider. Supply an API Route key and a model ID from its
+[current catalog](https://www.api-route.com/pricing):
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://global.api-route.com/v1
+-e AI_MEMORY_LLM_MODEL=gpt-5.5
+-e LLM_API_KEY="$API_ROUTE_API_KEY"
+```
+
+Replace `gpt-5.5` with the exact model ID you intend to use. As with other
+hosted compatibility endpoints, no dedicated ai-memory provider is required.
+Configure embeddings separately if your chosen API Route model does not
+provide an OpenAI-compatible embeddings endpoint.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash

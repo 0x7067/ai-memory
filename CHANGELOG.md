@@ -35,8 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `aarch64-darwin` with `scripts/check-nix-packaging.sh` artifact smoke tests
   (binary, hooks, config template, `nix run`); NixOS module eval and the
   NixOS systemd container smoke stay on the Linux leg only. (#NNN)
+- Documented API Route as an endpoint for the existing `openai-compat`
+  provider. (#997)
 
 ### Fixed
+- Kimi Code no longer receives a bare `{}` when a `UserPromptSubmit` is
+  dropped by capture policy: the hook now writes an empty success response
+  Kimi accepts instead of a JSON object it rejects. (#996)
 - `install-hooks --apply --as-user <user> --auth-token <key>` no longer fails
   with `--as-user '<user>' requires --auth-token` when the token was supplied.
   The guard was handed the *rendered* credential, which is deliberately `None`
