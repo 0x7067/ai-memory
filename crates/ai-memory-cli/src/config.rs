@@ -2649,7 +2649,13 @@ pub fn clear_hook_auth_token(data_dir: &Path) -> std::io::Result<()> {
 /// Read the persisted bearer, if one was stored. Trailing newline trimmed.
 #[must_use]
 pub fn read_hook_auth_token(data_dir: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(hook_auth_token_path_in(data_dir)).ok()?;
+    read_trimmed_secret(&hook_auth_token_path_in(data_dir))
+}
+
+/// Read a one-value secret file. Surrounding whitespace is trimmed, and a
+/// missing, unreadable, or blank file is `None` — never an empty bearer.
+pub(crate) fn read_trimmed_secret(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }

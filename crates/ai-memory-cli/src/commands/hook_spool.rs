@@ -229,36 +229,9 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
 /// Create the spool directory `0700` on Unix so the excerpt bodies that reside
 /// there (up to `MAX_AGE_MS`) — and even the timestamp+pid metadata in the file
 /// names — are only reachable by the owner (#196). The spool holds private
-/// capture until it drains; a world-readable directory would leak that. On
-/// non-Unix the mode is a no-op (falls back to `create_dir_all`). Idempotent:
-/// an existing directory's mode is left untouched (never widened, never
-/// narrowed) to avoid churning a path an operator may have set deliberately.
+/// capture until it drains; a world-readable directory would leak that.
 fn create_spool_dir(spool: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        if spool.is_dir() {
-            return Ok(());
-        }
-        match std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(spool)
-        {
-            Ok(()) => Ok(()),
-            // A concurrent drainer/enqueue may have created it between the check
-            // and the call; treat an existing directory as success.
-            Err(e) if spool.is_dir() => {
-                let _ = e;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(spool)
-    }
+    super::path_util::create_private_dir(spool)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
