@@ -28,6 +28,7 @@ mod install_layout;
 mod logging;
 mod marker;
 mod process_guard;
+mod server_profiles;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -176,6 +177,7 @@ pub async fn run() -> Result<()> {
         Command::User(args) => commands::user::run(&config, args).await,
         Command::ApiKey(args) => commands::api_key::run(&config, args).await,
         Command::Project(args) => commands::project::run(&config, args).await,
+        Command::Server(args) => commands::server::run(&config, args),
         // `Completions` is handled in the fast-path above (before config/tracing).
         Command::Completions(args) => commands::completions::run(args),
     }

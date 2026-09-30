@@ -253,6 +253,10 @@ pub enum Command {
     /// or `restricted` (root and grant holders) (#708). Requires the root
     /// bearer token.
     Project(ProjectArgs),
+    /// Manage local server profiles, which a repository's `.ai-memory.toml`
+    /// selects with `server = "<name>"` to route its hook capture to a
+    /// different ai-memory server.
+    Server(ServerArgs),
     /// Print a shell-completion script to stdout. Generated from this
     /// binary's own command tree, so it never drifts from the real CLI
     /// surface. See `docs/shell-completions.md` for install paths.
@@ -979,6 +983,61 @@ pub struct ApiKeyArgs {
     /// API-credential action to run.
     #[command(subcommand)]
     pub command: ApiKeyCommand,
+}
+
+/// Arguments for `server`.
+#[derive(Debug, Args)]
+pub struct ServerArgs {
+    /// Server-profile action to run.
+    #[command(subcommand)]
+    pub command: ServerCommand,
+}
+
+/// Subcommands for `server`.
+#[derive(Debug, Subcommand)]
+pub enum ServerCommand {
+    /// Register a server profile, or replace one with the same name.
+    Add(ServerAddArgs),
+    /// List server profiles (never prints a token).
+    List(ServerListArgs),
+    /// Remove a server profile and its stored token.
+    Remove(ServerRemoveArgs),
+}
+
+/// Arguments for `server add`.
+#[derive(Debug, Args)]
+pub struct ServerAddArgs {
+    /// Profile name a marker selects: lowercase letters, digits, `-`, `_`.
+    pub name: String,
+    /// Server URL, e.g. `https://memory.example.com`.
+    #[arg(long)]
+    pub url: String,
+    /// Directory allowed to select this profile (repeatable; absolute or
+    /// `~/`). Required once more than one profile is registered.
+    #[arg(long = "root")]
+    pub roots: Vec<String>,
+    /// Bearer token for this server. Prefer `--auth-token-stdin`, which
+    /// keeps it out of shell history and the process table.
+    #[arg(long, hide_env_values = true, conflicts_with = "auth_token_stdin")]
+    pub auth_token: Option<String>,
+    /// Read the bearer token from the first line of stdin.
+    #[arg(long)]
+    pub auth_token_stdin: bool,
+}
+
+/// Arguments for `server list`.
+#[derive(Debug, Args)]
+pub struct ServerListArgs {
+    /// Emit the list as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `server remove`.
+#[derive(Debug, Args)]
+pub struct ServerRemoveArgs {
+    /// Profile name to remove.
+    pub name: String,
 }
 
 /// Subcommands for `api-key`.
