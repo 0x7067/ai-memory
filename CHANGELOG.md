@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The shell and PowerShell session-start hooks for Claude Code, Codex,
+  Cursor, Gemini CLI, OpenCode, Command Code, Devin and Antigravity CLI now
+  send the marker's `[briefing]` keys (`briefing`, `briefing_budget`) on the
+  handoff request, so a repository with `inject_on_session_start = true` gets
+  its compiled brief at session start on script installs too, as
+  `docs/marker-file.md` describes. Only the native `ai-memory hook` command
+  and the Kiro CLI and Kimi Code scripts sent them before, so Docker and
+  `setup-agent` installs silently received the handoff without the brief.
+  (#998)
+
 ## [2.5.0] - 2026-09-30
 
 ### Added
