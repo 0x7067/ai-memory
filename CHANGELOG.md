@@ -1,10 +1,3 @@
-# Changelog
-
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
 ## [Unreleased]
 
 ### Added
@@ -279,6 +272,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
 
 
+
 ### Changed
 - `ai-memory purge-session` without `--confirm` now previews what a confirmed
   purge would delete before refusing, the same way `purge-project` does (#945):
@@ -349,6 +343,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Documented Cheaper Inference as an endpoint for the existing `openai-compat`
   provider. (#981)
+
 
 
 ### Fixed
@@ -688,6 +683,244 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `export-okf`'s generated `index.md` no longer has a prose sentence outside
   its list structure. Some strict OKF v0.2 validators read §11.3 as
   rejecting it. (#979)
+
+- `install-hooks --apply --as-user <user> --auth-token <key>` no longer fails
+  with `--as-user '<user>' requires --auth-token` when the token was supplied.
+  The guard was handed the *rendered* credential, which is deliberately `None`
+  on the #552 secure path (the token is persisted under the data dir for the
+  hooks to read), so the recommended multi-user install command in
+  `docs/users.md` and `install-hooks --help` bailed on every native install
+  while reporting the token as absent. It now validates the resolved token.
+  `install-hooks` without `--as-user` was unaffected, and `--as-user` with no
+  token anywhere still bails. (#993)
+- Wiki link extraction and the wikilink export now follow CommonMark for code
+  fences and link destinations: a fence closes only on the same glyph and at
+  least the opening length (so a ```` ``` ```` line inside `~~~` or a four-tick
+  fence no longer ends it), and a backtick line whose info string holds a
+  backtick is text, not a fence that hides the rest of the page from the link
+  index. `[doc](notes/foo_(1).md)` keeps its balanced parentheses, `<...>`
+  destinations and trailing titles are parsed (a `)` or link inside a title is
+  no longer read as part of the link), and a destination scan is bounded so a
+  line of unclosed `[a](` cannot stall a page write. (#985)
+- `[routing] mid_session = "sticky"` was silently disabled for every
+  marker-covered install. `workspace` is a required `.ai-memory.toml` key, so
+  the host hook forwards `&workspace=…` on every event under any marker's
+  tree — including events that never left the session's own workspace — and
+  `overrides_permit_sticky` (`ai-memory-hooks::router`) disqualified
+  stickiness on that presence alone, before the project-provenance logic
+  (`project_src=repo-root` vs. `marker`) ever ran. A mid-session `cd` into a
+  sibling checkout therefore always rescoped under a marker, exactly as if
+  `sticky` were unset, while the identical scenario outside any marker's tree
+  (`workspace_override` naturally `None`) worked as documented — the entire
+  difference between the two cases this bug reports as "identical except for
+  being under `$HOME`". `find_session_scope` now runs before the sticky-permit
+  gate, and a `workspace_override` is resolved once against the session's own
+  workspace (`workspace_override_is_rescope`, via the existing no-create
+  `lookup_existing_workspace` — no new lookup mechanism): the SAME workspace
+  is not a rescope and falls through to the existing project-provenance logic
+  unchanged; a genuinely DIFFERENT or unresolvable workspace still fails
+  closed and disqualifies sticky, exactly as before. (#984)
+- Auto-improve no longer rejects every proposal from a model that spells the
+  full-page edit mode as `"full"`. `edit_mode` had the same shape #458 fixed
+  for `operation`: a free-form string validated by exact match, no schema
+  constraint, and a system prompt that says "Full-page proposals" without the
+  literal value. `gpt-oss-20b` via LM Studio answered `"full"` for every
+  candidate, so runs finished with zero accepted proposals and only
+  `unsupported_edit_mode` rejections. The schema now advertises
+  `["full_page", "patch"]`, and normalisation folds `full`, `full-page` and
+  `Full Page` into `full_page` (with a warning) for providers without
+  constrained decoding. Unknown modes still fail validation. (#991)
+
+## [2.4.2] - 2026-09-29
+
+### Changed
+- Documented Cheaper Inference as an endpoint for the existing `openai-compat`
+  provider. (#981)
+- `docs/llm-providers.md` now has a dedicated OpenRouter subsection and a
+  matching row in the recommended-defaults table. The wiring
+  (`openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1`)
+  and the `HTTP-Referer` / `X-Title` app-attribution headers were already
+  shipped, and `docker/.env.production.example` already ships an OpenRouter
+  default, but the provider-facing doc mentioned OpenRouter only inside the
+  generic `openai-compat` row. The new subsection covers a full working
+  env-file, the `openai-compat` embedder path (with a note to verify any
+  provider's `/v1/embeddings` endpoint before relying on it), a pointer to
+  `docs/llm-provider-comparison.md` for model selection, and a security /
+  gotchas block (auth-token requirement for non-loopback binds, env-file
+  hygiene, cheap-model consolidation drift, `:free`-tier shared-pool
+  limits, reasoning-model incompatibility). (#949)
+- `docs/backup.md` documents the remote-git-mirror backup pattern for a
+  single-user install: what to include, what to exclude (derived SQLite index,
+  models cache, logs, secrets), how to schedule with a `systemd --user` timer,
+  how to restore, and the security posture per `SECURITY.md`, including a
+  "what ends up in your wiki" section that names the exposure (sanitized
+  prompts, tool I/O, page bodies) and lists encrypted-archive alternatives
+  (`age`, `restic`, `borg`, `git-crypt`) for cases where a private mirror
+  repo is not enough. A worked example ships under `docs/examples/backup/`
+  (snapshot script, `.service` and `.timer` unit files, `.gitignore` for
+  the mirror repo). Pointers added from `docs/deploy.md#backups`,
+  `docs/airgapped-install.md`, and the README docs table. The on-box
+  `ai-memory backup --to <tarball>` command
+  (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
+
+
+### Fixed
+- `observations.title` is now sanitized before it is truncated, not after.
+  `title_hint` used to be cut to 80 chars in `ai-memory-hooks::payload`
+  *before* the sanitizer ever ran, so a secret straddling that cutoff was
+  often left as a fragment too short to match a built-in or `[sanitize]
+  extra_patterns` rule — landing in the title, its FTS index, and every
+  surface that renders titles (session pages, briefings, handoffs, search)
+  unredacted, even though the same observation's body was correctly scrubbed
+  first. `title_hint` extraction now keeps the full first line untruncated;
+  `Sanitized::new` scrubs the title and only then applies the 80-char display
+  cap (`ai_memory_core::sanitize::truncate_for_title`), mirroring the order
+  the body already used. (#982)
+- The `/web` page view keeps a leading H1 that is not the page title. It
+  dropped the body's first H1 whatever it said, as a duplicate of the title
+  in the header, but a frontmatter `title:` outranks the H1 and a setext H1
+  never names the page, so a heading like `# Token refresh after sleep`
+  under `title: Auth decisions` vanished from the rendered page. An H1 that
+  repeats the title is still dropped. (#967)
+- `memory_query` now returns `global_scope_hits` (standing `_global` user/team
+  preferences) for a single-project query whose project is named explicitly
+  with `workspace`+`project`, not only when scope is omitted. The routing
+  doctrine tells static MCP clients to pass `workspace`+`project` on every call,
+  which set the old gate's "no named scope" condition to false, so those clients
+  never received global preferences despite the documented contract. The union
+  now keys on single-project resolution (`scopes` empty); only an explicit
+  multi-`scopes` set opts out, and `global=true`/`as_of` are unaffected. The
+  reserved-scope union is still keyed strictly to `_global` and never leaks
+  another project's pages. (#930)
+- A page file rewritten under `wiki/<ws>/<project>/` (the OKF import path)
+  now gets its new version embedded the same way a brand-new file does.
+  The watcher's `reindex_page` upserted the new version and stopped —
+  embedding only ever ran on the `write_page` API path — so a rewrite left
+  hybrid search silently degraded to FTS-only ranking for that page until
+  someone ran `ai-memory embed` by hand. (#958)
+- `[capture] ignore_paths` now covers shell commands. Shell tools (`Bash`,
+  `shell`, `execute_bash`, `terminal`, …) were classified as non-file and always
+  kept, so `cat docs/adr/*.md` stored the ignored file's full text in the
+  observation body. The native `ai-memory hook` now splits the command line
+  lexically and drops the event when an argument, resolved from the event's
+  `cwd`, matches an ignored pattern or is a glob that can reach one. Variables,
+  command substitution and commands that name no path are not followed. The
+  marker-file reference also documents excluding large tool results that Claude
+  Code saves and re-reads from `~/.claude/projects/**/tool-results/**`. (#946)
+- The generated OpenCode, OMP, Pi and OpenClaw integrations now apply the same
+  lexical shell-command `ignore_paths` matching as the native hook, so a `bash`
+  call such as `cat docs/adr/0001.md` is dropped there too instead of being
+  captured. Both matchers now also recognize OpenClaw's and Devin's `exec` shell
+  tool, resolve relative arguments from a shell tool's `workdir` (OpenCode
+  `bash`, OpenClaw `exec`, Codex `shell`) instead of the event cwd, and treat
+  `dir/**` as covering `dir` itself when `dir` holds a glob (`docs/a?r/**`), as
+  the generated plugins already did. Refresh or reinstall generated plugins to
+  pick it up. (#948)
+- Shell-command `ignore_paths` matching no longer joins an argument vector
+  before splitting it, which broke a path with spaces (`["cat", "private
+  notes/x.md"]`) apart and let one element's stray quote hide the elements
+  after it; each element now counts whole and is split on its own. An invalid
+  `.ai-memory.toml` now makes a shell command metadata-only, like a file tool,
+  instead of keeping its command and output, including one whose command is
+  missing or unparseable (`web_search` runs nothing and is still kept), and the
+  server now does the same when it cannot parse the client's capture marker. A
+  long `bash -lc "<script>"` element is read only as words, not also as one
+  path, so it can no longer exhaust the match budget and drop an innocuous
+  event. Applies to the native hook and the generated plugins; the server
+  accepts the new metadata-only shell form, so upgrade it together with them
+  (an older server drops such an event). (#973)
+- `ai-memory-importer omc-wiki` now reads the frontmatter of a page saved
+  with CRLF line endings or a UTF-8 BOM, as a wiki checked out on Windows
+  with `core.autocrlf=true` is. It missed the fence, so the page's kind,
+  tier, tags and pin were dropped and the YAML block was imported as the
+  top of the body; the fence check now matches the wiki's own parser.
+  (#970)
+- Grok Build CLI tool observations are no longer stored with an empty body.
+  Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
+  `tool_use_id`), but it was missing from both `closed_tool_agent` and the
+  tool-metadata agent match, so every `PostToolUse` body extraction returned
+  nothing while the observation itself was still captured. Grok now shares the
+  Claude Code tool mapping, so tool family, outcome and output land in the
+  body. (#931)
+- `ai-memory serve --web-ui-dir` no longer panics at startup when the
+  custom SPA's `index.html` starts with a UTF-8 BOM, or has any other
+  non-ASCII text before `<head>`. The `<base href>` injection scanned the
+  page a byte at a time and sliced inside the multi-byte character
+  ("byte index 1 is not a char boundary"); it now steps a whole
+  character. (#969)
+- `ai-memory bootstrap` on a repository small enough for one chunk no longer
+  asks the provider for 64K output tokens. The output cap was keyed on the
+  number of chunks, so the only chunk of a small repo got the one-shot cap
+  meant for `--chunk-input-tokens 0`, and every such run failed on a
+  64K-context model. Under chunking (the default) every call now asks for up
+  to 16K; only `--chunk-input-tokens 0` keeps 64K. The `--max-input-tokens`
+  help no longer claims its 150K default leaves room for 64K of output in a
+  200K window. (#928)
+- `ai-memory bootstrap` now leaves headroom for its own token estimate. It
+  counts bytes ÷ 4, which undercounts non-English text and source code (about
+  40% on Portuguese mixed with code, as measured for consolidation), and it
+  filled `--max-input-tokens` and `--chunk-input-tokens` to the last estimated
+  token, so a chunk sized to fit a model's window could overflow it on input
+  alone. Prunes and chunks now fill 80% of each budget by the estimate, the
+  same default consolidation uses; a run may plan more chunks than before.
+  (#937)
+- The `bootstrap.md` manifest no longer shows bare `---` separators when a
+  chunk returns no rationale. Empty rationales are dropped before the
+  per-chunk ones are joined, and a run where no chunk returned one says so.
+  (#939)
+- Multi-page consolidation (`memory_consolidate` with `multi_page=true`) no
+  longer overwrites a pinned page. The batch's page paths are chosen by the
+  model, and an update that named an existing pinned page replaced its body
+  and wrote the new version unpinned, despite pinned pages being documented as
+  immutable to automation. Such updates are now skipped with a warning; the
+  rest of the batch is written. `_slots/` pages, which are pinned
+  automatically, keep their state/invariant rules. (#934)
+- The `/api/v1` single-page route's `ETag` now covers the whole JSON it
+  returns. It hashed only the markdown body and author, so pinning a page,
+  a frontmatter edit, or a new backlink changed the response without
+  changing the tag, and a client revalidating with `If-None-Match` got
+  `304` and kept the stale page. (#971)
+- Session consolidation no longer writes a page title that already exists
+  in the project. A colliding session title gets a deterministic
+  `(session <8-char-id>)` suffix (stable for the same session, distinct
+  across sessions) and a matching leading H1 is retitled with it. The
+  consolidator prompt tells the model to name THIS session rather than a
+  generic harness-run phrase and not to reuse listed titles; that wording
+  is compact enough that the advertised 6000-token input floor still
+  projects observation bodies instead of dropping them. (#926)
+- The web page view now links a `[[wikilink]]` on a line indented four
+  spaces that is not code. A nested list item written with four spaces
+  (`- Decisions:` then `    - see [[decisions/auth]]`) or a paragraph's
+  continuation line showed the wikilink as literal text, although the
+  engine indexed it and listed the page in the target's backlinks. The
+  preprocessor now skips exactly the code blocks and inline code the
+  renderer's parser reads as code. (#955)
+- A wikilink or markdown link written inside an inline code span is no
+  longer indexed as a link. The engine skipped only fenced blocks, so a
+  page showing the syntax as code (`` `[[other-project:notes/x]]` ``) got a
+  lint `broken_link` finding for a dependency it does not have, and a
+  local example listed the page in the target's backlinks, while the web
+  page rendered neither as a link. A link whose label is code
+  (`` [`foo`](foo.md) ``) is still indexed. (#968)
+- `export-okf`'s generated `index.md` no longer has a prose sentence outside
+  its list structure. Some strict OKF v0.2 validators read §11.3 as
+  rejecting it. (#979)
+- `export-okf` now backfills a `title` (derived, same as `derive_title`) and
+  a `description` (from `summary`, else `abstract`) on an exported page when
+  missing, so a generic OKF consumer sees both §4.1-recommended keys. The
+  backfill only ever changes the bundle's copy, never the on-disk wiki file.
+  (#979)
+- `export-okf` now rewrites a page's local `[[wikilink]]`s to bundle-relative
+  standard Markdown links, since a generic OKF consumer has no idea what
+  `[[decisions/b.md]]` means. A cross-project or cross-workspace wikilink has
+  no Markdown equivalent and ships untouched, as literal `[[...]]` text.
+  (#979)
+- `sources[].author` in conformed frontmatter is now `process:<agent>`
+  (e.g. `process:claude-code`) instead of a bare agent name, matching the
+  OKF actor grammar's `process:<id>` form for automated processes (#979).
+  This changes the default `sources[].author` value written for every page
+  from now on; already-written pages are not retroactively rewritten.
+
 
 ## [2.4.1] - 2026-09-25
 
@@ -7237,7 +7470,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...HEAD
+[2.4.2]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.4.0
 [2.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.2

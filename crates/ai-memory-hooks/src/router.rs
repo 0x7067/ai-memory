@@ -19,7 +19,10 @@ use ai_memory_core::{
     NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
     WorkstreamEvent, WorkstreamEventKind,
 };
-use ai_memory_store::{HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle};
+use ai_memory_store::{
+    HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle,
+    lookup_existing_workspace,
+};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::Json;
 use axum::Router;
@@ -2540,6 +2543,39 @@ fn sticky_out_of_tree_under_repo_root(
         && meaningful_session_anchor(session_cwd, home_dir).is_some()
 }
 
+/// Whether `workspace_override`, resolved against the session's own
+/// workspace, is a genuine rescope (issue #976).
+///
+/// `workspace` is a *required* key in every `.ai-memory.toml` (see
+/// `docs/marker-file.md`), so the host-side hook forwards `&workspace=…` on
+/// every event under any marker's tree — including events that never left the
+/// session's own workspace. Treating that presence alone as a rescope (the
+/// pre-#976 behavior) silently disqualified sticky routing for every
+/// marker-covered install, because the marker's own workspace rides along
+/// with every event whether or not the agent actually moved.
+///
+/// `None` never disqualifies. `Some(name)` that resolves, via the existing
+/// no-create scope lookup (never a hand-rolled chain — see the "Scope
+/// resolution" rule in AGENTS.md), to the SAME workspace as the session is
+/// not a rescope either: the event just re-declared where it already is.
+/// Different, or unresolvable (a typo, a workspace that doesn't exist yet),
+/// fails closed and is treated as a genuine rescope — matching
+/// `ProjectSource::parse`'s fail-closed stance in this same file: a typo must
+/// never silently downgrade a real rescope into a sticky no-op.
+async fn workspace_override_is_rescope(
+    reader: &ai_memory_store::ReaderPool,
+    workspace_override: Option<&str>,
+    session_workspace: WorkspaceId,
+) -> bool {
+    let Some(name) = workspace_override else {
+        return false;
+    };
+    match lookup_existing_workspace(reader, name).await {
+        Ok(resolved) => resolved != session_workspace,
+        Err(_) => true,
+    }
+}
+
 /// Whether this event's declared overrides leave room for session-sticky
 /// attribution at all (issue #394's `sticky` knob).
 ///
@@ -2552,14 +2588,17 @@ fn sticky_out_of_tree_under_repo_root(
 /// too old to tag its override reports `Unspecified` and keeps today's
 /// behavior, so `sticky` degrades safely rather than silently capturing
 /// deliberate rescopes.
+///
+/// `workspace_is_rescope` is [`workspace_override_is_rescope`]'s verdict,
+/// resolved by the caller before this function runs (it needs the session's
+/// own workspace and a DB read that this function has no access to).
 fn overrides_permit_sticky(
-    workspace_override: Option<&str>,
+    workspace_is_rescope: bool,
     project_override: Option<&str>,
     project_source: ProjectSource,
     routing: MidSessionRouting,
 ) -> bool {
-    // A workspace override only ever comes from a marker file.
-    if workspace_override.is_some() {
+    if workspace_is_rescope {
         return false;
     }
     if project_override.is_none() {
@@ -2797,28 +2836,39 @@ async fn process_authorized(
     // - Under `[routing] mid_session = "sticky"` the session also overrules a
     //   host-derived `repo-root` override, closing the cross-repo `cd` case;
     //   marker-declared scopes still win. See `overrides_permit_sticky`.
-    let sticky_scope = if moved_from_cwd.is_none()
-        && overrides_permit_sticky(
-            env.workspace_override.as_deref(),
-            env.project_override.as_deref(),
-            env.project_source,
-            state.mid_session_routing,
-        ) {
-        state
-            .reader
-            .find_session_scope(session_id)
-            .await?
-            .filter(|(_, _, session_cwd)| {
-                sticky_cwd_admits(
-                    session_cwd.as_deref(),
-                    env.cwd.as_deref(),
-                    state.home_dir.as_deref(),
-                    env.project_strategy,
-                    state.mid_session_routing,
-                )
-            })
-    } else {
-        None
+    //
+    // `find_session_scope` runs unconditionally (issue #976) — the
+    // `workspace_override.is_some()` early return used to gate it, so a
+    // marker's mandatory `workspace` key disqualified stickiness before the
+    // session's own workspace was ever consulted. Resolving the session's
+    // scope first lets `workspace_override_is_rescope` compare the two:
+    // "still the session's own workspace" is not a rescope, only a genuinely
+    // different (or unresolvable) one is. A session with a pending native
+    // move (`moved_from_cwd`) never sticks — it is being rebound.
+    let session_scope = state.reader.find_session_scope(session_id).await?;
+    let sticky_scope = match session_scope {
+        Some((session_ws, session_proj, session_cwd)) if moved_from_cwd.is_none() => {
+            let workspace_is_rescope = workspace_override_is_rescope(
+                &state.reader,
+                env.workspace_override.as_deref(),
+                session_ws,
+            )
+            .await;
+            let permits = overrides_permit_sticky(
+                workspace_is_rescope,
+                env.project_override.as_deref(),
+                env.project_source,
+                state.mid_session_routing,
+            ) && sticky_cwd_admits(
+                session_cwd.as_deref(),
+                env.cwd.as_deref(),
+                state.home_dir.as_deref(),
+                env.project_strategy,
+                state.mid_session_routing,
+            );
+            permits.then_some((session_ws, session_proj, session_cwd))
+        }
+        _ => None,
     };
     let publishable_scope = sticky_scope.is_some()
         || has_publishable_scope_hint(env.cwd.as_deref(), env.project_override.as_deref());
@@ -5210,40 +5260,102 @@ mod tests {
     // The override gate for `[routing] mid_session` (#394). The invariant
     // under test: a marker-declared project is a deliberate rescope and wins
     // in BOTH modes; only a host-derived repo-root name may yield, and only
-    // under `sticky`.
+    // under `sticky`. The workspace side of the gate is exercised in terms of
+    // `workspace_is_rescope` directly here (the caller's already-resolved
+    // verdict) — `workspace_override_is_rescope`'s own DB-backed resolution
+    // (same-workspace vs. different vs. unresolvable) is covered separately
+    // below (issue #976) and in the `cross_repo_cd`-based integration tests.
     #[test]
     fn override_gate_distinguishes_marker_from_derived_project() {
         use MidSessionRouting::{FollowCwd, Sticky};
         use ProjectSource::{Marker, RepoRoot, Unspecified};
 
-        // (workspace, project, source, routing, expected)
+        // (workspace_is_rescope, project, source, routing, expected)
         let cases = [
-            // No override at all: both modes may stick (pre-#394 behavior).
-            (None, None, Unspecified, FollowCwd, true),
-            (None, None, Unspecified, Sticky, true),
+            // No workspace rescope, no project override: both modes may
+            // stick (pre-#394 behavior).
+            (false, None, Unspecified, FollowCwd, true),
+            (false, None, Unspecified, Sticky, true),
             // Marker-declared project: never yields, in either mode.
-            (None, Some("acme"), Marker, FollowCwd, false),
-            (None, Some("acme"), Marker, Sticky, false),
+            (false, Some("acme"), Marker, FollowCwd, false),
+            (false, Some("acme"), Marker, Sticky, false),
             // Host-derived repo-root name: yields only under `sticky`. This
             // is the cross-repo `cd` case the knob exists for.
-            (None, Some("acme"), RepoRoot, FollowCwd, false),
-            (None, Some("acme"), RepoRoot, Sticky, true),
+            (false, Some("acme"), RepoRoot, FollowCwd, false),
+            (false, Some("acme"), RepoRoot, Sticky, true),
             // An untagged override from an older client stays authoritative,
             // so `sticky` degrades safely instead of capturing a rescope.
-            (None, Some("acme"), Unspecified, Sticky, false),
-            // A marker workspace is itself a deliberate scope declaration.
-            (Some("oss"), None, Unspecified, Sticky, false),
-            (Some("oss"), Some("acme"), RepoRoot, Sticky, false),
+            (false, Some("acme"), Unspecified, Sticky, false),
+            // A genuine workspace rescope (a marker naming a DIFFERENT
+            // workspace than the session's own, or an unresolvable one)
+            // disqualifies sticky outright, regardless of project override.
+            (true, None, Unspecified, Sticky, false),
+            (true, Some("acme"), RepoRoot, Sticky, false),
         ];
-        for (ws, project, source, routing, expected) in cases {
+        for (workspace_is_rescope, project, source, routing, expected) in cases {
             assert_eq!(
-                overrides_permit_sticky(ws, project, source, routing),
+                overrides_permit_sticky(workspace_is_rescope, project, source, routing),
                 expected,
-                "ws={ws:?} project={project:?} source={} routing={}",
+                "workspace_is_rescope={workspace_is_rescope:?} project={project:?} source={} routing={}",
                 source.as_str(),
                 routing.as_str(),
             );
         }
+    }
+
+    // Issue #976: `workspace_override_is_rescope`'s own resolution, in
+    // isolation from the rest of the sticky gate. `workspace` is a required
+    // marker key, so every marker-covered install forwards it on every
+    // event — the same workspace the session is already in, most of the
+    // time. Only a genuinely different (or unresolvable) workspace name may
+    // disqualify stickiness.
+    #[tokio::test]
+    async fn workspace_override_is_rescope_only_on_a_genuine_workspace_change() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let other_ws = state
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+
+        // No override at all: never a rescope.
+        assert!(
+            !workspace_override_is_rescope(&state.reader, None, state.workspace_id).await,
+            "a missing workspace override must never disqualify sticky"
+        );
+        // The marker re-declaring the session's OWN workspace: not a
+        // rescope — this is the exact #976 repro (every event under a
+        // marker's tree carries the workspace it's already in).
+        assert!(
+            !workspace_override_is_rescope(&state.reader, Some("default"), state.workspace_id)
+                .await,
+            "re-declaring the session's own workspace must not disqualify sticky"
+        );
+        // A marker naming a genuinely different, EXISTING workspace: a real
+        // rescope.
+        assert!(
+            workspace_override_is_rescope(
+                &state.reader,
+                Some("other-workspace"),
+                state.workspace_id
+            )
+            .await,
+            "a marker naming a different workspace must disqualify sticky"
+        );
+        let _ = other_ws;
+        // An unresolvable workspace name (typo, not-yet-created): fails
+        // closed, exactly like `ProjectSource::parse`'s stance on an unknown
+        // `project_src` value.
+        assert!(
+            workspace_override_is_rescope(
+                &state.reader,
+                Some("no-such-workspace"),
+                state.workspace_id
+            )
+            .await,
+            "an unresolvable workspace override must fail closed and disqualify sticky"
+        );
     }
 
     // `sticky` extends out-of-tree inheritance to every strategy, but must
@@ -5538,10 +5650,22 @@ mod tests {
     /// host hook tagging each `project` override by provenance, and report
     /// where the second observation landed. The shared fixture behind the
     /// cross-repo cases below (#394).
+    ///
+    /// `workspace`, when set, is forwarded on BOTH events — mirroring every
+    /// real marker-covered install, where `workspace` is a required marker
+    /// key and rides along with every event under the marker's tree whether
+    /// or not the agent actually changed workspace (#976). Before #976 this
+    /// fixture never set `workspace` at all, which is exactly why the bug —
+    /// a marker's mandatory `workspace` unconditionally disqualifying sticky
+    /// — went untested: none of the cross-repo cases below ever exercised a
+    /// marker's workspace key riding alongside a repo-root-derived project,
+    /// which is exactly the combination every real marker-covered install
+    /// sends.
     async fn cross_repo_cd(
         state: &HookState,
         sid: &str,
         source: &str,
+        workspace: Option<&str>,
     ) -> (ProjectId, Option<ProjectId>) {
         let fire = |event: &str, cwd: &str, project: &str, project_src: Option<&str>| {
             HookEnvelope::from_query_and_body(
@@ -5549,6 +5673,7 @@ mod tests {
                     event: event.into(),
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
+                    workspace: workspace.map(str::to_owned),
                     project: Some(project.to_string()),
                     project_src: project_src.map(str::to_owned),
                     project_strategy: Some("repo-root".into()),
@@ -5598,6 +5723,15 @@ mod tests {
     // hop into a sibling checkout keeps the session's project: the override
     // is host-derived (`project_src=repo-root`), so it carries no operator
     // intent and yields to the session.
+    //
+    // Also issue #976's regression case: BOTH events carry `workspace=default`
+    // (matching `state.workspace_id`'s name, per `make_state`), exactly as a
+    // real marker-covered install forwards its required `workspace` key on
+    // every event under the marker's tree — the same workspace the session
+    // is already in. Before the #976 fix, `workspace_override.is_some()`
+    // alone disqualified sticky here, so this exact test would have failed
+    // (see `mid_session_out_of_tree_cwd_still_resolves_per_event_under_basename`-
+    // style per-event splitting) had the fixture ever forwarded `workspace`.
     #[tokio::test]
     async fn sticky_routing_keeps_the_session_project_across_a_sibling_checkout() {
         let tmp = TempDir::new().unwrap();
@@ -5612,7 +5746,7 @@ mod tests {
             .unwrap();
         assert_eq!(repo_a, None, "fixture starts clean");
 
-        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root", Some("default")).await;
         let repo_a = state
             .reader
             .find_project(state.workspace_id, "repo-a".to_string())
@@ -5643,7 +5777,7 @@ mod tests {
         );
         let sid = "88888888-8888-4888-8888-888888888888";
 
-        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root", Some("default")).await;
         let repo_b = repo_b.expect("follow-cwd mints the visited checkout's project");
         assert_eq!(
             landed, repo_b,
@@ -5661,11 +5795,108 @@ mod tests {
         state.mid_session_routing = MidSessionRouting::Sticky;
         let sid = "99999999-9999-4999-8999-999999999999";
 
-        let (landed, repo_b) = cross_repo_cd(&state, sid, "marker").await;
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "marker", Some("default")).await;
         let repo_b = repo_b.expect("a marker-declared project must still be created");
         assert_eq!(
             landed, repo_b,
             "a marker override is a deliberate rescope and outranks stickiness"
+        );
+    }
+
+    // Issue #976's opposite-direction case, left untested before this fix: a
+    // marker naming a genuinely DIFFERENT workspace than the session's own
+    // must still rescope, even under `sticky`. Only "same workspace, still
+    // here" may fall through to the project-provenance logic above — a real
+    // workspace change is not drift and must never be captured by
+    // stickiness.
+    #[tokio::test]
+    async fn sticky_routing_still_rescopes_when_marker_names_a_different_workspace_mid_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        // Pre-create the target workspace so the mid-session event's lookup
+        // resolves to a real, distinct WorkspaceId (the `Ok(resolved) !=
+        // session_workspace` branch) instead of accidentally only exercising
+        // the fail-closed "unresolvable name" branch, which would also
+        // disqualify stickiness but for the wrong reason and leave the
+        // resolved-and-different comparison unproven at this level.
+        state
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+        let sid = "cdcdcdcd-cdcd-4cdc-8cdc-cdcdcdcdcdcd";
+        let fire = |event: &str, cwd: &str, project: &str, workspace: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string()),
+                    workspace: Some(workspace.to_string()),
+                    project: Some(project.to_string()),
+                    project_src: Some("repo-root".into()),
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd,
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", "/checkouts/repo-a", "repo-a", "default"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire(
+                "post-tool-use",
+                "/checkouts/repo-b",
+                "repo-b",
+                "other-workspace",
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        let other_ws = state
+            .reader
+            .find_workspace("other-workspace".to_string())
+            .await
+            .unwrap()
+            .expect(
+                "a genuinely different workspace override must still resolve/create its own workspace",
+            );
+        let repo_b_in_other_ws = state
+            .reader
+            .find_project(other_ws, "repo-b".to_string())
+            .await
+            .unwrap()
+            .expect("the rescoped event's project must exist in the NEW workspace");
+        let second = observations.last().unwrap();
+        assert_eq!(
+            second.project_id, repo_b_in_other_ws,
+            "a marker naming a genuinely different workspace must still rescope, even under sticky"
+        );
+        assert_ne!(
+            second.workspace_id, state.workspace_id,
+            "the rescoped event must not stay in the session's original workspace"
         );
     }
 
