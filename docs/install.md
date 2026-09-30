@@ -565,6 +565,16 @@ server, and needs a JSON payload naming the directory to test. In the output,
 Note the trade: recall is lost for every repository you do not mark, and a
 repository you *intended* to capture stays silent until you add its marker.
 
+**Send different repositories to different servers.** One install can deliver
+capture to several ai-memory servers, for example one per organisation. Register
+each server once with `ai-memory server add <name> --url <url> --root <dir>
+--auth-token-stdin`, then set `server = "<name>"` in each repository's
+`.ai-memory.toml`. Repositories without the key keep using the server
+`install-hooks` configured. A profile that does not resolve drops the event
+instead of falling back. Native hook commands route profiles; the generated
+TypeScript integrations and the script hooks drop routed repositories. See
+[`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
+
 Some agent harnesses attach the assistant's final turn to their `Stop` event —
 Claude Code sends it as a raw `last_assistant_message`. By default that text is
 never persisted: the native hook binary strips the raw field before it can reach

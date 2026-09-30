@@ -191,6 +191,29 @@ ai-memory run --yolo claude
 See [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) for the
 full contract.
 
+## Recipe: send different repositories to different servers
+
+One machine, several organisations, each with its own ai-memory server.
+Register each server once under a name, with the directory it is allowed to
+serve, then let each repository's marker pick it:
+
+```bash
+ai-memory server add team-a --url https://memory-a.example.com --root ~/work/team-a --auth-token-stdin
+ai-memory server add team-b --url https://memory-b.example.com --root ~/work/team-b --auth-token-stdin
+```
+
+```toml
+# ~/work/team-b/.ai-memory.toml
+workspace = "team-b"
+server = "team-b"
+```
+
+Repositories without a `server` key keep using the server `install-hooks`
+configured. The marker only ever names a profile; a profile that does not
+resolve drops the event rather than sending it anywhere else. Details, the
+fail-closed rules, and which integrations support it:
+[`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
+
 ## Recipe: run the server on a Mac
 
 Use the menu bar app when you want one `.app` that starts the server and
@@ -229,6 +252,7 @@ ai-memory backfill                   # import prior local history into an empty 
 ai-memory write-page …               # save a durable page
 ai-memory handoffs                   # list open handoffs for the project
 ai-memory message list               # cross-project inbox
+ai-memory server list                # server profiles a marker can route to
 ai-memory export-okf …               # export the wiki as an OKF bundle
 ai-memory serve                      # run the server
 ```

@@ -280,6 +280,30 @@
   handoff ownership, so a forwarded id cannot report another operator's or
   another session's claim. The `handoff` field is unchanged. (#988, #920)
 
+- Hook capture can be routed to a different ai-memory server per repository.
+  `ai-memory server add|list|remove` registers named server profiles locally,
+  in `<data_dir>/servers.toml`, with each token in its own owner-only file
+  under `<data_dir>/auth-tokens/`. A repository's `.ai-memory.toml` then
+  selects one with `server = "<name>"`. The marker carries only the name,
+  never a URL or token. When several profiles are registered, each must
+  declare `--root` directories, and a marker outside them cannot select it.
+  An unknown, tokenless, out-of-roots or unrooted profile, or a malformed
+  `servers.toml`, makes the hook emit nothing, never fall back to the install
+  default.
+  - Native hooks route the spooled event, the session-start handoff fetch,
+    later drains and the one-time boot backfill.
+  - Generated TypeScript integrations and the `.sh`/`.ps1` script hooks
+    cannot route yet, so they drop a routed repository's events and handoff
+    fetch.
+  - Clients older than this release ignore the key, so upgrade every client
+    before adding `server` to a shared marker.
+  - Re-running `server add` keeps a profile's roots when `--root` is omitted,
+    and changing its URL without a new token discards the old token.
+  - `uninstall` removes the stored profile tokens together with the hook
+    token; the registry of URLs stays.
+  - `hook --check-capture` reports `server_profile` and `server_resolution`.
+
+  See `docs/marker-file.md`. (#992)
 
 
 ### Changed
@@ -743,6 +767,11 @@
   `["full_page", "patch"]`, and normalisation folds `full`, `full-page` and
   `Full Page` into `full_page` (with a warning) for providers without
   constrained decoding. Unknown modes still fail validation. (#991)
+- The one-time SessionStart backfill now delivers to the server the hook is
+  installed against, authenticated with the persisted hook token. Before,
+  it resolved the server from the environment and fell back to
+  `http://127.0.0.1:49374` when `AI_MEMORY_SERVER_URL` was unset where the
+  agent was launched. (#992)
 
 - Kimi Code no longer receives a bare `{}` when a `UserPromptSubmit` is
   dropped by capture policy: the hook now writes an empty success response

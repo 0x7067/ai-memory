@@ -406,7 +406,8 @@ your machine can reach it. From there, hardening is incremental: a bearer
 token for the LAN, per-user accounts, OIDC device auth for hooks, TLS via
 a reverse proxy. Capture is sanitized at a typed privacy boundary before
 anything is stored, and per-repository `[capture]` rules can exclude
-paths or invert to allowlist mode.
+paths or invert to allowlist mode. A repository can also route its capture
+to a different server than the one the hooks were installed against.
 
 The full model is in [`docs/security.md`](docs/security.md),
 [`docs/users.md`](docs/users.md), and
@@ -459,7 +460,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
 | [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across harnesses: auto harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice. |
-| [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
+| [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation, plus per-repository server profiles. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
 | [`docs/macos.md`](docs/macos.md) | macOS install paths: menu bar app, native release tarball, source build, Docker wrapper, launchd, and current limitations. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and caveats. |
