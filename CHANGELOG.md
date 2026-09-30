@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#997)
 
 ### Fixed
+- NixOS systemd container smoke (`scripts/test-nixos-systemd-container.sh`)
+  now invokes `systemctl`/`journalctl` via absolute NixOS profile paths.
+  `docker import` leaves no image `PATH`, so bare names failed with
+  `executable file not found in $PATH` on the Linux `nix.yml` leg. (#989)
 - Kimi Code no longer receives a bare `{}` when a `UserPromptSubmit` is
   dropped by capture policy: the hook now writes an empty success response
   Kimi accepts instead of a JSON object it rejects. (#996)

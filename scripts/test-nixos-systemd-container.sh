@@ -33,6 +33,11 @@ MARKER_VALUE="nixos-container-smoke"
 ENGINE=""
 ROOTFS=""
 BUILT_IMAGE=0
+# docker import leaves no image ENV PATH. nixpkgs documents absolute NixOS
+# paths for docker exec (see virtualisation/docker-image.nix). Prefer the
+# profile path — present in the rootfs before activation links
+# /run/current-system.
+NIXOS_SW_BIN="/nix/var/nix/profiles/system/sw/bin"
 
 log() {
   printf '\n==> %s\n' "$*"
@@ -41,6 +46,18 @@ log() {
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
+}
+
+ctr_exec() {
+  "${ENGINE}" exec "${CONTAINER_NAME}" "$@"
+}
+
+ctr_systemctl() {
+  ctr_exec "${NIXOS_SW_BIN}/systemctl" "$@"
+}
+
+ctr_journalctl() {
+  ctr_exec "${NIXOS_SW_BIN}/journalctl" "$@"
 }
 
 repo_root() {
@@ -90,20 +107,20 @@ wait_for_http() {
     fi
     sleep 0.5
   done
-  "${ENGINE}" exec "${CONTAINER_NAME}" journalctl -u ai-memory --no-pager -n 120 >&2 || true
+  ctr_journalctl -u ai-memory --no-pager -n 120 >&2 || true
   fail "timed out waiting for ${url}"
 }
 
 wait_for_active() {
   local i
   for i in $(seq 1 120); do
-    if "${ENGINE}" exec "${CONTAINER_NAME}" systemctl is-active --quiet ai-memory; then
+    if ctr_systemctl is-active --quiet ai-memory; then
       return 0
     fi
     sleep 0.5
   done
-  "${ENGINE}" exec "${CONTAINER_NAME}" systemctl status ai-memory --no-pager >&2 || true
-  "${ENGINE}" exec "${CONTAINER_NAME}" journalctl -u ai-memory --no-pager -n 120 >&2 || true
+  ctr_systemctl status ai-memory --no-pager >&2 || true
+  ctr_journalctl -u ai-memory --no-pager -n 120 >&2 || true
   fail "timed out waiting for systemctl is-active ai-memory"
 }
 
@@ -121,13 +138,15 @@ run_container() {
 }
 
 write_marker() {
-  "${ENGINE}" exec -u root "${CONTAINER_NAME}" sh -c \
+  # /bin/sh is the activation-created wrapper; present once systemd has
+  # finished early boot (we only write markers after wait_for_active).
+  "${ENGINE}" exec -u root "${CONTAINER_NAME}" /bin/sh -c \
     "printf '%s\n' '${MARKER_VALUE}' > '${MARKER_PATH}' && chown ai-memory:ai-memory '${MARKER_PATH}'"
 }
 
 assert_marker() {
   local got
-  got="$("${ENGINE}" exec "${CONTAINER_NAME}" cat "${MARKER_PATH}")"
+  got="$(ctr_exec "${NIXOS_SW_BIN}/cat" "${MARKER_PATH}")"
   if [ "${got}" != "${MARKER_VALUE}" ]; then
     fail "marker mismatch at ${MARKER_PATH}: expected '${MARKER_VALUE}', got '${got}'"
   fi
@@ -136,7 +155,7 @@ assert_marker() {
 smoke_once() {
   log "Waiting for ai-memory unit"
   wait_for_active
-  "${ENGINE}" exec "${CONTAINER_NAME}" systemctl is-active ai-memory
+  ctr_systemctl is-active ai-memory
 
   log "Waiting for ${HEALTH_URL}"
   wait_for_http "${HEALTH_URL}"
@@ -144,7 +163,7 @@ smoke_once() {
 
   log "Writing marker and restarting ai-memory"
   write_marker
-  "${ENGINE}" exec "${CONTAINER_NAME}" systemctl restart ai-memory
+  ctr_systemctl restart ai-memory
   wait_for_active
   wait_for_http "${HEALTH_URL}"
   assert_marker
