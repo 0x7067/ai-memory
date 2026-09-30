@@ -26,9 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `packages.x86_64-linux.nixos-ai-memory-docker` builds one NixOS
   `system.build.toplevel` (via the docker-image rootfs tarball) and
   `scripts/test-nixos-systemd-container.sh` runs a privileged systemd
-  container smoke (`systemctl` + `/healthz` + dataDir restart/volume
-  persistence) on the Linux `nix.yml` leg. The existing `flake.nix`
-  package/devShell/CLI build is unchanged. (#NNN)
+  container smoke (`systemctl` + in-container `/healthz` + dataDir
+  restart/volume persistence) on the Linux `nix.yml` leg. The existing
+  `flake.nix` package/devShell/CLI build is unchanged. (#NNN)
 
 ### Changed
 - `.github/workflows/nix.yml` now builds the flake on `x86_64-linux` and
@@ -39,10 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#997)
 
 ### Fixed
-- NixOS systemd container smoke (`scripts/test-nixos-systemd-container.sh`)
-  now invokes `systemctl`/`journalctl` via absolute NixOS profile paths.
-  `docker import` leaves no image `PATH`, so bare names failed with
-  `executable file not found in $PATH` on the Linux `nix.yml` leg. (#989)
+- NixOS systemd container smoke probes `/healthz` via in-container `curl`
+  (and ships `curl` in the smoke image). The module's default
+  `127.0.0.1` bind is unreachable through Docker published ports, so the
+  previous host-side probe timed out after the unit was already active.
+  Also invokes `systemctl`/`journalctl` via absolute NixOS profile paths
+  because `docker import` leaves no image `PATH`. (#989)
 - Kimi Code no longer receives a bare `{}` when a `UserPromptSubmit` is
   dropped by capture policy: the hook now writes an empty success response
   Kimi accepts instead of a JSON object it rejects. (#996)

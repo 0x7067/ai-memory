@@ -195,7 +195,7 @@
         modules = [
           self.nixosModules.default
           (
-            { modulesPath, ... }:
+            { modulesPath, pkgs, ... }:
             {
               imports = [ "${modulesPath}/virtualisation/docker-image.nix" ];
               system.stateVersion = "25.05";
@@ -206,6 +206,9 @@
               documentation.info.enable = false;
               documentation.man.enable = false;
               documentation.nixos.enable = false;
+              # In-container /healthz probe (docker published ports cannot
+              # reach the module's default 127.0.0.1 bind).
+              environment.systemPackages = [ pkgs.curl ];
               services.ai-memory.enable = true;
             }
           )

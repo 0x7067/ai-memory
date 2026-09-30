@@ -5,7 +5,8 @@
 # tarball derived from one NixOS system.build.toplevel — imports it into
 # Docker/Podman, starts systemd as PID 1, and checks:
 #   - systemctl is-active ai-memory
-#   - curl /healthz from the host
+#   - curl /healthz inside the container (module default bind is loopback;
+#     Docker published ports hit eth0 and cannot reach 127.0.0.1)
 #   - a marker under /var/lib/ai-memory survives systemctl restart
 #   - optional: the same marker survives a recreate with a named volume
 #
@@ -24,8 +25,8 @@ VOLUME_NAME="${AI_MEMORY_NIXOS_TEST_VOLUME_NAME:-ai-memory-nixos-test-data}"
 KEEP="${AI_MEMORY_NIXOS_TEST_KEEP:-0}"
 # Default on: one volume remount persistence pass. Set 0 to skip.
 TEST_VOLUME="${AI_MEMORY_NIXOS_TEST_VOLUME:-1}"
-PORT="${AI_MEMORY_NIXOS_TEST_PORT:-49374}"
-HEALTH_URL="http://127.0.0.1:${PORT}/healthz"
+# Probed via docker exec against the unit's loopback bind (not host-mapped).
+HEALTH_URL="http://127.0.0.1:49374/healthz"
 DATA_DIR="/var/lib/ai-memory"
 MARKER_PATH="${DATA_DIR}/.ai-memory-nixos-ci-marker"
 MARKER_VALUE="nixos-container-smoke"
@@ -58,6 +59,10 @@ ctr_systemctl() {
 
 ctr_journalctl() {
   ctr_exec "${NIXOS_SW_BIN}/journalctl" "$@"
+}
+
+ctr_curl() {
+  ctr_exec "${NIXOS_SW_BIN}/curl" "$@"
 }
 
 repo_root() {
@@ -102,13 +107,13 @@ wait_for_http() {
   local url="$1"
   local i
   for i in $(seq 1 120); do
-    if curl -fsS "${url}" >/dev/null 2>&1; then
+    if ctr_curl -fsS "${url}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
   done
   ctr_journalctl -u ai-memory --no-pager -n 120 >&2 || true
-  fail "timed out waiting for ${url}"
+  fail "timed out waiting for in-container ${url}"
 }
 
 wait_for_active() {
@@ -128,11 +133,11 @@ run_container() {
   local extra_args=("$@")
   # Privileged + host cgroup namespace: systemd as PID 1 on cgroup v2 hosts
   # (including GitHub Actions ubuntu-latest) needs this to activate units.
+  # No -p: default --bind is 127.0.0.1; published ports never reach it.
   "${ENGINE}" run -d --name "${CONTAINER_NAME}" \
     --privileged \
     --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -p "127.0.0.1:${PORT}:49374" \
     "${extra_args[@]}" \
     "${IMAGE_NAME}" /init
 }
@@ -157,9 +162,9 @@ smoke_once() {
   wait_for_active
   ctr_systemctl is-active ai-memory
 
-  log "Waiting for ${HEALTH_URL}"
+  log "Waiting for in-container ${HEALTH_URL}"
   wait_for_http "${HEALTH_URL}"
-  curl -fsS "${HEALTH_URL}" >/dev/null
+  ctr_curl -fsS "${HEALTH_URL}" >/dev/null
 
   log "Writing marker and restarting ai-memory"
   write_marker

@@ -749,7 +749,9 @@ scripts/test-nixos-systemd-container.sh
 ```
 
    That script imports the rootfs, runs a privileged systemd container,
-   checks `systemctl is-active ai-memory` and `curl /healthz`, writes a
+   checks `systemctl is-active ai-memory` and in-container `curl /healthz`
+   (the module's default loopback bind is unreachable via Docker `-p`),
+   writes a
    marker under `/var/lib/ai-memory`, restarts the unit, and (by default)
    remounts a named volume once. Wired into the Linux leg of `nix.yml`
    only (same path filters as the rest of the Nix job).
