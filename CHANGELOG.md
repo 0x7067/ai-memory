@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Documented API Route as an endpoint for the existing `openai-compat`
+  provider. (#997)
+
 ### Fixed
 - `install-hooks --apply --as-user <user> --auth-token <key>` no longer fails
   with `--as-user '<user>' requires --auth-token` when the token was supplied.
