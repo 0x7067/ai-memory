@@ -2016,15 +2016,15 @@ fn render_handoff_markdown(h: &Handoff) -> String {
 
     // Agent-facing reading instructions. This block is the
     // load-bearing UX fix — without it, agents call
-    // memory_handoff_accept again, get `null` (single-use
+    // memory_handoff_accept again, get no handoff (single-use
     // already consumed by this hook), and conclude "no handoff"
     // *despite this content being right in their context*.
     buf.push_str(
         "\n---\n\
          _**To the receiving agent:** this content IS the pending \
          handoff — already consumed by the SessionStart hook. A \
-         subsequent `memory_handoff_accept` call will return \
-         `{ \"handoff\": null }` (single-use). When the user asks \
+         subsequent `memory_handoff_accept` call returns no handoff \
+         (single-use). When the user asks \
          \"where did we leave off?\" or \"any pending handoff?\", \
          answer from THIS content; do NOT re-call the tool. Call \
          `memory_query` / `memory_recent` only for additional \

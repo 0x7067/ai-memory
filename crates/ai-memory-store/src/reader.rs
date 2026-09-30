@@ -6084,6 +6084,51 @@ impl ReaderPool {
         .await
     }
 
+    /// The handoff `session` claimed in this scope while it is still running —
+    /// its own SessionStart delivery, so the baton is already in that session's
+    /// context — or `None`.
+    ///
+    /// The session id is a routing coordinate the caller supplies, never
+    /// identity: the scope and owner predicates bound the answer, so a forged
+    /// id can only confirm a claim on a row the caller could have claimed
+    /// itself. A receiving session holds at most one baton, and one that ended
+    /// no longer has a context the baton could be in.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn handoff_claimed_by_live_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session: SessionId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<Option<HandoffId>> {
+        self.with_conn(move |conn| {
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 4);
+            let sql = format!(
+                "SELECT id FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND state = 'accepted' AND accepted_by_session = ?3{owner_clause} \
+                   AND EXISTS (SELECT 1 FROM sessions s \
+                               WHERE s.id = ?3 AND s.ended_at IS NULL) \
+                 ORDER BY accepted_at DESC LIMIT 1"
+            );
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                session.as_bytes(),
+            ];
+            if let Some(owner) = owner_param.as_ref() {
+                binds.push(owner);
+            }
+            let id: Option<Vec<u8>> = conn
+                .query_row(&sql, binds.as_slice(), |row| row.get(0))
+                .optional()?;
+            Ok(id.map(|id| HandoffId::from_slice(&id)).transpose()?)
+        })
+        .await
+    }
+
     /// Snapshot the database to `dest_path` using SQLite's online backup
     /// API. The source DB stays writable for the duration of the copy.
     ///

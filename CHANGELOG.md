@@ -270,7 +270,15 @@
   `docs/airgapped-install.md`, and the README docs table. The on-box
   `ai-memory backup --to <tarball>` command
   (`docs/lifecycle-ops.md#backup`) is unchanged. (#950)
-
+- `memory_handoff_accept` returns a `status` next to `handoff`: `claimed` when
+  the call took the handoff, `consumed_by_hook` when the calling session's own
+  SessionStart already claimed it (so it is in that session's context), and
+  `none_pending` when nothing is left to claim. A bare `{"handoff": null}` used
+  to cover both of the last two. `consumed_by_hook` needs the session id the
+  hook claimed under, which Claude Code's `install-mcp --session-aware` bridge
+  and OpenCode 2 forward; the answer stays inside the caller's project and
+  handoff ownership, so a forwarded id cannot report another operator's or
+  another session's claim. The `handoff` field is unchanged. (#988, #920)
 
 
 ### Changed
