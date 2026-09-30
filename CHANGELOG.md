@@ -37,12 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NixOS systemd container smoke stay on the Linux leg only. (#989)
 
 ### Fixed
-- NixOS systemd container smoke probes `/healthz` via in-container `curl`
-  (and ships `curl` in the smoke image). The module's default
-  `127.0.0.1` bind is unreachable through Docker published ports, so the
-  previous host-side probe timed out after the unit was already active.
-  Also invokes `systemctl`/`journalctl` via absolute NixOS profile paths
-  because `docker import` leaves no image `PATH`. (#989)
+- NixOS systemd container smoke injects a NixOS `PATH` on every
+  `docker exec` (`/run/current-system/sw/bin` + profile + `/bin`) so
+  `systemctl`/`curl`/`chown` resolve after activation. Bare `chown` under
+  `/bin/sh` previously exited 127 once `/healthz` already passed; absolute
+  profile paths alone were also missing until activation linked
+  `current-system`. Host-side `/healthz` stays in-container because the
+  module's default `127.0.0.1` bind is unreachable through Docker
+  published ports. (#989)
 
 ## [2.5.0] - 2026-09-30
 
