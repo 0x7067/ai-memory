@@ -152,6 +152,45 @@ ai-memory run --env CODEX_HOME="$HOME/.codex-work" codex   # the dir must exist
 
 See [`managed-workstreams.md`](managed-workstreams.md).
 
+## Recipe: run an unsupervised agent safely (`--yolo` + ai-jail)
+
+`--yolo` maps to each harness's dangerous-mode flag (Claude Code →
+`--dangerously-skip-permissions`), which runs every tool call with no
+confirmation. `ai-memory run --yolo` adds guardrails around that, gated
+entirely on a real interactive terminal (stdin and stderr both TTYs), so
+scripts, hooks, and CI are never prompted:
+
+```bash
+ai-memory run --yolo claude
+```
+
+- **The warning.** Before the agent spawns, you are asked to confirm:
+  `Enter`/`y`/`yes` proceeds (the default); `n`/`no` aborts before anything
+  launches.
+- **The ai-jail offer.** If [ai-jail](https://github.com/akitaonrails/ai-jail)
+  is on `PATH` (or `~/.local/bin/ai-jail`) and you are not already inside it,
+  a second question offers to re-run the session inside it. Accepting
+  re-execs the original command under `ai-jail --network --agent-state
+  --env <NAME>...`, forwarding only the credential/config
+  environment variables that are already set (server/hook URL,
+  `CLAUDE_CONFIG_DIR`, provider API keys, etc.) — `--network` keeps the
+  loopback ai-memory server reachable while still sandboxing the filesystem.
+  Declining keeps the run unsandboxed (your choice, already warned).
+- **Already inside ai-jail.** Both prompts are skipped and the run proceeds
+  directly — `ai-jail ai-memory run … --yolo` sees no extra friction.
+  Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
+  `(jail) `); it fails open (shows the warning) when undetectable, never
+  open to skipping it silently.
+- **Claude "true yolo".** `--dangerously-skip-permissions` alone still pauses
+  Claude Code on `permissions.ask`/`deny` rules and on a 2-minute `rm`
+  confirmation. Opt in with `--true-yolo` (or `claude_true_yolo = true` in
+  `config.toml` / `AI_MEMORY_CLAUDE_TRUE_YOLO=true`) to also silence those —
+  Claude-only, off by default, and best paired with ai-jail since it does not
+  widen your own `deny`/`ask` rules.
+
+See [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) for the
+full contract.
+
 ## Recipe: run the server on a Mac
 
 Use the menu bar app when you want one `.app` that starts the server and

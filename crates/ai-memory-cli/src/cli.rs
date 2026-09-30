@@ -284,6 +284,15 @@ pub struct RunArgs {
     /// equivalent dangerous-mode option.
     #[arg(long)]
     pub yolo: bool,
+    /// Claude-only: additionally silence the residual `--dangerously-skip-permissions`
+    /// prompts (rm timeout/confirmation, PowerShell rm deny) and force
+    /// `bypassPermissions` via `--settings`. No-op for every other harness
+    /// (a one-line note is printed instead of being silently ignored).
+    /// Off by default; overrides `[claude_true_yolo]` in config.toml when
+    /// passed. Best paired with ai-jail — see
+    /// `docs/design-yolo-safety-ai-jail.md`.
+    #[arg(long = "true-yolo")]
+    pub true_yolo: bool,
     /// Start a new native session in the selected workstream instead of
     /// resuming or adopting an existing harness session.
     #[arg(long)]
@@ -432,6 +441,9 @@ pub struct ShowArgs {
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
     pub yolo: bool,
+    /// Claude-only true-yolo (see `RunArgs::true_yolo`). Forwarded to `run`.
+    #[arg(long = "true-yolo")]
+    pub true_yolo: bool,
     /// Start a new native session instead of resuming or adopting an existing
     /// harness session. Forwarded to `run`.
     #[arg(long)]
@@ -455,6 +467,9 @@ pub struct ContinueArgs {
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
     pub yolo: bool,
+    /// Claude-only true-yolo (see `RunArgs::true_yolo`). Forwarded to `run`.
+    #[arg(long = "true-yolo")]
+    pub true_yolo: bool,
     /// Start a new native session instead of resuming the linked one.
     /// Forwarded to `run`.
     #[arg(long)]
@@ -478,6 +493,9 @@ pub struct ResumeArgs {
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
     pub yolo: bool,
+    /// Claude-only true-yolo (see `RunArgs::true_yolo`). Forwarded to `run`.
+    #[arg(long = "true-yolo")]
+    pub true_yolo: bool,
     /// Start a new native session instead of resuming the linked one.
     /// Forwarded to `run`.
     #[arg(long)]

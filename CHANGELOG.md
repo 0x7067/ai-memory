@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory run --yolo` now warns before disarming an agent's safety prompts
+  and, on Linux/macOS, offers to re-run the session inside
+  [ai-jail](https://github.com/akitaonrails/ai-jail) when it is installed.
+  The warning and offer are TTY-gated (stdin and stderr must both be real
+  terminals) and skipped entirely when already running inside ai-jail
+  (detected via the Linux `ai-sandbox` hostname or the macOS `(jail) ` `PS1`
+  prefix), so hook, CI, detached, and piped runs are unaffected. Accepting
+  the ai-jail offer re-execs the original invocation under `ai-jail
+  --network --agent-state <harness> --env <NAME>...` (only already-set
+  credential/config env vars are forwarded); declining `--yolo` itself
+  aborts before the agent spawns. A new opt-in `--true-yolo` flag /
+  `claude_true_yolo` config key additionally silences Claude Code's
+  residual `--dangerously-skip-permissions` prompts (the `rm` timeout and
+  confirmation, and the PowerShell `rm` deny) and forces
+  `--settings '{"permissions":{"defaultMode":"bypassPermissions","ask":[]}}'`;
+  it is a no-op for every other harness. See
+  `docs/design-yolo-safety-ai-jail.md`. (#994)
 - `ai-memory repair-backfill-timestamps [--project] [--workspace] [--confirm]
   [--json]` and `POST /admin/repair-session-times` correct
   `sessions.started_at`/`ended_at` for sessions an older `backfill` imported
