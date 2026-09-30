@@ -281,6 +281,7 @@
   another session's claim. The `handoff` field is unchanged. (#988, #920)
 
 
+
 ### Changed
 - `ai-memory purge-session` without `--confirm` now previews what a confirmed
   purge would delete before refusing, the same way `purge-project` does (#945):
@@ -352,6 +353,10 @@
 - Documented Cheaper Inference as an endpoint for the existing `openai-compat`
   provider. (#981)
 
+
+
+- Documented API Route as an endpoint for the existing `openai-compat`
+  provider. (#997)
 
 
 ### Fixed
@@ -738,6 +743,10 @@
   `["full_page", "patch"]`, and normalisation folds `full`, `full-page` and
   `Full Page` into `full_page` (with a warning) for providers without
   constrained decoding. Unknown modes still fail validation. (#991)
+
+- Kimi Code no longer receives a bare `{}` when a `UserPromptSubmit` is
+  dropped by capture policy: the hook now writes an empty success response
+  Kimi accepts instead of a JSON object it rejects. (#996)
 
 ## [2.4.2] - 2026-09-29
 

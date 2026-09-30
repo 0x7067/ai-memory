@@ -453,6 +453,11 @@ fn write_success_response<W: std::io::Write>(
         // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
         Ok(())
+    } else if event == HookEvent::UserPrompt && agent.user_prompt_injects_handoff() {
+        // Kimi Code injects any non-empty UserPromptSubmit stdout into the turn
+        // verbatim, so a `{}` here would become user-visible text on every
+        // prompt a gate dropped (allowlist, capture policy, refused profile).
+        Ok(())
     } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
         writeln!(stdout, r#"{{"decision": "allow"}}"#)
     } else {
@@ -2850,6 +2855,28 @@ mod tests {
             }),
             "{recorded:?}"
         );
+    }
+
+    /// Kimi injects any UserPromptSubmit stdout into the turn verbatim, so a
+    /// prompt dropped by allowlist mode must print nothing — not even `{}`.
+    #[tokio::test]
+    async fn an_allowlist_drop_prints_nothing_for_kimi_user_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = kimi_hook_args("user-prompt", &dead_server_url());
+        args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            serde_json::json!({"session_id": "k", "cwd": tmp.path(), "prompt": "hi"}).to_string(),
+            &mut stdout,
+            |_, _| panic!("a dropped prompt spawns nothing"),
+        )
+        .await
+        .unwrap();
+        assert!(stdout.is_empty(), "{:?}", String::from_utf8_lossy(&stdout));
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
     }
 
     #[tokio::test]
