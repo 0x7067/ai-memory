@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the caller cannot read under per-project authorization, nor walks through
   them to reach others. `page_links` and the graph already hid them; the
   multi-hop related walk now filters every hop the same way. Installs without
-  authorization, and root, are unchanged. (#NNN)
+  authorization, and root, are unchanged. (#999)
 
 ## [2.5.0] - 2026-09-30
 
