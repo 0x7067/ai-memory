@@ -2,9 +2,10 @@ name: nix
 
 # Builds the flake on Linux and macOS so the Nix packaging cannot rot unnoticed.
 #
-# Matrix: x86_64-linux (package + NixOS module eval) and aarch64-darwin
-# (package + artifact smoke only). NixOS checks always evaluate x86_64-linux
-# and stay on the Linux leg — Darwin attrs would add noise without signal.
+# Matrix: x86_64-linux (package + NixOS module eval + NixOS systemd container
+# smoke) and aarch64-darwin (package + artifact smoke only). NixOS checks and
+# the OCI/systemd container smoke always target x86_64-linux and stay on the
+# Linux leg — Darwin attrs would add noise without signal.
 #
 # ai-memory does not otherwise test on Nix, so without this job `flake.nix`
 # is source nobody executes: it can break through a dependency bump, a
@@ -26,6 +27,7 @@ on:
       - 'Cargo.toml'
       - 'rust-toolchain.toml'
       - 'scripts/check-nix-packaging.sh'
+      - 'scripts/test-nixos-systemd-container.sh'
       - '.github/workflows/nix.yml'
   pull_request:
     paths:
@@ -35,6 +37,7 @@ on:
       - 'Cargo.toml'
       - 'rust-toolchain.toml'
       - 'scripts/check-nix-packaging.sh'
+      - 'scripts/test-nixos-systemd-container.sh'
       - '.github/workflows/nix.yml'
   schedule:
     # Mondays 05:17 UTC. Off the hour so it does not pile onto the
@@ -76,3 +79,17 @@ jobs:
         run: nix build --print-build-logs '.#checks.x86_64-linux.nixos-module-eval'
       - if: matrix.system == 'x86_64-linux'
         run: nix build --print-build-logs '.#checks.x86_64-linux.nixos-sandbox-parity'
+      # One runtime path: packages.x86_64-linux.nixos-ai-memory-docker builds
+      # system.build.toplevel once (via the docker-image tarball) and the
+      # script imports that rootfs, starts systemd, and checks install +
+      # /healthz + dataDir restart/volume persistence.
+      #
+      # Non-goals for this step (do not expand here):
+      #   - A→B package upgrade / SQLite-wiki migration matrix
+      #   - Exhaustive settings-options.nix key matrix
+      #   - Soft fake-systemd without a real unit start
+      #   - Claiming the app Docker image covers the NixOS module
+      #   - Darwin / multi-arch NixOS OCI (Linux x86_64 only by design)
+      #   - Re-asserting sandbox keys (covered by nixos-sandbox-parity)
+      - if: matrix.system == 'x86_64-linux'
+        run: scripts/test-nixos-systemd-container.sh

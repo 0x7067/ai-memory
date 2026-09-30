@@ -308,6 +308,10 @@ in
 
   auth = lib.mkOption {
     type = types.nullOr (types.submodule {
+      # Freeform so a mistaken secret key reaches the module assertion
+      # ("settings.auth must not contain secrets") instead of a generic
+      # "option does not exist" type error.
+      freeformType = types.attrsOf types.str;
       options = {
         secure_cookie = lib.mkOption { type = types.nullOr types.bool; default = null; };
         root_username = lib.mkOption { type = types.nullOr types.str; default = null; };

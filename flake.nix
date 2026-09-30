@@ -132,18 +132,113 @@
           bind = "0.0.0.0";
         };
       };
-      failingAssertions =
-        lib.filter (a: !a.assertion) nonLoopbackNoSecrets.config.assertions;
+      bothAgeAndSops = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          ageSecret = "ai-memory-env";
+          sopsSecret = "ai-memory/env";
+        };
+      };
+      secretsInSettings = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          settings.auth.bearer_token = "sekrit";
+        };
+      };
+      bindInSettings = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          settings.bind = "0.0.0.0";
+        };
+      };
+      withCustomDataDir = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          dataDir = "/data/custom-ai-memory";
+        };
+      };
+      withFirewall = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          openFirewall = true;
+        };
+      };
+      withLimits = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          memoryMax = "2G";
+          tasksMax = 512;
+        };
+      };
+
+      failingAssertions = sys: lib.filter (a: !a.assertion) sys.config.assertions;
+      nonLoopbackFailing = failingAssertions nonLoopbackNoSecrets;
+      ageSopsFailing = failingAssertions bothAgeAndSops;
+      secretsFailing = failingAssertions secretsInSettings;
+      bindFailing = failingAssertions bindInSettings;
 
       enabledSc = enabled.config.systemd.services.ai-memory.serviceConfig;
+      enabledUnit = enabled.config.systemd.services.ai-memory;
       execStart = enabledSc.ExecStart;
       settingsExec =
         withSettings.config.systemd.services.ai-memory.serviceConfig.ExecStart;
+      ageUnit = withAge.config.systemd.services.ai-memory;
+      customSc = withCustomDataDir.config.systemd.services.ai-memory.serviceConfig;
+      customTmpfiles = withCustomDataDir.config.systemd.tmpfiles.rules;
+      limitsSc = withLimits.config.systemd.services.ai-memory.serviceConfig;
+
+      # One NixOS system for the container smoke path. Building its
+      # docker-image tarball builds system.build.toplevel once; there is
+      # no separate bare-toplevel check that would rebuild the same closure.
+      containerNixos = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          self.nixosModules.default
+          (
+            { modulesPath, ... }:
+            {
+              imports = [ "${modulesPath}/virtualisation/docker-image.nix" ];
+              system.stateVersion = "25.05";
+              networking.hostName = "ai-memory";
+              # Slim the closure: docs are useless inside the smoke image.
+              documentation.enable = false;
+              documentation.doc.enable = false;
+              documentation.info.enable = false;
+              documentation.man.enable = false;
+              documentation.nixos.enable = false;
+              services.ai-memory.enable = true;
+            }
+          )
+        ];
+      };
+
+      nixosAiMemoryDocker =
+        linuxPkgs.runCommand "nixos-ai-memory-docker"
+          {
+            meta.description = "NixOS rootfs tarball with services.ai-memory for systemd-in-container smoke tests";
+            passthru = {
+              toplevel = containerNixos.config.system.build.toplevel;
+              tarball = containerNixos.config.system.build.tarball;
+              imageName = "ai-memory-nixos-test";
+            };
+          }
+          ''
+            mkdir -p "$out"
+            # Building this derivation builds toplevel via the tarball dep —
+            # single closure path for CI (no duplicate bare-toplevel job).
+            ln -s ${containerNixos.config.system.build.tarball}/tarball/*.tar.xz \
+              "$out/rootfs.tar.xz"
+            ln -s ${containerNixos.config.system.build.toplevel} "$out/toplevel"
+            printf '%s\n' "ai-memory-nixos-test" > "$out/image-name"
+          '';
 
       nixosChecks = {
         nixos-module-eval =
           assert lib.hasInfix "--enable-web" execStart;
           assert lib.hasInfix "--bind 127.0.0.1:49374" execStart;
+          assert lib.hasInfix "--data-dir" execStart;
+          assert lib.hasInfix " serve " (" " + execStart + " ");
+          assert lib.hasInfix "--transport http" execStart;
           assert !(disabled.config.systemd.services ? ai-memory);
           assert enabledSc.MemoryDenyWriteExecute == true;
           assert enabledSc.RestrictNamespaces == true;
@@ -153,6 +248,8 @@
           assert enabledSc.PrivateTmp == true;
           assert enabledSc.ProtectHome == true;
           assert enabledSc.ProtectSystem == "strict";
+          assert enabledSc.StateDirectory == "ai-memory";
+          assert lib.elem "/var/lib/ai-memory" enabledSc.ReadWritePaths;
           assert lib.hasInfix "--config" settingsExec;
           assert withAge.config.systemd.services.ai-memory.serviceConfig.EnvironmentFile
             == "/run/agenix/ai-memory-env";
@@ -160,9 +257,24 @@
             == "/run/secrets/ai-memory/env";
           assert loopbackEnvFile.config.systemd.services.ai-memory.serviceConfig.EnvironmentFile
             == "-/run/ai-memory/env";
-          assert failingAssertions != [ ];
+          assert nonLoopbackFailing != [ ];
           assert lib.any (a: lib.hasInfix "non-loopback bind requires" a.message)
-            failingAssertions;
+            nonLoopbackFailing;
+          assert lib.any (a: lib.hasInfix "mutually exclusive" a.message) ageSopsFailing;
+          assert lib.any (a: lib.hasInfix "settings.auth must not contain secrets" a.message)
+            secretsFailing;
+          assert lib.any (a: lib.hasInfix "settings.bind is not allowed" a.message)
+            bindFailing;
+          assert (customSc.StateDirectory or null) == null;
+          assert lib.elem "/data/custom-ai-memory" customSc.ReadWritePaths;
+          assert lib.any (r: lib.hasPrefix "d /data/custom-ai-memory 0750 " r) customTmpfiles;
+          assert lib.elem "network.target" enabledUnit.after;
+          assert !(lib.elem "network-online.target" (enabledUnit.wants or [ ]));
+          assert lib.elem "network-online.target" ageUnit.after;
+          assert lib.elem "network-online.target" ageUnit.wants;
+          assert lib.elem 49374 withFirewall.config.networking.firewall.allowedTCPPorts;
+          assert limitsSc.MemoryMax == "2G";
+          assert limitsSc.TasksMax == 512;
           linuxPkgs.runCommand "ai-memory-nixos-module-eval" { } "touch $out";
 
         nixos-sandbox-parity =
@@ -196,57 +308,65 @@
         };
       in
       {
-        packages.default = rustPlatform.buildRustPackage {
-          pname = "ai-memory";
-          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+        packages =
+          {
+            default = rustPlatform.buildRustPackage {
+              pname = "ai-memory";
+              version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
 
-          # No nativeBuildInputs needed — the build is fully self-contained
-          # (SQLite bundled, libgit2 vendored, rustls with webpki-roots).
+              # No nativeBuildInputs needed — the build is fully self-contained
+              # (SQLite bundled, libgit2 vendored, rustls with webpki-roots).
 
-          # Skip the Tailwind CLI download in the sandbox. The build script
-          # falls back to the vendored static/tailwind.css committed to the
-          # repo (see crates/ai-memory-web/build.rs).
-          TAILWIND_SKIP = "1";
+              # Skip the Tailwind CLI download in the sandbox. The build script
+              # falls back to the vendored static/tailwind.css committed to the
+              # repo (see crates/ai-memory-web/build.rs).
+              TAILWIND_SKIP = "1";
 
-          buildType = "release";
+              buildType = "release";
 
-          # The packaging test suite (tests/packaging.rs) exercises the
-          # Docker-wrapper shell script `bin/ai-memory` and needs
-          # docker/podman on PATH — not available in a Nix sandbox. The
-          # rest of the workspace test suite (unit tests + integration)
-          # does not need them and can be run via `nix develop -c cargo
-          # test --workspace` on a machine with Docker.
-          doCheck = false;
+              # The packaging test suite (tests/packaging.rs) exercises the
+              # Docker-wrapper shell script `bin/ai-memory` and needs
+              # docker/podman on PATH — not available in a Nix sandbox. The
+              # rest of the workspace test suite (unit tests + integration)
+              # does not need them and can be run via `nix develop -c cargo
+              # test --workspace` on a machine with Docker.
+              doCheck = false;
 
-          # Install the bundled hook scripts alongside the binary,
-          # mirroring what the AUR PKGBUILD does. Native binary users
-          # (`ai-memory serve`, `install-hooks`) look up hooks under
-          # the binary's share directory at runtime.
-          #
-          # `bin/ai-memory` (the Docker-wrapper shell script) is NOT
-          # installed — Nix users build the native binary directly and
-          # have no need for a Docker wrapper.
-          postInstall = ''
-            mkdir -p $out/share/ai-memory
-            cp -a hooks $out/share/ai-memory/
+              # Install the bundled hook scripts alongside the binary,
+              # mirroring what the AUR PKGBUILD does. Native binary users
+              # (`ai-memory serve`, `install-hooks`) look up hooks under
+              # the binary's share directory at runtime.
+              #
+              # `bin/ai-memory` (the Docker-wrapper shell script) is NOT
+              # installed — Nix users build the native binary directly and
+              # have no need for a Docker wrapper.
+              postInstall = ''
+                mkdir -p $out/share/ai-memory
+                cp -a hooks $out/share/ai-memory/
 
-            # Install the default config template so `ai-memory init`
-            # has a known-good starting point without a network fetch.
-            mkdir -p $out/etc/ai-memory
-            cp crates/ai-memory-cli/templates/config.default.toml \
-               $out/etc/ai-memory/config.default.toml
-          '';
+                # Install the default config template so `ai-memory init`
+                # has a known-good starting point without a network fetch.
+                mkdir -p $out/etc/ai-memory
+                cp crates/ai-memory-cli/templates/config.default.toml \
+                   $out/etc/ai-memory/config.default.toml
+              '';
 
-          meta = {
-            description = "Long-term memory for AI coding agents";
-            homepage = "https://github.com/akitaonrails/ai-memory";
-            license = pkgs.lib.licenses.mit;
-            mainProgram = "ai-memory";
+              meta = {
+                description = "Long-term memory for AI coding agents";
+                homepage = "https://github.com/akitaonrails/ai-memory";
+                license = pkgs.lib.licenses.mit;
+                mainProgram = "ai-memory";
+              };
+            };
+          }
+          // lib.optionalAttrs (system == "x86_64-linux") {
+            # Rootfs tarball derived from the same NixOS system as
+            # passthru.toplevel — single closure for the container smoke.
+            nixos-ai-memory-docker = nixosAiMemoryDocker;
           };
-        };
 
         devShells.default = pkgs.mkShell {
           name = "ai-memory-dev";

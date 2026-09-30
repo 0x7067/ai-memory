@@ -18,14 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binds). The web UI defaults off (`enableWeb = false`, matching the CLI
   flag's own default rather than the packaged unit's hardcoded
   `--enable-web`). `flake.nix` adds eval checks for sandbox keys, settings →
-  `--config`, and agenix/sops wiring. The existing `flake.nix`
+  `--config`, agenix/sops wiring, refusal contracts (age+sops mutex, secrets
+  in `settings.auth`, forbidden `settings.bind`), `ExecStart`
+  (`--data-dir` / `serve` / `--transport http`), default `StateDirectory` vs
+  custom `dataDir` tmpfiles/`ReadWritePaths`, and cheap
+  network-online / `openFirewall` / `MemoryMax` / `TasksMax` round-trips.
+  `packages.x86_64-linux.nixos-ai-memory-docker` builds one NixOS
+  `system.build.toplevel` (via the docker-image rootfs tarball) and
+  `scripts/test-nixos-systemd-container.sh` runs a privileged systemd
+  container smoke (`systemctl` + `/healthz` + dataDir restart/volume
+  persistence) on the Linux `nix.yml` leg. The existing `flake.nix`
   package/devShell/CLI build is unchanged. (#NNN)
 
 ### Changed
 - `.github/workflows/nix.yml` now builds the flake on `x86_64-linux` and
   `aarch64-darwin` with `scripts/check-nix-packaging.sh` artifact smoke tests
-  (binary, hooks, config template, `nix run`); NixOS module eval stays on the
-  Linux leg only. (#NNN)
+  (binary, hooks, config template, `nix run`); NixOS module eval and the
+  NixOS systemd container smoke stay on the Linux leg only. (#NNN)
 
 ### Fixed
 - `install-hooks --apply --as-user <user> --auth-token <key>` no longer fails
