@@ -83,11 +83,58 @@ ai_memory_marker_declares_settings() {
     for key in workspace project project_strategy drop_subagent_captures identity; do
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
+    ai_memory_marker_declares_server "$file" && return 0
     for key in default_global inject_on_session_start max_chars; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
     done
     return 1
 }
+
+# Whether marker "$1" declares a `server = ...` profile selection (#992), in
+# any value shape. Line-based and section-blind like marker.rs
+# `server_selection_in`; the leading class also skips a UTF-8 BOM, which is
+# not whitespace to grep. An unreadable marker counts as declaring one.
+ai_memory_marker_declares_server() {
+    [ -r "$1" ] || return 0
+    LC_ALL=C grep -Eq '^[^A-Za-z0-9_#"]*server[[:space:]]*=' "$1"
+}
+
+# Whether any marker on the walk from "$1" (default: the process cwd)
+# selects a server profile (#992). These script hooks cannot route profiles
+# — only native `ai-memory hook` commands can — so a routed repository must
+# emit nothing rather than reach the install-default server. Mirrors the
+# native walk: inside $HOME it stops at $HOME; outside it continues past the
+# checkout root, so an organisation-level marker above a repository counts.
+ai_memory_server_routed() {
+    _amsr_dir="${1:-${PWD:-}}"
+    [ -z "$_amsr_dir" ] && return 1
+    _amsr_boundary=""
+    if [ -n "${HOME:-}" ]; then
+        case "$_amsr_dir" in
+            "$HOME"|"$HOME"/*) _amsr_boundary="$HOME" ;;
+        esac
+    fi
+    while [ -n "$_amsr_dir" ]; do
+        if [ -f "$_amsr_dir/.ai-memory.toml" ] \
+            && ai_memory_marker_declares_server "$_amsr_dir/.ai-memory.toml"; then
+            return 0
+        fi
+        [ "$_amsr_dir" = "$_amsr_boundary" ] && return 1
+        [ "$_amsr_dir" = "/" ] && return 1
+        # Parameter expansion, not `dirname`: this walk runs on every hook
+        # event, and a fork per directory level adds up.
+        _amsr_parent="${_amsr_dir%/*}"
+        [ "$_amsr_parent" = "$_amsr_dir" ] && return 1
+        _amsr_dir="${_amsr_parent:-/}"
+    done
+    return 1
+}
+
+# Query-string flag `ai_memory_marker_qs` appends for a profile-routed
+# repository. `ai_memory_post_hook` and `ai_memory_get_handoff` refuse any URL
+# carrying it, so every script that builds its URL from the marker query —
+# all of them — fails closed without a per-script check.
+AI_MEMORY_SERVER_ROUTED_QS="&server_routed=1"
 
 # Like ai_memory_find_marker, but skips a marker that declares nothing beyond
 # `[capture]` (see ai_memory_marker_declares_settings) and continues the walk
@@ -382,6 +429,10 @@ ai_memory_identity_qs() {
 # as the prior hook events even when no marker file exists.
 ai_memory_marker_qs() {
     cwd="$1"
+    if ai_memory_server_routed "$cwd"; then
+        printf '%s' "$AI_MEMORY_SERVER_ROUTED_QS"
+        return 0
+    fi
     if [ -z "$cwd" ]; then
         ai_memory_managed_qs
         return 0
@@ -597,6 +648,7 @@ ai_memory_post_hook() {
         cat >/dev/null 2>&1 || true
         return 0
     fi
+    case "$1" in *"$AI_MEMORY_SERVER_ROUTED_QS"*) cat >/dev/null; return 0 ;; esac
     _amurl=$(ai_memory_url_with_ingest_key "$1")
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')
@@ -635,6 +687,7 @@ ai_memory_post_hook() {
 # stdout (and prepended to the agent's context), so we want to avoid
 # truncating a handoff that was almost ready.
 ai_memory_get_handoff() {
+    case "$1" in *"$AI_MEMORY_SERVER_ROUTED_QS"*) return 0 ;; esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
         curl -s --max-time 1.0 "$1" \

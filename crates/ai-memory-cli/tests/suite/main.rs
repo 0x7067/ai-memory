@@ -25,6 +25,7 @@ mod repo_layout;
 mod routing_instructions;
 mod routing_skills;
 mod serve_shutdown;
+mod server_profiles;
 mod shutdown_signals;
 mod upgrade_e2e;
 mod yolo_ai_jail;

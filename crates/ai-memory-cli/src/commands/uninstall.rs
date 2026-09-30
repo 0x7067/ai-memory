@@ -723,6 +723,14 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
             config.data_dir.display()
         );
     }
+    // Server-profile tokens (#992) are read by the same hooks, so the same
+    // reasoning applies; the registry of URLs stays.
+    if let Err(error) = crate::server_profiles::clear_tokens(&config.data_dir) {
+        eprintln!(
+            "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
+            config.data_dir.display()
+        );
+    }
 
     if args.purge_data {
         for path in data_purge::purge_data_dirs(&config.data_dir)? {

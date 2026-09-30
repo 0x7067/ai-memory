@@ -811,6 +811,13 @@ const DOS_DEVICE_NAMES: &[&str] = &[
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
+/// Whether `stem` (a file name without its extension) is a DOS device name
+/// Windows resolves to a device instead of a file, compared case-insensitively.
+#[must_use]
+pub fn is_dos_device_name(stem: &str) -> bool {
+    DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str())
+}
+
 /// Characters Windows refuses in a filename. `/` is the separator and is
 /// handled by the caller; `\\` and a drive prefix are already rejected by
 /// [`PagePath::new`].
@@ -857,7 +864,7 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
     // Device names match on the stem, so `CON`, `CON.md` and `con.markdown`
     // are all the console.
     let stem = component.split('.').next().unwrap_or(component);
-    if DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
+    if is_dos_device_name(stem) {
         return invalid(&format!(
             "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
         ));

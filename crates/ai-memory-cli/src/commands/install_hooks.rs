@@ -3537,6 +3537,7 @@ pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(te
   for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures", "identity"]) {
     if (tomlKey(text, key) !== undefined) return true;
   }
+  if (/^\s*server\s*=/m.test(text)) return true;
   for (const key of ["default_global", "inject_on_session_start", "max_chars"]) {
     if (tomlFlag(text, key) !== undefined) return true;
   }
@@ -4136,6 +4137,7 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
 }}
 
 async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
+  if (captureServerRouted(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
@@ -4875,6 +4877,7 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
 }}
 
 async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
+  if (captureServerRouted(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
@@ -9971,6 +9974,49 @@ model = "gpt-5"
             "{extension}"
         );
         assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    /// #992: the generated integrations do not route `server` profiles, so
+    /// every one must drop a routed repository's events and skip its handoff
+    /// fetch — both before anything reaches the install-default `SERVER`.
+    #[test]
+    fn generated_integrations_fail_closed_on_a_server_profile_marker() {
+        let plugins = [
+            (
+                "opencode",
+                build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist"),
+            ),
+            (
+                "opencode2",
+                build_opencode2_plugin("http://127.0.0.1:49374", None, None, "denylist", false)
+                    .unwrap(),
+            ),
+            (
+                "omp",
+                build_omp_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            ),
+            (
+                "pi",
+                build_pi_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            ),
+        ];
+        for (agent, plugin) in plugins {
+            assert!(
+                plugin.contains(
+                    "if (captureServerRouted(cwd)) return { disposition: \"drop\", payload };"
+                ),
+                "{agent}: capture must drop a server-routed repository"
+            );
+            let handoff = plugin
+                .split_once("async function fetchHandoff(")
+                .unwrap_or_else(|| panic!("{agent}: no fetchHandoff"))
+                .1;
+            let guard = handoff
+                .find("if (captureServerRouted(")
+                .unwrap_or_else(|| panic!("{agent}: handoff fetch must be gated"));
+            let request = handoff.find("/handoff`").unwrap();
+            assert!(guard < request, "{agent}: gate must precede the request");
+        }
     }
 
     #[test]

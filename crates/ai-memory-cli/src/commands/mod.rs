@@ -81,6 +81,7 @@ pub mod run;
 pub mod run_autowire;
 pub mod search;
 pub mod serve;
+pub mod server;
 pub mod setup_agent;
 pub mod show;
 pub mod status;

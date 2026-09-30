@@ -193,6 +193,16 @@ PS_HOME_STATIC=$(grep -Fq '$userHome = if ($env:HOME)' hooks/lib/ai-memory-hook.
     && ! grep -Eq '\$home[[:space:]]*=' hooks/lib/ai-memory-hook.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell marker helper avoids read-only HOME" "ok" "$PS_HOME_STATIC"
+# The guard's own behaviour is exercised by the Windows-only Rust test
+# (`powershell_server_routed.rs`); this pins that the hook entry point calls
+# it before it builds the query, on every platform the shell suite runs.
+PS_ROUTED_STATIC=$(grep -q 'function Test-AiMemoryServerRouted' hooks/lib/ai-memory-hook.ps1 \
+    && awk '/function Invoke-AiMemoryHook/ {f=1}
+            f && /Test-AiMemoryServerRouted/ && !t {t=NR}
+            f && /Get-AiMemoryMarkerQuery/ && !q {q=NR}
+            END {exit !(t && q && t < q)}' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell hook refuses a routed repository before building its query" "ok" "$PS_ROUTED_STATIC"
 
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path
@@ -679,6 +689,50 @@ if command -v pwsh >/dev/null 2>&1; then
 else
     printf '  skip grok ps behavioral probe (pwsh unavailable)\n'
 fi
+
+# --- server profiles (#992) --------------------------------------------
+# Script hooks cannot route a `server` profile, so a routed repository must
+# reach neither the install-default server nor the spool.
+mkdir -p "$TMP/routed/sub" "$TMP/routed-bom" "$TMP/server-only/inner"
+printf 'workspace = "team-b"\nserver = "team-b"\n' >"$TMP/routed/.ai-memory.toml"
+printf 'workspace = "sub"\n' >"$TMP/routed/sub/.ai-memory.toml"
+printf '\357\273\277server = team-b\n' >"$TMP/routed-bom/.ai-memory.toml"
+printf 'workspace = "outer"\n' >"$TMP/server-only/.ai-memory.toml"
+printf 'server = "team-b"\n' >"$TMP/server-only/inner/.ai-memory.toml"
+
+assert_eq "routed marker: marker_qs carries only the routed flag" \
+    "&server_routed=1" "$(ai_memory_marker_qs "$TMP/routed")"
+assert_eq "routed marker is inherited past a nested workspace-only marker" \
+    "&server_routed=1" "$(ai_memory_marker_qs "$TMP/routed/sub")"
+assert_eq "a BOM cannot hide the server key" \
+    "&server_routed=1" "$(ai_memory_marker_qs "$TMP/routed-bom")"
+assert_eq "a server-only marker is a settings boundary" \
+    "$TMP/server-only/inner/.ai-memory.toml" \
+    "$(ai_memory_find_settings_marker "$TMP/server-only/inner")"
+assert_eq "an unrouted repository is unchanged" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+AI_MEMORY_DATA_DIR="$TMP/routed-data"
+export AI_MEMORY_DATA_DIR
+CURL_CALLED="$TMP/curl-called"
+rm -f "$CURL_CALLED"
+curl() {
+    : >"$CURL_CALLED"
+    cat >/dev/null
+    return 7
+}
+printf '%s' '{"e":"routed"}' \
+    | ai_memory_post_hook "http://127.0.0.1:1/hook?event=user-prompt&agent=cursor$(ai_memory_marker_qs "$TMP/routed")" \
+    >/dev/null 2>&1
+ROUTED_HANDOFF=$(ai_memory_get_handoff "http://127.0.0.1:1/handoff?agent=cursor$(ai_memory_marker_qs "$TMP/routed")")
+unset -f curl
+assert_eq "a routed post and handoff never call curl" "no" \
+    "$([ -e "$CURL_CALLED" ] && echo yes || echo no)"
+assert_eq "a routed post is not spooled" "0" \
+    "$(ls "$TMP/routed-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "a routed handoff fetch prints nothing" "" "$ROUTED_HANDOFF"
+unset AI_MEMORY_DATA_DIR
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

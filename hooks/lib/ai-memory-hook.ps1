@@ -81,6 +81,41 @@ function Get-AiMemoryMarkerToml {
     return $null
 }
 
+# Whether any marker on the walk from $Cwd (default: the current directory)
+# selects a server profile (`server = ...`, #992). This script fallback cannot
+# route profiles — only native `ai-memory hook` commands can — so a routed
+# repository must emit nothing rather than reach the install-default server.
+# Mirrors the native walk: inside home it stops at home; outside it continues
+# past the checkout root. An unreadable marker counts as a selection.
+function Test-AiMemoryServerRouted {
+    param([string] $Cwd)
+    $dir = if ($Cwd) { $Cwd } else { (Get-Location).Path }
+    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $boundary = $null
+    if ($userHome) {
+        $userHomePrefix = $userHome.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
+        if (($dir -eq $userHome) -or $dir.StartsWith($userHomePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $boundary = $userHome
+        }
+    }
+    while ($dir) {
+        $candidate = Join-Path $dir ".ai-memory.toml"
+        if (Test-Path $candidate -PathType Leaf) {
+            try {
+                $text = [IO.File]::ReadAllText($candidate)
+            } catch {
+                return $true
+            }
+            if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
+        }
+        if ($boundary -and $dir -eq $boundary) { return $false }
+        $parent = Split-Path $dir -Parent
+        if (-not $parent -or $parent -eq $dir) { return $false }
+        $dir = $parent
+    }
+    return $false
+}
+
 function Get-AiMemoryTomlKey {
     param([string] $File, [string] $Key)
     if (-not (Test-Path $File -PathType Leaf)) { return $null }
@@ -444,6 +479,10 @@ function Invoke-AiMemoryHook {
         return
     }
     $Cwd = Resolve-AiMemoryCwd -Payload $Payload -Agent $Agent
+    if (Test-AiMemoryServerRouted -Cwd $Cwd) {
+        if ($AntigravityPreInvocationOutput) { [Console]::Out.Write("{}") }
+        return
+    }
     $QS = Get-AiMemoryMarkerQuery -Cwd $Cwd
     if ($env:AI_MEMORY_RUN_ID) {
         $QS += "&managed_run=$([Uri]::EscapeDataString($env:AI_MEMORY_RUN_ID))"

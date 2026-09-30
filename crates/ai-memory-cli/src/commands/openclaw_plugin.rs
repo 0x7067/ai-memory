@@ -500,6 +500,7 @@ function postPreCompact(event: any, ctx: any): void {{
 async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {{
   const currentCwd = cwd(event, ctx);
   if (!currentCwd) return undefined;
+  if (captureServerRouted(currentCwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, currentCwd);
@@ -756,6 +757,24 @@ mod tests {
             ),
             "allowlist build must carry the marker-presence admit gate: {plugin}"
         );
+    }
+
+    /// #992: OpenClaw posts to `SERVER` directly and does not route `server`
+    /// profiles, so a routed repository must emit nothing and fetch no handoff.
+    #[test]
+    fn openclaw_plugin_fails_closed_on_a_server_profile_marker() {
+        let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(
+            plugin.contains(
+                "if (captureServerRouted(cwd)) return { disposition: \"drop\", payload };"
+            ),
+            "{plugin}"
+        );
+        let handoff = plugin.split_once("async function fetchHandoff(").unwrap().1;
+        let guard = handoff
+            .find("if (captureServerRouted(currentCwd)) return undefined;")
+            .expect("handoff fetch must be gated");
+        assert!(guard < handoff.find("/handoff`").unwrap());
     }
 
     #[test]
