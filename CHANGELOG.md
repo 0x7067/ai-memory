@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `install-hooks --apply --as-user <user> --auth-token <key>` no longer fails
+  with `--as-user '<user>' requires --auth-token` when the token was supplied.
+  The guard was handed the *rendered* credential, which is deliberately `None`
+  on the #552 secure path (the token is persisted under the data dir for the
+  hooks to read), so the recommended multi-user install command in
+  `docs/users.md` and `install-hooks --help` bailed on every native install
+  while reporting the token as absent. It now validates the resolved token.
+  `install-hooks` without `--as-user` was unaffected, and `--as-user` with no
+  token anywhere still bails. (#993)
+
 ## [2.4.2] - 2026-09-29
 
 ### Changed
