@@ -61,7 +61,8 @@ pub use handoff::{
 pub use ids::{
     AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
     ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
-    UserId, WorkspaceId, WorkstreamId, is_git_reserved_component, portable_page_key,
+    UserId, WorkspaceId, WorkstreamId, is_dos_device_name, is_git_reserved_component,
+    portable_page_key,
 };
 pub use message::{
     AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
