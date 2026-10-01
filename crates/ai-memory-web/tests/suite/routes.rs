@@ -1271,6 +1271,32 @@ async fn api_sessions_lists_completed_sessions_for_the_scope() {
     assert_eq!(sessions[0]["session_id"], completed.to_string());
     assert_eq!(sessions[0]["observation_count"], 1);
     assert!(sessions[0]["ended_at"].is_string());
+    assert!(
+        sessions[0]
+            .get("consolidation")
+            .is_some_and(serde_json::Value::is_null)
+    );
+
+    store
+        .writer
+        .enqueue_session_consolidation(ws, proj, completed)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let with_job = json_body(resp).await;
+    assert_eq!(
+        with_job["sessions"][0]["consolidation"],
+        serde_json::json!({"state":"pending","attempts":0})
+    );
 
     let resp = app
         .oneshot(
@@ -1339,6 +1365,11 @@ async fn api_session_observations_pages_orders_and_caps() {
     );
     let json = json_body(resp).await;
     assert_eq!(json["session"]["session_id"], session_id.to_string());
+    assert!(
+        json["session"]
+            .get("consolidation")
+            .is_some_and(serde_json::Value::is_null)
+    );
     assert_eq!(json["total"], 3);
     assert_eq!(json["limit"], 2);
     assert_eq!(json["offset"], 0);

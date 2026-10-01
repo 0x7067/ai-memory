@@ -837,6 +837,15 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// Public state and attempt count for the latest scoped consolidation job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionConsolidationSummary {
+    /// Latest generation state, without provider diagnostics.
+    pub state: String,
+    /// Provider attempts spent on this generation.
+    pub attempts: u32,
+}
+
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
 /// and [`ReaderPool::session_summary_scoped`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -856,6 +865,8 @@ pub struct SessionSummary {
     pub observation_count: u64,
     /// Operator the session belongs to, as stored on the `sessions` row.
     pub actor_user: Option<String>,
+    /// Latest consolidation generation in the requested scope, if present.
+    pub consolidation: Option<SessionConsolidationSummary>,
 }
 
 /// Aggregate MCP tool-call counts for one client, from
@@ -3473,8 +3484,14 @@ impl ReaderPool {
                 "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
                         (SELECT COUNT(*) FROM observations o \
                          WHERE o.session_id = s.id \
-                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n \
+                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
+                        j.state, j.attempts \
                  FROM sessions s \
+                 LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
+                   AND j.workspace_id = :ws AND j.project_id = :proj \
+                   AND j.generation = (SELECT MAX(latest.generation) \
+                     FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
+                       AND latest.workspace_id = :ws AND latest.project_id = :proj) \
                  WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
                  ORDER BY s.started_at DESC, s.id DESC \
                  LIMIT :limit OFFSET :offset"
@@ -3506,12 +3523,30 @@ impl ReaderPool {
                 let actor_user: Option<String> = row.get(5)?;
                 let n: i64 = row.get(6)?;
                 Ok((
-                    id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n,
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<u32>>(8)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n) = row?;
+                let (
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    state,
+                    attempts,
+                ) = row?;
                 let started_at = jiff::Timestamp::from_microsecond(started_us)
                     .map(|ts| ts.to_string())
                     .unwrap_or_default();
@@ -3526,6 +3561,9 @@ impl ReaderPool {
                     ended_at,
                     observation_count: u64::try_from(n).unwrap_or(0),
                     actor_user,
+                    consolidation: state
+                        .zip(attempts)
+                        .map(|(state, attempts)| SessionConsolidationSummary { state, attempts }),
                 });
             }
             Ok(out)

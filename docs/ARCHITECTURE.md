@@ -250,6 +250,11 @@ for provenance and stable, namespaced `ingest_key` values for retries. See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
 
+Session summaries expose the latest consolidation generation's state and
+attempt count, selected in the same scoped, owner-filtered query. HTTP session
+reads and MCP `memory_read_session_observations` share that summary type; neither
+response includes provider diagnostics.
+
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at
 16 KiB; notification and tool excerpts are capped at 2 KB. Native

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added the latest scoped consolidation job's state and attempt count to HTTP
+  session summaries and MCP `memory_read_session_observations`. The field is
+  `null` when no job exists; provider errors remain private and existing session
+  ownership filters are preserved. (#1010)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added
