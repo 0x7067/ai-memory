@@ -1,6 +1,6 @@
 # Design proposal: offer, don't claim, at session start (#959)
 
-**Status: proposal for review — not implemented.** The maintainer marked #959
+**Status: accepted design (maintainer review folded in, 2026-10-01) — not implemented.** The maintainer marked #959
 design-first: it touches the single-claim contract (invariant #16 — a handoff
 is claimed exactly once by two independent `state='open'` guards) in several
 places at once, so this is the design pass requested before any code lands.
@@ -49,7 +49,15 @@ has no opt-out, and `to_agent` is stored but never used to target delivery.
   one. An automatic (`SessionEnd`) handoff is scoped by cwd path-boundary.
   Owner is checked first, before the manual short-circuit, so cross-operator
   mixing is already excluded — this proposal only touches same-operator,
-  same-project delivery.
+  same-project delivery. `startup_handoff` (`reader.rs`) also already skips a
+  baton whose source session is still live (`LIVE_BATON_QUIET_PERIOD`, 10
+  minutes, `router.rs`), so a session started next to a running one does not
+  take its handoff.
+- **Expiry**: handoffs already have an `expired` state. `SessionEnd` expires
+  the same cwd's older automatic batons (`expire_same_cwd_auto_handoffs`,
+  `ops.rs`) and a post-claim sweep expires superseded ones, so automatic
+  batons do not pile up; only manual ones stay open until accepted or
+  cancelled.
 - **`to_agent`**: a column exists on the handoff row (`ai-memory-store`), is
   threaded through `row_to_agent_message`-adjacent plumbing, and is written
   — always as `None`. `memory_handoff_begin`'s args
@@ -93,6 +101,11 @@ siblings in `crates/ai-memory-cli/src/config.rs`):
 claim_on_session_start = true   # default: unchanged behavior
 ```
 
+**Where the switch lives.** A server-wide `[handoff]` key applies to every
+operator on a shared server. Prefer (or additionally offer) a per-project
+`.ai-memory.toml` marker key, so one team's repository can opt into offer mode
+without changing another's. Settle this before implementation.
+
 When `true` (default — **no behavior change for existing installs**),
 `fetch_and_accept_handoff_at` claims exactly as it does today.
 
@@ -104,8 +117,18 @@ almost this exact lookup — this proposal does not add a second tool).
 
 ```
 📬 ai-memory: a pending handoff `<id>` from `<from_agent>`, left `<age>` ago.
-   Use `memory_handoff_accept` to pick it up.
+   To pick it up, call `memory_handoff_accept` with handoff_id `<id>`.
 ```
+
+The notice must name the exact `handoff_id` and tell the agent to accept that
+id. "Accept the latest" could claim a different handoff that arrived after the
+notice was rendered; an exact-id accept just loses the race cleanly when the
+notice is stale (both `state='open'` guards still decide).
+
+**Managed-run ledger.** Today the managed-run context claim commits in the
+same transaction as the handoff claim. In offer mode the ledger/context claim
+still happens at session start — only the single-use handoff slot becomes an
+offer — so a managed run does not lose its continuity packet.
 
 The brief and managed-run context (`managed_md`) are unaffected either way —
 only the single-use handoff slot's own claim becomes conditional.
@@ -140,6 +163,9 @@ interact).
   manual-beats-automatic short-circuit matters — see Open questions.
 - Selection (`prefer_handoff`) is otherwise unchanged: `to_agent` filters the
   candidate set, it does not introduce a new ranking dimension.
+- An explicit `memory_handoff_accept` with an exact `handoff_id` ignores
+  `to_agent`: targeting only shapes automatic delivery and the notice, it never
+  stops a user from deliberately picking a baton up in another harness.
 
 ## Open questions for review
 
@@ -149,7 +175,7 @@ interact).
    specifically to block a hostile handoff summary from injecting
    instructions into a session that never asked to see it (a non-consuming
    notice is, by construction, something the receiving agent cannot choose
-   to skip the way it can choose not to call `memory_handoff_pop`). A
+   to skip the way it can choose not to call `memory_handoff_accept`). A
    handoff's summary is written by whatever agent or operator ended the
    prior session — same trust level as a cross-project message. **Leaning
    toward metadata-only** (id, `from_agent`, age — no summary text), matching
@@ -179,10 +205,11 @@ interact).
    otherwise — an un-regenerated plugin simply keeps claiming unconditionally
    forever, which is not a crash, just a no-op upgrade.
 5. **A handoff nobody ever explicitly accepts**: with `claim_on_session_start
-   = false`, does an un-accepted handoff expire on its own, or stay open
-   indefinitely until `memory_handoff_cancel`/a new one supersedes it? No
-   existing TTL mechanism was found for handoffs; proposing no new one here
-   (status quo: open until accepted or cancelled) unless review disagrees.
+   = false`, does an un-accepted handoff expire on its own? Partly answered:
+   automatic batons are already expired by `SessionEnd` and the post-claim
+   sweep (see Expiry above), so offer mode does not accumulate them. Only
+   manual handoffs stay open until accepted or cancelled; no new TTL is
+   proposed for those unless review disagrees.
 
 ## Non-goals (v1)
 
