@@ -877,7 +877,7 @@ fn extract_paths(name: &str, args: &Value) -> Option<Vec<String>> {
 }
 
 /// Return the bounded, normalized absolute paths named by a recognized file
-/// tool call.
+/// tool call, in the path's own separator style.
 ///
 /// Native hook clients use this only to notice a file operation that targets
 /// another checkout while the harness keeps reporting the parent session's
@@ -898,7 +898,16 @@ pub fn absolute_file_tool_paths(agent: AgentKind, raw: &Value, cwd: &str) -> Opt
             is_absolute(path)
                 .then(|| normalize_candidate(path, cwd))
                 .flatten()
-                .map(|candidate| candidate.path)
+                .map(|candidate| match candidate.flavor {
+                    // Matching works on `/`-separated paths, but this path
+                    // leaves the policy module: the hook sends its directory
+                    // as the event's `cwd`. It keeps the native style
+                    // (`C:\…`, like every other cwd the hook forwards) so
+                    // the server never sees two spellings of one checkout;
+                    // segment normalization (`.`/`..`) still applies.
+                    Flavor::Windows => candidate.path.replace('/', "\\"),
+                    Flavor::Posix => candidate.path,
+                })
         })
         .collect()
 }
@@ -1361,6 +1370,36 @@ fn char_equal(left: char, right: char, insensitive: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The routed `cwd` is built from these paths, so a Windows target keeps
+    /// backslashes (as the harness reports every other cwd) while `..` is
+    /// still collapsed; a POSIX target is unchanged. Windows CI caught the
+    /// forward-slash `C:/…` form being sent as the destination cwd.
+    #[test]
+    fn absolute_file_tool_paths_keep_the_native_separator_style() {
+        let edit = |path: &str| {
+            serde_json::json!({
+                "tool_name": "Edit",
+                "tool_input": {"file_path": path}
+            })
+        };
+        assert_eq!(
+            absolute_file_tool_paths(
+                AgentKind::ClaudeCode,
+                &edit(r"C:\work\destination\sub\..\a.txt"),
+                r"C:\work\source",
+            ),
+            Some(vec![r"C:\work\destination\a.txt".to_owned()])
+        );
+        assert_eq!(
+            absolute_file_tool_paths(
+                AgentKind::ClaudeCode,
+                &edit("/work/destination/sub/../a.txt"),
+                "/work/source",
+            ),
+            Some(vec!["/work/destination/a.txt".to_owned()])
+        );
+    }
 
     #[test]
     fn denylist_admits_every_repository() {
