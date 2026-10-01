@@ -2035,6 +2035,26 @@ hosted compatibility endpoints, no dedicated ai-memory provider is required.
 Configure embeddings separately if your chosen API Route model does not
 provide an OpenAI-compatible embeddings endpoint.
 
+[FutureInfra](https://futureinfra.ai/ai/) is an OpenAI-compatible AI API
+router and uses the same provider; no dedicated ai-memory provider is needed.
+Its OpenAI-compatible base is `https://futureinfra.ai/v1/ai`. That path does
+not end in a version segment, so pass the full Chat Completions URL (ai-memory
+uses a base URL that already ends in `/chat/completions` as-is). Pass its API
+key through the generic compatibility credential:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://futureinfra.ai/v1/ai/chat/completions
+-e AI_MEMORY_LLM_MODEL=openai/gpt-4o-mini
+-e LLM_API_KEY="$FUTUREINFRA_API_KEY"
+```
+
+Model ids use the `provider/model` format, e.g. `anthropic/claude-sonnet-4` or
+`deepseek/deepseek-chat`; `GET https://futureinfra.ai/v1/ai/models` lists the
+current ids. Keys are created in the
+[FutureInfra console](https://futureinfra.ai/console/?screen=ai-router). This
+example configures the LLM only; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
