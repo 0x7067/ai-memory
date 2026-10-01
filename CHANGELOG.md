@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Documented FutureInfra as an endpoint for the existing `openai-compat`
+  provider. (#1026)
+
 ### Fixed
 - `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
   `[capture]` section is invalid. This fails closed today — every file and
@@ -28,7 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
-
 ## [2.5.2] - 2026-10-01
 
 ### Added
