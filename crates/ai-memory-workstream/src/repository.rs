@@ -18,6 +18,13 @@ pub struct RepositoryIdentity {
     pub worktree_fingerprint: String,
     /// Current non-mutating Git checkpoint.
     pub checkpoint: WorkstreamCheckpoint,
+    /// First URL of the `origin` remote, when there is one. The ai-jail
+    /// toggles read it to decide whether `git push` needs SSH.
+    pub origin_url: Option<String>,
+    /// Whether the cwd is a linked worktree (its git dir differs from the
+    /// repository's common dir), whose metadata ai-jail must mount writable
+    /// for the agent to commit.
+    pub linked_worktree: bool,
 }
 
 /// Inspect the current checkout without committing, stashing, resetting, or
@@ -53,6 +60,16 @@ pub fn inspect_repository(cwd: &Path) -> Result<RepositoryIdentity> {
         repo_fingerprint: sha256(&repo_seed),
         worktree_fingerprint: sha256(&worktree_seed),
         checkpoint: checkpoint(&canonical),
+        origin_url: remotes
+            .as_deref()
+            .and_then(|remotes| remotes.lines().next())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned),
+        linked_worktree: matches!(
+            (&git_dir, &common_dir),
+            (Some(git_dir), Some(common)) if git_dir != common
+        ),
     })
 }
 
@@ -144,6 +161,71 @@ mod tests {
         assert_eq!(first.repo_fingerprint, second.repo_fingerprint);
         assert_eq!(first.worktree_fingerprint, second.worktree_fingerprint);
         assert_eq!(first.repo_fingerprint.len(), 64);
+        assert_eq!(first.origin_url, None);
+        assert!(!first.linked_worktree);
+    }
+
+    fn git_fixture(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The ai-jail toggle defaults key off these two facts: an SSH-style
+    /// `origin` pre-checks `ssh`, and only a linked worktree shows `worktree`.
+    #[test]
+    fn reports_origin_url_and_linked_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git_fixture(&main, &["init", "-q"]);
+        git_fixture(
+            &main,
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        git_fixture(
+            &main,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "init",
+            ],
+        );
+        let primary = inspect_repository(&main).unwrap();
+        assert_eq!(
+            primary.origin_url.as_deref(),
+            Some("git@github.com:example/repo.git")
+        );
+        assert!(!primary.linked_worktree, "the main checkout is not linked");
+
+        let linked = temp.path().join("linked");
+        git_fixture(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let worktree = inspect_repository(&linked).unwrap();
+        assert!(worktree.linked_worktree);
+        assert_eq!(worktree.origin_url, primary.origin_url);
     }
 
     #[test]

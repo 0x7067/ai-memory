@@ -12,7 +12,10 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 
-use ai_memory_workstream::{build_ai_jail_invocation, usable_ai_jail_here};
+use ai_memory_workstream::{
+    JAIL_TOGGLES, JailToggleChoice, ai_jail_support, build_ai_jail_invocation, parse_jail_toggles,
+    usable_ai_jail_here,
+};
 
 fn forwarded() -> Vec<OsString> {
     ["run", "claude", "--yolo"]
@@ -35,6 +38,8 @@ fn invocation_puts_all_sandbox_flags_before_the_wrapped_exe() {
         &forwarded(),
         &["AI_MEMORY_SERVER_URL", "ANTHROPIC_API_KEY"],
         true,
+        true,
+        &[],
     );
     let strs: Vec<String> = argv
         .iter()
@@ -76,7 +81,8 @@ fn invocation_puts_all_sandbox_flags_before_the_wrapped_exe() {
 #[test]
 fn invocation_emits_one_bare_env_flag_per_present_name() {
     let exe = Path::new("/bin/ai-memory");
-    let argv = build_ai_jail_invocation(exe, &forwarded(), &["CLAUDE_CONFIG_DIR"], false);
+    let argv =
+        build_ai_jail_invocation(exe, &forwarded(), &["CLAUDE_CONFIG_DIR"], false, false, &[]);
     let strs: Vec<String> = argv
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -97,13 +103,26 @@ fn invocation_emits_one_bare_env_flag_per_present_name() {
 /// executing it) over the argv built for `forwarded`, wrapping this test binary
 /// so any failure is about the argv shape rather than an unresolvable command.
 /// `None` ⇒ the feature would not offer ai-jail on this host, so skip.
-fn real_dry_run(forwarded: &[OsString]) -> Option<(std::process::Output, String, String)> {
+fn real_dry_run(
+    forwarded: &[OsString],
+    toggles: &[JailToggleChoice],
+) -> Option<(std::process::Output, String, String)> {
     let Some(ai_jail) = usable_ai_jail_here() else {
         eprintln!("skipping: ai-jail is not usable here (absent, no sandbox backend, or Windows)");
         return None;
     };
     let exe = std::env::current_exe().expect("test binary path");
-    let argv = build_ai_jail_invocation(&exe, forwarded, &["AI_MEMORY_SERVER_URL"], true);
+    let no_save_config = ai_jail_support(&ai_jail)
+        .expect("ai-jail --help")
+        .supports("no-save-config");
+    let argv = build_ai_jail_invocation(
+        &exe,
+        forwarded,
+        &["AI_MEMORY_SERVER_URL"],
+        true,
+        no_save_config,
+        toggles,
+    );
     let output = Command::new(&ai_jail)
         .arg("--dry-run")
         .args(&argv)
@@ -123,7 +142,7 @@ fn real_dry_run(forwarded: &[OsString]) -> Option<(std::process::Output, String,
 /// exe — fails here.
 #[test]
 fn real_ai_jail_dry_run_accepts_and_forwards_the_invocation() {
-    let Some((output, combined, exe)) = real_dry_run(&forwarded()) else {
+    let Some((output, combined, exe)) = real_dry_run(&forwarded(), &[]) else {
         return;
     };
     assert!(
@@ -181,7 +200,7 @@ fn real_ai_jail_dry_run_forwards_child_flags_that_collide_with_its_own() {
     .into_iter()
     .map(OsString::from)
     .collect();
-    let Some((output, combined, _)) = real_dry_run(&forwarded) else {
+    let Some((output, combined, _)) = real_dry_run(&forwarded, &[]) else {
         return;
     };
     assert!(
@@ -191,5 +210,71 @@ fn real_ai_jail_dry_run_forwards_child_flags_that_collide_with_its_own() {
     assert!(
         combined.contains("GH_TOKEN=placeholder"),
         "the child's --env value must be forwarded verbatim; plan was:\n{combined}"
+    );
+}
+
+/// Every toggle the installed ai-jail advertises in its real `--help`, parsed
+/// through `--jail=…`'s own parser: on 2.4.1 that exercises `--ssh`, `--gpu`,
+/// `--docker`, …; on 2.5.0+ the credential mounts and `--toolchains` too.
+/// The real ai-jail must accept the whole invocation with every one of them
+/// placed before the `--`.
+#[test]
+fn real_ai_jail_dry_run_accepts_every_supported_toggle() {
+    let Some(ai_jail) = usable_ai_jail_here() else {
+        eprintln!("skipping: ai-jail is not usable here (absent, no sandbox backend, or Windows)");
+        return;
+    };
+    let support = ai_jail_support(&ai_jail).expect("ai-jail --help");
+    let supported: Vec<&str> = JAIL_TOGGLES
+        .iter()
+        .map(|toggle| toggle.stem)
+        .filter(|stem| support.supports(stem))
+        .collect();
+    assert!(
+        supported.contains(&"ssh")
+            && supported.contains(&"gpu")
+            && support.supports("no-save-config"),
+        "every ai-jail since 2.4.1 advertises --ssh, --gpu and --no-save-config: {supported:?}"
+    );
+    let toggles = parse_jail_toggles(&supported.join(","), &[], &support)
+        .expect("every advertised toggle parses");
+    assert_eq!(toggles.len(), supported.len());
+    let Some((output, combined, exe)) = real_dry_run(&forwarded(), &toggles) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "ai-jail --dry-run rejected the toggles {supported:?}:\n{combined}"
+    );
+    assert!(combined.contains(&exe), "plan was:\n{combined}");
+
+    // And the forced-off spelling of each is accepted too.
+    let negated: Vec<String> = supported.iter().map(|stem| format!("no-{stem}")).collect();
+    let toggles = parse_jail_toggles(&negated.join(","), &[], &support).unwrap();
+    let Some((output, combined, _)) = real_dry_run(&forwarded(), &toggles) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "ai-jail --dry-run rejected the negated toggles:\n{combined}"
+    );
+}
+
+/// Why support detection is load-bearing: the real ai-jail rejects a flag it
+/// does not know, so passing a 2.5.0 credential flag to an older ai-jail would
+/// abort the launch instead of being ignored.
+#[test]
+fn real_ai_jail_rejects_an_unknown_toggle() {
+    let Some(ai_jail) = usable_ai_jail_here() else {
+        eprintln!("skipping: ai-jail is not usable here (absent, no sandbox backend, or Windows)");
+        return;
+    };
+    let output = Command::new(&ai_jail)
+        .args(["--dry-run", "--ai-memory-not-a-toggle", "--", "/bin/true"])
+        .output()
+        .expect("run ai-jail --dry-run");
+    assert!(
+        !output.status.success(),
+        "ai-jail accepted an unknown flag; support detection would be moot"
     );
 }
