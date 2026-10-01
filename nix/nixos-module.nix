@@ -104,7 +104,8 @@ in
         The ai-memory package to run. No default here, so this module stays
         usable standalone. This repo's `flake.nix` supplies a default via
         `nixosModules.default`, which sets
-        `services.ai-memory.package = lib.mkDefault self.packages.${pkgs.system}.default`.
+        `services.ai-memory.package = lib.mkDefault
+        self.packages.${pkgs.stdenv.hostPlatform.system}.default`.
         A consumer importing this file directly (bypassing that wrapper)
         must set this option themselves.
       '';

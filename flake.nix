@@ -59,7 +59,7 @@
 
       # Eval-only NixOS module smoke tests. Kept at the top level under
       # checks.x86_64-linux only — the eval always targets x86_64-linux, so
-      # duplicating these under eachDefaultSystem would add noise on Darwin.
+      # duplicating these under every package system would add noise on Darwin.
       ageSopsStub =
         { lib, ... }:
         {
@@ -84,6 +84,7 @@
         modules = [
           self.nixosModules.default
           ageSopsStub
+          { system.stateVersion = "25.05"; }
           extra
         ];
       };
@@ -213,6 +214,7 @@
       customSc = withCustomDataDir.config.systemd.services.ai-memory.serviceConfig;
       customTmpfiles = withCustomDataDir.config.systemd.tmpfiles.settings."10-ai-memory";
       limitsSc = withLimits.config.systemd.services.ai-memory.serviceConfig;
+      escapedExecArgs = args: lib.concatStringsSep " " (map builtins.toJSON args);
 
       # One NixOS system for the container smoke path. Building its
       # docker-image tarball builds system.build.toplevel once; there is
@@ -264,11 +266,13 @@
 
       nixosChecks = {
         nixos-module-eval =
-          assert lib.hasInfix "--enable-web" execStart;
-          assert lib.hasInfix "--bind 127.0.0.1:49374" execStart;
-          assert lib.hasInfix "--data-dir" execStart;
-          assert lib.hasInfix " serve " (" " + execStart + " ");
-          assert lib.hasInfix "--transport http" execStart;
+          assert lib.hasInfix (escapedExecArgs [ "--enable-web" ]) execStart;
+          assert lib.hasInfix
+            (escapedExecArgs [ "--bind" "127.0.0.1:49374" ]) execStart;
+          assert lib.hasInfix
+            (escapedExecArgs [ "--data-dir" "/var/lib/ai-memory" ]) execStart;
+          assert lib.hasInfix
+            (escapedExecArgs [ "serve" "--transport" "http" ]) execStart;
           assert !(disabled.config.systemd.services ? ai-memory);
           assert enabledSc.MemoryDenyWriteExecute == true;
           assert enabledSc.RestrictNamespaces == true;
@@ -280,7 +284,7 @@
           assert enabledSc.ProtectSystem == "strict";
           assert enabledSc.StateDirectory == "ai-memory";
           assert lib.elem "/var/lib/ai-memory" enabledSc.ReadWritePaths;
-          assert lib.hasInfix "--config" settingsExec;
+          assert lib.hasInfix (escapedExecArgs [ "--config" ]) settingsExec;
           assert withAge.config.systemd.services.ai-memory.serviceConfig.EnvironmentFile
             == "/run/agenix/ai-memory-env";
           assert withSops.config.systemd.services.ai-memory.serviceConfig.EnvironmentFile
@@ -292,7 +296,8 @@
             nonLoopbackFailing;
           assert lib.any (a: lib.hasInfix "non-loopback bind requires" a.message)
             localhostFailing;
-          assert lib.hasInfix "--bind [::1]:49374" ipv6Exec;
+          assert lib.hasInfix
+            (escapedExecArgs [ "--bind" "[::1]:49374" ]) ipv6Exec;
           assert lib.any (a: lib.hasInfix "mutually exclusive" a.message) ageSopsFailing;
           assert lib.any (a: lib.hasInfix "mutually exclusive" a.message)
             ageEnvironmentFailing;
@@ -305,7 +310,9 @@
           assert lib.elem "/data/custom ai-memory" customSc.ReadWritePaths;
           assert customTmpfiles."/data/custom ai-memory".d.mode == "0750";
           assert customTmpfiles."/data/custom ai-memory".d.user == "ai-memory";
-          assert lib.hasInfix "/data/custom\\x20ai-memory" customSc.ExecStart;
+          assert lib.hasInfix
+            (escapedExecArgs [ "--data-dir" "/data/custom ai-memory" ])
+            customSc.ExecStart;
           assert lib.elem "network.target" enabledUnit.after;
           assert !(lib.elem "network-online.target" (enabledUnit.wants or [ ]));
           assert lib.elem "network-online.target" ageUnit.after;
@@ -317,7 +324,11 @@
 
       };
     in
-    (flake-utils.lib.eachDefaultSystem (
+    (flake-utils.lib.eachSystem [
+      "x86_64-linux"
+      "aarch64-linux"
+      "aarch64-darwin"
+    ] (
       system:
       let
         pkgs = import nixpkgs {
@@ -424,12 +435,12 @@
       # Additive: a NixOS host can run `services.ai-memory.enable = true` to
       # get this binary as a hardened systemd service (see
       # nix/nixos-module.nix). Merged at the top level, not inside
-      # eachDefaultSystem, because NixOS modules are not system-scoped.
+      # eachSystem, because NixOS modules are not system-scoped.
       nixosModules.default =
         { pkgs, lib, ... }:
         {
           imports = [ ./nix/nixos-module.nix ];
-          config.services.ai-memory.package = lib.mkDefault self.packages.${pkgs.system}.default;
+          config.services.ai-memory.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
 
       checks.x86_64-linux = nixosChecks;

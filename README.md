@@ -387,6 +387,9 @@ This flake ships a NixOS module (`nixosModules.default`) with a
 `MemoryDenyWriteExecute`, `RestrictAddressFamilies`, and the rest — see
 [`nix/systemd-sandbox.nix`](nix/systemd-sandbox.nix)). Packaged FHS units
 under `packaging/systemd/` keep their existing lighter hardening.
+The flake exports packages for `x86_64-linux`, `aarch64-linux`, and
+`aarch64-darwin`. Intel macOS remains supported by the release tarball and
+Homebrew, but not by the pinned Nixpkgs revision.
 
 ```nix
 {

@@ -38,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secrets (including `llm_headers`) use `ageSecret`, `sopsSecret`, or
   `environmentFile`. Non-loopback binds require a secret source. The module
   includes opt-in web, firewall, and resource settings plus eval and privileged
-  container checks. (#989)
+  container checks. Flake packages are exported for x86_64 Linux, aarch64
+  Linux, and Apple Silicon macOS; Intel macOS remains available through the
+  release tarball and Homebrew rather than the pinned Nixpkgs revision. (#989)
 - Added `ai-memory doctor` reporting for Claude Code's default native
   `memory/` store for the current repository: location, file count, and whether
   the nearest marker's `ignore_paths` would exclude a read. Repository-root
