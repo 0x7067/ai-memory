@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace then project. Previously the only way to see this from outside
   an interactive `show` session was to call `GET /api/v1/projects` directly.
   (#1022)
+- Added scope and policy preflight to `ai-memory hook --check-capture`, including
+  event eligibility, sanitized routing hints and server-remapping information.
+  Partial scope, excluded events, rejected profiles and oversized hints refuse
+  capture. Inspection neither ingests events nor claims handoffs. (#1019)
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`

@@ -34,7 +34,7 @@ Older installations do not understand this context.
 | Supported handoff, briefing and inbox-notice delivery | Preserved |
 | Native identity used by handoff/session-aware MCP | Preserved |
 | MCP recall and deliberate writes | Unchanged |
-| Existing repository capture policy | Unchanged; an opted-out repository stays opted out |
+| Repository capture policy | The producer checks and applies it before queueing each event |
 
 Claude Code receives context through SessionStart. Kimi Code receives it through
 UserPromptSubmit because it discards SessionStart output. The same existing
@@ -52,6 +52,16 @@ installed ai-memory integrations; it must manage finer capture ownership itself.
 `ai-memory hook --check-capture` reports `external_capture: true` and
 `admits_capture: false` when this context is active. It performs no ingestion or
 handoff delivery. The producer namespace itself is not printed or authenticated.
+
+Use `policy_admits_capture` for the external producer's preflight: it ignores
+capture ownership but checks repository policy, event eligibility, exclusions,
+scope completeness and server-profile resolution. Partial scope and a rejected
+profile return `false`. Apply `disposition`, including metadata-only stripping,
+before queueing. `scope` contains sanitized local routing hints of at most 512
+bytes each; oversized hints are omitted and preflight fails closed.
+`scope_resolution` distinguishes explicit, partial, server-derived and
+unavailable scope. `server_may_remap` warns that the server may choose different
+coordinates. Native routing values are unaffected by the inspection bound.
 
 ## Reuse the public event contract
 
