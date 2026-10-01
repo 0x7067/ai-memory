@@ -179,6 +179,31 @@ ai-memory run --yolo claude
   `CLAUDE_CONFIG_DIR`, provider API keys, etc.) — `--network` keeps the
   loopback ai-memory server reachable while still sandboxing the filesystem.
   Declining keeps the run unsandboxed (your choice, already warned).
+- **Choosing what the jail gets.** After you accept the offer, a checklist
+  lists what this host can mount, pre-marked so `Enter` does the friendly
+  thing: every credential that exists (`~/.config/gh`, `~/.aws`, `~/.kube`,
+  `~/.config/gcloud`, `~/.docker/config.json`), SSH keys + agent when your
+  `origin` is an SSH remote, and worktree metadata in a linked worktree. The
+  Docker socket (grants host root), GPU, display, Pictures, and Tailscale are
+  listed unchecked. Type row numbers to flip them (`2 4`), or `all` / `none`.
+  A mounted credential is usable by the unsupervised agent, so uncheck what it
+  should not touch.
+- **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
+  ai-jail straight away with those defaults — with or without `--yolo`, and in
+  scripts too; it fails rather than running unjailed if ai-jail is not usable.
+  `--jail=github,ssh,no-mise` enables exactly the listed toggles (`no-X`
+  forces one off), plus `all` / `none`. `--no-jail` never jails and skips the
+  offer (the `--yolo` warning stays). There are no bare `--github`-style
+  flags on purpose: they would collide with the harness's own flags (Claude
+  Code has a `--worktree`). The credential mounts need ai-jail 2.5.0; toggles
+  your installed ai-jail lacks are hidden, and naming one is an error.
+- **A project `.ai-jail` wins.** If the directory you launch from has its own
+  `.ai-jail`, ai-jail loads it as-is: no checklist, and a bare `--jail` adds
+  no toggles; `--jail=…` still applies its list on top. A project file cannot
+  enable credentials (ai-jail treats it as untrusted), so to have them mounted
+  automatically there, enable them in your global `~/.ai-jail` or pass
+  `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
+  run never writes its own flags into your repository's `.ai-jail`.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
   directly — `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with

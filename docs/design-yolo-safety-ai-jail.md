@@ -27,7 +27,8 @@ every tool call with no confirmation. Three gaps:
 ## Non-goals
 
 - Changing default (non-`--yolo`) behavior. Everything here is gated on
-  `--yolo`.
+  `--yolo`, except the explicit `--jail` flag (§5), which a user types to ask
+  for a jailed run.
 - Modifying ai-jail. Detection uses ai-jail's *existing* observable surface
   (see "Already inside ai-jail"). No companion change is required.
 - Prompting in any non-interactive path. The warning/offer only appear on a
@@ -75,7 +76,7 @@ On yes, ai-memory re-execs itself under ai-jail instead of spawning the agent
 directly:
 
 ```
-ai-jail --network --agent-state <state> \
+ai-jail --network --agent-state --no-save-config \
         --env AI_MEMORY_SERVER_URL --env AI_MEMORY_HOOK_URL \
         --env ANTHROPIC_API_KEY --env CLAUDE_CODE_OAUTH_TOKEN \
         --env CLAUDE_CONFIG_DIR --env … \
@@ -110,6 +111,8 @@ ai-jail --network --agent-state <state> \
   are **not** inherited. ai-memory forwards the ones it set (server/hook URL,
   the token vars it already threads) with `--env NAME`. Only names that are
   actually set in the current environment are forwarded.
+- **`--no-save-config`** so ai-jail never writes these flags into the
+  project `.ai-jail` (§5).
 - **`--agent-state`** so the harness's own login/credentials persist across the
   private home.
 
@@ -176,6 +179,163 @@ The `claude_true_yolo` config key only upgrades a launch that is already
 `--yolo`/`--true-yolo`; on its own it never turns an ordinary run into a
 permission-bypassing one without the warning.
 
+### 5. Choosing what the jail exposes: `--jail`, `--no-jail`, the checklist
+
+ai-jail keeps credentials and host devices out by default and exposes each
+through a boolean toggle (`--X` / `--no-X`). A jailed agent that cannot reach
+`gh`, the AWS CLI, or an SSH key often cannot finish the task, so the user
+picks what the jail mounts — from the CLI or an interactive checklist — and
+pressing Enter does the friendly thing.
+
+**CLI.** Two wrapper flags on `ai-memory run` (and recognized after native
+arguments too, like `--yolo`; neither ever reaches the harness):
+
+| Form | Meaning |
+|---|---|
+| `--jail` | Re-run inside ai-jail now, without the "Re-run inside it?" question or the checklist, using the smart defaults below. |
+| `--jail=github,aws,no-mise` | Same, enabling exactly the listed toggles; `no-X` forces one off (`--no-X`). Nothing unlisted is enabled. |
+| `--jail=all` / `--jail=none` | Every checklist row this host shows / no toggles at all. Lists are applied left to right, so `all,no-docker` works. |
+| `--no-jail` | Never re-run inside ai-jail; the `--yolo` warning still shows. Conflicts with `--jail`. |
+
+`--jail` needs `=` for its list (`require_equals`), so `ai-memory run --jail
+claude` keeps `claude` as the harness. It works with or without `--yolo` and
+in non-interactive runs too — that is how a script gets a jailed run. When
+ai-jail is not usable on the host (§2) it fails with an error instead of
+silently running unjailed. An explicit `--jail` re-execs *before* the managed
+run is prepared, so no lease is opened and cancelled outside the jail. Inside
+ai-jail (§3) both flags are ignored: no nesting, no error.
+
+There are deliberately **no bare `--github`-style flags** on `ai-memory run`.
+They would collide with harness-native flags of the same name (Claude Code
+has its own `--worktree`), and wrapper flags after the harness name are
+stripped from the native argv — a bare `--worktree` meant for Claude would be
+silently taken away from it. The single namespaced `--jail=` list has no such
+collision.
+
+**Toggles.** The table (`JAIL_TOGGLES` in `ai-memory-workstream/src/jail.rs`):
+
+| Toggle | Kind | Checklist | Smart default (Enter / bare `--jail`) |
+|---|---|---|---|
+| `github` (`~/.config/gh`) | credential | when that directory exists | on when present |
+| `aws` (`~/.aws`) | credential | when present | on when present |
+| `kube` (`~/.kube`) | credential | when present | on when present |
+| `gcloud` (`~/.config/gcloud`) | credential | when present | on when present |
+| `docker-config` (`~/.docker/config.json`) | credential | when present | on when present |
+| `ssh` (`~/.ssh` read-only + `SSH_AUTH_SOCK`) | credential | when `~/.ssh` exists or an agent socket is set | on only when `origin` is SSH-style (`git@host:…`, `ssh://…`) |
+| `worktree` | capability | only in a linked git worktree | on there |
+| `docker` (socket — ⚠ grants host root) | capability | always | off |
+| `gpu`, `display` | capability | Linux only | off |
+| `pictures`, `tailscale` | capability | always | off |
+| `audio`, `x11`, `host-shm`, `terminal-passthrough`, `update-check`, `mise`, `toolchains` | capability | never (`--jail=` only) | not passed |
+
+Why these defaults: every credential is pre-checked when present because a
+user who keeps `gh` or AWS credentials on the machine almost always wants the
+agent able to use them, and a box shown only when the path exists never mounts
+nothing. The credential rows check the exact path ai-jail mounts — `GH_CONFIG_DIR`
+is not consulted, because ai-jail 2.5.0 mounts `~/.config/gh` regardless. SSH
+is shown but left unchecked for an HTTPS remote, since only an SSH `origin`
+makes `git push` need it. `worktree` is pre-checked in a linked worktree,
+where without its metadata mounted writable the agent cannot commit. The host
+capabilities stay off: they widen the sandbox without being needed for the
+usual task.
+
+**Semantics.** Unchecked rows (and toggles a list does not name) emit
+nothing, so ai-jail's own default — off for every checklist toggle — and the
+user's own ai-jail configuration stay in charge; `no-X` is the explicit way to
+force one off. The chosen toggles are emitted as `--X` / `--no-X` after the
+`--network --agent-state --no-save-config --env …` baseline and before the `--` separator.
+
+**A project `.ai-jail` replaces the checklist.** ai-jail reads its project
+config only from the invocation directory, which the re-exec inherits from
+ai-memory. When a regular file `.ai-jail` exists there:
+
+| | no project `.ai-jail` | project `.ai-jail` present |
+|---|---|---|
+| offer accepted (no flag) | checklist, smart defaults | no checklist, no toggles: the file is loaded as-is |
+| bare `--jail` | smart defaults | no toggles: the file is loaded as-is |
+| `--jail=LIST` | exactly the list | the list, on top of the file (CLI flags override config in ai-jail) |
+
+A project file is untrusted — it lives in the repository the agent works on.
+ai-jail lets it disable capabilities but never enable credentials, `docker`,
+`agent_state`, and the like, so ai-memory must not pre-check anything on its
+behalf either, and an untrusted repository must not be able to steer the
+checklist. Only the file's presence is probed (`JailHostFacts::project_config`);
+its contents are never read or parsed. The global `~/.ai-jail` is not
+consulted: ai-jail writes it for its status-bar preferences, so most users have
+one. To get credentials mounted automatically alongside a project `.ai-jail`,
+enable them in the trusted global `~/.ai-jail` or pass `--jail=github,…`,
+because the project file cannot enable them.
+
+**Why every re-exec passes `--no-save-config`.** On every ordinary run (not
+`--dry-run`, not lockdown, saving not disabled) ai-jail merges its CLI flags
+into the project config and writes `.ai-jail` back. Without the flag, the
+first jailed run would persist ai-memory's transient flags (`--network`,
+`--agent-state`, the checked credentials) into the user's repository; every
+later run would then find a project file, skip the checklist, and silently
+lose the credential mounts a project file cannot enable — and ai-jail would
+warn that the project file's `agent_state` is ignored because it weakens the
+baseline sandbox. `--no-save-config` sits in the baseline next to `--network`
+/ `--agent-state`, before the `--`, guarded by the same `--help` detection (both
+2.4.1 and 2.5.0 have it). It is reserved: `--jail=save-config` is refused.
+
+**Checklist.** Without either flag and without a project `.ai-jail`, after the
+user accepts the §2 offer, the rows visible on this host are listed with their
+smart defaults:
+
+```
+Enable in the jail (Enter = as marked; numbers flip, e.g. "2 4"; "all" / "none"):
+  [x] 1) GitHub CLI credentials        ~/.config/gh, read-only
+  [x] 2) AWS credentials               ~/.aws, read-only
+  [ ] 3) SSH keys + agent              ~/.ssh read-only + SSH_AUTH_SOCK; needed for git over SSH
+  [ ] 4) Docker socket                 ⚠ grants host root
+>
+```
+
+Enter (or EOF) accepts as marked; row numbers (spaces or commas) flip rows and
+redraw the list; `all` / `none` set every row. An unrecognized answer changes
+nothing and re-prompts; the third one aborts the launch rather than guessing
+what to mount. One summary line then names what the jail gets, grouped into
+credentials, capabilities, and forced-off toggles. With no visible row the
+checklist is skipped. The reader takes injected `BufRead`/`Write`, like the §1
+prompt, so its grammar is unit-tested without a TTY.
+
+**Decision table** (`jail_decision` in `run.rs`):
+
+| | already jailed | `--no-jail` | `--jail[=…]` | neither |
+|---|---|---|---|---|
+| `--yolo` warning (interactive only) | no | yes | yes | yes |
+| ai-jail | no (no nesting) | never | re-exec now; error if not usable | offer + checklist when interactive and usable (no checklist with a project `.ai-jail`) |
+
+**Version requirements.** ai-jail rejects an unknown flag, so ai-memory only
+passes flags the *installed* ai-jail supports. It runs `<ai-jail> --help` once
+and treats a toggle as supported only when the exact token `--X` appears
+(tokens split on whitespace and `/`; never a substring match, so `--docker`
+and `--docker-config` stay distinct). Unsupported toggles are hidden from the
+checklist; one named explicitly in `--jail=` is an error naming the release
+that has it. The credential mounts (`github`, `aws`, `kube`, `gcloud`,
+`docker-config`) and `toolchains` need ai-jail **2.5.0**; the rest are in
+2.4.1.
+
+**Never offered.** `--jail=` refuses the security switches and the flags
+ai-memory owns, with "not available through ai-memory; run ai-jail directly":
+`private-home`, `lockdown`, `landlock`, `seccomp`, `rlimits`, `systemd-user`,
+`inherit-env`, `macos-host-ipc`, `browser`, the audit-log flags (each weakens
+or reconfigures the sandbox itself), and `network` / `agent-state` /
+`save-config` (set by ai-memory, §2). Someone who needs one runs ai-jail
+directly.
+
+**Security notes.**
+
+- A credential mounted into an unsupervised (`--yolo`) agent is usable by it:
+  read-only stops it from changing the files, not from using the tokens in
+  them. Pre-checking present credentials trades that exposure for a jailed
+  agent that can do its job; the checklist shows each one, and `--jail=none`
+  or unchecking opts out.
+- `docker` grants effective root on the host; it is never on by default and
+  its note says so.
+- The re-exec still forwards only environment names already set (§2), and
+  the toggle flags carry no values or secrets.
+
 ## OS support matrix
 
 | Concern | Linux | macOS | Windows |
@@ -197,6 +357,11 @@ permission-bypassing one without the warning.
   (gate → warn → offer → re-exec or proceed), reusing the existing
   `is_terminal` gate and a `confirm`-style reader.
 - `ai-memory-cli/src/config.rs`: `[run] claude_true_yolo: bool` (default false).
+- §5: the toggle table, `--help` support detection (`JailSupport`), host facts
+  (`JailHostFacts`, fed by `inspect_repository`'s `origin_url` /
+  `linked_worktree`), `jail_checklist`, and `parse_jail_toggles` live in
+  `jail.rs`; `run.rs` owns `--jail`/`--no-jail` parsing, the `jail_decision`
+  table, and the checklist reader.
 - `ai-memory-workstream/src/harness.rs`: `apply_claude_true_yolo(env, args)`
   next to `apply_yolo`.
 
@@ -223,3 +388,11 @@ permission-bypassing one without the warning.
   `--settings` arg for Claude and is a no-op for other harnesses.
 - CHANGELOG `### Added` (minor); support-matrix + cookbook updated in the same
   change.
+- §5: `jail.rs` unit tests cover list parsing, support detection against
+  2.4.1/2.5.0 help text, and every smart default with an injected `$HOME`;
+  `run.rs` tests cover the decision table, flag stripping via a real clap
+  parse, and the checklist grammar. `tests/suite/yolo_ai_jail.rs` feeds every
+  toggle the real installed ai-jail advertises through `ai-jail --dry-run`;
+  `tests/suite/jail_toggles_e2e.rs` runs the built binary with fake
+  `ai-jail`/`bwrap`/`claude` and a mock server (including a PTY run of the
+  offer + checklist and of `--yolo --no-jail`).

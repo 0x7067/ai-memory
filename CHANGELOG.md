@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory run --jail[=TOGGLES]` and `--no-jail`, and an interactive
+  checklist after the `--yolo` ai-jail offer, to choose which ai-jail
+  credentials and capabilities the jailed session gets. Bare `--jail` re-runs
+  inside ai-jail without asking, using smart defaults: every credential present
+  on the host (`~/.config/gh`, `~/.aws`, `~/.kube`, `~/.config/gcloud`,
+  `~/.docker/config.json`), SSH when `origin` is an SSH remote, and worktree
+  metadata in a linked worktree; host capabilities (`docker`, `gpu`,
+  `display`, `pictures`, `tailscale`) stay off. `--jail=github,aws,no-mise`
+  enables exactly the listed toggles (`all` and `none` also work), works
+  without `--yolo` and in scripts, and fails instead of running unjailed when
+  ai-jail is not usable. Only toggles the installed ai-jail advertises in its
+  `--help` are offered or passed; the credential mounts need ai-jail 2.5.0.
+  ai-jail's security switches (`seccomp`, `landlock`, `private-home`, …) are
+  never accepted. `--no-jail` skips the offer while keeping the `--yolo`
+  warning. A project `.ai-jail` in the launch directory replaces the checklist
+  and the bare-`--jail` defaults (ai-jail loads it under its own trust rules;
+  `--jail=…` still applies on top), and every jailed re-run now passes
+  `--no-save-config`, so ai-jail no longer writes ai-memory's `--network` /
+  `--agent-state` / credential flags into the repository's `.ai-jail`.
+
 ### Fixed
 - Fixed the shell and PowerShell session-start hooks for Claude Code, Codex,
   Cursor, Gemini CLI, OpenCode, Command Code, Devin, and Antigravity CLI not

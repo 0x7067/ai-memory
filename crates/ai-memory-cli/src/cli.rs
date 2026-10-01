@@ -298,6 +298,29 @@ pub struct RunArgs {
     /// `docs/design-yolo-safety-ai-jail.md`.
     #[arg(long = "true-yolo")]
     pub true_yolo: bool,
+    /// Re-run this session inside ai-jail without asking. Bare `--jail` uses
+    /// the smart defaults (credentials present on this host, SSH for an SSH
+    /// `origin`, worktree metadata in a linked worktree); `--jail=LIST` enables
+    /// exactly the comma-separated ai-jail toggles listed (`github`, `aws`,
+    /// `ssh`, `gpu`, `docker`, …; `no-X` forces one off; `all`; `none`). A
+    /// project `.ai-jail` in the launch directory replaces the smart defaults
+    /// (a list still applies on top). Fails when ai-jail is not usable here;
+    /// ignored inside ai-jail. Wrapper-owned
+    /// like `--yolo`, never forwarded to the harness. See
+    /// `docs/design-yolo-safety-ai-jail.md`.
+    #[arg(
+        long,
+        value_name = "TOGGLES",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        conflicts_with = "no_jail"
+    )]
+    pub jail: Option<String>,
+    /// Never re-run inside ai-jail: skips the `--yolo` ai-jail offer (the
+    /// `--yolo` warning itself still shows).
+    #[arg(long)]
+    pub no_jail: bool,
     /// Start a new native session in the selected workstream instead of
     /// resuming or adopting an existing harness session.
     #[arg(long)]

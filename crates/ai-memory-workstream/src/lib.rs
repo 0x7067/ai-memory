@@ -14,8 +14,11 @@ pub use harness::{
     store_override_vars,
 };
 pub use jail::{
-    FORWARDED_ENV_NAMES, JailEnv, JailOs, build_ai_jail_invocation, current_jail_os,
-    inside_ai_jail, inside_ai_jail_here, usable_ai_jail, usable_ai_jail_here,
+    FORWARDED_ENV_NAMES, JAIL_TOGGLES, JailChecklistItem, JailEnv, JailHostFacts, JailOs,
+    JailSupport, JailToggle, JailToggleChoice, JailToggleError, JailToggleKind, ai_jail_support,
+    build_ai_jail_invocation, checked_choices, current_jail_os, inside_ai_jail,
+    inside_ai_jail_here, jail_checklist, jail_toggle, parse_jail_toggles, usable_ai_jail,
+    usable_ai_jail_here,
 };
 pub use repository::{RepositoryIdentity, inspect_repository};
 pub use transcript::{
