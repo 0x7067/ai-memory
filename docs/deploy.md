@@ -236,6 +236,11 @@ scp "$SERVER:$DEPLOY_DIR/data/snapshot-$(date +%F).tar.gz" ./backups/
 The `ai-memory backup` command uses SQLite's online backup API so
 writes during the snapshot are coherent.
 
+For a remote-first backup pattern (rsync the data dir into a git mirror on a
+schedule, push to a private repository, paired with a tarball for the DB
+and models), see [`docs/backup.md`](backup.md) and the worked example under
+[`docs/examples/backup/`](examples/backup/README.md).
+
 ## Sharing one server between people or harnesses
 
 A deployed server is the supported way to share a project — between teammates,
@@ -406,7 +411,11 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
 - **`unhealthy`** status: the container is running but its embedded
   `ai-memory status` healthcheck is failing. Most likely the data
   dir's permissions don't match the container's user (uid 1000). Fix
-  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host.
+  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host. A slower-onset
+  cause (days, not minutes) is fd exhaustion from dead-peer connections
+  (laptop sleep, a VPN flap) accumulating without TCP keepalive; `serve`
+  enables it by default (`tcp_keepalive_secs = 60`, `AI_MEMORY_TCP_KEEPALIVE_SECS`
+  to tune or `=0` to disable) (#792).
 - **Embedding mismatch after a model change**: startup logs a warning
   when stored `(provider, model, dim)` triples differ from config.
   Hybrid search ignores stale rows until they are re-embedded. Start
@@ -441,7 +450,10 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
 - **Provider failures**: `ai-memory status` reports passive LLM and
   embedding health from the last real provider call. A fresh process
   reports `unknown` until the server actually uses that role; it does
-  not probe providers or spend tokens for health reporting.
+  not probe providers or spend tokens for health reporting. If provider
+  calls fail with `invalid peer certificate: UnknownIssuer` behind a
+  TLS-inspecting firewall or antivirus, see
+  [https-via-proxy.md](https-via-proxy.md#outbound-llm-calls-fail-behind-a-tls-inspecting-firewall).
 - **Container restart loop**: check
   `docker logs ai-memory` - the `ai-memory starting` line at the top
   reports the resolved config; a missing required env var (e.g.

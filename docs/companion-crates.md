@@ -23,6 +23,11 @@ the core workspace.
 
 ## Integration rules for companions
 
+Orchestrators that own their harness lifecycle can use the
+[external capture contract](external-lifecycle.md) to suppress native observation
+capture per execution while retaining handoff delivery and MCP retrieval.
+Producer provenance and retry identity use the existing hook ingestion fields.
+
 Companion projects may:
 
 - call the read-only `/api/v1` endpoints for workspaces, projects, pages,
@@ -57,6 +62,23 @@ If a companion exposes browser writes, it must implement its own server-side
 mutation broker. Browsers should talk to the companion; the companion should talk
 to ai-memory with an operator token. That keeps CSRF, confirmation, audit, rate
 limits, and UI-specific policy outside the core server.
+
+## `ai-memory-relay`: external lifecycle delivery
+
+[`ai-memory-relay`](../companions/ai-memory-relay) delivers events collected by
+an external orchestrator through `/hook/batch`. Its own local queue records events
+before sending and retains unacknowledged entries for a later flush. It does not
+launch agents, claim handoffs, or open ai-memory's database or wiki.
+
+The orchestrator still maps its events to the native harness payloads and sets
+`AI_MEMORY_CAPTURE_OWNER` when launching that harness. The relay uses the native
+session identity and derives retry keys from the producer's stable event IDs.
+Only the first pending event for each session enters a batch; that session
+advances after acknowledgement, even when other sessions are rate-limited.
+
+The package has its own workspace, tests and CLI. Its README defines queue limits,
+local data handling and recovery, with an executable test against the real
+ai-memory server. Root workspace tests do not run the companion's unit tests.
 
 ## `ai-memory-importer`: migration and ingestion companion
 
@@ -177,6 +199,56 @@ Re-home by kind:
 5. Add re-home/link-rewrite as a separate subcommand after import is stable.
 6. Only after repeated usage, consider whether ai-memory core lacks a small,
    generic API seam; do not start by patching core endpoints.
+
+## `ai-memory-macos`: menu bar wrapper
+
+Self-contained macOS accessory app at
+[`companions/ai-memory-macos`](../companions/ai-memory-macos). It is a
+**wrapper**, not a data-seam dashboard: it ships the `ai-memory` binary and
+`hooks/` tree inside an `.app`, governs the existing LaunchAgent, and opens
+`/web`, `ai-memory status`, `config.toml`, the data directory, and logs.
+
+It is not a root workspace member. Build and test it separately:
+
+```bash
+./companions/ai-memory-macos/build.sh
+swift test --package-path companions/ai-memory-macos
+```
+
+### Goal
+
+Give macOS a first-class install that does not require a prior tarball, without
+reimplementing status, search, wiki browsing, or config editing in SwiftUI.
+
+### How it talks to ai-memory
+
+- `GET /admin/status` for the menu-bar traffic light and two headline lines
+  (version, page/session counts, LLM role).
+- Bundled `ai-memory status` / `ai-memory init` via `Process` (the real CLI).
+- `launchctl` against `com.github.akitaonrails.ai-memory` and the checked-in
+  plist template in `packaging/launchd/`.
+- `NSWorkspace` to open `/web`, `config.toml`, the data dir, and logs.
+
+It does not open SQLite or the wiki, does not call writable `/admin` routes, and
+does not add MCP tools.
+
+### Data vs bundle
+
+Durable state stays in `~/Library/Application Support/ai-memory` (the binary’s
+existing macOS default) and logs under `~/Library/Logs/ai-memory`. Replacing
+`/Applications/AI Memory.app` does not rewrite that tree. An optional data-dir
+override is written only into the rendered LaunchAgent plist
+(`AI_MEMORY_DATA_DIR`), never into the bundle.
+
+### Safety requirements
+
+- Do not silently start the LaunchAgent on first launch; **Install & Start**
+  is an explicit click.
+- Do not write `AI_MEMORY_AUTH_TOKEN` into the plist. The menu bar’s own HTTP
+  client may keep a bearer in the Keychain.
+- Do not sandbox the app in a way that blocks `launchctl` or LaunchAgents.
+
+See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
 
 ## `ai-memory-web-editor`: browser chat/editor companion
 

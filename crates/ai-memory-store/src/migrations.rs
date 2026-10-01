@@ -14,7 +14,26 @@ refinery::embed_migrations!("migrations");
 /// is remapped to [`StoreError::DataSchemaAhead`], which names the offending
 /// migration and points the operator at the fix.
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
-    migrations::runner().run(conn).map_err(classify_run_error)?;
+    migrations::runner()
+        // Tolerate a divergent checksum on an already-applied migration.
+        //
+        // V62 was reshaped in place (#776) from an in-migration backfill to
+        // DDL-only + a chunked boot-path backfill (`ops::backfill_page_windows`).
+        // A store that applied the ORIGINAL V62 recorded that migration's
+        // checksum in `refinery_schema_history`; the embedded V62 now hashes
+        // differently, which refinery's default `abort_divergent = true` would
+        // reject as `DivergentVersion`, refusing to open a correctly-migrated
+        // store. Those stores already have the columns fully backfilled, so the
+        // boot step is inert for them — opening is safe. Relaxing divergence is
+        // the intentional cost of an in-place migration reshape.
+        //
+        // `abort_missing` stays TRUE: a store whose applied version is *ahead*
+        // of this binary must still fail closed with the actionable
+        // `DataSchemaAhead` error (the schema-version pin), not open silently.
+        .set_abort_divergent(false)
+        .set_abort_missing(true)
+        .run(conn)
+        .map_err(classify_run_error)?;
     Ok(())
 }
 
@@ -385,6 +404,7 @@ mod tests {
         crate::ops::insert_observation(
             &mut conn,
             &NewObservation {
+                occurred_at: None,
                 session_id,
                 workspace_id,
                 project_id,
@@ -578,6 +598,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -636,6 +657,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -708,6 +730,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -780,6 +803,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -847,6 +871,7 @@ mod tests {
         crate::ops::begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
@@ -870,6 +895,47 @@ mod tests {
             };
             assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
         }
+    }
+
+    /// V62 was reshaped in place (#776) from an in-migration backfill to
+    /// DDL-only + a boot-path backfill, changing its checksum. A store that
+    /// applied the ORIGINAL V62 recorded the old checksum; `run` must still
+    /// open it (divergence tolerated) rather than aborting with
+    /// `DivergentVersion` — while a strict runner would reject it, proving
+    /// the relaxation is load-bearing. `abort_missing` stays true, so a
+    /// schema that is genuinely *ahead* still fails closed (covered by
+    /// `data_ahead_of_binary_reports_schema_ahead_not_raw_refinery`).
+    #[test]
+    fn reshaped_migration_divergent_checksum_is_tolerated() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        // Simulate the original V62's recorded checksum by rewriting the
+        // stored value so it no longer matches the embedded migration.
+        let rewritten = conn
+            .execute(
+                "UPDATE refinery_schema_history SET checksum = '0' WHERE version = 62",
+                [],
+            )
+            .unwrap();
+        assert_eq!(rewritten, 1, "V62 history row must exist to diverge");
+
+        // A strict runner (refinery's default) rejects the divergence.
+        let strict = migrations::runner().run(&mut conn);
+        match strict {
+            Err(err) => assert!(
+                matches!(err.kind(), refinery::error::Kind::DivergentVersion(_, _)),
+                "expected DivergentVersion, got: {err:?}"
+            ),
+            Ok(_) => panic!("strict runner should reject a divergent checksum"),
+        }
+
+        // The production path tolerates it: the already-migrated store opens.
+        run(&mut conn).expect("divergence must be tolerated so migrated stores open");
+
+        // And the boot backfill is inert on such a store (no NULL windows).
+        let summary = crate::ops::backfill_page_windows(&mut conn).unwrap();
+        assert_eq!(summary, crate::ops::PageWindowBackfillSummary::default());
     }
 
     #[test]
@@ -900,5 +966,64 @@ mod tests {
         );
         assert!(after.contains("superseded_at IS NOT NULL"), "{after}");
         assert!(!after.contains("supersedes IS NULL"), "{after}");
+    }
+
+    /// Upstream's `UNIQUE (workspace_id, name)` is case-sensitive, so one
+    /// workspace may hold both `API` and `api`. The identity index is on
+    /// case-folded values, and backfilling `lower(name)` into it failed the
+    /// whole upgrade on such an install. Looked up by name, not number: this
+    /// migration is renumbered on every upstream sync that adds one of its own.
+    #[test]
+    fn project_identity_upgrades_a_workspace_with_names_differing_only_in_case() {
+        let identity_version = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|m| m.name() == "project_identity")
+            .map(refinery::Migration::version)
+            .expect("the project_identity migration is embedded");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, identity_version - 1).unwrap();
+        let workspace_id = [7_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'acme', 1)",
+            params![workspace_id.as_slice()],
+        )
+        .unwrap();
+        for (id, name) in [([1_u8; 16], "API"), ([2_u8; 16], "api")] {
+            conn.execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, ?3, 1)",
+                params![id.as_slice(), workspace_id.as_slice(), name],
+            )
+            .unwrap();
+        }
+
+        run(&mut conn).expect("names differing only in case must not fail the upgrade");
+
+        // Both projects survive, and neither is claimed: which one a future
+        // `api/` checkout resolves to is not the migration's decision.
+        let unclaimed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE identity = '' AND identity_source = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unclaimed, 2);
+
+        // The index still does its job once the resolver claims an identity.
+        conn.execute(
+            "UPDATE projects SET identity = 'api', identity_source = 'folder_name' WHERE name = 'api'",
+            [],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            "UPDATE projects SET identity = 'api', identity_source = 'folder_name' WHERE name = 'API'",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "a claimed identity must stay unique per workspace"
+        );
     }
 }

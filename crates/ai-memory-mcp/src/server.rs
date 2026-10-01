@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_options,
+    run_auto_improve_review, run_lint, run_sweep_with_compaction,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -24,8 +24,8 @@ use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
-    ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolResult, ContentBlock as Content, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -60,6 +60,11 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
         proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
         pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
         max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+        patchable_page_prefixes:
+            ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
         max_patchable_body_chars:
             ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
         max_edits_per_proposal: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
@@ -198,12 +203,27 @@ developer, user, and canonical project instructions.\n\
   to propose architecture (always check first). Defaults to the \
   current project; pass `scopes` to search named sibling projects, \
   or `global=true` to search EVERY project at once when you don't \
-  know where the knowledge lives. Default-scoped calls also return \
-  `global_scope_hits` — standing user/team preferences from the \
-  reserved `_global` scope; treat them as context that applies to \
-  every project. Expired pages are hidden by default; use \
+  know where the knowledge lives. Single-project calls — whether the \
+  project is left implicit or named explicitly with `workspace`+`project` \
+  — also return `global_scope_hits`: standing user/team preferences from \
+  the reserved `_global` scope; treat them as context that applies to \
+  every project. Only an explicit multi-`scopes` set opts out. Expired pages are hidden by default; use \
   `include_expired=true` only when the user explicitly wants to inspect \
-  expired historical memory. Use `explain=true` only when diagnosing \
+  expired historical memory. Superseded (older) page versions are hidden \
+  by default; pass `include_superseded=true` when the user wants a page's \
+  history or an answer a later edit removed — each older hit is labelled \
+  `superseded: true`. Pass `pin_first=true` to prepend the project's \
+  bounded pinned latest pages ahead of the search hits (deduped, each \
+  marked `pinned: true`) when standing operator-curated context should be \
+  seen before the ranked matches. Pass `answer=true` (opt-in, off by \
+  default, and only when the server has an LLM provider) to also synthesize \
+  a cited natural-language answer over the top hits, attached as \
+  `answer: { text, citations }`; with no provider it returns the hits plus \
+  an `answer_unavailable` note (never an error), and the default path makes \
+  no LLM call. Pair `answer=true` with `reasoning` \
+  (`minimal` (default) / `low` / `medium` / `high` / `max`) to give the \
+  synthesis a larger token budget for a harder question; `minimal` and \
+  omitting it are unchanged. Use `explain=true` only when diagnosing \
   project/scopes ranking; it adds score provenance, while global search \
   reports only its distinct FTS stream.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
@@ -211,14 +231,18 @@ developer, user, and canonical project instructions.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
   'how big is the knowledge base'. Returns lifetime counts.\n\
 - `memory_briefing` — when the user wants a STRUCTURED snapshot \
-  (counts + 7d/30d activity + rules + recent pages, JSON, no LLM \
+  (counts + 7d/30d activity + rules + recent pages + a bounded `pinned` \
+  list of the project's pinned standing-context pages, JSON, no LLM \
   call). READ-ONLY: it never creates handoffs or mutates state. Use \
   over memory_status when more detail is wanted.\n\
 - `memory_explore` — when the user wants a PROSE digest. \
   Calibrates verbosity to time since last activity: 'fresh' → one \
   line, 'stale' (>30d) → full catchup. Accepts an optional `focus` \
-  arg. Use over memory_briefing when the user asks open-ended \
-  questions like 'catch me up' or 'what's important right now'.\n\
+  arg, and a `reasoning` tier (`minimal` (default) / `low` / `medium` / \
+  `high` / `max`) that widens the digest's token budget when a provider \
+  is configured (inert on the briefing-only path). Use over \
+  memory_briefing when the user asks open-ended questions like 'catch me \
+  up' or 'what's important right now'.\n\
 - `memory_handoff_list` — READ-ONLY list of OPEN handoffs in the \
   resolved project. It does not claim or expire anything. Use it when \
   no SessionStart handoff block is in context (Grok, Zero, and other \
@@ -234,7 +258,7 @@ developer, user, and canonical project instructions.\n\
   before you see your first prompt; if a block starting with \
   '📥 ai-memory: pending handoff' is anywhere in your context, \
   THAT is the handoff — answer from it directly, don't re-call \
-  this tool (it'll return null because handoffs are single-use). \
+  this tool (it'll return no handoff because handoffs are single-use). \
   When no prepended block is visible, inspect with memory_handoff_list \
   first, then pass the listed `handoff_id` to claim that exact row; \
   omitting `handoff_id` still claims the latest eligible open handoff. \
@@ -313,7 +337,10 @@ should be proposed from a completed session, or at explicit wrap-up \
   the client-aware project-scope rule above; session-aware clients add \
   explicit scope when reading a page from a named sibling workspace/project. Use \
   this instead of memory_query when the user wants the complete text, \
-  not just snippets.\n\
+  not just snippets. Pass `include_related: true` (with an optional \
+  `related_depth`, default 1, max 3) to also walk the link graph outward and \
+  get a `related` array of the pages reachable from this one, each tagged \
+  with its hop `depth` and `direction`.\n\
 - `memory_read_session_observations` — when the user asks what actually \
   happened in a session, wants to check a compiled page against its raw \
   evidence, or needs the exact prompt/tool text behind a `memory_query` \
@@ -346,7 +373,7 @@ should be proposed from a completed session, or at explicit wrap-up \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
   slim markered snippet (`markered_block`), filename hints, \
   `managed_skills` payloads, `target_hints` for `.claude/skills`, \
-  `.agents/skills`, `.devin/skills`, `.grok/skills`, and Devin's Windows global \
+  `.agents/skills`, `.devin/skills`, `.grok/skills`, `.hermes/skills`, and Devin's Windows global \
   `%APPDATA%\\devin\\skills` root, and overwrite guidance. Use your own Write/Edit \
   tool to replace only the ai-memory marker block in the rules file, \
   then write each managed skill under the selected skill root. Only \
@@ -431,6 +458,16 @@ pub struct AiMemoryServer {
     /// Opt-in bound on how long raw observations outlive their consolidation.
     /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
     observation_retention: ObservationRetention,
+    /// A2 opt-in: compact cold episodic pages (tier-down) instead of evicting
+    /// them. Default `false`, so the sweep evicts exactly as before.
+    compact_cold_episodic: bool,
+    /// Lower edge of `memory_lint`'s A5 zero-LLM contradiction-similarity
+    /// band, from `config.contradiction_band_min`. Defaults to
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW`].
+    contradiction_band_min: f32,
+    /// Upper edge of the A5 band — see `contradiction_band_min`. Defaults to
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH`].
+    contradiction_band_max: f32,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
@@ -442,6 +479,11 @@ pub struct AiMemoryServer {
     /// burst costs the writer one tiny upsert batch, not one write per
     /// call (same reasoning as the M8 access-bump throttle).
     client_activity: Arc<std::sync::Mutex<ClientActivityBuffer>>,
+    /// Shared "last client activity" clock (microseconds), bumped on every tool
+    /// call. The B3 dream scheduler reads it to detect idle and to cancel a
+    /// running pass the moment the operator returns — consolidation must never
+    /// contend with live work.
+    activity_clock: ai_memory_consolidate::ActivityClock,
     /// Shared across cloned request handlers so concurrent searches cannot
     /// create an unbounded number of billable provider calls.
     rerank_gate: Arc<tokio::sync::Semaphore>,
@@ -506,6 +548,10 @@ pub struct AiMemoryServer {
 
 const MAX_QUERY_SCOPES: usize = 25;
 
+/// Upper bound on how many pinned latest pages `memory_query(pin_first=true)`
+/// prepends, so standing context never crowds out the search result entirely.
+const PIN_FIRST_MAX: usize = 10;
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct MemoryScopeArg {
     /// Project to read inside the workspace.
@@ -548,6 +594,22 @@ struct QueryArgs {
     /// default; they are deleted by the next forget sweep). Default false.
     #[serde(default)]
     include_expired: Option<bool>,
+    /// Also return superseded (older) page versions, not just the current
+    /// one. Each superseded hit is labelled `superseded: true` so you can
+    /// tell it from the live version. Use when you need the history of a
+    /// page or an answer that a later edit removed. Ignored on `global`
+    /// search and folded into `as_of` time-travel. Default false.
+    #[serde(default)]
+    include_superseded: Option<bool>,
+    /// Pin before search: prepend the project's bounded pinned latest pages
+    /// ahead of the fused search hits, deduped against them so a pinned page
+    /// that also matches the query appears once (marked `pinned: true`).
+    /// Standing operator-curated context an agent should see first. Applies to
+    /// single-project searches (default or `workspace`+`project`); ignored on
+    /// `scopes`, `global`, and `as_of` queries. Default false → ordering
+    /// unchanged.
+    #[serde(default)]
+    pin_first: Option<bool>,
     /// Attach `score_details` to project/scopes hits: per-stream ranks
     /// (FTS5, entity, vector, graph), raw scores, and RRF contributions, plus a
     /// top-level `streams_active` list. A `global=true` query uses a
@@ -565,6 +627,69 @@ struct QueryArgs {
     /// combined with `global` or `scopes`. Omit for a normal search.
     #[serde(default)]
     as_of: Option<String>,
+    /// Opt-in, off by default. When `true` AND the server has an LLM provider
+    /// configured, synthesize a natural-language, cited answer over the top
+    /// retrieved hits and attach it as `answer: { text, citations }` (the
+    /// citations are the page paths the answer drew from). When `true` but no
+    /// provider is configured, the normal hits are returned plus an
+    /// `answer_unavailable` note — never an error. When `false`/omitted (the
+    /// default) the response is unchanged and NO LLM call is made. Applies to
+    /// the normal single-project / `scopes` search; ignored on `global` and
+    /// `as_of` queries.
+    #[serde(default)]
+    answer: Option<bool>,
+    /// Reasoning effort for the `answer` synthesis path: one of `minimal`
+    /// (default), `low`, `medium`, `high`, `max`. Higher tiers give the model a
+    /// larger token budget to reason within. Only meaningful together with
+    /// `answer=true`; inert on the default (no-LLM) path. Omitting it, or
+    /// `minimal`, is byte-identical to today. An unknown value is rejected.
+    #[serde(default)]
+    reasoning: Option<ReasoningTier>,
+}
+
+/// Operator-facing reasoning-effort tier for the opt-in LLM synthesis paths
+/// (`memory_query(answer=true)` and `memory_explore`). Borrowed from Honcho's
+/// reasoning-effort ladder.
+///
+/// `ChatRequest` carries no per-request reasoning/effort field today (the
+/// provider-level `reasoning_effort` is fixed at construction from config), so
+/// the honest per-request mapping is a per-tier **max-token budget**: a higher
+/// tier gives the model more room to reason before its answer is truncated.
+/// [`Self::Minimal`] (the default) leaves each path's base budget unchanged, so
+/// omitting `reasoning` is byte-identical to the pre-tier behavior. Serde
+/// rejects an unknown value (invariant #7: typed, schema-checked inputs).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+enum ReasoningTier {
+    /// Current behavior: the path's base token budget, unchanged.
+    #[default]
+    Minimal,
+    /// A modestly wider budget.
+    Low,
+    /// Twice the base budget.
+    Medium,
+    /// Three times the base budget.
+    High,
+    /// Four times the base budget.
+    Max,
+}
+
+impl ReasoningTier {
+    /// Scale a path's base max-token budget for this tier. `Minimal` returns the
+    /// base unchanged (byte-identical to pre-tier behavior); higher tiers widen
+    /// it so synthesis can reason longer before truncation. Saturating so a
+    /// large base never overflows.
+    const fn scale_max_tokens(self, base: u32) -> u32 {
+        match self {
+            Self::Minimal => base,
+            Self::Low => base.saturating_add(base / 2),
+            Self::Medium => base.saturating_mul(2),
+            Self::High => base.saturating_mul(3),
+            Self::Max => base.saturating_mul(4),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -623,11 +748,47 @@ struct ProjectSearchOptions<'a> {
     limit: usize,
     include_expired: bool,
     explain: bool,
+    include_superseded: bool,
+}
+
+/// Synthesized "dialectic" answer attached to a `memory_query` response when
+/// the caller opts in with `answer=true` and a provider is configured. The
+/// `text` is a natural-language answer drawn strictly from the retrieved hit
+/// snippets; `citations` are the page paths the model reported drawing from.
+#[derive(Debug, Serialize)]
+struct QueryAnswer {
+    text: String,
+    citations: Vec<String>,
+}
+
+/// LLM structured-output schema for `memory_query(answer=true)`. JSON-schema
+/// structured output only (invariant #7): derived via `schemars` and passed to
+/// [`ai_memory_llm::complete_structured`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AnswerSynthesis {
+    /// A concise natural-language answer to the user's query, drawn strictly
+    /// from the provided page snippets. If the snippets do not contain the
+    /// answer, say so plainly instead of guessing.
+    answer: String,
+    /// The page paths (exactly as given in the context) that the answer drew
+    /// from. Empty when the context did not contain the answer.
+    citations: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct MemoryQueryResponse {
     hits: Vec<QueryHit>,
+    /// Present only when the caller set `answer=true` and a provider produced a
+    /// synthesized answer. Omitted otherwise so the default response is
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer: Option<QueryAnswer>,
+    /// Present only when the caller set `answer=true` but synthesis could not
+    /// run (no provider configured, or the provider call failed). A short
+    /// human-readable reason; the hits are still returned normally and this is
+    /// never an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer_unavailable: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     raw_hits: Vec<ai_memory_store::ObservationHit>,
     /// Populated only by a `global=true` query: cross-project hits, each
@@ -665,6 +826,20 @@ struct MemoryRecentResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     counts: ai_memory_store::StatusCounts,
+    /// Which project the counts belong to, and how it was chosen (#757).
+    scope: AnsweredScope,
+}
+
+/// The scope a response was answered from. Without it an unscoped call that
+/// fell back to another project returns plausible numbers the caller has no
+/// way to question.
+#[derive(Debug, Serialize)]
+struct AnsweredScope {
+    workspace: String,
+    project: String,
+    /// `explicit`, `session`, `shared_slot`, `startup_seed`, `default`, or
+    /// `default_after_mismatch`.
+    resolved_by: &'static str,
 }
 
 /// How many extra candidates to fetch for the reranker to reorder. The
@@ -940,8 +1115,11 @@ struct LintArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ConsolidateArgs {
-    /// UUID of the session to consolidate.
-    session_id: String,
+    /// UUID of the session to consolidate. Omit to consolidate the latest
+    /// completed session in the resolved project; pass it to target a
+    /// specific session.
+    #[serde(default)]
+    session_id: Option<String>,
     /// If true, preview without writing. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
@@ -1075,6 +1253,22 @@ struct HandoffAcceptArgs {
     /// the latest eligible open handoff. Omit to keep the latest-open behavior.
     #[serde(default)]
     handoff_id: Option<String>,
+}
+
+/// Why `memory_handoff_accept` did or did not return a handoff. `handoff: null`
+/// alone meant both "nothing to claim" and "your own SessionStart already
+/// claimed it", which only a paragraph of tool description told apart (#920).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HandoffAcceptStatus {
+    /// This call claimed the handoff it returns.
+    Claimed,
+    /// The calling session's own SessionStart claimed it, so it is already in
+    /// that session's context. Reported only when the request carries the
+    /// session id the hook claimed under.
+    ConsumedByHook,
+    /// Nothing is left for this caller to claim.
+    NonePending,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1239,6 +1433,13 @@ struct ExploreArgs {
     /// omit both for the current project; static MCP clients must pass both.
     #[serde(default)]
     workspace: Option<String>,
+    /// Reasoning effort for the LLM digest: one of `minimal` (default), `low`,
+    /// `medium`, `high`, `max`. Higher tiers give the model a larger token
+    /// budget. Inert when no provider is configured (the briefing-only path).
+    /// Omitting it, or `minimal`, is byte-identical to today. Unknown value
+    /// rejected.
+    #[serde(default)]
+    reasoning: Option<ReasoningTier>,
 }
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct InstallSelfRoutingArgs {
@@ -1282,6 +1483,16 @@ struct ReadPageArgs {
     /// both for the current project; static MCP clients must pass both.
     #[serde(default)]
     workspace: Option<String>,
+    /// Opt-in: also walk the link graph outward from this page and return the
+    /// reachable pages in a `related` array. Default false → the response is
+    /// byte-identical to a plain single-page read (no `related` field).
+    #[serde(default)]
+    include_related: bool,
+    /// How many hops to walk when `include_related` is set. Default 1 (direct
+    /// neighbours only); hard-capped at 3, so a larger value is clamped.
+    /// Ignored when `include_related` is false.
+    #[serde(default)]
+    related_depth: Option<u8>,
 }
 
 /// Bounds for `memory_read_session_observations`. The defaults keep one call
@@ -1407,14 +1618,62 @@ struct WritePageArgs {
 
 #[tool_router]
 impl AiMemoryServer {
-    fn scope_resolver(&self) -> ScopeResolver<'_> {
-        ScopeResolver::new(&self.reader, self.workspace_id, self.project_id)
+    /// A resolver bound to the user this request authenticated as (#708).
+    ///
+    /// The viewer is an argument rather than something read from `&self`
+    /// because it is per-request: the server is shared, the caller is not.
+    /// Every tool below reaches its project through here, so this is the one
+    /// place the MCP surface attaches the per-project choke point. A viewer is
+    /// only ever stamped for a database user, so a present one means the
+    /// deployment distinguishes operators; none (root, or an install with no
+    /// database users) attaches no principal and resolves as before.
+    fn scope_resolver_as(&self, viewer: Option<ai_memory_core::UserId>) -> ScopeResolver<'_> {
+        let resolver = ScopeResolver::new(&self.reader, self.workspace_id, self.project_id)
             .with_writer(&self.writer)
-            .with_active_project(&self.active_project)
+            .with_active_project(&self.active_project);
+        match viewer {
+            Some(viewer) => {
+                resolver.with_project_authz(ai_memory_store::ProjectPrincipal::user(viewer), true)
+            }
+            None => resolver,
+        }
     }
 
+    /// The user whose grants apply to this request, if any do.
+    ///
+    /// Deliberately reads [`ai_memory_core::AuthorizedViewer`] rather than the
+    /// bare `UserId` alongside it. The bare id is always present for a
+    /// database user because attribution must not depend on a policy setting;
+    /// this one is stamped only when an operator has switched per-repository
+    /// authorization on, and never for root. `None` therefore means "no
+    /// per-repository check applies" — an open install, an install that has
+    /// not enabled authorization, or the operator.
+    fn viewer_from_parts(
+        parts: Option<&axum::http::request::Parts>,
+    ) -> Option<ai_memory_core::UserId> {
+        parts.and_then(|parts| {
+            parts
+                .extensions
+                .get::<ai_memory_core::AuthorizedViewer>()
+                .map(|viewer| viewer.user())
+        })
+    }
+
+    /// Map a scope-resolution failure to the error the caller can act on.
+    ///
+    /// A malformed scope argument, or a name that does not resolve to an
+    /// existing workspace/project, is caller input rather than a server fault:
+    /// it maps to `invalid_params` (`-32602`), the same split the web route
+    /// applies with its 400/404 (`ai-memory-web/src/routes/api.rs::
+    /// scope_error_response`). Only the remaining classes — a missing writer
+    /// handle for a create-on-write resolution, or an underlying store failure
+    /// — stay `internal_error` (`-32603`).
     fn scope_error(err: ai_memory_store::ScopeResolutionError) -> McpError {
-        McpError::internal_error(err.to_string(), None)
+        if err.is_bad_request() || err.is_not_found() {
+            McpError::invalid_params(err.to_string(), None)
+        } else {
+            McpError::internal_error(err.to_string(), None)
+        }
     }
 
     /// Construct a server backed by the given reader/writer + 3-tuple
@@ -1439,9 +1698,15 @@ impl AiMemoryServer {
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
             observation_retention: ObservationRetention::default(),
+            compact_cold_episodic: false,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
+            activity_clock: ai_memory_consolidate::ActivityClock::new(
+                jiff::Timestamp::now().as_microsecond(),
+            ),
             rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
@@ -1452,6 +1717,13 @@ impl AiMemoryServer {
             per_user_slots: false,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The shared last-client-activity clock, so the B3 dream scheduler reads the
+    /// same signal the tool router bumps on every call.
+    #[must_use]
+    pub fn activity_clock(&self) -> ai_memory_consolidate::ActivityClock {
+        self.activity_clock.clone()
     }
 
     /// Declare that a trusted proxy may assert end-user identities — mirror of
@@ -1548,8 +1820,12 @@ impl AiMemoryServer {
     ///   raw client-supplied headers.
     /// - `session_id` comes from the same `ActorContext` when the auth
     ///   middleware filled it; if not, falls back to the rung-4
-    ///   `X-Memory-Actor-Session-Id` request header, then to the standard
-    ///   MCP `Mcp-Session-Id` header. The session id is just a cache key
+    ///   `X-Memory-Actor-Session-Id` request header, then native request
+    ///   `_meta["ai.opencode/sessionID"]`, then the transport's
+    ///   `Mcp-Session-Id` header. The native id matches lifecycle hooks; a
+    ///   transport id does not, and only `--http-stateful` issues one (the
+    ///   default stateless transport never does, so clients send none).
+    ///   The session id is just a cache key
     ///   for the active-project map — getting it wrong only routes the
     ///   lookup to a different (or absent) slot, with no auth-bypass risk,
     ///   so trusting the header here is safe.
@@ -1584,6 +1860,12 @@ impl AiMemoryServer {
         let session_id = ctx
             .and_then(|c| c.session_id.clone())
             .or_else(|| header_session("x-memory-actor-session-id"))
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<NativeSessionId>()
+                    .map(|id| id.0.clone())
+            })
             .or_else(|| header_session("mcp-session-id"));
         ai_memory_core::ActorKey { user, session_id }
     }
@@ -1606,25 +1888,148 @@ impl AiMemoryServer {
         &self,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_current_or_project(explicit_project, actor)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
     }
 
+    /// Resolve the scope for a tool that only READS it.
+    ///
+    /// Paired with [`Self::effective_ids_for_mutation_args_with_actor`], which
+    /// takes identical arguments and differs only in the level it demands. Two
+    /// methods named for intent rather than one with a role argument: a role
+    /// argument is a thing a call site can forget, or copy from the wrong
+    /// neighbour, and the neighbours here are tools that delete pages. The
+    /// name at the call site should say which one this is.
     async fn effective_ids_for_read_args_with_actor(
         &self,
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
-            .resolve_read_args(explicit_workspace, explicit_project, actor)
+        self.resolve_existing_args_as(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Read,
+        )
+        .await
+    }
+
+    /// Resolve the scope for a tool that CHANGES it, without creating it.
+    ///
+    /// Same argument shape as a read — an explicit workspace/project pair, or
+    /// the current-project fallback chain — and that is exactly the trap this
+    /// exists to close. `memory_delete_page`, `memory_feedback`,
+    /// `memory_forget_sweep`, `memory_lint`, `memory_auto_improve`, the
+    /// handoff accept/cancel pair, and the message queue's pop, cancel and the
+    /// recipient of a send all take read-shaped arguments and all mutate.
+    ///
+    /// Distinct from [`Self::write_target_ids_with_actor`], which may CREATE
+    /// the target. These tools act on something that must already be there.
+    async fn effective_ids_for_mutation_args_with_actor(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        self.resolve_existing_args_as(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await
+    }
+
+    async fn resolve_existing_args_as(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+        required: ai_memory_store::ProjectAccess,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        self.scope_resolver_as(viewer)
+            .resolve_existing_args(explicit_workspace, explicit_project, actor, required)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
+    }
+
+    /// [`Self::effective_ids_for_read_args_with_actor`], plus where the scope
+    /// came from. Every unscoped read passes through here, so this is where a
+    /// fallback gets logged: a static MCP client answered from a project it
+    /// never named is otherwise indistinguishable from a correct answer (#757).
+    async fn traced_ids_for_read_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> Result<((WorkspaceId, ProjectId), ai_memory_store::ScopeSource), McpError> {
+        self.traced_ids_for_existing_args(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Read,
+        )
+        .await
+    }
+
+    /// [`Self::effective_ids_for_mutation_args_with_actor`], plus where the
+    /// scope came from — for a mutating tool whose empty answer from an
+    /// inferred scope needs the same hint a read's does.
+    async fn traced_ids_for_mutation_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> Result<((WorkspaceId, ProjectId), ai_memory_store::ScopeSource), McpError> {
+        self.traced_ids_for_existing_args(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await
+    }
+
+    async fn traced_ids_for_existing_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+        need: ai_memory_store::ProjectAccess,
+    ) -> Result<((WorkspaceId, ProjectId), ai_memory_store::ScopeSource), McpError> {
+        let (scope, source) = self
+            .scope_resolver_as(viewer)
+            .resolve_existing_args_traced(explicit_workspace, explicit_project, actor, need)
+            .await
+            .map_err(Self::scope_error)?;
+        if source.is_fallback() {
+            tracing::warn!(
+                resolved_by = %source,
+                has_session_id = actor.session_id.is_some(),
+                workspace_id = %scope.workspace_id,
+                project_id = %scope.project_id,
+                "unscoped MCP read resolved by fallback, not by the caller's hook session; \
+                 static MCP clients should pass workspace + project explicitly"
+            );
+        }
+        Ok((scope.as_tuple(), source))
     }
 
     /// Resolve the target for a WRITE, **creating** the workspace/project when
@@ -1656,6 +2061,7 @@ impl AiMemoryServer {
             explicit_workspace,
             explicit_project,
             &ai_memory_core::ActorKey::default(),
+            None,
         )
         .await
     }
@@ -1665,8 +2071,9 @@ impl AiMemoryServer {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_write_args(explicit_workspace, explicit_project, actor)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
@@ -1676,12 +2083,13 @@ impl AiMemoryServer {
     async fn resolve_query_scopes(
         &self,
         scopes: &[MemoryScopeArg],
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<Vec<(WorkspaceId, ProjectId)>, McpError> {
         let names: Vec<_> = scopes
             .iter()
             .map(|scope| ScopeName::new(&scope.workspace, &scope.project))
             .collect();
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_many_existing(&names, MAX_QUERY_SCOPES)
             .await
             .map(|scopes| {
@@ -1704,6 +2112,17 @@ impl AiMemoryServer {
         ws: ai_memory_core::WorkspaceId,
         proj: ai_memory_core::ProjectId,
     ) -> String {
+        let (ws_name, proj_name) = self.scope_names(ws, proj).await;
+        format!("{ws_name}/{proj_name}")
+    }
+
+    /// Workspace and project names for a resolved scope, with the same
+    /// placeholders as [`Self::scope_label`] when a lookup fails.
+    async fn scope_names(
+        &self,
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+    ) -> (String, String) {
         let ws_name = self.reader.workspace_name_by_id(ws).await.ok().flatten();
         let proj_name = self
             .reader
@@ -1711,18 +2130,58 @@ impl AiMemoryServer {
             .await
             .ok()
             .flatten();
-        format!(
-            "{}/{}",
-            ws_name.as_deref().unwrap_or("<unknown-workspace>"),
-            proj_name.as_deref().unwrap_or("<unknown-project>")
+        (
+            ws_name.unwrap_or_else(|| "<unknown-workspace>".to_owned()),
+            proj_name.unwrap_or_else(|| "<unknown-project>".to_owned()),
         )
+    }
+
+    /// Diagnostic fields for an EMPTY inbox read whose scope was *inferred*
+    /// (not named by the caller, not bound to the caller's hook session).
+    ///
+    /// An inferred scope can be the wrong inbox: two same-operator agents with
+    /// no session id share one active-project slot, so a no-scope
+    /// `memory_message_pop` / `memory_message_list` can resolve a *different*
+    /// project than the on-start notice / `memory_briefing` counted — the exact
+    /// dead-end where "you have mail" is followed by an empty fetch. Naming the
+    /// resolved scope and how it was inferred turns that silent empty into an
+    /// actionable "re-run with explicit workspace + project". Merged into the
+    /// response only when the read came back empty AND the scope was inferred.
+    async fn inferred_scope_hint(
+        &self,
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+        source: ai_memory_store::ScopeSource,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let (ws_name, proj_name) = self.scope_names(ws, proj).await;
+        let hint = format!(
+            "This inbox ({ws_name}/{proj_name}) was resolved by {source} scope, not \
+             named explicitly, so it may not be the inbox you meant. A SessionStart \
+             notice or memory_briefing count is for the project it named; if you \
+             expected mail here, re-run with explicit workspace and project.",
+            source = source.as_str(),
+        );
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "resolved_scope".to_owned(),
+            serde_json::json!({ "workspace": ws_name, "project": proj_name }),
+        );
+        fields.insert(
+            "scope_source".to_owned(),
+            serde_json::Value::String(source.as_str().to_owned()),
+        );
+        fields.insert("hint".to_owned(), serde_json::Value::String(hint));
+        fields
     }
 
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
         let Some(embedder) = &self.embedder else {
             return None;
         };
-        match embedder.embed(query).await {
+        // `embed_query`, not `embed`: an asymmetric embedder (configured
+        // query/document prefixes, or Google's RETRIEVAL_QUERY task type)
+        // must see this text on the query side, not the document side.
+        match embedder.embed_query(query).await {
             Ok(qv) => Some(qv),
             Err(e) => {
                 tracing::warn!(
@@ -1750,7 +2209,11 @@ impl AiMemoryServer {
         // eligible; with no query vector the vector stream never runs,
         // so the empty triple is inert rather than a fake identity.
         let (provider, model, dim) = match (&self.embedder, options.query_vec) {
-            (Some(e), Some(_)) => (e.provider().to_string(), e.model().to_string(), e.dim()),
+            // Not `.model()`: eligible stored vectors are keyed by the
+            // DOCUMENT identity they were embedded under, which a
+            // configured document prefix folds in. See
+            // `Embedder::model_identity`.
+            (Some(e), Some(_)) => (e.provider().to_string(), e.model_identity(), e.dim()),
             _ => (String::new(), String::new(), 0),
         };
         let fused: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = if options.explain {
@@ -1765,6 +2228,7 @@ impl AiMemoryServer {
                     dim,
                     options.limit,
                     expiry_cutoff,
+                    options.include_superseded,
                 )
                 .await?
                 .into_iter()
@@ -1782,6 +2246,7 @@ impl AiMemoryServer {
                     dim,
                     options.limit,
                     expiry_cutoff,
+                    options.include_superseded,
                 )
                 .await?
                 .into_iter()
@@ -1936,6 +2401,25 @@ impl AiMemoryServer {
         self
     }
 
+    /// Attach a bare LLM provider so `memory_query(answer=true)` can synthesize
+    /// a cited answer over the retrieved hits, without the full consolidation
+    /// pipeline that [`with_consolidator_arc`](Self::with_consolidator_arc)
+    /// wires.
+    ///
+    /// Production startup always populates `self.llm` through
+    /// `with_consolidator_arc` (a provider without a consolidator has no
+    /// production use), so this thin builder exists only for the query-answer
+    /// tests, which need a provider but not the rest of that machinery — hence
+    /// `#[cfg(test)]`. It is behavior-preserving: it only sets the same
+    /// `self.llm` field the production builder does, and `answer` defaults off
+    /// so an attached provider is never called unless the caller opts in.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.llm = Some(llm);
+        self
+    }
+
     /// Override the retention-sweep parameters (typically populated
     /// from the user's config.toml `[decay]` table).
     #[must_use]
@@ -1948,6 +2432,26 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_decay_breadth_weight(mut self, breadth_weight: f64) -> Self {
         self.decay_breadth_weight = breadth_weight;
+        self
+    }
+
+    /// Enable A2 extractive tier-down: the sweep compacts cold episodic pages
+    /// instead of evicting them. Off by default.
+    #[must_use]
+    pub fn with_compact_cold_episodic(mut self, compact: bool) -> Self {
+        self.compact_cold_episodic = compact;
+        self
+    }
+
+    /// Override the A5 zero-LLM contradiction-similarity band (typically
+    /// populated from `config.contradiction_band_min`/`_max`). Unset, it
+    /// defaults to the historical fixed band (see
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW`] /
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH`]).
+    #[must_use]
+    pub fn with_contradiction_band(mut self, min: f32, max: f32) -> Self {
+        self.contradiction_band_min = min;
+        self.contradiction_band_max = max;
         self
     }
 
@@ -2008,9 +2512,11 @@ impl AiMemoryServer {
         If compiled wiki search misses in default/project/`scopes` mode, \
         `raw_hits` contains bounded raw observation fallback matches; \
         `global=true` searches compiled wiki pages only and returns no raw \
-        fallback. Default-scoped calls also return \
+        fallback. Single-project calls (project implicit or named with \
+        `workspace`+`project`) also return \
         `global_scope_hits`: standing user/team preferences from the \
-        reserved `_global` scope that apply across projects. Set \
+        reserved `_global` scope that apply across projects; only an explicit \
+        multi-`scopes` set opts out. Set \
         `global=true` to search EVERY \
         project at once (cross-project) when you don't know which project \
         holds the knowledge — each hit then carries its workspace + \
@@ -2023,6 +2529,7 @@ impl AiMemoryServer {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
+        let include_superseded = args.include_superseded.unwrap_or(false);
         let explain = args.explain.unwrap_or(false);
         // A repo that opted into `[recall] default_global` (published on the
         // ActiveProject by the hook) makes a query with NO explicit scoping
@@ -2056,11 +2563,17 @@ impl AiMemoryServer {
                     args.query.clone(),
                     limit,
                     include_expired.then_some(i64::MIN),
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryQueryResponse {
                 hits: Vec::new(),
+                answer: None,
+                answer_unavailable: args.answer.unwrap_or(false).then(|| {
+                    "answer synthesis is not supported for global (cross-project) queries"
+                        .to_string()
+                }),
                 raw_hits: Vec::new(),
                 global_hits,
                 global_scope_hits: Vec::new(),
@@ -2103,6 +2616,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             let fused = self
@@ -2125,6 +2639,10 @@ impl AiMemoryServer {
                         score_details: details,
                     })
                     .collect(),
+                answer: None,
+                answer_unavailable: args.answer.unwrap_or(false).then(|| {
+                    "answer synthesis is not supported for as_of (time-travel) queries".to_string()
+                }),
                 raw_hits: Vec::new(),
                 global_hits: Vec::new(),
                 global_scope_hits: Vec::new(),
@@ -2138,7 +2656,10 @@ impl AiMemoryServer {
         let resolved_scopes = if args.scopes.is_empty() {
             None
         } else {
-            Some(self.resolve_query_scopes(&args.scopes).await?)
+            Some(
+                self.resolve_query_scopes(&args.scopes, Self::viewer_from_parts(Some(&parts)))
+                    .await?,
+            )
         };
         let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
@@ -2154,6 +2675,7 @@ impl AiMemoryServer {
                             limit: candidate_limit,
                             include_expired,
                             explain,
+                            include_superseded,
                         },
                     )
                     .await
@@ -2186,6 +2708,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             self.search_project(
@@ -2197,6 +2720,7 @@ impl AiMemoryServer {
                     limit: candidate_limit,
                     include_expired,
                     explain,
+                    include_superseded,
                 },
             )
             .await
@@ -2238,6 +2762,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             self.reader
@@ -2248,25 +2773,33 @@ impl AiMemoryServer {
         // Default-scoped queries (no workspace/project/scopes/global args)
         // also union the reserved `_global` preferences scope, so standing
         // user/team context travels into every project without the caller
-        // knowing a magic project name (issue #154). Explicit scoping means
-        // the caller asked for exactly those scopes — leave it alone. One
-        // extra scoped search when the scope exists; zero cost when it
-        // doesn't.
-        let default_scoped = args.scopes.is_empty()
-            && args
-                .workspace
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
-        let global_scope_hits = if default_scoped {
+        // knowing a magic project name (issue #154). This unions for any query
+        // that resolves to a single project — whether the project is left
+        // implicit (active-project pointer) or named explicitly with
+        // `workspace`+`project`. Naming the current project is exactly what the
+        // static-client routing doctrine tells callers to do, so gating the
+        // union on absent `workspace`/`project` silently denied global
+        // preferences to every static client (#930). Only an explicit,
+        // deliberately-narrowed multi-scope set (`scopes`) opts out — the
+        // caller asked for exactly those scopes. One extra scoped search when
+        // the reserved scope exists; zero cost when it doesn't.
+        let single_project_scoped = args.scopes.is_empty();
+        let global_scope_hits = if single_project_scoped {
             match ai_memory_store::lookup_global_scope(&self.reader).await {
                 Ok(Some(scope)) => {
-                    // If the current project IS the reserved scope (e.g. the
-                    // actor's active-project pointer lands there after a
-                    // global write), `hits` already covers it — don't search
-                    // it twice.
+                    // If the project this query resolves to IS the reserved
+                    // scope (e.g. the caller named it, or the actor's
+                    // active-project pointer lands there after a global write),
+                    // `hits` already covers it — don't search it twice. Resolve
+                    // through the query's own `workspace`/`project` so a named
+                    // project is compared, not the active-project default.
                     let current = self
-                        .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                        .effective_ids_for_read_args_with_actor(
+                            args.workspace.as_deref(),
+                            args.project.as_deref(),
+                            &aps_actor,
+                            Self::viewer_from_parts(Some(&parts)),
+                        )
                         .await?;
                     if current == scope.as_tuple() {
                         Vec::new()
@@ -2281,6 +2814,7 @@ impl AiMemoryServer {
                                     limit,
                                     include_expired,
                                     explain,
+                                    include_superseded,
                                 },
                             )
                             .await
@@ -2311,15 +2845,100 @@ impl AiMemoryServer {
             streams.push("graph");
             streams
         });
-        let hits = hits
+        let hits: Vec<QueryHit> = hits
             .into_iter()
             .map(|(hit, score_details)| QueryHit {
                 hit,
                 score_details: score_details.filter(|_| explain),
             })
             .collect();
+        // Pin before search: when the caller opts in AND this is a
+        // single-project search (no `scopes`; `global`/`as_of` returned
+        // earlier), prepend the project's bounded pinned latest pages ahead of
+        // the fused hits. Deduped by page id so a pinned page that also matched
+        // the query appears once, and the combined list is re-truncated to the
+        // requested limit so the total stays bounded. Default off → this branch
+        // never runs and the ordering is byte-identical.
+        let hits = if args.pin_first.unwrap_or(false) && resolved_scopes.is_none() {
+            let (ws, proj) = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
+                )
+                .await?;
+            let pins = self
+                .reader
+                .list_pinned_pages(ws, proj, limit.min(PIN_FIRST_MAX))
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if pins.is_empty() {
+                hits
+            } else {
+                let pin_ids: std::collections::HashSet<PageId> =
+                    pins.iter().map(|p| p.id).collect();
+                let mut combined: Vec<QueryHit> = pins.into_iter().map(QueryHit::from).collect();
+                combined.extend(hits.into_iter().filter(|h| !pin_ids.contains(&h.hit.id)));
+                combined.truncate(limit);
+                combined
+            }
+        } else {
+            hits
+        };
+        // Opt-in dialectic answer (off by default). Only when the caller set
+        // `answer=true` do we touch the LLM at all — this is the invariant-#13
+        // guard: with `answer` unset/false the provider (if any) is never
+        // accessed and the response is byte-identical to today. When requested
+        // but no provider is configured, we return the hits plus a short
+        // `answer_unavailable` note rather than erroring.
+        let (answer, answer_unavailable) = if args.answer.unwrap_or(false) {
+            match self.llm.as_ref() {
+                Some(llm) => {
+                    let request = build_answer_request(
+                        &args.query,
+                        &hits,
+                        &global_scope_hits,
+                        args.reasoning.unwrap_or_default(),
+                    );
+                    match ai_memory_llm::complete_structured::<AnswerSynthesis>(
+                        llm.as_ref(),
+                        request,
+                    )
+                    .await
+                    {
+                        Ok(synth) => (
+                            Some(QueryAnswer {
+                                text: synth.answer,
+                                citations: synth.citations,
+                            }),
+                            None,
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "memory_query answer synthesis failed; returning hits without an answer"
+                            );
+                            (None, Some(format!("answer synthesis failed: {e}")))
+                        }
+                    }
+                }
+                None => (
+                    None,
+                    Some(
+                        "no LLM provider configured on the server; returning hits without a \
+                         synthesized answer"
+                            .to_string(),
+                    ),
+                ),
+            }
+        } else {
+            (None, None)
+        };
         let response = MemoryQueryResponse {
             hits,
+            answer,
+            answer_unavailable,
             raw_hits,
             global_hits: Vec::new(),
             global_scope_hits,
@@ -2351,7 +2970,7 @@ impl AiMemoryServer {
         if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
             let global_hits = self
                 .reader
-                .recent_pages_global(limit)
+                .recent_pages_global(limit, Self::viewer_from_parts(Some(&parts)))
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryRecentResponse {
@@ -2364,6 +2983,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let hits = self
@@ -2406,10 +3026,11 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let kind = args.signal;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // The reason is free-text from the model; scrub it on the way in
@@ -2648,13 +3269,14 @@ impl AiMemoryServer {
         self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        let report = run_sweep_with_options(
+        let report = run_sweep_with_compaction(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -2663,6 +3285,7 @@ impl AiMemoryServer {
             &self.decay_params,
             self.decay_breadth_weight,
             self.observation_retention,
+            self.compact_cold_episodic,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -2688,10 +3311,11 @@ impl AiMemoryServer {
             ));
         };
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let report = run_lint(
@@ -2704,6 +3328,19 @@ impl AiMemoryServer {
                 dry_run: args.dry_run.unwrap_or(false),
                 use_llm: !args.no_llm.unwrap_or(false),
                 decay_lambda: self.decay_params.lambda,
+                // Drive the zero-LLM contradiction detector (A5) off the
+                // configured embedder's triple; `None` when no embedder is
+                // configured makes that pass a clean no-op.
+                embedding: self
+                    .embedder
+                    .as_ref()
+                    .map(|e| ai_memory_consolidate::EmbeddingCoord {
+                        provider: e.provider().to_string(),
+                        model: e.model_identity(),
+                        dim: e.dim(),
+                    }),
+                contradiction_band_min: self.contradiction_band_min,
+                contradiction_band_max: self.contradiction_band_max,
             },
         )
         .await
@@ -2716,7 +3353,9 @@ impl AiMemoryServer {
         (single-page) rewrites sessions/<id>.md from the observation \
         log. multi_page=true fans out into a batch of concept/decision/\
         gotcha pages plus the session page, all written in one atomic \
-        SQL transaction. Off by default; requires AI_MEMORY_LLM_PROVIDER \
+        SQL transaction. Omit `session_id` to consolidate the latest \
+        completed session in the resolved project; pass it to target a \
+        specific session. Off by default; requires AI_MEMORY_LLM_PROVIDER \
         plus that provider's credentials. AI_MEMORY_LLM_MODEL is optional \
         for providers with a built-in default. \
         The target project's `_prompts/consolidation.md` page supplies \
@@ -2743,9 +3382,75 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = SessionId::from_str(&args.session_id)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // A blank id (`""` or whitespace) means the same thing as an omitted
+        // one — the resolved project's latest completed session — exactly as
+        // `memory_read_session_observations` already reads it. Anything else
+        // that is not a UUID is caller input, so it fails as `invalid_params`,
+        // the code `memory_auto_improve` uses for the same argument.
+        let session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            Some(raw) => SessionId::from_str(raw)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
+            _ => {
+                let aps_actor = Self::actor_key_from_parts(Some(&parts));
+                let (ws, proj) = self
+                    .effective_ids_for_read_args_with_actor(
+                        None,
+                        None,
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
+                    .await?;
+                let latest = self
+                    .reader
+                    .latest_completed_session_for_project(ws, proj)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                match latest {
+                    Some(session_id) => session_id,
+                    None => {
+                        let scope = self.scope_label(ws, proj).await;
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "no completed session in {scope}; pass session_id to consolidate a specific session"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+        };
         let dry = args.dry_run.unwrap_or(false);
+        // A session id reaches a repository without naming it, so it never
+        // passes through scope resolution and the grant check that comes with
+        // it (#708). Authorize the repository the page would land in — the
+        // consolidator's own target, not a guess — before anything runs,
+        // dry runs included: a dry run reports the resolved path and the
+        // admission verdict, which is itself information about that
+        // repository. Writing a page needs `write`.
+        if let Some(viewer) = Self::viewer_from_parts(Some(&parts))
+            && let Some((workspace_id, project_id)) = consolidator
+                .session_target(session_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        {
+            ai_memory_store::authorize_scope_for(
+                &self.reader,
+                Some(&self.writer),
+                ai_memory_store::ResolvedScope {
+                    workspace_id,
+                    project_id,
+                },
+                Some(viewer),
+                ai_memory_store::ProjectAccess::Write,
+            )
+            .await
+            .map_err(Self::scope_error)?;
+        }
         // Carry the request's authenticated identity into the write so the
         // consolidated page is attributed to the real operator and any
         // admission webhook authorizes by that actor (rather than the previous
@@ -2762,13 +3467,38 @@ impl AiMemoryServer {
                 .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if !dry {
+                self.reconcile_consolidation_job(session_id).await;
+            }
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
             let outcome = consolidator
                 .consolidate_session(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if !dry {
+                self.reconcile_consolidation_job(session_id).await;
+            }
             ok_json(&outcome)
+        }
+    }
+
+    /// Reconcile the durable SessionEnd job row after a successful manual
+    /// `memory_consolidate` so the operator does not see a `failed` job for a
+    /// session that is now consolidated. The automatic worker owns the job's
+    /// lease, so the reconcile never touches a `running` row; a best-effort
+    /// failure here must not fail the consolidate that already wrote the page.
+    async fn reconcile_consolidation_job(&self, session_id: SessionId) {
+        if let Err(error) = self
+            .writer
+            .reconcile_session_consolidation_completed(session_id)
+            .await
+        {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "failed to reconcile session consolidation job after manual consolidate"
+            );
         }
     }
 
@@ -2795,10 +3525,11 @@ impl AiMemoryServer {
             .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
         let author_id = parts.extensions.get::<ai_memory_core::UserId>().copied();
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let Some(llm) = self.llm.as_ref() else {
@@ -2843,6 +3574,7 @@ impl AiMemoryServer {
             proposal_actor: defaults.proposal_actor.clone(),
             pending_path: defaults.pending_path.clone(),
             max_patchable_pages: defaults.max_patchable_pages,
+            patchable_page_prefixes: defaults.patchable_page_prefixes.clone(),
             max_patchable_body_chars: defaults.max_patchable_body_chars,
             max_edits_per_proposal: defaults.max_edits_per_proposal,
             max_edit_content_chars: defaults.max_edit_content_chars,
@@ -3081,6 +3813,8 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        path.ensure_portable()
+            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
@@ -3088,6 +3822,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?
             }
@@ -3220,7 +3955,15 @@ impl AiMemoryServer {
         this when the user asks to read, open, or show a specific page by \
         name or topic — not just snippets. Returns `{ path, title, body, \
         frontmatter }` (plus `served_from` when a missing markdown file is \
-        served from the DB fallback). Errors if the page is not found.")]
+        served from the DB fallback). \
+        \
+        Set `include_related: true` to also walk the link graph outward from \
+        this page and get a `related` array of the reachable pages, each with \
+        its `path`/`title`/`kind`/`workspace`/`project` plus the `depth` (hop \
+        distance) and `direction` (`link`/`backlink`) it was reached by; \
+        `related_depth` (default 1, hard-capped at 3) sets how far to walk. \
+        Default off → the response omits `related` entirely. Errors if the \
+        page is not found.")]
     async fn memory_read_page(
         &self,
         Parameters(args): Parameters<ReadPageArgs>,
@@ -3241,6 +3984,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Diagnose cross-project scope-bleed: a read with no explicit scope
@@ -3288,7 +4032,53 @@ impl AiMemoryServer {
         // Markdown on disk is the source of truth. Only a missing markdown file
         // uses the DB fallback; parse/permission/corruption errors must surface
         // so operators can fix the disk source of truth.
-        match wiki.read_page(ws, proj, &page_path) {
+        //
+        // Opt-in related-pages walk. Computed once against the resolved scope so
+        // both the disk and DB-fallback branches attach the same `related`
+        // block; default off → `attach_related` is a no-op and the response
+        // stays byte-identical to a plain single-page read.
+        let related = if args.include_related {
+            let depth = args.related_depth.unwrap_or(1);
+            Some(
+                self.reader
+                    .related_walk(ws, proj, page_path.to_string(), depth)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            )
+        } else {
+            None
+        };
+        let attach_related = |mut value: serde_json::Value| {
+            if let (Some(nodes), Some(map)) = (&related, value.as_object_mut()) {
+                map.insert(
+                    "related".into(),
+                    serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            value
+        };
+
+        // Access reinforcement (C1): a page opened directly by path/query, and
+        // any page the graph surfaces via the related walk, is *used* and should
+        // resist decay exactly as a `memory_query`/`memory_recent` hit does.
+        // Resolve the seed id and the walked ids up front; the fire-and-forget,
+        // per-(page,operator)-throttled, FTS-exempt `spawn_access_bump` is fired
+        // only on the success paths below, so an error read reinforces nothing.
+        let bump_actor = Self::bump_actor_from_parts(&parts);
+        let mut bump_ids: Vec<PageId> = Vec::new();
+        if let Some(seed_id) = self
+            .reader
+            .latest_page_id_by_ids(ws, proj, page_path.to_string())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        {
+            bump_ids.push(seed_id);
+        }
+        if let Some(nodes) = &related {
+            bump_ids.extend(nodes.iter().map(|n| n.id));
+        }
+
+        let result = match wiki.read_page(ws, proj, &page_path) {
             Ok(md) => {
                 // Derive the title so an empty/absent frontmatter `title`
                 // falls back to the body's H1 (then the path stem), instead
@@ -3296,12 +4086,12 @@ impl AiMemoryServer {
                 // frontmatter title was never filled otherwise read back
                 // titleless despite a proper `# Heading` (#599).
                 let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
-                ok_json(&serde_json::json!({
+                ok_json(&attach_related(serde_json::json!({
                     "path": page_path.to_string(),
                     "title": title,
                     "body": md.body,
                     "frontmatter": md.frontmatter,
-                }))
+                })))
             }
             Err(disk_err) if is_missing_wiki_file(&disk_err) => {
                 match self
@@ -3319,13 +4109,13 @@ impl AiMemoryServer {
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .or(Some(stored.title));
-                        ok_json(&serde_json::json!({
+                        ok_json(&attach_related(serde_json::json!({
                             "path": page_path.to_string(),
                             "title": title,
                             "body": stored.body,
                             "frontmatter": frontmatter,
                             "served_from": "db-fallback",
-                        }))
+                        })))
                     }
                     None => {
                         // Not on disk and not in the DB under the resolved
@@ -3352,7 +4142,11 @@ impl AiMemoryServer {
                 }
             }
             Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
+        };
+        if result.is_ok() {
+            self.spawn_access_bump(bump_ids, bump_actor.as_ref());
         }
+        result
     }
 
     /// Read one session's raw lifecycle observations, in scope, paged and
@@ -3384,6 +4178,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let owner_filter =
@@ -3547,10 +4342,11 @@ impl AiMemoryServer {
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
 
@@ -3629,6 +4425,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let open_questions = cap_handoff_list(
@@ -3728,6 +4525,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -3767,17 +4565,16 @@ impl AiMemoryServer {
         '📥 ai-memory: pending handoff from previous session' anywhere \
         in your context, that IS the handoff. \
         \
-        A subsequent call to this tool will return `{ \"handoff\": null }` \
-        because the hook already consumed it. Do NOT interpret null as \
-        'no handoff exists' — check your context for the prepended block \
-        first, and answer the user from there. Call this tool only when \
-        you BOTH don't see a prepended block AND the user explicitly asks \
-        for a handoff (e.g. a hook script ran with no stdout capture). \
-        Prefer memory_handoff_list first in that case, then pass the listed \
-        `handoff_id` here to claim that exact row. Omitting `handoff_id` \
-        claims the latest eligible open handoff. \
-        \
-        Returns the handoff body only when THIS call wins the claim.")]
+        `status`: `claimed` (THIS call won it; see `handoff`), \
+        `consumed_by_hook` (your SessionStart took it; answer from that \
+        block), `none_pending` (nothing to claim, or a hook took it for a \
+        client that does not forward its session id: do NOT answer 'no \
+        handoff exists' before checking your context). Call this tool \
+        only when you BOTH don't see a prepended block AND the user \
+        explicitly asks for a handoff (e.g. a hook script ran with no \
+        stdout capture). Prefer memory_handoff_list first in that case, \
+        then pass the listed `handoff_id` here to claim that exact row. \
+        Omitting `handoff_id` claims the latest eligible open handoff.")]
     async fn memory_handoff_accept(
         &self,
         Parameters(args): Parameters<HandoffAcceptArgs>,
@@ -3785,10 +4582,11 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -3812,10 +4610,13 @@ impl AiMemoryServer {
             .handoff_id
             .as_deref()
             .map(str::trim)
-            .filter(|id| !id.is_empty());
-        let handoff = if let Some(id) = requested_id {
-            let handoff_id = HandoffId::from_str(id)
-                .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                HandoffId::from_str(id)
+                    .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))
+            })
+            .transpose()?;
+        let handoff = if let Some(handoff_id) = requested_id {
             self.reader
                 .handoff_by_id_in_scope(ws, proj, handoff_id, owner_filter.clone())
                 .await
@@ -3828,7 +4629,10 @@ impl AiMemoryServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
         match handoff {
-            None => ok_json(&serde_json::json!({ "handoff": null })),
+            None => {
+                self.unclaimed_handoff(ws, proj, &aps_actor, requested_id, owner_filter)
+                    .await
+            }
             Some(h) => {
                 // Admission is asked here, not before the lookup: the routine
                 // outcome of this tool is `{"handoff": null}` — the tool's own
@@ -3858,19 +4662,64 @@ impl AiMemoryServer {
                         accepting_agent: AgentKind::Other,
                         accepting_session: None,
                         accepting_user: actor_user.clone(),
-                        owner_filter,
+                        owner_filter: owner_filter.clone(),
                         receiving_cwd,
                     })
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 if claimed {
                     self.notify_operation_observers(admission.as_ref());
-                    ok_json(&serde_json::json!({ "handoff": h }))
+                    ok_json(&serde_json::json!({
+                        "handoff": h,
+                        "status": HandoffAcceptStatus::Claimed,
+                    }))
                 } else {
-                    ok_json(&serde_json::json!({ "handoff": null }))
+                    // The racing claimant may be this session's own SessionStart.
+                    self.unclaimed_handoff(ws, proj, &aps_actor, requested_id, owner_filter)
+                        .await
                 }
             }
         }
+    }
+
+    /// `memory_handoff_accept`'s answer when this call claimed nothing.
+    ///
+    /// `consumed_by_hook` needs proof that the caller's own session took the
+    /// baton at SessionStart: the session id the hook claimed under, which only
+    /// a session-aware client forwards. Without it the answer is `none_pending`
+    /// rather than a guess from some other session's claim, since pointing an
+    /// agent at a block that is not in its context is the failure the status
+    /// exists to remove. A requested `handoff_id` counts only when it is the
+    /// row the session took.
+    async fn unclaimed_handoff(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        actor: &ai_memory_core::ActorKey,
+        requested: Option<HandoffId>,
+        owner_filter: ai_memory_core::OwnerFilter,
+    ) -> Result<CallToolResult, McpError> {
+        let claimed_at_start = match actor.session_id.as_deref() {
+            Some(native) => self
+                .reader
+                .handoff_claimed_by_live_session(
+                    workspace_id,
+                    project_id,
+                    SessionId::from_native(native),
+                    owner_filter,
+                )
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            None => None,
+        };
+        let status = match (claimed_at_start, requested) {
+            (Some(claimed), Some(requested)) if claimed != requested => {
+                HandoffAcceptStatus::NonePending
+            }
+            (Some(_), _) => HandoffAcceptStatus::ConsumedByHook,
+            (None, _) => HandoffAcceptStatus::NonePending,
+        };
+        ok_json(&serde_json::json!({ "handoff": null, "status": status }))
     }
 
     /// Cancel a mistaken open handoff by exact id.
@@ -3892,10 +4741,11 @@ impl AiMemoryServer {
         let handoff_id = HandoffId::from_str(&args.handoff_id)
             .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Resolve the cross-owner escape hatch before reading the object. A
@@ -3977,16 +4827,21 @@ impl AiMemoryServer {
                 args.from_workspace.as_deref(),
                 args.from_project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        // Recipient MUST already exist: resolve through the no-create read path
-        // so a typo fails closed with a scope error naming the target, instead
-        // of dropping a message into a phantom inbox nobody reads.
+        // Recipient MUST already exist: resolved without creating it, so a typo
+        // fails closed with a scope error naming the target instead of dropping
+        // a message into a phantom inbox nobody reads. And it needs `write`:
+        // delivering into a project's inbox puts text into its agents' context,
+        // which is a write to that project — otherwise the mailbox would be a
+        // way around a restricted project's grants (#708).
         let (to_ws, to_proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 Some(args.to_workspace.as_str()),
                 Some(args.to_project.as_str()),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Messages bypass `Wiki::write_page`, so scrub the agent-supplied text
@@ -4047,11 +4902,12 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+        let ((ws, proj), scope_source) = self
+            .traced_ids_for_read_args(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let mailbox = match args.r#box.as_deref().map(str::trim) {
@@ -4075,7 +4931,19 @@ impl AiMemoryServer {
             .list_messages(ws, proj, mailbox, limit)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&serde_json::json!({ "messages": messages }))
+        let mut obj = serde_json::Map::new();
+        // An empty inbox listing under an inferred scope is the same ambiguity
+        // as an empty pop: the caller may be looking at the wrong project.
+        // Only the inbox side can be mis-resolved this way (the outbox is the
+        // caller's own sent mail).
+        if messages.is_empty()
+            && matches!(mailbox, ai_memory_core::MessageBox::Inbox)
+            && scope_source.is_inferred()
+        {
+            obj.extend(self.inferred_scope_hint(ws, proj, scope_source).await);
+        }
+        obj.insert("messages".to_owned(), serde_json::json!(messages));
+        ok_json(&serde_json::Value::Object(obj))
     }
 
     /// Pop (claim exactly once) the next inbox message.
@@ -4098,11 +4966,12 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+        let ((ws, proj), scope_source) = self
+            .traced_ids_for_mutation_args(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let specific_id =
@@ -4133,7 +5002,20 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match popped {
-            None => ok_json(&serde_json::json!({ "message": null })),
+            None => {
+                // A no-scope pop that resolves the shared active-project slot
+                // can land on a different (empty) inbox than the on-start
+                // notice counted — a silent dead-end. When the scope was
+                // inferred, say which inbox was checked and how, so the caller
+                // can re-pop with explicit workspace + project (#847-adjacent
+                // messaging scope divergence).
+                let mut obj = serde_json::Map::new();
+                obj.insert("message".to_owned(), serde_json::Value::Null);
+                if scope_source.is_inferred() {
+                    obj.extend(self.inferred_scope_hint(ws, proj, scope_source).await);
+                }
+                ok_json(&serde_json::Value::Object(obj))
+            }
             Some(message) => {
                 self.notify_operation_observers(admission.as_ref());
                 // Fence the body as untrusted cross-project input, and surface
@@ -4161,10 +5043,11 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let specific_id =
@@ -4192,18 +5075,22 @@ impl AiMemoryServer {
     #[tool(description = "Report aggregate memory counts and runtime status \
         (pages latest, pages all versions, sessions, observations). \
         Use this at session start to see how much context the agent has \
-        accumulated for this workspace.")]
+        accumulated for this workspace. `scope` names the workspace and \
+        project the counts belong to and `resolved_by` how it was chosen; \
+        `default_after_mismatch` or `startup_seed` means the call was not \
+        matched to this session, so pass `workspace` + `project`.")]
     async fn memory_status(
         &self,
         Parameters(args): Parameters<StatusArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+        let ((ws, proj), source) = self
+            .traced_ids_for_read_args(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let counts = self
@@ -4211,7 +5098,15 @@ impl AiMemoryServer {
             .status_counts_for_project(ws, proj)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let response = StatusResponse { counts };
+        let (workspace, project) = self.scope_names(ws, proj).await;
+        let response = StatusResponse {
+            counts,
+            scope: AnsweredScope {
+                workspace,
+                project,
+                resolved_by: source.as_str(),
+            },
+        };
         ok_json(&response)
     }
 
@@ -4240,6 +5135,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
@@ -4285,6 +5181,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
@@ -4302,6 +5199,31 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // Access reinforcement (C1): `memory_explore` surfaces a bounded set of
+        // pages (rules, slots, recent, pinned, settled) — those pages are used
+        // and should resist decay like a `memory_query`/`memory_recent` hit.
+        // The snapshot carries paths, not ids; resolve them in one batched read
+        // (no per-page N+1, invariant #2), then fire the sanctioned throttled,
+        // FTS-exempt, fire-and-forget bump. Same set whether or not an LLM digest
+        // runs — the pages were read either way.
+        let surfaced_paths: Vec<String> = snapshot
+            .rules
+            .iter()
+            .chain(snapshot.slots.iter())
+            .chain(snapshot.recent_pages.iter())
+            .chain(snapshot.pinned.iter())
+            .map(|p| p.path.clone())
+            .chain(snapshot.settled.iter().map(|p| p.path.clone()))
+            .collect();
+        if !surfaced_paths.is_empty() {
+            let ids = self
+                .reader
+                .latest_page_ids_by_paths(ws, proj, surfaced_paths)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            self.spawn_access_bump(ids, Self::bump_actor_from_parts(&parts).as_ref());
+        }
+
         let Some(llm) = &self.consolidator else {
             // No LLM configured — return the structured snapshot.
             // Caller can render prose itself if it wants.
@@ -4313,7 +5235,12 @@ impl AiMemoryServer {
         };
 
         let gap = explore_gap_from_snapshot(&snapshot);
-        let request = build_explore_request(&snapshot, &gap, args.focus.as_deref());
+        let request = build_explore_request(
+            &snapshot,
+            &gap,
+            args.focus.as_deref(),
+            args.reasoning.unwrap_or_default(),
+        );
         let provider = llm.llm();
         let text = match provider.complete(request).await {
             Ok(resp) => resp.text,
@@ -4344,7 +5271,7 @@ impl AiMemoryServer {
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
         `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, \
-        `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. \
+        `.hermes/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. \
         Use when the user asks to install or refresh ai-memory routing in this project. \
         Pass `compact: true` to return the compact routing block that delegates \
         to installed Agent Skills, or when refreshing a file that already uses the compact snippet. \
@@ -4405,7 +5332,8 @@ impl AiMemoryServer {
                     "claude_code": ".claude/skills",
                     "agents": ".agents/skills",
                     "devin": ".devin/skills",
-                    "grok": ".grok/skills"
+                    "grok": ".grok/skills",
+                    "hermes": ".hermes/skills"
                 },
                 "global": {
                     "claude_code": "~/.claude/skills",
@@ -4414,7 +5342,8 @@ impl AiMemoryServer {
                         "windows": "%APPDATA%\\devin\\skills",
                         "non_windows": "~/.devin/skills"
                     },
-                    "grok": "$GROK_HOME/skills (default: ~/.grok/skills)"
+                    "grok": "$GROK_HOME/skills (default: ~/.grok/skills)",
+                    "hermes": "~/.hermes/skills"
                 }
             },
             "overwrite_guidance": {
@@ -4470,8 +5399,10 @@ impl ServerHandler for AiMemoryServer {
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
-        context: rmcp::service::RequestContext<RoleServer>,
+        mut context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
+        // rmcp moves params._meta into RequestContext before dispatch.
+        attach_native_session(&mut context.extensions, &context.meta);
         self.record_client_activity(&request.name, &context);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -4776,9 +5707,11 @@ impl AiMemoryServer {
                     .and_then(sanitize_client_name)
             })
             .unwrap_or_else(|| "unknown".to_string());
-        let day = jiff::Timestamp::now()
-            .as_microsecond()
-            .div_euclid(US_PER_DAY);
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        // B3: record that a client is active NOW so the dream scheduler can tell
+        // idle from busy and cancel a running pass the moment work resumes.
+        self.activity_clock.mark(now_us);
+        let day = now_us.div_euclid(US_PER_DAY);
         let is_write = tool_call_is_write(tool);
         let schedule_flush = {
             let mut buffer = self
@@ -4940,6 +5873,7 @@ fn build_explore_request(
     snapshot: &ai_memory_store::BriefingSnapshot,
     gap: &ExploreGap,
     focus: Option<&str>,
+    reasoning: ReasoningTier,
 ) -> ai_memory_llm::ChatRequest {
     let snapshot_json = serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".into());
     let mut user = String::new();
@@ -4965,7 +5899,8 @@ fn build_explore_request(
         // memory_explore returns prose, not JSON, so a truncated
         // response is degraded but not unparseable. Still generous
         // so the long `dormant`/`stale` digests don't get cut off.
-        max_tokens: 16_000,
+        // Base budget scaled by the reasoning tier; `Minimal` keeps 16_000.
+        max_tokens: reasoning.scale_max_tokens(16_000),
         temperature: Some(0.2),
     }
 }
@@ -4973,6 +5908,63 @@ fn build_explore_request(
 /// System prompt for `memory_explore`. Loaded at compile time from
 /// `prompts/explore_system.md`.
 const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md");
+
+/// System prompt for the opt-in `memory_query(answer=true)` synthesis. Keeps
+/// the model strictly grounded in the supplied snippets and forces the cited
+/// paths to come from the provided context (invariant against fabricated
+/// citations).
+const ANSWER_SYSTEM_PROMPT: &str = "You answer a user's question using ONLY the \
+    numbered memory-page snippets provided. Do not use any outside knowledge. \
+    Write a concise, direct answer grounded strictly in those snippets. In \
+    `citations`, list the exact `path` values (as given) of the pages you drew \
+    from — never invent a path, and cite only pages you actually used. If the \
+    snippets do not contain enough information to answer, say so plainly in \
+    `answer` and return an empty `citations` list.";
+
+/// Build the structured-output request for `memory_query(answer=true)`. Inlines
+/// the retrieved hit snippets (project hits first, then any `_global` scope
+/// hits) as numbered, path-labelled context so the model can ground its answer
+/// and cite exact paths. Snippets are stripped of the FTS `<mark>` HTML so the
+/// model sees clean text.
+fn build_answer_request(
+    query: &str,
+    hits: &[QueryHit],
+    global_scope_hits: &[QueryHit],
+    reasoning: ReasoningTier,
+) -> ai_memory_llm::ChatRequest {
+    fn clean(snippet: &str) -> String {
+        snippet.replace("<mark>", "").replace("</mark>", "")
+    }
+    let mut user = String::new();
+    user.push_str("## Question\n\n");
+    user.push_str(query);
+    user.push_str("\n\n## Memory page snippets\n\n");
+    let mut n = 0usize;
+    for hit in hits.iter().chain(global_scope_hits.iter()) {
+        n += 1;
+        user.push_str(&format!(
+            "{}. path: `{}`\n   title: {}\n   snippet: {}\n\n",
+            n,
+            hit.hit.path.as_str(),
+            hit.hit.title,
+            clean(&hit.hit.snippet),
+        ));
+    }
+    if n == 0 {
+        user.push_str("(no snippets matched the query)\n\n");
+    }
+    ai_memory_llm::ChatRequest {
+        system: Some(ANSWER_SYSTEM_PROMPT.into()),
+        messages: vec![ai_memory_llm::ChatMessage {
+            role: ai_memory_llm::Role::User,
+            content: user,
+        }],
+        // Base budget scaled by the reasoning tier; `Minimal` keeps 2_000
+        // (byte-identical to the pre-tier answer path).
+        max_tokens: reasoning.scale_max_tokens(2_000),
+        temperature: Some(0.1),
+    }
+}
 
 /// Synthetic anonymous request `Parts` for callers arriving without request
 /// parts (for example stdio): no actor headers, so downstream resolves an
@@ -4984,6 +5976,29 @@ fn default_parts() -> axum::http::request::Parts {
     *request.method_mut() = axum::http::Method::POST;
     *request.uri_mut() = axum::http::Uri::from_static("/mcp");
     request.into_parts().0
+}
+
+/// Routing-only native identity; never populate authenticated actor extensions
+/// from client metadata. Keep it request-local even on shared MCP transports.
+#[derive(Clone)]
+struct NativeSessionId(String);
+
+fn attach_native_session(extensions: &mut rmcp::model::Extensions, meta: &rmcp::model::Meta) {
+    // OpenCode 2 (2.0.4+) sends this on every tools/call, never on
+    // initialize. Its transport session is shared per (server, directory).
+    let Some(session_id) = meta
+        .get("ai.opencode/sessionID")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let OptionalParts(mut parts) = OptionalParts::from_extensions(extensions);
+    parts
+        .extensions
+        .insert(NativeSessionId(session_id.to_owned()));
+    extensions.insert(parts);
 }
 
 /// Tool-handler extractor for the request `Parts`. Unlike rmcp's
@@ -5152,6 +6167,71 @@ mod tests {
         (tmp, store, server, ws, proj)
     }
 
+    /// A test-only embedder whose three `Embedder` methods each return a
+    /// different, identifiable vector — mirroring `ai-memory-llm`'s own
+    /// `health::tests::TaskAwareEmbedder` fixture (same idea, duplicated
+    /// here because that one is private to its crate). `embed` deliberately
+    /// returns the SAME vector as `embed_document`: that is what the
+    /// pre-fix bug actually called (`AiMemoryServer::embed_query` invoked
+    /// the generic `Embedder::embed` instead of `Embedder::embed_query`),
+    /// so a regression back to that bug is what this fixture would surface.
+    struct TaskAwareEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for TaskAwareEmbedder {
+        fn provider(&self) -> &'static str {
+            "task-aware-test"
+        }
+
+        fn model(&self) -> &str {
+            "task-aware-test-model"
+        }
+
+        fn dim(&self) -> u32 {
+            2
+        }
+
+        async fn embed(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_document(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_query(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            Ok(vec![0.0, 1.0])
+        }
+    }
+
+    /// Regression test for the bug fixed alongside the embedding
+    /// query/document prefix feature: `AiMemoryServer::embed_query` (the
+    /// helper `memory_query` calls to vectorize the search query) called
+    /// `Embedder::embed` instead of `Embedder::embed_query`. For any
+    /// query/document-asymmetric embedder — Google's task-typed
+    /// `embedContent`, or the new `openai`/`openai-compat` query/document
+    /// prefixes — that silently embedded the search query as if it were a
+    /// document, corrupting vector-stream retrieval. `TaskAwareEmbedder`
+    /// makes the two paths return distinguishable vectors so the right one
+    /// being called is a direct, exact-equality assertion rather than an
+    /// inference from downstream ranking.
+    #[tokio::test]
+    async fn memory_query_embeds_the_query_with_embed_query_not_embed() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let server = server.with_embedder(Arc::new(TaskAwareEmbedder));
+
+        let query_vec = server.embed_query("anything").await;
+
+        assert_eq!(
+            query_vec.as_deref(),
+            Some([0.0_f32, 1.0].as_slice()),
+            "memory_query's embed_query helper must call Embedder::embed_query \
+             (query-side vector [0.0, 1.0]), not the generic Embedder::embed \
+             (which this fixture deliberately aliases to the document-side \
+             vector [1.0, 0.0] to make a regression to the old bug fail loudly)"
+        );
+    }
+
     fn installed_ai_memory_prompt_surface() -> String {
         let mut prompt = String::from(ai_memory_core::SNIPPET_BODY);
         for skill in ai_memory_core::routing_skills::MANAGED_SKILLS {
@@ -5272,6 +6352,8 @@ mod tests {
                         title: format!("Page {idx}"),
                         snippet: format!("candidate {idx}"),
                         rank: idx as f64,
+                        superseded: false,
+                        pinned: false,
                     },
                     Some(ai_memory_store::SearchExplain::default()),
                 )
@@ -5468,8 +6550,12 @@ mod tests {
                         ],
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
+                        pin_first: None,
                         explain: Some(true),
                         as_of: None,
+                        answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -5499,8 +6585,12 @@ mod tests {
                         scopes: Vec::new(),
                         global: Some(true),
                         include_expired: None,
+                        include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -5523,6 +6613,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id,
@@ -5536,6 +6627,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,
@@ -5615,6 +6707,86 @@ mod tests {
 
         assert_eq!(actor.user, None);
         assert_eq!(actor.session_id.as_deref(), Some("hook-session"));
+    }
+
+    #[test]
+    fn native_session_metadata_is_routing_only_and_preserves_precedence() {
+        let native = serde_json::json!({"ai.opencode/sessionID": "  native-session  "});
+        let other_native = serde_json::json!({"ai.opencode/sessionID": "other-native"});
+        // `sessionID` is not an OpenCode key, so the transport id wins.
+        let alias = serde_json::json!({"sessionID": "alias-session"});
+        let none = serde_json::json!({});
+        for (context_session, header_session, meta, expected) in [
+            (None, None, &native, "native-session"),
+            // Same shared transport, another native session: another slot.
+            (None, None, &other_native, "other-native"),
+            (None, None, &alias, "transport-session"),
+            (None, None, &none, "transport-session"),
+            (None, Some("header-session"), &native, "header-session"),
+            (
+                Some("context-session"),
+                Some("header-session"),
+                &native,
+                "context-session",
+            ),
+        ] {
+            let mut parts = test_parts_default();
+            parts
+                .headers
+                .insert("mcp-session-id", "transport-session".parse().unwrap());
+            if let Some(session) = header_session {
+                parts
+                    .headers
+                    .insert("x-memory-actor-session-id", session.parse().unwrap());
+            }
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(ActorContext {
+                user: Some("alice".into()),
+                session_id: context_session.map(str::to_owned),
+                ..ActorContext::default()
+            });
+            let mut extensions = rmcp::model::Extensions::new();
+            extensions.insert(parts);
+            let mut meta = meta.clone();
+            meta["user"] = "root".into();
+            meta["auth"] = "root".into();
+            let meta = serde_json::from_value(meta).unwrap();
+            attach_native_session(&mut extensions, &meta);
+            let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+            let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+            assert_eq!(actor.user.as_deref(), Some("user:alice"));
+            assert_eq!(actor.session_id.as_deref(), Some(expected));
+            assert_eq!(parts.extensions.get::<AuthLevel>(), Some(&AuthLevel::User));
+        }
+    }
+
+    #[test]
+    fn native_session_metadata_validates_strings_without_granting_identity() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(true),
+            serde_json::json!(" \t "),
+            serde_json::json!(" ses_native "),
+        ] {
+            let mut extensions = rmcp::model::Extensions::new();
+            let meta = serde_json::from_value(
+                serde_json::json!({"ai.opencode/sessionID": value, "user": "root"}),
+            )
+            .unwrap();
+            attach_native_session(&mut extensions, &meta);
+            let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+            let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+            assert_eq!(actor.user, None);
+            assert_eq!(
+                actor.session_id.as_deref(),
+                value.as_str().map(str::trim).filter(|id| !id.is_empty())
+            );
+            assert!(parts.extensions.get::<ActorContext>().is_none());
+            assert!(parts.extensions.get::<AuthLevel>().is_none());
+        }
     }
 
     #[test]
@@ -5829,6 +7001,140 @@ mod tests {
             result.is_err(),
             "sending to a non-existent recipient project must fail closed, not create it"
         );
+    }
+
+    /// The design's open question 3 (#708): delivering into a restricted
+    /// project's inbox needs `write` on it, or the mailbox is a way around its
+    /// grants. Popping an inbox and cancelling an outbox change a queue, so
+    /// they need `write` on it too; a `read` grant is refused all three.
+    #[tokio::test]
+    async fn a_restricted_projects_queues_need_write() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        let team = store
+            .writer
+            .get_or_create_project(ws, "team", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(team, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let reader = human("ray").await;
+        let member = human("mia").await;
+        grant_role(store.db_path(), reader, team, "read");
+        grant_role(store.db_path(), member, team, "write");
+        let as_user = |user: ai_memory_core::UserId| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(user));
+            OptionalParts(parts)
+        };
+        let send = |user, from: &'static str, to: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_send(
+                        Parameters(MessageSendArgs {
+                            to_workspace: "default".into(),
+                            to_project: to.into(),
+                            body: "please look at this".into(),
+                            subject: None,
+                            from_project: Some(from.into()),
+                            from_workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let pop = |user| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_pop(
+                        Parameters(MessagePopArgs {
+                            message_id: None,
+                            project: Some("team".into()),
+                            workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let cancel = |user| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_cancel(
+                        Parameters(MessageCancelArgs {
+                            message_id: None,
+                            project: Some("team".into()),
+                            workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let refused_for_write = |result: Result<CallToolResult, McpError>| {
+            let err = result.expect_err("a read grant must be refused");
+            assert!(format!("{err:?}").contains("needs write"), "{err:?}");
+        };
+
+        // Into the restricted inbox: `read` is not enough, `write` is.
+        refused_for_write(send(reader, "scratch", "team").await);
+        send(member, "scratch", "team")
+            .await
+            .expect("write delivers");
+        // Out of it: popping consumes the team's mail.
+        refused_for_write(pop(reader).await);
+        let json = |result: CallToolResult| -> serde_json::Value {
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        let popped = json(pop(member).await.expect("write pops"));
+        assert!(
+            popped["message"]
+                .to_string()
+                .contains("please look at this"),
+            "{popped}"
+        );
+        // The team's outbox: sending FROM it reads the sender side only, but
+        // clearing it is a change to the team's queue.
+        send(member, "team", "scratch")
+            .await
+            .expect("send from team");
+        refused_for_write(cancel(reader).await);
+        let cancelled = json(cancel(member).await.expect("write cancels"));
+        assert_eq!(cancelled["cancelled"], 1, "{cancelled}");
     }
 
     async fn server_project_json(store: &Store, ws: WorkspaceId, name: &str) -> serde_json::Value {
@@ -6368,6 +7674,18 @@ mod tests {
                 .as_str()
                 .unwrap(),
             ".grok/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["project"]["hermes"]
+                .as_str()
+                .unwrap(),
+            ".hermes/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["hermes"]
+                .as_str()
+                .unwrap(),
+            "~/.hermes/skills"
         );
         assert_eq!(
             response["target_hints"]["global"]["claude_code"]
@@ -6946,7 +8264,7 @@ mod tests {
         // Baseline: nothing published, no arg → baked-in default.
         assert_eq!(
             server
-                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default(), None)
                 .await
                 .unwrap(),
             (ws, baked)
@@ -6967,7 +8285,7 @@ mod tests {
         server.active_project.set(ws, other);
         assert_eq!(
             server
-                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default(), None)
                 .await
                 .unwrap(),
             (ws, other)
@@ -6976,7 +8294,11 @@ mod tests {
         // An explicit (existing) project arg wins over the active pointer.
         assert_eq!(
             server
-                .effective_ids_with_actor(Some("scratch"), &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(
+                    Some("scratch"),
+                    &ai_memory_core::ActorKey::default(),
+                    None
+                )
                 .await
                 .unwrap(),
             (ws, baked),
@@ -6986,7 +8308,11 @@ mod tests {
         // An explicit but unknown project name fails closed instead of
         // silently falling through to the active pointer.
         let err = server
-            .effective_ids_with_actor(Some("does-not-exist"), &ai_memory_core::ActorKey::default())
+            .effective_ids_with_actor(
+                Some("does-not-exist"),
+                &ai_memory_core::ActorKey::default(),
+                None,
+            )
             .await
             .expect_err("unknown explicit project must not fall back");
         assert!(
@@ -7153,7 +8479,11 @@ mod tests {
         );
         assert_eq!(
             server
-                .effective_ids_with_actor(Some("sibling"), &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(
+                    Some("sibling"),
+                    &ai_memory_core::ActorKey::default(),
+                    None
+                )
                 .await
                 .unwrap(),
             (active_ws, sibling_proj),
@@ -7226,8 +8556,12 @@ mod tests {
             workspace: Some("default".into()),
             global,
             include_expired: None,
+            include_superseded: None,
+            pin_first: None,
             explain: Some(true),
             as_of,
+            answer: None,
+            reasoning: None,
         };
 
         // Historical instant → the superseded version answers.
@@ -7264,8 +8598,12 @@ mod tests {
                     workspace: Some("default".into()),
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: Some(jiff::Timestamp::now().to_string()),
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7333,8 +8671,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7358,8 +8700,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7451,8 +8797,12 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
+                        pin_first: None,
                         explain: Some(true),
                         as_of: None,
+                        answer: None,
+                        reasoning: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -7505,7 +8855,7 @@ mod tests {
     // Issue #154: default-scoped queries union the reserved `_global`
     // preferences scope; explicitly scoped queries do not.
     #[tokio::test]
-    async fn default_query_unions_global_scope_and_explicit_scope_skips_it() {
+    async fn single_project_query_unions_global_scope_and_multi_scope_skips_it() {
         let (_tmp, store, server, _ws, _proj) = setup_server().await;
         let global = ai_memory_store::create_global_scope(&store.writer)
             .await
@@ -7538,8 +8888,12 @@ mod tests {
             workspace: workspace.map(str::to_string),
             global: None,
             include_expired: None,
+            include_superseded: None,
+            pin_first: None,
             explain: None,
             as_of: None,
+            answer: None,
+            reasoning: None,
         };
 
         let result = server
@@ -7585,6 +8939,9 @@ mod tests {
             "the default query's reserved global-scope union must keep its explanation"
         );
 
+        // A query that names its single project explicitly with
+        // `workspace`+`project` — exactly what the static-client routing
+        // doctrine requires — still unions the reserved global scope (#930).
         let result = server
             .memory_query(
                 Parameters(query(Some("default"), Some("scratch"))),
@@ -7594,8 +8951,120 @@ mod tests {
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
         assert!(
+            text.text.contains("global_scope_hits") && text.text.contains("preferences/style.md"),
+            "a query naming its single project must still union the global scope (#930): {}",
+            text.text
+        );
+
+        // A deliberately-narrowed multi-scope set (`scopes`) is the one form
+        // that opts out: the caller asked for exactly those scopes.
+        let mut scoped = query(None, None);
+        scoped.scopes = vec![MemoryScopeArg {
+            workspace: "default".into(),
+            project: "scratch".into(),
+        }];
+        let result = server
+            .memory_query(Parameters(scoped), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
             !text.text.contains("preferences/style.md"),
-            "explicitly scoped queries must not union the global scope: {}",
+            "an explicit multi-scope query must not union the global scope: {}",
+            text.text
+        );
+    }
+
+    // Adversarial (invariant #16): the reserved-scope union must surface ONLY
+    // the `_global` scope's pages — never a different real project's pages.
+    // Broadening the union to single-project queries (#930) must not become a
+    // cross-project read. This fails if the union is ever mis-keyed to a real
+    // project instead of the reserved global scope.
+    #[tokio::test]
+    async fn global_union_never_leaks_a_foreign_projects_pages() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: global.workspace_id,
+                project_id: global.project_id,
+                path: PagePath::new("preferences/sharedterm.md").unwrap(),
+                title: "Reserved".into(),
+                body: "sharedterm reserved global preference".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        // A different real project in the same workspace, NOT the queried one
+        // and NOT the reserved scope.
+        let foreign = store
+            .writer
+            .get_or_create_project(ws, "foreign", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: foreign,
+                path: PagePath::new("leak.md").unwrap(),
+                title: "Foreign".into(),
+                body: "sharedterm foreign project must not leak".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "sharedterm".into(),
+                    limit: Some(10),
+                    project: Some("scratch".into()),
+                    scopes: Vec::new(),
+                    workspace: Some("default".into()),
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: None,
+                    answer: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
+            text.text.contains("global_scope_hits")
+                && text.text.contains("preferences/sharedterm.md"),
+            "the reserved global page must surface for a single-project query: {}",
+            text.text
+        );
+        assert!(
+            !text.text.contains("leak.md"),
+            "a foreign project's page must never surface via the global union: {}",
             text.text
         );
     }
@@ -7615,8 +9084,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7705,6 +9178,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -7718,6 +9192,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -7743,8 +9218,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7781,6 +9260,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: scoped,
@@ -7794,6 +9274,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: scoped,
@@ -7822,8 +9303,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 test_optional_parts(),
             )
@@ -7917,8 +9402,12 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -7983,8 +9472,12 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8025,8 +9518,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 test_optional_parts(),
             )
@@ -8100,8 +9597,12 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8166,8 +9667,12 @@ mod tests {
                     workspace: Some("practice".into()),
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8576,6 +10081,8 @@ mod tests {
                     path: None,
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8626,6 +10133,8 @@ mod tests {
                     path: Some("notes/sibling.md".into()),
                     project: Some("docs".into()),
                     workspace: Some("practice".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8679,6 +10188,8 @@ mod tests {
                     path: Some("notes/db-only-tool.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8715,6 +10226,8 @@ mod tests {
                     path: Some("does-not-exist.md".into()),
                     project: Some("scratch".into()),
                     workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 test_optional_parts(),
             )
@@ -8738,6 +10251,8 @@ mod tests {
                     path: Some("does-not-exist.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 test_optional_parts(),
             )
@@ -8762,6 +10277,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -8776,6 +10292,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,
@@ -8837,6 +10354,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: other,
@@ -9209,8 +10727,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9318,8 +10840,12 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9365,8 +10891,12 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: Some(true),
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9445,8 +10975,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9477,8 +11011,12 @@ mod tests {
                     workspace: Some("ops".into()),
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9513,8 +11051,12 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9545,6 +11087,133 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(text.contains("\"pages_latest\": 1"));
+        // The belief-strength substrate footprint (P2) is surfaced in status;
+        // this fresh project has consolidated nothing, so it reads 0.
+        assert!(text.contains("\"evidence_rows\": 0"));
+    }
+
+    /// A scope that does not resolve is caller input, not a server fault: the
+    /// tool must answer with `invalid params` (`-32602`) instead of an opaque
+    /// internal error (`-32603`), and keep the message callers already match on.
+    #[tokio::test]
+    async fn memory_status_reports_an_unknown_project_as_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_status(
+                Parameters(StatusArgs {
+                    project: Some("caminhar".into()),
+                    workspace: Some("default".into()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("an unknown project must be rejected");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            err.message, "project 'caminhar' not found in workspace 'default'",
+            "the scope message must not change"
+        );
+    }
+
+    /// The classification is by error class, not by tool: a malformed scope
+    /// argument is `invalid params` (the not-found half is covered by the tool
+    /// test above), while a missing writer handle or an underlying store
+    /// failure stay internal errors — the caller cannot fix those by changing
+    /// the request.
+    #[test]
+    fn scope_error_keeps_internal_failures_internal() {
+        use ai_memory_store::ScopeResolutionError;
+
+        for err in [
+            ScopeResolutionError::WorkspaceProjectPairRequired,
+            ScopeResolutionError::ScopeProjectEmpty,
+        ] {
+            assert_eq!(
+                AiMemoryServer::scope_error(err).code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+            );
+        }
+
+        for err in [
+            ScopeResolutionError::WriterRequired,
+            ScopeResolutionError::Store("disk on fire".into()),
+        ] {
+            assert_eq!(
+                AiMemoryServer::scope_error(err).code,
+                rmcp::model::ErrorCode::INTERNAL_ERROR,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_status_names_the_project_that_answered() {
+        // #757: a static MCP client's transport session id is not a hook
+        // session id, so its unscoped read cannot follow the caller's cwd. The
+        // counts must say whose they are, or they read as plausible and wrong.
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let neighbour = store
+            .writer
+            .get_or_create_project(ws, "neighbour", None)
+            .await
+            .unwrap();
+        let hook_session = ai_memory_core::ActorKey {
+            user: None,
+            session_id: Some("hook-session".into()),
+        };
+        let pointer = ActiveProject::new();
+        pointer.set_for(&hook_session, ws, neighbour, false);
+        let server = server.with_active_project(pointer);
+
+        let status = |session: &'static str, workspace: Option<&str>, project: Option<&str>| {
+            let mut parts = test_parts_default();
+            parts
+                .headers
+                .insert("mcp-session-id", session.parse().unwrap());
+            let args = StatusArgs {
+                workspace: workspace.map(str::to_owned),
+                project: project.map(str::to_owned),
+            };
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_status(Parameters(args), OptionalParts(parts))
+                    .await
+                    .unwrap();
+                let text = result
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()["scope"].clone()
+            }
+        };
+
+        assert_eq!(
+            status("hook-session", None, None).await,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "neighbour",
+                "resolved_by": "session",
+            })
+        );
+        assert_eq!(
+            status("transport-session", None, None).await,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "scratch",
+                "resolved_by": "default_after_mismatch",
+            }),
+            "a static client falls back to the server default and says so"
+        );
+        assert_eq!(
+            status("transport-session", Some("default"), Some("neighbour")).await,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "neighbour",
+                "resolved_by": "explicit",
+            })
+        );
     }
 
     #[tokio::test]
@@ -9666,6 +11335,7 @@ mod tests {
                     recent_pages_limit: Some(5),
                     project: None,
                     workspace: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9905,8 +11575,64 @@ mod tests {
             .unwrap();
         assert!(
             recent_text.contains("notes/santander-2025.md"),
-            "write-page result must be visible to read tools; got {recent_text}"
+            "got {recent_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_write_page_refuses_git_reserved_and_non_portable_paths() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        for bad in [
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+            "CON.md",
+            "notes/aux.md",
+            "notes/a|b.md",
+        ] {
+            let err = server
+                .memory_write_page(
+                    Parameters(WritePageArgs {
+                        path: bad.into(),
+                        body: "# Bad\n\nShould be refused.".into(),
+                        title: None,
+                        tier: None,
+                        tags: vec![],
+                        pinned: false,
+                        project: None,
+                        workspace: None,
+                        scope: None,
+                        expires_at: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid path"),
+                "expected invalid path error for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10022,6 +11748,542 @@ mod tests {
         assert_eq!(author.username, "alice");
         assert_eq!(author.name.as_deref(), Some("Alice Smith"));
         assert_eq!(author.email.as_deref(), Some("alice@example.com"));
+    }
+
+    /// Grant `role` on `repository` by writing the row directly, so these
+    /// tests exercise the decision without depending on the grant API.
+    fn grant_role(
+        db: &std::path::Path,
+        user: ai_memory_core::UserId,
+        repository: ProjectId,
+        role: &str,
+    ) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO project_grants \
+             (workspace_id, project_id, user_id, level, granted_by, granted_at) \
+             SELECT workspace_id, ?1, ?2, ?3, ?2, 1 FROM projects WHERE id = ?1",
+            rusqlite::params![
+                repository.as_bytes().to_vec(),
+                user.as_bytes().to_vec(),
+                role
+            ],
+        )
+        .unwrap();
+    }
+
+    fn grant_writer(db: &std::path::Path, user: ai_memory_core::UserId, repository: ProjectId) {
+        grant_role(db, user, repository, "write");
+    }
+
+    /// A reader-only grant must not be able to change anything.
+    ///
+    /// This is the bug this branch exists for. Every tool below takes the same
+    /// read-shaped arguments as `memory_read_page`, and every one of them
+    /// mutates; they all resolved through the read path, so `read` was
+    /// enough to delete a page. The table is the audit: if a tool moves
+    /// between the two lists, that is a deliberate policy change and this test
+    /// is where it has to be argued.
+    #[tokio::test]
+    async fn a_reader_may_read_everything_and_change_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let reader_user = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "ray".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        grant_role(store.db_path(), reader_user, proj, "read");
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        // Seed a page as the operator (no viewer stamped = root or no database users
+        // for this call), so there is something to try to delete.
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/keep.md".into(),
+                    body: "# Keep\n\nSomething to try to delete.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("operator seeds the page");
+
+        let parts_as_reader = || {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(reader_user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(reader_user));
+            parts
+        };
+
+        // Reads: allowed, and must stay allowed. Raising these would be its
+        // own bug — a reader who cannot read holds nothing at all.
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("notes/keep.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("a reader may read");
+        server
+            .memory_status(
+                Parameters(StatusArgs {
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("a reader may see status");
+
+        // Mutations: refused, and the refusal says what is missing.
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/keep.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect_err("a reader must not delete a page");
+        let message = err.message.to_string();
+        assert!(
+            message.contains("you have read access and this needs write"),
+            "the refusal must name both levels: {message}"
+        );
+
+        let err = server
+            .memory_feedback(
+                Parameters(FeedbackArgs {
+                    path: "notes/keep.md".into(),
+                    signal: ai_memory_core::FeedbackKind::Stale,
+                    reason: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect_err("a reader must not record feedback");
+        assert!(
+            err.message.to_string().contains("needs write"),
+            "{}",
+            err.message
+        );
+
+        // The page is still there: a refused delete must not half-happen.
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("notes/keep.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("the refused delete left the page alone");
+    }
+
+    /// A writer may do the things a reader was just refused.
+    ///
+    /// The other half of the pair: without it, the fix above would also pass
+    /// if the guard simply refused everyone.
+    #[tokio::test]
+    async fn a_writer_may_change_what_a_reader_may_not() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let scribe = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "wren".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        grant_role(store.db_path(), scribe, proj, "write");
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+        let parts = || {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(scribe);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(scribe));
+            parts
+        };
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/mine.md".into(),
+                    body: "# Mine\n\nWritten by a writer.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(parts()),
+            )
+            .await
+            .expect("a writer may write");
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/mine.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts()),
+            )
+            .await
+            .expect("a writer may delete");
+    }
+
+    /// The finding that started #708, as a test.
+    ///
+    /// Two `role=user` accounts on upstream 2.1.1: alice writes a page into her
+    /// client project and bob reads the whole body back. This asserts both
+    /// halves of the fix — that bob is refused when authorization is on, and
+    /// that he is *not* refused when it is off, because an install that has
+    /// never issued a grant must keep working exactly as it did.
+    #[tokio::test]
+    async fn bob_cannot_read_alices_page_in_a_restricted_project() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let user = |name: &str| {
+            let writer = store.writer.clone();
+            let name = name.to_owned();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name,
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = user("alice").await;
+        let bob = user("bob").await;
+        grant_writer(store.db_path(), alice, proj);
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        // Alice holds write on this repository, so her write lands.
+        let mut alice_parts = test_parts_default();
+        alice_parts.extensions.insert(AuthLevel::User);
+        alice_parts.extensions.insert(alice);
+        alice_parts
+            .extensions
+            .insert(ai_memory_core::AuthorizedViewer(alice));
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "secrets/rates.md".into(),
+                    body: "# Rates\n\nDay rate is confidential.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(alice_parts),
+            )
+            .await
+            .expect("alice holds write on her own repository");
+
+        let read_as = |viewer: Option<ai_memory_core::UserId>| {
+            let server = &server;
+            async move {
+                let mut parts = test_parts_default();
+                parts.extensions.insert(AuthLevel::User);
+                parts.extensions.insert(bob);
+                if let Some(viewer) = viewer {
+                    parts
+                        .extensions
+                        .insert(ai_memory_core::AuthorizedViewer(viewer));
+                }
+                server
+                    .memory_read_page(
+                        Parameters(ReadPageArgs {
+                            include_related: false,
+                            related_depth: None,
+                            path: Some("secrets/rates.md".into()),
+                            query: None,
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        // Authorization ON: bob is stamped as an authorized viewer, holds
+        // nothing, and is refused — with a message that says so rather than
+        // handing back an empty result he would read as "there is nothing here".
+        let err = read_as(Some(bob))
+            .await
+            .expect_err("bob holds no grant on alice's repository");
+        let message = err.message.to_string();
+        assert!(
+            message.contains("not authorized for alice-client-work"),
+            "refusal must name the repository: {message}"
+        );
+        assert!(
+            message.contains("not an empty memory"),
+            "refusal must not be mistakable for an empty repository: {message}"
+        );
+
+        // No viewer (root, or no database users): nothing is
+        // enforced and the install behaves as it did before grants existed.
+        read_as(None)
+            .await
+            .expect("with no viewer, an existing install must be unchanged");
+    }
+
+    /// The other half of #708: bob could not open alice's page, but he could
+    /// still find it. `global` searches and the `default_global` recent
+    /// listing never resolve a scope, so the resolver guard never saw them.
+    #[tokio::test]
+    async fn bob_cannot_find_alices_page_by_searching_in_a_restricted_project() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let client = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        grant_writer(store.db_path(), alice, client);
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: client,
+                path: PagePath::new("secrets/rates.md").unwrap(),
+                title: "Rates".into(),
+                body: "Day rate is confidential.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // `memory_recent` only goes global for a repo that opted into
+        // `[recall] default_global`; opt the test actor in.
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, client, true);
+
+        // `authorized` is whether the middleware stamped an AuthorizedViewer:
+        // a database user, rather than root or an install with no users.
+        let as_user = |user: ai_memory_core::UserId, authorized: bool| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            if authorized {
+                parts
+                    .extensions
+                    .insert(ai_memory_core::AuthorizedViewer(user));
+            }
+            parts
+        };
+        let text = |result: CallToolResult| {
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap()
+        };
+        let found_by_query = |user, authorized| {
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_query(
+                        Parameters(QueryArgs {
+                            reasoning: None,
+                            answer: None,
+                            include_superseded: None,
+                            pin_first: None,
+                            query: "confidential".into(),
+                            limit: Some(10),
+                            project: None,
+                            workspace: None,
+                            scopes: Vec::new(),
+                            global: Some(true),
+                            include_expired: None,
+                            explain: None,
+                            as_of: None,
+                        }),
+                        OptionalParts(as_user(user, authorized)),
+                    )
+                    .await
+                    .unwrap();
+                text(result).contains("secrets/rates.md")
+            }
+        };
+        let found_by_recent = |user, authorized| {
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_recent(
+                        Parameters(RecentArgs {
+                            limit: Some(10),
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(as_user(user, authorized)),
+                    )
+                    .await
+                    .unwrap();
+                text(result).contains("secrets/rates.md")
+            }
+        };
+
+        // Authorization on: bob holds nothing on alice's repository, so a
+        // global search and the global recent listing do not surface it...
+        assert!(!found_by_query(bob, true).await, "bob found it by search");
+        assert!(!found_by_recent(bob, true).await, "bob found it in recent");
+        // ...while alice, who holds a grant, still finds her own page.
+        assert!(found_by_query(alice, true).await);
+        assert!(found_by_recent(alice, true).await);
+
+        // No viewer is stamped and nothing changes.
+        assert!(found_by_query(bob, false).await);
+        assert!(found_by_recent(bob, false).await);
     }
 
     fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {
@@ -10304,6 +12566,8 @@ mod tests {
                     path: Some("notes/default.md".into()),
                     project: Some("typo".into()),
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10381,6 +12645,8 @@ mod tests {
                     path: Some("notes/temp.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10473,6 +12739,8 @@ mod tests {
                     path: Some("notes/keep.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10582,6 +12850,8 @@ mod tests {
                     path: Some("notes/twin.md".into()),
                     project: Some("shared".into()),
                     workspace: Some("alpha".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10599,6 +12869,8 @@ mod tests {
                     path: Some("notes/twin.md".into()),
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10809,6 +13081,7 @@ mod tests {
             .unwrap();
         assert!(accept_text.contains("left mid-refactor"));
         assert!(accept_text.contains("what max channel size?"));
+        assert!(accept_text.contains("\"status\": \"claimed\""));
 
         // Second accept returns null (handoff is now accepted).
         let again = server
@@ -10831,6 +13104,8 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(again_text.contains("\"handoff\": null"));
+        // Taken by this server's own MCP call, not by a SessionStart hook.
+        assert!(again_text.contains("\"status\": \"none_pending\""));
     }
 
     /// `Handoff` is grouped internally into `HandoffScope`/`HandoffOrigin`/
@@ -11414,6 +13689,8 @@ mod tests {
                         path: Some("notes/bob-authored.md".into()),
                         project: None,
                         workspace: None,
+                        include_related: false,
+                        related_depth: None,
                     }),
                     OptionalParts(alice_parts),
                 )
@@ -11675,7 +13952,7 @@ mod tests {
         let err = server
             .memory_consolidate(
                 Parameters(ConsolidateArgs {
-                    session_id: "00000000-0000-0000-0000-000000000000".into(),
+                    session_id: Some("00000000-0000-0000-0000-000000000000".into()),
                     dry_run: Some(true),
                     multi_page: Some(false),
                     instructions: None,
@@ -11696,6 +13973,199 @@ mod tests {
         assert!(
             msg.contains("without a built-in model"),
             "error should not imply every provider needs an explicit model: {msg}",
+        );
+    }
+
+    /// An omitted `session_id` must not fail at the tool boundary: the call
+    /// reaches the consolidator and resolves the latest COMPLETED session of
+    /// the resolved project, skipping an open one — the same default the
+    /// read-only tools use.
+    #[tokio::test]
+    async fn memory_consolidate_defaults_to_latest_completed_session() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let completed = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            true,
+            &[(ObservationKind::UserPrompt, "done", "completed work")],
+        )
+        .await;
+        let _open = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            false,
+            &[(ObservationKind::UserPrompt, "live", "still running")],
+        )
+        .await;
+
+        let outcome = call_tool_json(
+            server
+                .memory_consolidate(
+                    Parameters(ConsolidateArgs {
+                        session_id: None,
+                        dry_run: Some(true),
+                        multi_page: Some(false),
+                        instructions: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            outcome["path"],
+            format!("sessions/{completed}.md"),
+            "the omitted session_id must resolve the latest completed session",
+        );
+    }
+
+    /// A project with no completed session has no implicit default: the
+    /// omission must fail with the same actionable error the read tools use.
+    #[tokio::test]
+    async fn memory_consolidate_without_completed_session_errors_cleanly() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let err = server
+            .memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: None,
+                    dry_run: Some(true),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("an empty project has no completed session");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.to_string()
+                .contains("no completed session in default/scratch"),
+            "got {err}"
+        );
+    }
+
+    /// A blank `session_id` (`""`, or whitespace only) is the same request as
+    /// an omitted one: it must resolve the latest completed session of the
+    /// resolved project instead of failing as a malformed UUID.
+    #[tokio::test]
+    async fn memory_consolidate_treats_a_blank_session_id_as_omitted() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let completed = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            true,
+            &[(ObservationKind::UserPrompt, "done", "completed work")],
+        )
+        .await;
+
+        for session_id in [None, Some(String::new()), Some("   ".to_owned())] {
+            let outcome = call_tool_json(
+                server
+                    .memory_consolidate(
+                        Parameters(ConsolidateArgs {
+                            session_id,
+                            dry_run: Some(true),
+                            multi_page: Some(false),
+                            instructions: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                outcome["path"],
+                format!("sessions/{completed}.md"),
+                "a blank session_id must behave exactly like an omitted one",
+            );
+        }
+    }
+
+    /// A malformed id is caller input rather than a server fault: it must fail
+    /// as `invalid params`, the code the sibling tools already answer with for
+    /// the same argument.
+    #[tokio::test]
+    async fn memory_consolidate_rejects_a_malformed_session_id_as_invalid_params() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let err = server
+            .memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: Some("not-a-uuid".into()),
+                    dry_run: Some(true),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a malformed session id must be rejected");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.to_string().contains("invalid uuid"),
+            "the malformed-id message must stay as callers already read it; got {err}"
         );
     }
 
@@ -11813,6 +14283,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id,
@@ -11826,6 +14297,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,
@@ -11842,6 +14314,149 @@ mod tests {
             .unwrap();
         store.writer.end_session(session_id, None).await.unwrap();
         session_id
+    }
+
+    /// A session id reaches a repository without naming it, so
+    /// `memory_consolidate` used to write into whichever project a session
+    /// landed in, for anyone holding the id (#708). Bob consolidating alice's
+    /// session is refused before the LLM or the admission chain runs — the
+    /// stub panics if it is called — and a dry run is refused too, because it
+    /// reports the resolved path and admission verdict of her repository.
+    #[tokio::test]
+    async fn bob_cannot_consolidate_a_session_in_alices_repository() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let alices = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let session = seed_short_completed_session(&store, ws, alices).await;
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        // Bob holds read on alice's repository: enough to read it, not to
+        // have a page written into it on his behalf.
+        store
+            .writer
+            .grant_memory(alice, alices, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .grant_memory(bob, alices, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            alices,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, alices)
+            .with_consolidator_arc(wiki, llm, consolidator);
+        let consolidate = |viewer: Option<ai_memory_core::UserId>, id: SessionId, dry: bool| {
+            let server = &server;
+            async move {
+                let mut parts = test_parts_default();
+                if let Some(viewer) = viewer {
+                    parts.extensions.insert(AuthLevel::User);
+                    parts.extensions.insert(viewer);
+                    parts
+                        .extensions
+                        .insert(ai_memory_core::AuthorizedViewer(viewer));
+                }
+                server
+                    .memory_consolidate(
+                        Parameters(ConsolidateArgs {
+                            session_id: Some(id.to_string()),
+                            dry_run: Some(dry),
+                            multi_page: None,
+                            instructions: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        for dry in [true, false] {
+            let err = consolidate(Some(bob), session, dry)
+                .await
+                .expect_err("bob holds only reader on alice's repository");
+            let message = err.message.to_string();
+            assert!(
+                message.contains("not authorized for alice-client-work"),
+                "dry={dry}: {message}"
+            );
+            assert!(
+                message.contains("write"),
+                "names the level needed: {message}"
+            );
+        }
+        let page = format!("sessions/{session}.md");
+        assert!(
+            store
+                .reader
+                .page_meta("default", "alice-client-work", &page)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused consolidation wrote nothing"
+        );
+
+        // Alice, and a caller with no viewer, get the plan.
+        for viewer in [Some(alice), None] {
+            let plan = call_tool_json(consolidate(viewer, session, true).await.unwrap());
+            assert_eq!(plan["dry_run"], true, "{viewer:?}");
+            assert_eq!(plan["path"], page, "{viewer:?}");
+        }
+
+        // An id that matches nothing is still reported as the consolidator
+        // reports it — not as a refusal on the server's default project.
+        let err = consolidate(Some(bob), SessionId::new(), true)
+            .await
+            .expect_err("no such session");
+        assert!(
+            !err.message.contains("not authorized"),
+            "an unknown session read as a refusal: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -12006,6 +14621,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -12019,6 +14635,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -12357,6 +14974,113 @@ mod tests {
             text.contains("\"handoff\": null"),
             "expected handoff=null in: {text}",
         );
+        assert!(
+            text.contains("\"status\": \"none_pending\""),
+            "expected status=none_pending in: {text}",
+        );
+    }
+
+    /// A requested `handoff_id` that some other caller took must not be
+    /// reported as `consumed_by_hook` just because this session's SessionStart
+    /// took a different baton: the agent would look for the wrong block.
+    #[tokio::test]
+    async fn memory_handoff_accept_by_id_reports_the_hook_only_for_its_own_row() {
+        let (_tmp, store, server, ws, pj) = setup_server().await;
+        let insert = |summary: &str| NewHandoff {
+            workspace_id: ws,
+            project_id: pj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: summary.into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        };
+        let by_hook = store
+            .writer
+            .insert_handoff(insert("taken at session start"))
+            .await
+            .unwrap();
+        let by_other = store
+            .writer
+            .insert_handoff(insert("taken by another caller"))
+            .await
+            .unwrap();
+
+        let session = SessionId::from_native("claude-session-1");
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: pj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for (handoff_id, accepting_session) in [(by_hook, Some(session)), (by_other, None)] {
+            let claimed = store
+                .writer
+                .accept_handoff(ai_memory_core::HandoffAcceptance {
+                    handoff_id,
+                    workspace_id: ws,
+                    project_id: pj,
+                    accepting_agent: AgentKind::ClaudeCode,
+                    accepting_session,
+                    accepting_user: None,
+                    owner_filter: ai_memory_core::OwnerFilter::Unattributed,
+                    receiving_cwd: None,
+                })
+                .await
+                .unwrap();
+            assert!(claimed);
+        }
+
+        let status_for = |handoff_id: Option<HandoffId>| {
+            let server = server.clone();
+            async move {
+                let mut parts = test_parts_default();
+                parts.headers.insert(
+                    "x-memory-actor-session-id",
+                    axum::http::HeaderValue::from_static("claude-session-1"),
+                );
+                let result = server
+                    .memory_handoff_accept(
+                        Parameters(HandoffAcceptArgs {
+                            cwd: None,
+                            project: None,
+                            workspace: None,
+                            any_owner: None,
+                            handoff_id: handoff_id.map(|id| id.to_string()),
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+                    .unwrap();
+                let text = result
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(value["handoff"].is_null(), "nothing is open: {text}");
+                value["status"].as_str().unwrap().to_owned()
+            }
+        };
+        assert_eq!(status_for(Some(by_hook)).await, "consumed_by_hook");
+        assert_eq!(status_for(None).await, "consumed_by_hook");
+        assert_eq!(
+            status_for(Some(by_other)).await,
+            "none_pending",
+            "the row this session asked for went to another caller",
+        );
     }
 
     /// `memory_query` clamps `limit` into [1, 100]. Anyone sending
@@ -12378,8 +15102,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -12412,8 +15140,12 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

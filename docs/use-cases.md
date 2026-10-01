@@ -83,7 +83,7 @@
   that recovery for one harness. Managed mode currently covers Claude Code,
   Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP,
   Grok Build CLI, and Antigravity CLI; direct harness launches remain unchanged. See
-  [Managed cross-harness workstreams](docs/managed-workstreams.md).
+  [Managed cross-harness workstreams](managed-workstreams.md).
 - **"Just put me back where I was."** From any directory, with no name to
   type and no list to read:
 
@@ -117,9 +117,10 @@
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
-  captures lifecycle events but ignores SessionStart stdout, so ask it to call
-  `memory_handoff_accept` when resuming from a handoff. Zero has the same
-  no-stdout behavior and also must call `memory_handoff_accept`.
+  cannot show that text before the first prompt. The first tool's
+  `PostToolUse` hook adds it as `additionalContext`. If the session never
+  calls a tool, ask Grok to call `memory_handoff_accept`. Zero still must
+  call `memory_handoff_accept`.
 - **"What did we decide about X six weeks ago?"** Use `memory_query X` from
   the agent for FTS5 fused with entity matches and linked-page expansion (plus
   vector similarity when an embedder is configured). For a quick terminal-only
@@ -188,7 +189,7 @@
   proposals are isolated by qualified operator identity, so one person's
   proposal for a page does not block another's; unattributed and single-user
   deployments retain the shared pending queue. See
-  [`docs/auto-improve-eval-gates.md`](docs/auto-improve-eval-gates.md) for
+  [`docs/auto-improve-eval-gates.md`](auto-improve-eval-gates.md) for
   example executable eval scorers.
 
   Existing installs do not need per-project migration. The scheduler initializes

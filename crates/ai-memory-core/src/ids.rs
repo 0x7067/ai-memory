@@ -80,6 +80,20 @@ macro_rules! id_newtype {
 id_newtype!(pub WorkspaceId, "Workspace identifier (top of the 3-tuple).");
 id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
+
+impl SessionId {
+    /// Resolve a harness-native session id to the `SessionId` the store keys
+    /// on: a UUID native id is used as-is (canonicalized); any other string
+    /// (Codex, OpenCode, ...) is hashed to a deterministic UUID v5, so hook
+    /// POSTs and later lookups by native id share one key. The hook router and
+    /// any offline tool that matches transcripts by native id (e.g.
+    /// `ai-memory repair-backfill-timestamps`) must agree on this one rule.
+    #[must_use]
+    pub fn from_native(raw: &str) -> Self {
+        Self::from_str(raw)
+            .unwrap_or_else(|_| Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+    }
+}
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
@@ -108,33 +122,6 @@ impl PagePath {
     ///
     /// # Errors
     /// Returns [`MemoryError::InvalidPagePath`] when the input is empty or
-    /// Reject a path that cannot be materialised and checkpointed on every
-    /// supported platform.
-    ///
-    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
-    /// reconstructed through that constructor on every read
-    /// (`reader.rs` does so in the recency, search, vector and graph
-    /// queries), so tightening it would make any already-stored
-    /// non-portable page unreadable — and because those are list queries,
-    /// one such page would break a whole listing rather than just itself.
-    /// The rule therefore applies where a *new* path enters the system.
-    ///
-    /// The rule is the same on every platform on purpose. A wiki authored
-    /// on Linux is expected to be usable on Windows by the same release;
-    /// making the check platform-conditional would let a Linux session
-    /// create pages a Windows session cannot read, which is the defect
-    /// being fixed rather than a fix for it (#462).
-    ///
-    /// # Errors
-    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
-    /// component and the reason.
-    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
-        for component in self.as_str().split('/') {
-            ensure_portable_component(component, self.as_str())?;
-        }
-        Ok(())
-    }
-
     /// contains a path component that would escape or alias the wiki root.
     pub fn new(raw: impl Into<String>) -> Result<Self, MemoryError> {
         let raw = raw.into();
@@ -184,6 +171,33 @@ impl PagePath {
         Ok(Self(raw))
     }
 
+    /// Reject a path that cannot be materialised and checkpointed on every
+    /// supported platform.
+    ///
+    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
+    /// reconstructed through that constructor on every read
+    /// (`reader.rs` does so in the recency, search, vector and graph
+    /// queries), so tightening it would make any already-stored
+    /// non-portable page unreadable — and because those are list queries,
+    /// one such page would break a whole listing rather than just itself.
+    /// The rule therefore applies where a *new* path enters the system.
+    ///
+    /// The rule is the same on every platform on purpose. A wiki authored
+    /// on Linux is expected to be usable on Windows by the same release;
+    /// making the check platform-conditional would let a Linux session
+    /// create pages a Windows session cannot read, which is the defect
+    /// being fixed rather than a fix for it (#462).
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
+    /// component and the reason.
+    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
+        for component in self.as_str().split('/') {
+            ensure_portable_component(component, self.as_str())?;
+        }
+        Ok(())
+    }
+
     /// Borrow the inner string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -200,6 +214,23 @@ impl fmt::Debug for PagePath {
 impl fmt::Display for PagePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The key a case-folding or Unicode-normalizing filesystem effectively
+/// stores a page path under: two paths with the same key are one file on
+/// macOS (APFS) and Windows (NTFS), whatever they look like here.
+///
+/// Lowercase first, then compose: `İ` lowercases to `i` + U+0307, which only
+/// composes back to a single scalar after the fold.
+#[must_use]
+pub fn portable_page_key(path: &str) -> String {
+    let lowered = path.to_lowercase();
+    let nfc = icu_normalizer::ComposingNormalizer::new_nfc();
+    if nfc.is_normalized(&lowered) {
+        lowered
+    } else {
+        nfc.normalize(&lowered).into_owned()
     }
 }
 
@@ -345,8 +376,10 @@ impl AgentKind {
     /// into the resuming session as context. Agents that consume it return
     /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
     ///
-    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
-    /// "For events like SessionStart or PostToolUse, stdout is ignored"), and
+    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks guide:
+    /// stdout for that event is ignored). `PostToolUse` stdout is read and
+    /// `additionalContext` is shown to the model after the tool result. See
+    /// [`Self::post_tool_injects_handoff`].
     /// Zero's agent loop discards the sessionStart dispatch result entirely
     /// (`internal/agent/loop.go` ignores `Dispatch`'s return there), so
     /// the native hook must NOT fetch the handoff for it: the fetch is
@@ -397,9 +430,45 @@ impl AgentKind {
     /// `session/hooks/user-prompt.ts`, verified in the v0.28.1 source).
     /// Empty stdout injects nothing, so the hook prints the raw handoff body
     /// or nothing at all — never a JSON envelope.
+    ///
+    /// Grok Build also ignores `SessionStart` stdout, and it is not in this
+    /// set. An allowing `UserPromptSubmit` discards stdout and has no
+    /// `additionalContext`. `GET /handoff` marks the handoff accepted, so
+    /// fetching on that event would burn the baton. Grok shows
+    /// `PostToolUse` `additionalContext` to the model; that is
+    /// [`Self::post_tool_injects_handoff`].
     #[must_use]
     pub fn user_prompt_injects_handoff(self) -> bool {
         matches!(self, Self::KimiCode)
+    }
+
+    /// Whether `PostToolUse` stdout is model-visible context.
+    ///
+    /// Grok Build reads that stdout and delivers `hookSpecificOutput.additionalContext`
+    /// after the tool result (`10-hooks.md`, PostToolUse Output). The handoff
+    /// is accepted on the first such event of a session, not on `SessionStart`
+    /// or `UserPromptSubmit`, because those outputs never reach the model.
+    /// The model sees the handoff after the first tool, not before the first
+    /// prompt. A session that never calls a tool leaves the handoff open for
+    /// `memory_handoff_accept`.
+    #[must_use]
+    pub fn post_tool_injects_handoff(self) -> bool {
+        matches!(self, Self::Grok)
+    }
+
+    /// Whether this agent reuses one session id across a `SessionEnd` and a
+    /// later restart of the same conversation.
+    ///
+    /// Grok does: the same session id comes back after an end, so an already-
+    /// ended receiver row is a live restart, not a corpse, and
+    /// `accept_handoff` reopens it. For every other agent an ended session is
+    /// final — a late/out-of-order startup fetch must not rebind it to a new
+    /// handoff, so accepting into an ended session stays an error (this is what
+    /// keeps a lifecycle-only receiver from reclaiming after it released and
+    /// ended).
+    #[must_use]
+    pub fn reuses_session_id_after_end(self) -> bool {
+        matches!(self, Self::Grok)
     }
 }
 
@@ -428,6 +497,28 @@ mod tests {
         assert!(PagePath::new("a/../b").is_err());
     }
 
+    /// A UUID native id round-trips as-is; a non-UUID native id (Codex,
+    /// OpenCode) hashes to a deterministic UUID v5, so hook capture and any
+    /// offline tool matching transcripts by native id agree on one key.
+    #[test]
+    fn session_id_from_native_hashes_non_uuid_ids_and_passes_uuids_through() {
+        let uuid_native = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(SessionId::from_native(uuid_native).to_string(), uuid_native);
+
+        let non_uuid_native = "codex-native-id-123";
+        let expected = SessionId(Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            non_uuid_native.as_bytes(),
+        ));
+        assert_eq!(SessionId::from_native(non_uuid_native), expected);
+        // Deterministic: repeated calls (and hence repeated hook deliveries,
+        // or a repeated repair run) must resolve to the same id.
+        assert_eq!(
+            SessionId::from_native(non_uuid_native),
+            SessionId::from_native(non_uuid_native)
+        );
+    }
+
     #[test]
     fn agent_kind_grok_round_trips() {
         assert_eq!(AgentKind::Grok.as_str(), "grok");
@@ -440,9 +531,13 @@ mod tests {
         );
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("grok-2"), AgentKind::Other);
-        // Grok cannot inject the session-start handoff (ignores hook stdout);
-        // every other agent can.
+        // Grok cannot inject the session-start handoff (ignores hook stdout),
+        // and must not fetch on UserPromptSubmit either (that stdout is discarded).
         assert!(!AgentKind::Grok.session_start_injects_handoff());
+        assert!(!AgentKind::Grok.user_prompt_injects_handoff());
+        assert!(AgentKind::Grok.post_tool_injects_handoff());
+        assert!(!AgentKind::KimiCode.post_tool_injects_handoff());
+        assert!(!AgentKind::ClaudeCode.post_tool_injects_handoff());
         assert!(!AgentKind::Zero.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
@@ -690,6 +785,23 @@ mod tests {
             AgentKind::Devin
         );
     }
+
+    #[test]
+    fn session_id_from_native_keeps_uuids_and_hashes_other_ids() {
+        let uuid = SessionId::new();
+        assert_eq!(SessionId::from_native(&uuid.to_string()), uuid);
+        let hashed = SessionId::from_native("agy-session-1");
+        assert_eq!(
+            hashed,
+            SessionId::from_native("agy-session-1"),
+            "deterministic"
+        );
+        assert_eq!(
+            hashed.0,
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, b"agy-session-1"),
+            "the key hook POSTs have always used"
+        );
+    }
 }
 
 /// Names Windows reserves regardless of extension: `CON.md` is still the
@@ -699,10 +811,29 @@ const DOS_DEVICE_NAMES: &[&str] = &[
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
+/// Whether `stem` (a file name without its extension) is a DOS device name
+/// Windows resolves to a device instead of a file, compared case-insensitively.
+#[must_use]
+pub fn is_dos_device_name(stem: &str) -> bool {
+    DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str())
+}
+
 /// Characters Windows refuses in a filename. `/` is the separator and is
 /// handled by the caller; `\\` and a drive prefix are already rejected by
 /// [`PagePath::new`].
 const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+/// Returns true if a path component is reserved by Git (`.git` case-insensitively,
+/// or an 8.3 short-name alias like `git~1`..`git~4`).
+#[must_use]
+pub fn is_git_reserved_component(component: &str) -> bool {
+    // Compare on bytes: a `str` slice at a fixed byte index panics on a
+    // multibyte component (a 5-byte UTF-8 name like "abcé" has no char
+    // boundary at 4), and this runs on untrusted write input.
+    let b = component.as_bytes();
+    component.eq_ignore_ascii_case(".git")
+        || (b.len() == 5 && b[..4].eq_ignore_ascii_case(b"git~") && (b'1'..=b'4').contains(&b[4]))
+}
 
 fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
     let invalid = |reason: &str| {
@@ -733,17 +864,23 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
     // Device names match on the stem, so `CON`, `CON.md` and `con.markdown`
     // are all the console.
     let stem = component.split('.').next().unwrap_or(component);
-    if DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
+    if is_dos_device_name(stem) {
         return invalid(&format!(
             "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
         ));
+    }
+    // Git reserves `.git` for repository metadata. Any tree entry named `.git`
+    // or an 8.3 alias is refused by libgit2 with `GIT_EINVALIDPATH` and cannot
+    // be checkpointed.
+    if is_git_reserved_component(component) {
+        return invalid("is reserved by Git for repository metadata and refused in tree entries");
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod portable_page_path_tests {
-    use super::PagePath;
+    use super::{PagePath, portable_page_key};
 
     /// Every shape #462 reproduced on native Windows. Each either fails late
     /// with a 500, or writes but cannot be checkpointed by libgit2 and cannot
@@ -778,6 +915,30 @@ mod portable_page_path_tests {
         }
     }
 
+    #[test]
+    fn git_reserved_paths_are_rejected() {
+        for raw in [
+            ".git",
+            ".git/config",
+            ".git/HEAD",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/.Git/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+            "notes/git~4/config",
+            "a/b/c/.git/deep.md",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} contains a git-reserved component and must be refused at write time"
+            );
+        }
+    }
+
     /// The rule must not reject ordinary pages. `con` is only reserved as a
     /// whole component, so `concepts/` and `icon.md` are fine.
     #[test]
@@ -792,8 +953,37 @@ mod portable_page_path_tests {
             "a/b/c/deep.md",
             "notes/dot.in.middle.md",
             "notes/UPPER.MD",
+            "notes/.git.md",
+            "notes/.gitignore",
+            "notes/.gitattributes",
+            "notes/github.md",
+            "git-notes/index.md",
         ] {
             let path = PagePath::new(raw).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// A multibyte component whose byte length is 5 must not be mistaken for
+    /// a `git~N` alias, and must not panic: `is_git_reserved_component` once
+    /// sliced the string at byte index 4, which is not a char boundary in a
+    /// name like "abcé" (5 bytes) or "a😀" (5 bytes). Since this runs on the
+    /// write funnel for untrusted input, the panic was a crashable defect.
+    #[test]
+    fn multibyte_components_are_not_git_reserved_and_do_not_panic() {
+        for component in ["abcé", "ab€", "a😀", "éé", "🦀🦀"] {
+            assert!(
+                !super::is_git_reserved_component(component),
+                "{component:?} is an ordinary name, not a git-reserved alias"
+            );
+        }
+        // The full write funnel (construct + ensure_portable) must accept a
+        // page path with a 5-byte multibyte component without panicking.
+        for raw in ["notes/abcé.md", "notes/a😀.md", "notes/ab€.md"] {
+            let path = PagePath::new(raw).expect("valid non-ASCII path");
             assert!(
                 path.ensure_portable().is_ok(),
                 "{raw:?} is portable and must stay writable"
@@ -806,11 +996,46 @@ mod portable_page_path_tests {
     /// not break on one bad row.
     #[test]
     fn existing_non_portable_pages_remain_constructible() {
-        for raw in ["CON.md", "notes/a|b.md", "notes/trailing./x.md"] {
+        for raw in [
+            "CON.md",
+            "notes/a|b.md",
+            "notes/trailing./x.md",
+            ".git/config",
+            "notes/.git/sub.md",
+            "notes/git~1/foo.md",
+        ] {
             assert!(
                 PagePath::new(raw).is_ok(),
                 "{raw:?} must still construct so persisted rows stay readable"
             );
+        }
+    }
+
+    #[test]
+    fn portable_key_collapses_case_and_normalization() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/Alpha.md"),
+            ("Concepts/alpha.md", "concepts/ALPHA.md"),
+            ("concepts/caf\u{00e9}.md", "concepts/cafe\u{0301}.md"),
+            ("concepts/CAF\u{00c9}.md", "concepts/cafe\u{0301}.md"),
+        ] {
+            assert_eq!(
+                portable_page_key(a),
+                portable_page_key(b),
+                "{a:?} and {b:?} are one file on macOS/Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_key_keeps_distinct_paths_distinct() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/alphabet.md"),
+            ("concepts/alpha.md", "decisions/alpha.md"),
+            ("concepts/nested/a.md", "concepts/a.md"),
+            ("concepts/cafe.md", "concepts/caf\u{00e9}.md"),
+        ] {
+            assert_ne!(portable_page_key(a), portable_page_key(b));
         }
     }
 }
