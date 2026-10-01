@@ -566,3 +566,80 @@ async fn session_summary_scoped_narrows_the_listing_predicates() {
         "unknown id",
     );
 }
+
+#[tokio::test]
+async fn incremental_pages_equal_timestamps_cutoff_expiry_and_foreign_scope() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    for n in 0..125u8 {
+        conn.execute("INSERT INTO pages (id, workspace_id, project_id, path, title, tier,
+            body, body_sha256, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'Page', 'semantic', '', ?5, ?6, ?6)",
+            params![&id(n + 40)[..], ws().as_bytes(), proj_a().as_bytes(), format!("p{n:03}.md"), &[0u8; 32][..], NOW]).unwrap();
+    }
+    // Expired latest versions remain in the legacy tree listing but are
+    // hidden from the incremental update listing even when pinned.
+    conn.execute(
+        "UPDATE pages SET expires_at = 1, pinned = 1 WHERE path = 'p124.md'",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO pages (id, workspace_id, project_id, path, title, tier,
+        body, body_sha256, created_at, updated_at, is_latest) VALUES (?1, ?2, ?3, 'p000.md', 'Old', 'semantic', '', ?4, ?5, ?5, 0)",
+        params![&id(200)[..], ws().as_bytes(), proj_a().as_bytes(), &[0u8;32][..], NOW + 1]).unwrap();
+    conn.execute("INSERT INTO pages (id, workspace_id, project_id, path, title, tier,
+        body, body_sha256, created_at, updated_at) VALUES (?1, ?2, ?3, 'foreign.md', 'Foreign', 'semantic', '', ?4, ?5, ?5)",
+        params![&id(201)[..], ws().as_bytes(), proj_b().as_bytes(), &[0u8;32][..], NOW]).unwrap();
+    let mut after = None;
+    let mut seen = Vec::new();
+    loop {
+        let mut pages = store
+            .reader
+            .incremental_pages(ws(), proj_a(), NOW - 1, after, 37)
+            .await
+            .unwrap();
+        assert!(pages.len() <= 38, "SQL fetches at most limit+1");
+        let more = pages.len() > 37;
+        pages.truncate(37);
+        seen.extend(pages.iter().map(|p| p.path.clone()));
+        if !more {
+            break;
+        }
+        let last = pages.last().unwrap();
+        after = Some((NOW, last.path.clone()));
+    }
+    assert_eq!(
+        seen,
+        (0..124).map(|n| format!("p{n:03}.md")).collect::<Vec<_>>()
+    );
+    assert!(
+        store
+            .reader
+            .incremental_pages(ws(), proj_a(), NOW, None, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "exact cutoff is exclusive"
+    );
+    assert_eq!(
+        store
+            .reader
+            .incremental_pages(ws(), proj_b(), NOW - 1, None, 100)
+            .await
+            .unwrap()[0]
+            .path,
+        "foreign.md"
+    );
+    assert!(
+        store
+            .reader
+            .incremental_pages(WorkspaceId::new(), proj_a(), NOW - 1, None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.reader.list_pages("w", "proj-a").await.unwrap().len(),
+        125,
+        "legacy expiry behavior stays unchanged"
+    );
+}

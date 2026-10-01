@@ -250,6 +250,10 @@ for provenance and stable, namespaced `ingest_key` values for retries. See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
 
+Tools can use MCP directly to write pages, query knowledge and claim handoffs.
+With `--enable-web`, incremental `recent` pages use a bounded `(updated_at, path)`
+query in the authorized scope. See [programmatic memory](programmatic-memory.md).
+
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at
 16 KiB; notification and tool excerpts are capped at 2 KB. Native
