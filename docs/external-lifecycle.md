@@ -160,6 +160,12 @@ Use the tuple recipe when event IDs have narrower scope.
   across concurrent requests and no all-or-nothing transaction for a batch.
 - Prefer `accepted_indices` when present. Otherwise `accepted` is the contiguous
   acknowledged prefix. Preserve every unacknowledged item for retry.
+- `results` contains one `{index, outcome}` for each acknowledged index, in
+  index order, including an empty array when nothing was acknowledged. Outcomes
+  are `stored`, `replayed`, `resumed`, `ignored_end`, `dropped_policy`,
+  `dropped_subagent`, `dropped_unauthorized` and `dropped_collision`. A drop is a
+  terminal acknowledgement. Older servers omit `results`; the relay records
+  those receipts as `unknown`.
 - A rate-limited source can be skipped while other sources advance. Inspect
   acknowledgements even on HTTP 429 or a partial failure; `failed_index` identifies
   a processing failure after earlier skips. An acknowledgement can also mean a
@@ -197,8 +203,9 @@ not disable native harness transcript files or other vendors' hooks.
 Auth, owner checks, admission rules and sanitization still apply. All items in
 one batch share one authenticated identity; separate batches by operator when
 representing multiple users. `extension` is self-declared provenance and the
-capture variable grants no permissions. ai-memory has a shared single-tenant
-wiki with multi-user attribution, not per-project RBAC or producer isolation.
+capture variable grants no permissions. Project access modes and grants apply
+to DB-user tokens. Pages are shared by authorized project members; session and
+handoff ownership still applies. Producer namespaces provide provenance only.
 See [multi-user attribution](users.md).
 
 No framework adapter, workflow engine, generic plugin runtime or OpenTelemetry

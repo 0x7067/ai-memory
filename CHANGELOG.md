@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added per-event outcomes to `/hook/batch` acknowledgements and process-lifetime
+  ingest counters for stored events, replays, recovery, ignored endings,
+  collisions and failures. Legacy acknowledgement fields were preserved. (#1015)
+- Added receipt outcomes and delivery counts to the companion relay. Opening a
+  schema 1 queue now upgrades it atomically to schema 2; older relay binaries
+  refuse schema 2, so downgrade requires a pre-upgrade backup with all queue
+  users stopped. Pending order and existing delivery metadata were preserved.
+  Receipts now retain their first known outcome. (#1015)
 - Added `ai-memory list-projects [--workspace] [--json]`: a plain, scriptable
   listing of every workspace/project pair the server knows about, sorted by
   workspace then project. Previously the only way to see this from outside
@@ -38,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed completed retries and no-op session endings advancing
+  `last_persisted_ms` without a durable write. Recovery still advances the
+  timestamp when it commits a new page or terminal effect. (#1015)
 - `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
   `[capture]` section is invalid. This fails closed today — every file and
   shell tool event is reduced to metadata until the marker is fixed, nothing
