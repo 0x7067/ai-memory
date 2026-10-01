@@ -46,15 +46,10 @@ pub struct GitAdapter {
 /// (tree cache included) survives them. `Index` itself is not `Send`.
 struct Open {
     repo: Repository,
-    commits_since_index_write: u32,
     /// HEAD as this adapter last left it; moved by another writer, the
     /// kept index is re-read and the next commit walks.
     head: Option<git2::Oid>,
 }
-
-/// The index file is written after a walk and every this many
-/// path-scoped commits.
-const INDEX_WRITE_EVERY: u32 = 50;
 
 #[derive(Debug, Default)]
 struct Written {
@@ -230,11 +225,7 @@ impl GitAdapter {
         let mut slot = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
             let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
-            *slot = Some(Open {
-                repo,
-                commits_since_index_write: 0,
-                head: None,
-            });
+            *slot = Some(Open { repo, head: None });
         }
         let open = slot.as_mut().expect("opened above");
         let head_now = open.repo.head().ok().and_then(|h| h.target());
@@ -328,15 +319,11 @@ impl GitAdapter {
 
     fn commit_staged(
         &self,
-        open: &mut Open,
+        open: &Open,
         message: &str,
         staging: &Staging,
     ) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let Open {
-            repo,
-            commits_since_index_write,
-            ..
-        } = open;
+        let repo = &open.repo;
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
         // Stage through libgit2's stat cache: an entry whose size and mtime
         // are unchanged keeps its cached blob OID and is not re-read, so a
@@ -356,19 +343,6 @@ impl GitAdapter {
                 stage_paths(&self.root, &mut index, paths).map_err(CommitGit2Error::Other)?
             }
         };
-        // The index file is the stat cache across restarts; serializing it
-        // costs the size of the tree, so not per commit.
-        let write_index = match staging {
-            Staging::Everything => true,
-            Staging::Paths(_) => {
-                *commits_since_index_write += 1;
-                *commits_since_index_write >= INDEX_WRITE_EVERY
-            }
-        };
-        if write_index {
-            index.write().map_err(CommitGit2Error::Other)?;
-            *commits_since_index_write = 0;
-        }
         debug!(
             touched,
             walked = matches!(staging, Staging::Everything),
@@ -387,6 +361,12 @@ impl GitAdapter {
                 index.write_tree().map_err(CommitGit2Error::Other)?
             }
         };
+        // Every commit, including the one with nothing to commit, leaves the
+        // index file matching the tree: another process (the git CLI, an
+        // editor, a backup) reads the file, and a stale one shows the
+        // checkpointed pages as both staged and unstaged (#983). Written
+        // after `write_tree`, it also carries the tree cache.
+        index.write().map_err(CommitGit2Error::Other)?;
 
         // If the index matches HEAD, there is nothing to commit.
         if let Ok(head) = repo.head()
@@ -1357,30 +1337,60 @@ mod tests {
         assert!(head_blob(&adapter, "d/y.md").is_none());
     }
 
+    /// What another process sees: a repository opened fresh reads the
+    /// index file, not the adapter's kept index.
+    fn assert_clean_from_outside(root: &Path, context: &str) {
+        let repo = Repository::open(root).unwrap();
+        let dirty: Vec<(String, git2::Status)> = repo
+            .statuses(None)
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.path().unwrap_or_default().to_owned(), entry.status()))
+            .collect();
+        assert!(dirty.is_empty(), "{context}: {dirty:?}");
+        // The git CLI too, where there is one.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["status", "--porcelain=v2"])
+            .current_dir(root)
+            .output()
+            && out.status.success()
+        {
+            let porcelain = String::from_utf8_lossy(&out.stdout);
+            assert!(porcelain.is_empty(), "{context}: git status: {porcelain}");
+        }
+    }
+
     #[test]
-    fn the_index_file_is_written_after_a_walk_and_every_fifty_commits() {
+    fn every_commit_leaves_the_index_file_matching_head() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a"), ("b.md", "b")]);
+        assert_clean_from_outside(&root, "after the walk");
+        for i in 1..=3 {
+            write(&root, "a.md", &format!("a{i}"));
+            adapter.mark_written(Path::new("a.md"));
+            assert!(
+                adapter
+                    .commit_all(&format!("scoped {i}"))
+                    .unwrap()
+                    .is_some()
+            );
+            assert_clean_from_outside(&root, &format!("after scoped commit {i}"));
+        }
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a3"));
+    }
+
+    #[test]
+    fn a_commit_with_nothing_to_commit_still_writes_the_index_file() {
         let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
         let index_file = root.join(".git/index");
-        let after_walk = std::fs::read(&index_file).unwrap();
-        for i in 1..=INDEX_WRITE_EVERY {
-            let rel = format!("n-{i}.md");
-            write(&root, &rel, "n");
-            adapter.mark_written(Path::new(&rel));
-            assert!(adapter.commit_all(&rel).unwrap().is_some());
-            let now = std::fs::read(&index_file).unwrap();
-            if i < INDEX_WRITE_EVERY {
-                assert_eq!(now, after_walk, "commit {i} wrote the index file");
-            } else {
-                assert_ne!(now, after_walk, "commit {i} did not write the index file");
-            }
-        }
-        let before_walk = std::fs::read(&index_file).unwrap();
-        write(&root, "b.md", "b");
-        adapter.mark_written(Path::new("b.md"));
-        adapter.age_last_walk();
-        assert!(adapter.commit_all("sweep").unwrap().is_some());
-        assert_ne!(std::fs::read(&index_file).unwrap(), before_walk);
-        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b"));
+        let stale = std::fs::read(&index_file).unwrap();
+        write(&root, "a.md", "a2");
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("a2").unwrap().is_some());
+        // The index file falls behind HEAD, as a missed write left it.
+        std::fs::write(&index_file, &stale).unwrap();
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("unchanged").unwrap().is_none());
+        assert_clean_from_outside(&root, "after the no-op commit");
     }
 
     #[test]
