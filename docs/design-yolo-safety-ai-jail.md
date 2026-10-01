@@ -221,7 +221,7 @@ collision.
 | `kube` (`~/.kube`) | credential | when present | on when present |
 | `gcloud` (`~/.config/gcloud`) | credential | when present | on when present |
 | `docker-config` (`~/.docker/config.json`) | credential | when present | on when present |
-| `ssh` (`~/.ssh` read-only + `SSH_AUTH_SOCK`) | credential | when `~/.ssh` exists or an agent socket is set | on only when `origin` is SSH-style (`git@host:…`, `ssh://…`) |
+| `ssh` (`~/.ssh` read-only + `SSH_AUTH_SOCK`) | credential | when `~/.ssh` exists or an agent socket is set | on only when `git push` to `origin` goes over SSH (`git@host:…`, an `~/.ssh/config` alias `host:…`, `ssh://…`), read from the push URL so an HTTPS fetch URL with an SSH `pushurl`/`pushInsteadOf` still counts |
 | `worktree` | capability | only in a linked git worktree | on there |
 | `docker` (socket — ⚠ grants host root) | capability | always | off |
 | `gpu`, `display` | capability | Linux only | off |
@@ -377,7 +377,7 @@ directly.
   `is_terminal` gate and a `confirm`-style reader.
 - `ai-memory-cli/src/config.rs`: `[run] claude_true_yolo: bool` (default false).
 - §5: the toggle table, `--help` support detection (`JailSupport`), host facts
-  (`JailHostFacts`, fed by `inspect_repository`'s `origin_url` /
+  (`JailHostFacts`, fed by `inspect_repository`'s `origin_push_url` /
   `linked_worktree`), `jail_checklist`, and `parse_jail_toggles` live in
   `jail.rs`; `run.rs` owns `--jail`/`--no-jail` parsing, the `jail_decision`
   table, and the checklist reader.
