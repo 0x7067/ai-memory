@@ -76,8 +76,12 @@ fn preflighted_ai_jail(
 /// protected-Nix-store exception) so our offer cannot lead directly to a
 /// refusal that the shallower PATH probe missed.
 fn ai_jail_preflight(ai_jail: &Path) -> bool {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return false;
+    };
     std::process::Command::new(ai_jail)
-        .args(["--dry-run", "--", "/bin/true"])
+        .args(["--dry-run", "--"])
+        .arg(current_exe)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
