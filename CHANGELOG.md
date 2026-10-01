@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `[handoff].claim_on_session_start` (default `true` - unchanged
+  behavior). When set to `false`, `SessionStart` no longer claims a pending
+  handoff automatically; it renders a non-consuming notice naming the exact
+  `handoff_id`, `from_agent`, and age instead (mirroring the existing inbox
+  notice: metadata only, never the stored summary/open-questions/next-steps
+  text), and the agent or operator picks it up explicitly with
+  `memory_handoff_accept`. Fixes an unrelated next session, a different
+  harness, or a non-interactive launch silently consuming a baton meant for
+  a specific session. Server-wide for now; a per-project override is left for
+  a follow-up change. (#1030)
 - Added a default-quit prompt after a successful interactive managed run so the
   operator can re-run the current harness or switch to another installed
   harness in the same workstream. Utility, failed, interrupted,
