@@ -265,8 +265,9 @@ reads and MCP `memory_read_session_observations` share that summary type; neithe
 response includes provider diagnostics.
 
 Tools can use MCP directly to write pages, query knowledge and claim handoffs.
-With `--enable-web`, incremental `recent` pages use a bounded `(updated_at, path)`
-query in the authorized scope. See [programmatic memory](programmatic-memory.md).
+With `--enable-api` (or `--enable-web`, which implies it), incremental `recent`
+pages use a bounded `(updated_at, path)` query in the authorized scope. API-only
+mode mounts no browser routes. See [programmatic memory](programmatic-memory.md).
 
 `GET /identity` is a machine-authenticated route mounted independently of the
 web UI. `ai-memory doctor` uses it to show caller identity and capture ownership;

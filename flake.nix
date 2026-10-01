@@ -94,6 +94,12 @@
       # wiring, it isn't asserting what the default is.
       enabled = mkNixos { services.ai-memory = { enable = true; enableWeb = true; }; };
       disabled = mkNixos { services.ai-memory.enable = false; };
+      apiOnly = mkNixos {
+        services.ai-memory = {
+          enable = true;
+          enableApi = true;
+        };
+      };
       withSettings = mkNixos {
         services.ai-memory = {
           enable = true;
@@ -210,6 +216,7 @@
       settingsExec =
         withSettings.config.systemd.services.ai-memory.serviceConfig.ExecStart;
       ipv6Exec = withIpv6Loopback.config.systemd.services.ai-memory.serviceConfig.ExecStart;
+      apiOnlyExec = apiOnly.config.systemd.services.ai-memory.serviceConfig.ExecStart;
       ageUnit = withAge.config.systemd.services.ai-memory;
       customSc = withCustomDataDir.config.systemd.services.ai-memory.serviceConfig;
       customTmpfiles = withCustomDataDir.config.systemd.tmpfiles.settings."10-ai-memory";
@@ -267,6 +274,8 @@
       nixosChecks = {
         nixos-module-eval =
           assert lib.hasInfix (escapedExecArgs [ "--enable-web" ]) execStart;
+          assert lib.hasInfix (escapedExecArgs [ "--enable-api" ]) apiOnlyExec;
+          assert !(lib.hasInfix (escapedExecArgs [ "--enable-web" ]) apiOnlyExec);
           assert lib.hasInfix
             (escapedExecArgs [ "--bind" "127.0.0.1:49374" ]) execStart;
           assert lib.hasInfix

@@ -2960,13 +2960,19 @@ pub struct ServeArgs {
     /// is public so it can render password login; `/api/v1` and the built-in
     /// server-rendered wiki remain protected by a web session or machine
     /// Bearer.
-    #[arg(long)]
+    #[arg(long, env = "AI_MEMORY_ENABLE_WEB")]
     pub enable_web: bool,
+    /// Mount only the read-only `/api/v1` JSON API. Off by default.
+    ///
+    /// `--enable-web` implies this API as before. Use this flag for
+    /// non-browser companions that must not expose the web UI.
+    #[arg(long, env = "AI_MEMORY_ENABLE_API")]
+    pub enable_api: bool,
     /// Serve this static directory at /web instead of the built-in UI.
     ///
     /// The read-only /api/v1 frontend API is still mounted when
     /// --enable-web is set.
-    #[arg(long)]
+    #[arg(long, env = "AI_MEMORY_WEB_UI_DIR")]
     pub web_ui_dir: Option<PathBuf>,
     /// Base path the whole HTTP surface is served under. Empty (default)
     /// keeps every route at the host root — byte-identical to previous
@@ -3043,6 +3049,18 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn serve_api_only_flag_does_not_enable_the_web_ui() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "serve", "--transport", "http", "--enable-api"])
+                .expect("api-only serve args parse");
+        let Command::Serve(args) = parsed.command else {
+            panic!("expected serve command");
+        };
+        assert!(args.enable_api);
+        assert!(!args.enable_web);
+    }
 
     /// The management surface uses the design's spelling (#708):
     /// `user grant --user … --workspace … --project … --level …`, `user revoke`,

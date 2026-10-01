@@ -78,8 +78,9 @@ historical text, even after sanitization.
 
 ## Read changed pages
 
-These JSON endpoints require `serve --enable-web` and the same machine key.
-They are read-only; memory writes remain MCP calls.
+These JSON endpoints require `serve --enable-api` (or `--enable-web`, which
+continues to imply the API) and the same machine key. They are read-only;
+memory writes remain MCP calls.
 
 ```http
 GET /api/v1/workspaces/demo/projects/app/recent?updated_since=2026-09-01T00%3A00%3A00Z&limit=100

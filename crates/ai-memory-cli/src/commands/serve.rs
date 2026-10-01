@@ -1548,6 +1548,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 store.reader.clone(),
                 wiki.clone(),
                 WebMountSpec {
+                    enable_api: args.enable_api,
                     web_ui_dir: args.web_ui_dir.as_deref(),
                     cors_origins: &cors_origins,
                     web_slug: &args.web_slug,
@@ -4403,6 +4404,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &[],
                 web_slug: "/web",
@@ -4490,6 +4492,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_only_mode_keeps_data_authenticated_and_web_absent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let web = split_web_routers(
+            false,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+                trusted_proxy_identity: false,
+            },
+        )
+        .unwrap();
+        assert!(web.html_auth.is_none());
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.public
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth,
+                    require_dual_auth,
+                ))),
+            vec!["localhost".to_string()],
+        );
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
+
+        let absent_web = router
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(absent_web.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn web_routes_are_inside_auth_layer() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -4499,6 +4578,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &[],
                 web_slug: "/web",
@@ -4644,6 +4724,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
@@ -4705,6 +4786,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/",

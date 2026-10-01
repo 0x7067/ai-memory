@@ -757,7 +757,7 @@ for the flake and module — what CI runs, and what each tier proves.
    `full-ci` label only.
 2. **Eval contracts** — `nix build .#checks.x86_64-linux.nixos-module-eval`
    and `nixos-sandbox-parity`. Cheap Linux-only asserts for enable/bind/
-   `--config`/secrets wiring, refusal messages (age+sops mutex, secrets in
+   `--config`/secrets wiring, API-only vs web mounts, refusal messages (age+sops mutex, secrets in
    `settings.auth`, `settings.bind`), escaped `ExecStart` (`--data-dir`,
    `serve`, `--transport http`), default `StateDirectory` vs custom
    `dataDir` tmpfiles/`ReadWritePaths`, and sandbox key parity with
@@ -1741,7 +1741,8 @@ The `serve` subcommand also accepts:
 
 | Flag | Env var | What it does |
 |---|---|---|
-| `--enable-web` | `AI_MEMORY_ENABLE_WEB=true` | Mount the read-only web browser + `/api/v1` JSON API. |
+| `--enable-web` | `AI_MEMORY_ENABLE_WEB=true` | Mount the read-only web browser and `/api/v1` JSON API. |
+| `--enable-api` | `AI_MEMORY_ENABLE_API=true` | Mount only the protected, read-only `/api/v1` JSON API for companions and other non-browser clients. |
 | `--base-path /wiki` | `AI_MEMORY_BASE_PATH` | Host the entire HTTP surface (`/mcp`, `/hook`, `/admin/*`, `/api/v1`, `/web`) under a configurable subpath — useful behind a reverse proxy sharing a hostname. `.` and `..` segments are rejected; unsafe chars cause a fallback to root with a warning. See [`docs/https-via-proxy.md`](https-via-proxy.md#hosting-under-a-subpath). |
 | `--web-slug /web` | `AI_MEMORY_WEB_SLUG` | Where the web UI mounts within the base-path. Default `/web`; set to `/` to mount the UI at the base-path root. |
 | `--web-ui-dir <path>` | `AI_MEMORY_WEB_UI_DIR` | Serve a custom SPA from `<path>` instead of the built-in browser. ai-memory injects `<base href>` and `<meta name="ai-memory-base-path">` so the SPA can build relative URLs and API calls under the configured prefix. |

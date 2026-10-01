@@ -92,6 +92,7 @@ let
       "--bind"
       "${bindHost}:${toString cfg.port}"
     ]
+    ++ lib.optionals cfg.enableApi [ "--enable-api" ]
     ++ lib.optionals cfg.enableWeb [ "--enable-web" ];
 in
 {
@@ -136,6 +137,17 @@ in
         Pass --enable-web (mounts the built-in web UI at /web). Off by
         default, matching the underlying --enable-web CLI flag's own
         default — NOT the packaged FHS systemd unit, which hardcodes it on.
+        Enabling the web UI also mounts `/api/v1`; `enableApi` is unnecessary
+        in that mode.
+      '';
+    };
+
+    enableApi = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Pass --enable-api to mount the protected read-only `/api/v1` surface
+        without the browser UI. Off by default.
       '';
     };
 
@@ -148,7 +160,8 @@ in
       description = ''
         Declarative config.toml fragment (non-secret keys only). Rendered to a
         generated file and passed as `--config`. Top-level `bind`, `port`, and
-        `enableWeb` service options win over duplicate keys here.
+        `enableWeb`, and `enableApi` service options win over duplicate keys
+        here.
 
         A small typed set covers common keys; `freeformType` accepts any other
         TOML key. Values here land in a world-readable Nix store path — never

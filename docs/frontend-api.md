@@ -606,6 +606,18 @@ historical text. Never cached (`no-store`). Same payload as the MCP tool
 
 ## 6. Custom UI hosting and base paths
 
+For an API-only companion, mount the protected JSON surface without a browser
+UI:
+
+```bash
+ai-memory serve --transport http --enable-api
+```
+
+`--enable-web` continues to imply `/api/v1` for compatibility. `--enable-api`
+alone does not mount `/web`, its login pages, static assets, or the unauthenticated
+favicon route. The API uses the same machine Bearer or browser-session auth gate
+in either mode.
+
 ```bash
 ai-memory serve \
     --transport http \

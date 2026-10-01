@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `serve --enable-api` / `AI_MEMORY_ENABLE_API=true` to mount the
+  authenticated read-only `/api/v1` surface without the browser UI. Existing
+  `--enable-web` behavior is unchanged and still includes the API. Documented
+  the acceptance and safety boundary for a repository-backed team-wiki sync
+  companion. (#986)
 - Added `[handoff].claim_on_session_start` (default `true` - unchanged
   behavior). When set to `false`, `SessionStart` no longer claims a pending
   handoff automatically; it renders a non-consuming notice naming the exact
