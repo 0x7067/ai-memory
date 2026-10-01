@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an intermittent `concurrent_commits_queue_instead_of_failing` CI failure.
 
 ### Security
-- Fixed `memory_read_page` with `include_related` returning pages from
+- Fixed GHSA-gf78-hf8g-vffm: `memory_read_page` with `include_related` returning pages from
   projects the caller cannot read under per-project authorization, and walking
   through them to reach others: in multi-user mode an authenticated user without
   a grant saw the paths, titles, kinds, and project names of pages in a
