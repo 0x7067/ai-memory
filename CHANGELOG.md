@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed `ai-memory upgrade` rewriting native hook commands with Linux's
+  ` (deleted)` executable-path suffix after replacing its own binary. Every
+  hook renderer now keeps a still-existing literal path, otherwise strips the
+  kernel suffix only when the resulting installed binary exists, and finally
+  falls back to the bare `ai-memory` command instead of embedding a dead path.
+  The in-process refresh continues using the already-loaded CLI/config scope.
+  (#1027)
 - Fixed native `ai-memory upgrade` rejecting every current Linux, macOS, and
   Windows release archive when it encountered the packaging, config-template,
   or documentation entries shipped beside the binary. The extractor now
