@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed native `ai-memory upgrade` rejecting every current Linux, macOS, and
+  Windows release archive when it encountered the packaging, config-template,
+  or documentation entries shipped beside the binary. The extractor now
+  validates the exact support-file layout emitted by `release.yml`, ignores
+  those non-runtime files during self-upgrade, and still extracts only the
+  binary and hooks. Archive entry-count and expanded-size caps now complement
+  the existing compressed-download limit. (#1025)
 - Fixed the recommended Linux/macOS Docker-wrapper `install-hooks` path
   silently installing shell hooks that cannot enforce client-side capture
   controls such as `[capture] ignore_paths` and allowlist mode. The wrapper now

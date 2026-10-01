@@ -2631,7 +2631,11 @@ The native path downloads the matching release archive
 Windows) and its `.sha256` sidecar from GitHub Releases, verifies the
 checksum, replaces the on-disk binary (and a sibling `hooks/` directory when
 present), then re-stages hooks for agents already under the data-dir hooks
-tree. Windows uses rename-aside (`.exe` → `.old`, then promote `.new`) because
+tree. The archive's packaged service files, default config, and documentation
+are checked against the release workflow's exact layout but are not extracted
+during self-upgrade. Archives are capped at 4,096 entries and 512 MiB expanded,
+in addition to the 128 MiB response-body cap. Windows uses rename-aside
+(`.exe` → `.old`, then promote `.new`) because
 a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
 installs (use the package manager), unwritable prefixes (for example Program
 Files — download the zip manually), and in-container binaries (upgrade the
