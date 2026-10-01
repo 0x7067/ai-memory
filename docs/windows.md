@@ -643,10 +643,12 @@ from what the repository actually ships today.
   decision is made; it is a blocker for a frictionless Supported experience on
   Application-Control-enforced fleets.
 
-- **Native `ai-memory upgrade` path — in-progress.** A first-class in-place
-  upgrade for native Windows installs (release-binary and wrapper flows) is
-  tracked in #801/#802. Until it lands, upgrading is the manual
-  download/extract/re-`install-hooks` sequence in Scenarios B and C.
+- **Native `ai-memory upgrade` path — done.** `ai-memory upgrade` upgrades a
+  writable native install in place (#801, #802): it verifies the
+  `ai-memory-windows-x86_64.zip` checksum, replaces `ai-memory.exe` by
+  rename-aside, refreshes a sibling `hooks/` tree, and re-stages installed
+  hooks — see Scenario B. A non-writable prefix (for example under Program
+  Files) still upgrades through the manual download/extract sequence.
 
 Promotion to Supported is the maintainer's decision once the in-progress items
 are closed and the deferred code-signing policy is resolved (or explicitly
