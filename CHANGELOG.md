@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture ownership and sessions with multiple capture sources (native events
   or distinct extensions, including backfill).
   Mixed-source counts preserve scope, session ownership and time-window filters;
-  older servers leave unsupported fields unknown. (#1010)
+  older servers leave unsupported fields unknown. (#1016)
 
 ## [2.5.2] - 2026-10-01
 
