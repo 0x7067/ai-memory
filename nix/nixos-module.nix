@@ -3,7 +3,7 @@
 # Standalone: no reference to `self` or anything flake-specific, so it stays
 # importable outside this flake. `flake.nix`'s `nixosModules.default` wraps
 # this file and supplies a default for `package` by closing over `self`.
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, utils, ... }:
 
 let
   cfg = config.services.ai-memory;
@@ -142,6 +142,11 @@ in
         Declarative config.toml fragment (non-secret keys only). Rendered to a
         generated file and passed as `--config`. Top-level `bind`, `port`, and
         `enableWeb` service options win over duplicate keys here.
+
+        A small typed set covers common keys; `freeformType` accepts any other
+        TOML key. Values here land in a world-readable Nix store path — never
+        put secrets in `settings` (including `llm_headers` / auth tokens);
+        use `ageSecret`, `sopsSecret`, or `environmentFile` instead.
       '';
     };
 
@@ -283,7 +288,7 @@ in
               Type = "simple";
               User = cfg.user;
               Group = cfg.group;
-              ExecStart = lib.concatStringsSep " " execStartArgs;
+              ExecStart = utils.escapeSystemdExecArgs execStartArgs;
               Restart = "on-failure";
               RestartSec = "5s";
               TimeoutStopSec = "30s";

@@ -751,15 +751,17 @@ for the flake and module — what CI runs, and what each tier proves.
 
 1. **Package smoke** — `nix build .#packages.<system>.default` then
    `scripts/check-nix-packaging.sh ./result` (binary `--version`, hooks
-   tree, config template, `nix run`). Runs on Linux and Darwin in
-   `.github/workflows/nix.yml`.
+   tree, config template, `nix run`). Linux runs on every path-filtered
+   `nix.yml` PR; Darwin is schedule / `workflow_dispatch` / `nix` or
+   `full-ci` label only.
 2. **Eval contracts** — `nix build .#checks.x86_64-linux.nixos-module-eval`
    and `nixos-sandbox-parity`. Cheap Linux-only asserts for enable/bind/
    `--config`/secrets wiring, refusal messages (age+sops mutex, secrets in
-   `settings.auth`, `settings.bind`), `ExecStart` (`--data-dir`, `serve`,
-   `--transport http`), default `StateDirectory` vs custom `dataDir`
-   tmpfiles/`ReadWritePaths`, and sandbox key parity with
-   `nix/systemd-sandbox.nix`.
+   `settings.auth`, `settings.bind`), escaped `ExecStart` (`--data-dir`,
+   `serve`, `--transport http`), default `StateDirectory` vs custom
+   `dataDir` tmpfiles/`ReadWritePaths`, and sandbox key parity with
+   `nix/systemd-sandbox.nix`. Runs on path-filtered PRs with the Linux
+   package job.
 3. **Toplevel → OCI → container smoke** — one closure path. Building
    `packages.x86_64-linux.nixos-ai-memory-docker` builds
    `system.build.toplevel` once (via the nixpkgs docker-image tarball);
@@ -774,8 +776,9 @@ scripts/test-nixos-systemd-container.sh
    (the module's default loopback bind is unreachable via Docker `-p`),
    writes a
    marker under `/var/lib/ai-memory`, restarts the unit, and (by default)
-   remounts a named volume once. Wired into the Linux leg of `nix.yml`
-   only (same path filters as the rest of the Nix job).
+   remounts a named volume once. Gated in `nix.yml` to schedule /
+   `workflow_dispatch` / `nix` or `full-ci` label (not every Cargo.lock
+   bump).
 
 **Non-goals** (do not treat these as covered by the ladder above):
 

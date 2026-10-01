@@ -1,16 +1,16 @@
 name: nix
 
-# Builds the flake on Linux and macOS so the Nix packaging cannot rot unnoticed.
+# Builds the flake on Linux (and optionally macOS) so the Nix packaging cannot
+# rot unnoticed.
 #
-# Matrix: x86_64-linux (package + NixOS module eval + NixOS systemd container
-# smoke) and aarch64-darwin (package + artifact smoke only). NixOS checks and
-# the OCI/systemd container smoke always target x86_64-linux and stay on the
-# Linux leg — Darwin attrs would add noise without signal.
+# Default PR path (path-filtered): x86_64-linux package + check-nix-packaging
+# + NixOS module eval / sandbox-parity. Cheap enough to run when flake inputs
+# or Cargo.lock change.
 #
-# ai-memory does not otherwise test on Nix, so without this job `flake.nix`
-# is source nobody executes: it can break through a dependency bump, a
-# toolchain change, or a new build script and stay green because no other
-# job touches it.
+# Expensive legs — aarch64-darwin package smoke and the privileged NixOS
+# systemd container (~14 min) — run only on schedule, workflow_dispatch, or a
+# PR labelled `nix` / `full-ci`. Per AGENTS.md CI pacing: fast per merge, full
+# matrix before release.
 #
 # Deliberately NOT run on every pull request — a full release build under
 # Nix costs far more wall-clock than the rest of the matrix combined, and
@@ -22,6 +22,7 @@ on:
     branches: [main]
     paths:
       - 'flake.nix'
+      - 'flake.lock'
       - 'nix/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -30,8 +31,10 @@ on:
       - 'scripts/test-nixos-systemd-container.sh'
       - '.github/workflows/nix.yml'
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'flake.nix'
+      - 'flake.lock'
       - 'nix/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -59,6 +62,16 @@ jobs:
             runner: ubuntu-latest
           - system: aarch64-darwin
             runner: macos-latest
+    # Linux always runs when this workflow fires. Darwin is gated to
+    # schedule / dispatch / `nix`|`full-ci` label so Cargo.lock bumps (and
+    # pushes to main) do not burn a macOS runner on every dependency PR.
+    if: >-
+      matrix.system == 'x86_64-linux' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       (contains(github.event.pull_request.labels.*.name, 'nix') ||
+        contains(github.event.pull_request.labels.*.name, 'full-ci')))
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,6 +97,7 @@ jobs:
       # script imports that rootfs, starts systemd, and checks install +
       # /healthz + dataDir restart/volume persistence.
       #
+      # Gated like Darwin: schedule / dispatch / `nix`|`full-ci` only.
       # Non-goals for this step (do not expand here):
       #   - A→B package upgrade / SQLite-wiki migration matrix
       #   - Exhaustive settings-options.nix key matrix
@@ -91,5 +105,11 @@ jobs:
       #   - Claiming the app Docker image covers the NixOS module
       #   - Darwin / multi-arch NixOS OCI (Linux x86_64 only by design)
       #   - Re-asserting sandbox keys (covered by nixos-sandbox-parity)
-      - if: matrix.system == 'x86_64-linux'
+      - if: >-
+          matrix.system == 'x86_64-linux' &&
+          (github.event_name == 'schedule' ||
+           github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'pull_request' &&
+            (contains(github.event.pull_request.labels.*.name, 'nix') ||
+             contains(github.event.pull_request.labels.*.name, 'full-ci'))))
         run: scripts/test-nixos-systemd-container.sh

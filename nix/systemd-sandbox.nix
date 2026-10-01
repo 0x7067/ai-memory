@@ -1,8 +1,9 @@
-# Shared systemd hardening for ai-memory (NixOS module + FHS units).
+# Shared systemd hardening for the NixOS ai-memory module.
 #
-# Keep packaging/systemd/ai-memory.service and ai-memory-user.service aligned
-# with these keys; scripts/check-native-packaging.sh asserts the system unit
-# contains every entry below.
+# Applied by `nix/nixos-module.nix`. Packaged FHS units under
+# `packaging/systemd/` keep their existing lighter hardening for now;
+# aligning those units with this sandbox is a follow-up (needs a real unit
+# start test — `systemd-analyze verify` alone is not enough).
 { lib, ... }:
 
 {
@@ -36,7 +37,9 @@
     ProtectSystem = "strict";
   };
 
-  # User-unit sandbox: same confinement where %h paths must stay writable.
+  # User-unit sandbox (reserved for a future FHS user-unit hardening PR).
+  # Same confinement keys less ProtectHome/ProtectSystem, which conflict
+  # with %h data paths.
   aiMemoryUserSandbox = {
     CapabilityBoundingSet = [ ];
     AmbientCapabilities = [ ];

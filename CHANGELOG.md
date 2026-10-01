@@ -11,15 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A NixOS module (`nix/nixos-module.nix`, exposed as `nixosModules.default`)
   so NixOS hosts can run `services.ai-memory.enable = true` as a hardened
   systemd service — dedicated `ai-memory` system user (`nologin`, gated by
-  `createUser`) plus a shared systemd sandbox applied to both NixOS and the
-  packaged FHS units (`nix/systemd-sandbox.nix`). Typed
-  `services.ai-memory.settings` renders declarative `config.toml`; secrets use
+  `createUser`) plus the NixOS systemd sandbox in `nix/systemd-sandbox.nix`.
+  Typed `services.ai-memory.settings` renders declarative `config.toml`
+  (minimal typed keys + `freeformType`; values land in a world-readable store
+  path — keep secrets out, including `llm_headers`); secrets use
   `ageSecret`, `sopsSecret`, or `environmentFile` (required for non-loopback
   binds). The web UI defaults off (`enableWeb = false`, matching the CLI
   flag's own default rather than the packaged unit's hardcoded
   `--enable-web`). `flake.nix` adds eval checks for sandbox keys, settings →
   `--config`, agenix/sops wiring, refusal contracts (age+sops mutex, secrets
-  in `settings.auth`, forbidden `settings.bind`), `ExecStart`
+  in `settings.auth`, forbidden `settings.bind`), escaped `ExecStart`
   (`--data-dir` / `serve` / `--transport http`), default `StateDirectory` vs
   custom `dataDir` tmpfiles/`ReadWritePaths`, and cheap
   network-online / `openFirewall` / `MemoryMax` / `TasksMax` round-trips.
@@ -27,24 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `system.build.toplevel` (via the docker-image rootfs tarball) and
   `scripts/test-nixos-systemd-container.sh` runs a privileged systemd
   container smoke (`systemctl` + in-container `/healthz` + dataDir
-  restart/volume persistence) on the Linux `nix.yml` leg. The existing
-  `flake.nix` package/devShell/CLI build is unchanged. (#989)
+  restart/volume persistence). The existing `flake.nix` package/devShell/CLI
+  build is unchanged. (#989)
 
 ### Changed
-- `.github/workflows/nix.yml` now builds the flake on `x86_64-linux` and
-  `aarch64-darwin` with `scripts/check-nix-packaging.sh` artifact smoke tests
-  (binary, hooks, config template, `nix run`); NixOS module eval and the
-  NixOS systemd container smoke stay on the Linux leg only. (#989)
-
-### Fixed
-- NixOS systemd container smoke injects a NixOS `PATH` on every
-  `docker exec` (`/run/current-system/sw/bin` + profile + `/bin`) so
-  `systemctl`/`curl`/`chown` resolve after activation. Bare `chown` under
-  `/bin/sh` previously exited 127 once `/healthz` already passed; absolute
-  profile paths alone were also missing until activation linked
-  `current-system`. Host-side `/healthz` stays in-container because the
-  module's default `127.0.0.1` bind is unreachable through Docker
-  published ports. (#989)
+- `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
+  filtered PRs and pushes (package smoke + NixOS module eval /
+  sandbox-parity). The `aarch64-darwin` package smoke and the privileged
+  NixOS container smoke run only on schedule, `workflow_dispatch`, or a PR
+  labelled `nix` / `full-ci`. (#989)
 
 ## [2.5.2] - 2026-10-01
 
