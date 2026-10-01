@@ -101,7 +101,8 @@ uncalled can). Pick it up explicitly:
 ```
 
 This is server-wide — every operator on the server gets the same behavior.
-The default (`true`) is unchanged for every existing install.
+Restart the server after changing `config.toml`; configuration is loaded once
+at startup. The default (`true`) is unchanged for every existing install.
 
 ## Compaction recovery
 

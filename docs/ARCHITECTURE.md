@@ -192,9 +192,13 @@ imports the native transcript tail and a Git checkpoint when the child exits.
 Every injected packet starts with a versioned origin marker. The Claude
 transcript normalizer excludes a marked packet if Claude persists and reads it
 back, preventing delivered history from recursively re-entering the ledger.
-An explicitly pending handoff is delivered before the managed event range;
-their single-use delivery claims share one writer transaction after the
-complete startup response has been assembled. Manual handoffs take precedence;
+An explicitly pending handoff is considered before the managed event range.
+By default their single-use delivery claims share one writer transaction after
+the complete startup response has been assembled. With server-wide
+`[handoff].claim_on_session_start = false`, SessionStart instead emits a
+metadata-only notice naming the exact handoff id and leaves the row open for
+an explicit `memory_handoff_accept`; the managed event range is still claimed.
+Manual handoffs take precedence;
 otherwise the newest cwd-eligible automatic handoff is delivered, and that
 same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
@@ -769,6 +773,9 @@ dedup_cold_clusters = false        # A3 opt-in: cluster near-duplicate cold
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
+
+[handoff]                         # optional server-wide delivery policy
+claim_on_session_start = true     # false offers metadata; explicit accept claims
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000

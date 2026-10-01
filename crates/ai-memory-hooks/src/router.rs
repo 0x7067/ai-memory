@@ -11917,6 +11917,29 @@ mod tests {
             open_handoff_exists(&state).await,
             "offer mode must never claim the handoff on its own",
         );
+
+        let accepted = state
+            .writer
+            .accept_handoff(ai_memory_core::HandoffAcceptance {
+                handoff_id,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                accepting_agent: AgentKind::Codex,
+                accepting_session: None,
+                accepting_user: None,
+                owner_filter: ai_memory_core::OwnerFilter::Unattributed,
+                receiving_cwd: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            accepted,
+            "an explicit exact-id accept must still claim the offered baton",
+        );
+        assert!(
+            !open_handoff_exists(&state).await,
+            "the explicit accept control must consume the offered baton",
+        );
     }
 
     /// A listener that accepts connections and never replies, so a webhook

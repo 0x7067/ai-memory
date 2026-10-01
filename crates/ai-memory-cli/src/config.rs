@@ -3762,6 +3762,9 @@ mod tests {
             [auth]
             secure_cookie = true
 
+            [handoff]
+            claim_on_session_start = false
+
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
@@ -3816,6 +3819,7 @@ mod tests {
         assert_eq!(cfg.contradiction_band_min, 0.5);
         assert_eq!(cfg.contradiction_band_max, 0.8);
         assert!(cfg.auth.secure_cookie);
+        assert!(!cfg.handoff.claim_on_session_start);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);
@@ -3851,6 +3855,11 @@ mod tests {
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    #[test]
+    fn handoff_claim_on_session_start_defaults_to_true() {
+        assert!(Config::default().handoff.claim_on_session_start);
     }
 
     #[test]
