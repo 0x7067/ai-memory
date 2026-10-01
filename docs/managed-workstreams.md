@@ -74,9 +74,9 @@ ai-memory run
 ```
 
 Everything after the harness name is native argv except the wrapper-owned exact
-flags `--yolo` and `--fresh`. No `--` separator is needed, and ai-memory does
-not maintain a second copy of each harness's option schema. Other wrapper
-options come first:
+flags `--yolo`, `--fresh`, and `--force-unlock`. No `--` separator is needed,
+and ai-memory does not maintain a second copy of each harness's option schema.
+Other wrapper options come first:
 
 Portable events, handoffs, and project briefs are injected as explicitly
 delimited, untrusted historical data. Instruction-like text inside stored
@@ -88,7 +88,8 @@ file, and the current checkout remain authoritative.
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
-              [--yolo] [--fresh] [--env KEY=VALUE]... [--env-file PATH]
+              [--yolo] [--fresh] [--force-unlock]
+              [--env KEY=VALUE]... [--env-file PATH]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
@@ -691,6 +692,8 @@ immediately. A new launch retries an active-workstream conflict briefly so a
 previous launcher can finish; if another harness is genuinely still running,
 the conflict remains and concurrent writers are still rejected.
 
+### Lease recovery
+
 A launcher that dies without releasing its lease — killed, its terminal
 closed, or a sandbox such as ai-jail torn down — leaves the workstream held
 until that lease lapses. An interactive relaunch (stdin and stderr are
@@ -704,6 +707,25 @@ another run off. Non-interactive launches (scripts, hooks, CI) keep the short
 retry window and fail fast rather than hanging. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
+
+When you know the prior launcher is gone and do not want to wait for the lease,
+force-expire it explicitly:
+
+```bash
+ai-memory run --force-unlock codex
+# The exact wrapper flag is also accepted after the harness name.
+ai-memory run codex --force-unlock
+```
+
+The replacement is atomic and limited to the same durable authenticated
+operator; in single-user or otherwise unattributed operation, both runs must be
+unattributed. A different operator's active run is still refused. The command
+expires the managed lease only — it does not signal or kill a native process.
+If the previous launcher is actually alive, its later heartbeats and finish are
+rejected, and its final transcript tail may not be imported. Use
+`--force-unlock` only after verifying that launcher has stopped. Older servers
+do not honor the request and return a refusal, so upgrade the server as well as
+the client before relying on this recovery path.
 
 Before the child starts, `Ctrl+C` at the native-session chooser cancels the
 acquired run and exits without requiring Enter or adopting the selected session.

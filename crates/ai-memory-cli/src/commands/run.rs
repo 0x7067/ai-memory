@@ -126,6 +126,7 @@ pub(super) async fn run_from_with_wiring(
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
     let trailing_true_yolo = remove_wrapper_true_yolo(&mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
+    let trailing_force_unlock = remove_wrapper_force_unlock(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
     let trailing_jail = remove_wrapper_jail(&mut native_args);
     let jail_request = jail_request(args.jail, args.no_jail, trailing_jail)?;
@@ -136,6 +137,7 @@ pub(super) async fn run_from_with_wiring(
     );
     let yolo_requested = yolo_modes.yolo;
     let force_fresh = args.fresh || trailing_fresh;
+    let force_unlock = args.force_unlock || trailing_force_unlock;
     let no_autowire = args.no_autowire || trailing_no_autowire;
     let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
         .context("resolving --env/--env-file for the managed run")?;
@@ -226,6 +228,7 @@ pub(super) async fn run_from_with_wiring(
         available_agents: unique_auto_agents(&auto_candidates),
         workstream: args.workstream,
         new_workstream: args.new_workstream,
+        force_unlock,
         lease_owner: lease_owner(),
     };
     let interrupted_before_spawn = CancellationToken::new();
@@ -1618,6 +1621,12 @@ fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+fn remove_wrapper_force_unlock(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--force-unlock"));
+    args.len() != before
+}
+
 fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     let before = args.len();
     args.retain(|arg| arg != OsStr::new("--no-autowire"));
@@ -2283,6 +2292,15 @@ async fn prepare_managed_run(
     interactive: bool,
     interrupted: &CancellationToken,
 ) -> Result<PrepareManagedRunResponse> {
+    if request.force_unlock {
+        return match post_json(endpoint, "/workstream/runs", request).await {
+            Err(error) if is_active_workstream_conflict(&error) => Err(error.context(
+                "--force-unlock was refused: the active lease belongs to another operator, or \
+                 the server does not support forced lease recovery",
+            )),
+            other => other,
+        };
+    }
     let result = prepare_managed_run_with_retry(
         endpoint,
         request,
@@ -3284,6 +3302,7 @@ mod tests {
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
+            force_unlock: false,
             lease_owner: "workstation:43".into(),
         };
 
@@ -3402,6 +3421,7 @@ mod tests {
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
+            force_unlock: false,
             lease_owner: "workstation:43".into(),
         }
     }
@@ -3470,6 +3490,27 @@ mod tests {
         .expect_err("a renewing owner is never displaced");
         assert!(
             format!("{error:#}").contains("renewed the lease"),
+            "{error:#}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn force_unlock_asks_once_instead_of_waiting_out_the_lease() {
+        let (app, attempts) = held_lease_server(usize::MAX, Duration::from_secs(60));
+        let (endpoint, server) = serve(app).await;
+        let mut request = held_lease_request();
+        request.force_unlock = true;
+        let started = std::time::Instant::now();
+
+        let error = prepare_managed_run(&endpoint, &request, true, &CancellationToken::new())
+            .await
+            .expect_err("a server that refuses the takeover must fail immediately");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            format!("{error:#}").contains("--force-unlock was refused"),
             "{error:#}"
         );
         server.abort();
@@ -3970,6 +4011,30 @@ mod tests {
     }
 
     #[test]
+    fn force_unlock_is_a_wrapper_flag_before_or_after_the_harness() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--force-unlock",
+            "codex",
+            "--model",
+            "gpt-5",
+        ])
+        .unwrap();
+        let CliCommand::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.force_unlock);
+        assert_eq!(args.native_args, ["--model", "gpt-5"].map(OsString::from));
+
+        let mut trailing = ["--model", "gpt-5", "--force-unlock"]
+            .map(OsString::from)
+            .to_vec();
+        assert!(remove_wrapper_force_unlock(&mut trailing));
+        assert_eq!(trailing, ["--model", "gpt-5"].map(OsString::from));
+    }
+
+    #[test]
     fn wrapper_no_autowire_parses_before_or_after_the_harness() {
         // Before the harness: clap binds it as the wrapper flag.
         let cli = Cli::try_parse_from(["ai-memory", "run", "--no-autowire", "kimi"]).unwrap();
@@ -4129,6 +4194,7 @@ mod tests {
             jail: None,
             no_jail: false,
             fresh: false,
+            force_unlock: false,
             no_autowire: true,
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
@@ -4617,6 +4683,7 @@ mod tests {
             jail: None,
             no_jail: false,
             fresh: false,
+            force_unlock: false,
             no_autowire: false,
             env: Vec::new(),
             env_file: None,
@@ -4772,6 +4839,7 @@ mod tests {
             jail: None,
             no_jail: false,
             fresh: false,
+            force_unlock: false,
             no_autowire: false,
             env,
             env_file: None,
