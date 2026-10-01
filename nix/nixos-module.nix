@@ -147,10 +147,12 @@ in
       description = ''
         Declarative config.toml fragment (non-secret keys only). Rendered to a
         generated file and passed as `--config`. Top-level `bind`, `port`, and
-        `enableWeb` service options win over duplicate keys here. The generated
-        file is in the world-readable Nix store: never put credentials here,
-        including `llm_headers`; use `AI_MEMORY_LLM_HEADERS` in one of the
-        secret environment-file options instead.
+        `enableWeb` service options win over duplicate keys here.
+
+        A small typed set covers common keys; `freeformType` accepts any other
+        TOML key. Values here land in a world-readable Nix store path — never
+        put secrets in `settings` (including `llm_headers` / auth tokens);
+        use `ageSecret`, `sopsSecret`, or `environmentFile` instead.
       '';
     };
 

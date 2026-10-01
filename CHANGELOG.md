@@ -21,12 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses duplicate or symlink-escaping targets, and keeps overwritten files
   as timestamped backups. Other asset types are copied verbatim and may contain
   secrets or active instructions/code. (#962)
-- Added a NixOS module exposed as `nixosModules.default`, with a dedicated
-  non-login service user, a hardened systemd unit, declarative non-secret
-  settings, agenix/sops/environment-file secret sources, and opt-in web,
-  firewall, and resource settings. Non-loopback binds require exactly one
-  secret source; expensive Darwin and privileged container checks run only in
-  the full CI tier. (#989)
+- Added a NixOS module (`nix/nixos-module.nix`, exposed as
+  `nixosModules.default`) with a dedicated non-login system user and a hardened
+  NixOS systemd sandbox. A minimal typed set plus `freeformType` renders
+  declarative `config.toml`; values land in a world-readable store path, so
+  secrets (including `llm_headers`) use `ageSecret`, `sopsSecret`, or
+  `environmentFile`. Non-loopback binds require a secret source. The module
+  includes opt-in web, firewall, and resource settings plus eval and privileged
+  container checks. (#989)
 - Added `ai-memory doctor` reporting for Claude Code's default native
   `memory/` store for the current repository: location, file count, and whether
   the nearest marker's `ignore_paths` would exclude a read. Repository-root
@@ -69,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
+- `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
+  filtered PRs and pushes (package smoke + NixOS module eval /
+  sandbox-parity). The `aarch64-darwin` package smoke and the privileged
+  NixOS container smoke run only on schedule, `workflow_dispatch`, or a PR
+  labelled `nix` / `full-ci`. (#989)
 
 ### Fixed
 - Fixed completed retries and no-op session endings advancing

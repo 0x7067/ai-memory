@@ -1,4 +1,5 @@
-# Systemd hardening for the NixOS ai-memory service.
+# Systemd hardening for the NixOS ai-memory module. Packaged FHS units under
+# `packaging/systemd/` keep their existing lighter hardening.
 { lib, ... }:
 
 {
@@ -31,4 +32,5 @@
     ProtectHome = true;
     ProtectSystem = "strict";
   };
+
 }

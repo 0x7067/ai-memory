@@ -1,13 +1,16 @@
 name: nix
 
-# Builds the flake so the Nix packaging cannot rot unnoticed. Linux package
-# and module evaluation are the fast path. Darwin and the privileged NixOS
-# container smoke run only on schedule, manual dispatch, or a `full-ci` PR.
+# Builds the flake on Linux (and optionally macOS) so the Nix packaging cannot
+# rot unnoticed.
 #
-# ai-memory does not otherwise test on Nix, so without this job `flake.nix`
-# is source nobody executes: it can break through a dependency bump, a
-# toolchain change, or a new build script and stay green because no other
-# job touches it.
+# Default PR path (path-filtered): x86_64-linux package + check-nix-packaging
+# + NixOS module eval / sandbox-parity. Cheap enough to run when flake inputs
+# or Cargo.lock change.
+#
+# Expensive legs — aarch64-darwin package smoke and the privileged NixOS
+# systemd container (~14 min) — run only on schedule, workflow_dispatch, or a
+# PR labelled `nix` / `full-ci`. Per AGENTS.md CI pacing: fast per merge, full
+# matrix before release.
 #
 # Deliberately NOT run on every pull request — a full release build under
 # Nix costs far more wall-clock than the rest of the matrix combined, and
@@ -19,6 +22,7 @@ on:
     branches: [main, release/2.6]
     paths:
       - 'flake.nix'
+      - 'flake.lock'
       - 'nix/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -30,6 +34,7 @@ on:
     types: [opened, synchronize, reopened, labeled]
     paths:
       - 'flake.nix'
+      - 'flake.lock'
       - 'nix/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -71,16 +76,20 @@ jobs:
       # script imports that rootfs, starts systemd, and checks install +
       # /healthz + dataDir restart/volume persistence.
       #
+      # Gated like Darwin: schedule / dispatch / `nix`|`full-ci` only.
       # Non-goals for this step (do not expand here):
       #   - A→B package upgrade / SQLite-wiki migration matrix
       #   - Exhaustive settings-options.nix key matrix
       #   - Soft fake-systemd without a real unit start
       #   - Claiming the app Docker image covers the NixOS module
       #   - Darwin / multi-arch NixOS OCI (Linux x86_64 only by design)
+      #   - Re-asserting sandbox keys (covered by nixos-sandbox-parity)
       - if: >-
           github.event_name == 'schedule' ||
           github.event_name == 'workflow_dispatch' ||
-          (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci'))
+          (github.event_name == 'pull_request' &&
+           (contains(github.event.pull_request.labels.*.name, 'nix') ||
+            contains(github.event.pull_request.labels.*.name, 'full-ci')))
         run: scripts/test-nixos-systemd-container.sh
 
   build-darwin:
@@ -88,7 +97,9 @@ jobs:
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci'))
+      (github.event_name == 'pull_request' &&
+       (contains(github.event.pull_request.labels.*.name, 'nix') ||
+        contains(github.event.pull_request.labels.*.name, 'full-ci')))
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

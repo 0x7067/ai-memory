@@ -381,11 +381,12 @@ timestamped backups next to any file they touch.
 ### NixOS
 
 This flake ships a NixOS module (`nixosModules.default`) with a
-`systemd.services.ai-memory` unit. It creates a dedicated `ai-memory` system
-user (`nologin`, no linger) and applies a NixOS-specific systemd sandbox
+`systemd.services.ai-memory` unit: a dedicated `ai-memory` system user
+(`nologin`, no linger) plus a hardened systemd sandbox
 (`ProtectSystem = "strict"`, empty capability sets,
 `MemoryDenyWriteExecute`, `RestrictAddressFamilies`, and the rest — see
-[`nix/systemd-sandbox.nix`](nix/systemd-sandbox.nix)).
+[`nix/systemd-sandbox.nix`](nix/systemd-sandbox.nix)). Packaged FHS units
+under `packaging/systemd/` keep their existing lighter hardening.
 
 ```nix
 {
@@ -416,11 +417,12 @@ user (`nologin`, no linger) and applies a NixOS-specific systemd sandbox
 }
 ```
 
-Declarative non-secret config lives in `services.ai-memory.settings`. Common
-keys are typed for discoverability and the TOML freeform type keeps every
-other current and future `config.toml` key usable without duplicating the Rust
-schema. The module renders a generated TOML file and passes `--config`;
-network and web-listener controls stay in the module's top-level options.
+Declarative non-secret config lives in `services.ai-memory.settings` (a
+small typed set for common keys, plus `freeformType` for the rest of
+`config.toml`). The module renders a generated TOML file and passes
+`--config`. Top-level `bind`, `port`, and `enableWeb` win over duplicate
+settings keys. Anything in `settings` (including `llm_headers`) lands in a
+world-readable Nix store path — do not put API keys there.
 
 Secrets such as `AI_MEMORY_AUTH_TOKEN` never go in `settings` or the
 world-readable Nix store. This includes `llm_headers`, which can carry API
