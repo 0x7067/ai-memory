@@ -116,6 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
+- Fixed Unix release archives potentially carrying macOS AppleDouble sidecars
+  outside the native upgrader's strict path allowlist. Release packing now
+  disables sidecar generation, and packaging tests lock the staged top-level
+  layout to the upgrader allowlist so future release changes cannot silently
+  make official archives un-upgradable. (#1029)
 - Fixed `ai-memory upgrade` rewriting native hook commands with Linux's
   ` (deleted)` executable-path suffix after replacing its own binary. Every
   hook renderer now keeps a still-existing literal path, otherwise strips the
