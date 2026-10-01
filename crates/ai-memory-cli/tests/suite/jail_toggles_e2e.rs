@@ -1,7 +1,8 @@
 //! End-to-end coverage for `ai-memory run --jail[=…]` / `--no-jail` through
 //! the built binary (docs/design-yolo-safety-ai-jail.md §5).
 //!
-//! Each test puts fake `ai-jail`, `bwrap`, and `claude` executables on a temp
+//! Each test puts fake `ai-jail`, sandbox-backend (`bwrap` on Linux,
+//! `sandbox-exec` on macOS), and `claude` executables on a temp
 //! `PATH`, runs the real `ai-memory run` in a temp git repository with a temp
 //! `HOME`, and points it at a local mock server that records every request.
 //! The fake `ai-jail` answers `--help` with a chosen help text (so support
@@ -83,9 +84,9 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 impl Fixture {
-    /// `help` is what the fake `ai-jail --help` prints; `with_bwrap` decides
+    /// `help` is what the fake `ai-jail --help` prints; `with_backend` decides
     /// whether ai-jail counts as usable; `origin` is the repo's remote.
-    fn new(help: &str, with_bwrap: bool, origin: Option<&str>) -> Self {
+    fn new(help: &str, with_backend: bool, origin: Option<&str>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let repo = root.join("repo");
@@ -110,10 +111,18 @@ impl Fixture {
                 jail_argv.display()
             ),
         );
-        if with_bwrap {
-            write_script(&bin.join("bwrap"), "exit 0\n");
+        if with_backend {
+            // The backend `usable_ai_jail` requires on this OS: a fake `bwrap`
+            // on Linux would leave ai-jail unusable on macOS, where it needs
+            // `sandbox-exec`.
+            let backend = if cfg!(target_os = "macos") {
+                "sandbox-exec"
+            } else {
+                "bwrap"
+            };
+            write_script(&bin.join(backend), "exit 0\n");
         }
-        // `PATH` is this directory alone, so a host `bwrap` cannot make
+        // `PATH` is this directory alone, so a host sandbox backend cannot make
         // ai-jail usable behind the test's back; link in the two host tools
         // the run itself needs.
         for tool in ["git", "cat"] {
