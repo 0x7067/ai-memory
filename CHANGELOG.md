@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the graph already hid them; the multi-hop related walk now filters every
   hop the same way. Installs without authorization, and root, are unchanged.
   (#999)
+- Fixed CLI `ai-memory message send` (`POST /admin/messages/send`) bypassing
+  `message_send` admission: it inserted the message without consulting a
+  configured webhook's reject policy or notifying observers, while the MCP
+  send path enforced both. It now runs admission at the recipient scope before
+  the insert — a rejection returns 403 and stores nothing — and notifies
+  observers only after a successful commit, without waiting on nonblocking
+  ones. (#756)
 
 ## [2.5.1] - 2026-10-01
 
