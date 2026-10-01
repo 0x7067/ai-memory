@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Fixed GHSA-vh98: a capture-exclusion candidate or shell argument spelled
+  with a leading `//` (e.g. `//repo/secret/token.txt`) self-classified as a
+  Windows UNC path regardless of the actual host, so it matched zero POSIX
+  `ignore_paths` patterns (a flavor mismatch) and was captured instead of
+  dropped. Path flavor for an untrusted candidate is now derived from the
+  host (the cwd) rather than the candidate string alone, both in the native
+  hook (`ai-memory-hooks` `capture_policy.rs`) and the generated
+  OpenCode/OMP/Pi/OpenClaw TypeScript integrations
+  (`ai-memory-cli` `render_shared.rs`); a genuine Windows/UNC host's UNC
+  candidates are unaffected.
+
 ## [2.5.0] - 2026-09-30
 
 ### Added
