@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and an opaque, scope-bound cursor. Queries preserve equal-time ordering,
   exclude expired and superseded pages and recheck authorization on each
   request. Calls without incremental arguments retain their existing array
-  response. Added a generic MCP/HTTP integration guide. (#1010)
+  response. Added a generic MCP/HTTP integration guide. (#1017)
 
 ## [2.5.2] - 2026-10-01
 
