@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `grizzybot` as a recognised agent (wire value `grizzybot`, alias
+  `grizzy-bot`), so GrizzyBot's lifecycle events are attributed to it instead
+  of `other` and its tool calls are captured as closed-schema tool families,
+  like other Claude Code-shaped agents. Adds migration V72 to extend the
+  `sessions.agent_kind` CHECK constraint.
+
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)

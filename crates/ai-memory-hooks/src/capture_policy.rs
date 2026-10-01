@@ -175,6 +175,7 @@ pub(crate) fn tool_observation_metadata(
         | AgentKind::CommandCode
         | AgentKind::Codex
         | AgentKind::Grok
+        | AgentKind::Grizzybot
         | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
@@ -225,6 +226,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::KiroCli
                             | AgentKind::Pool
                             | AgentKind::Zcode
+                            | AgentKind::Grizzybot
                     ) {
                         "tool_input"
                     } else {
@@ -719,7 +721,9 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::KiroCli
         | AgentKind::Pool
         // ZCode mirrors Claude Code's snake_case `tool_name`/`tool_input`
-        // aliases on every tool event (live-captured, #512).
+        // aliases on every tool event (live-captured, #512). GrizzyBot posts
+        // the same Claude Code-shaped payload from its agent loop.
+        | AgentKind::Grizzybot
         | AgentKind::Zcode => object
             .get("tool_name")
             .and_then(Value::as_str)
@@ -1733,6 +1737,23 @@ mod tests {
             ExtractionState::UnsupportedSchema
         );
         assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    #[test]
+    fn grizzybot_tool_shape_is_closed_and_unknown_agents_stay_unsupported() {
+        let raw = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "web_search",
+            "tool_input": {"query": "swift"},
+            "session_id": "gb-session",
+            "cwd": "/bot/home"
+        });
+        let metadata = tool_observation_metadata(AgentKind::Grizzybot, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        // A PreToolUse without an input is not a proven shape.
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, true).is_none());
+        assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, false).is_some());
     }
 
     #[test]

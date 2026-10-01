@@ -280,6 +280,8 @@ pub enum AgentKind {
     Pool,
     /// ZCode (z.ai) coding agent.
     Zcode,
+    /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
+    Grizzybot,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -290,7 +292,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -311,6 +313,7 @@ impl AgentKind {
         Self::Hermes,
         Self::Pool,
         Self::Zcode,
+        Self::Grizzybot,
         Self::Other,
     ];
 
@@ -338,6 +341,7 @@ impl AgentKind {
             Self::Hermes => "hermes",
             Self::Pool => "pool",
             Self::Zcode => "zcode",
+            Self::Grizzybot => "grizzybot",
             Self::Other => "other",
         }
     }
@@ -368,6 +372,7 @@ impl AgentKind {
             "hermes" | "hermes-agent" => Self::Hermes,
             "pool" | "poolside" => Self::Pool,
             "zcode" | "zai" => Self::Zcode,
+            "grizzybot" | "grizzy-bot" => Self::Grizzybot,
             _ => Self::Other,
         }
     }
@@ -617,6 +622,22 @@ mod tests {
         // destructive handoff fetch must not happen from its native hook.
         assert!(!AgentKind::Pool.session_start_injects_handoff());
         assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_grizzybot_round_trips() {
+        assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
+        assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
+        assert_eq!(AgentKind::from_wire("grizzy-bot"), AgentKind::Grizzybot);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Grizzybot).unwrap(),
+            "\"grizzybot\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"grizzybot\"").unwrap(),
+            AgentKind::Grizzybot
+        );
+        assert_eq!(AgentKind::from_wire("grizzybot-2"), AgentKind::Other);
     }
 
     #[test]
