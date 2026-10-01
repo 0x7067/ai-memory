@@ -23,7 +23,9 @@ use anyhow::{Context, Result};
 use crate::cli::{
     AgentChoice, CaptureModeArg, HookInstallScope, InstallHooksArgs, McpClient, ProjectStrategyArg,
 };
-use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
+use crate::commands::apply_shared::{
+    ApplyOutcome, PrivateBackup, apply_atomic, apply_atomic_with_backup, mutate_json, mutate_toml,
+};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
 use crate::commands::path_util::{home_dir, strip_windows_verbatim_prefix};
@@ -83,19 +85,80 @@ pub(crate) fn claude_settings_target(args: &InstallHooksArgs) -> Result<PathBuf>
     }
 }
 
-/// `<repo root>/.claude/settings.local.json` for the checkout containing
-/// `cwd`, else `<cwd>/.claude/settings.local.json`. This mirrors where Claude
-/// Code reads that file (code.claude.com/docs/en/settings, "Where Claude Code
-/// looks for each file"): the git repository root even when launched in a
-/// subdirectory, the *main* checkout's root from a linked worktree, and the
-/// launch directory outside a repository or on Windows — so Windows users
-/// launch from the root. `CLAUDE_CONFIG_DIR` relocates only the user-level
-/// files, so it plays no part here.
+/// The `.claude/settings.local.json` Claude Code reads for a session launched
+/// in `cwd` (code.claude.com/docs/en/settings, "Where Claude Code looks for
+/// each file"): at the git repository root even when launched in a
+/// subdirectory (the *main* checkout's root from a linked worktree), but in
+/// the launch directory itself outside a repository, on Windows, and when the
+/// repository root is the home directory. `CLAUDE_CONFIG_DIR` relocates only
+/// the user-level files, so it plays no part here.
 pub(crate) fn project_claude_settings_local(cwd: &Path) -> PathBuf {
-    ai_memory_consolidate::discover_main_repo_root(cwd)
-        .unwrap_or_else(|_| cwd.to_path_buf())
-        .join(".claude")
-        .join("settings.local.json")
+    project_claude_settings_local_for(cwd, cfg!(windows), home_dir().as_deref())
+}
+
+/// [`project_claude_settings_local`] with the platform and home directory
+/// injected, so the Windows and home-repository rules are testable anywhere.
+fn project_claude_settings_local_for(cwd: &Path, is_windows: bool, home: Option<&Path>) -> PathBuf {
+    let base = if is_windows {
+        cwd.to_path_buf()
+    } else {
+        match ai_memory_consolidate::discover_main_repo_root(cwd) {
+            Ok(root) if !home.is_some_and(|home| same_directory(&root, home)) => root,
+            _ => cwd.to_path_buf(),
+        }
+    };
+    base.join(".claude").join("settings.local.json")
+}
+
+/// Whether two paths name the same directory. libgit2 reports the repository
+/// root resolved while the home path may not be (`/var` vs `/private/var` on
+/// macOS), so a lexical mismatch falls back to comparing resolved paths; the
+/// result only picks a directory and is never stored.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (fs::canonicalize(a), fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// Where an update to a project `.claude/settings.local.json` keeps the prior
+/// file: under the data dir, never in the checkout. Claude Code's ignore rule
+/// covers only that file name, so a sibling `.bak-<ts>` would show up in
+/// `git status` carrying the full hook commands.
+pub(crate) fn project_settings_backup(data_dir: &Path, settings: &Path) -> PrivateBackup {
+    PrivateBackup {
+        dir: data_dir.join("backups").join("claude-settings-local"),
+        stem: project_settings_backup_stem(settings),
+    }
+}
+
+/// A file-name stem naming the checkout `settings` sits in: its directory
+/// flattened to safe characters and bounded to the tail (the repository name
+/// end), plus a short hash of the full path so checkouts that flatten alike
+/// stay apart.
+fn project_settings_backup_stem(settings: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    let checkout = settings
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(settings)
+        .to_string_lossy();
+    let mut flat = String::with_capacity(checkout.len());
+    for c in checkout.chars() {
+        let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+            c
+        } else {
+            '-'
+        };
+        if !(c == '-' && flat.ends_with('-')) {
+            flat.push(c);
+        }
+    }
+    let flat = flat.trim_matches('-');
+    let tail = &flat[flat.len().saturating_sub(64)..];
+    let digest = format!("{:x}", Sha256::digest(checkout.as_bytes()));
+    format!("{}-{}", tail.trim_start_matches('-'), &digest[..12])
 }
 
 /// The `hooks` table of a Claude-shaped settings document (`hooks` → event →
@@ -140,9 +203,12 @@ pub(crate) fn settings_file_carries_ai_memory_hooks(path: &Path) -> bool {
 
 /// Re-copy the Claude Code hook scripts into the stable staging dir the
 /// installed hook commands point at, without touching any settings file.
-/// `upgrade` uses it when the only Claude Code install is `--scope project`:
-/// the project files keep pointing at this dir, so refreshing it is what
-/// keeps them current.
+/// `upgrade` uses it when the only Claude Code install is `--scope project`,
+/// so a platform whose hook commands run these scripts gets the new ones.
+/// Native-hook commands call the absolute `ai-memory` binary instead, which
+/// the upgrade replaces in place. Either way the project files themselves are
+/// not rewritten: a change to the hook commands reaches a checkout only when
+/// `install-hooks --scope project --apply` is re-run there.
 pub(crate) fn restage_claude_code_scripts(
     data_dir: &Path,
     hooks_dir: Option<&Path>,
@@ -1845,7 +1911,7 @@ fn apply_to_claude_code_settings_in(
         ),
         capture_prompts,
     );
-    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
+    apply_to_claude_code_settings_with_payload(payload, args, data_dir, capture_prompts)
 }
 
 fn apply_to_claude_code_settings_with_staged(
@@ -1868,12 +1934,13 @@ fn apply_to_claude_code_settings_with_staged(
         ),
         capture_prompts,
     );
-    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
+    apply_to_claude_code_settings_with_payload(payload, args, data_dir, capture_prompts)
 }
 
 fn apply_to_claude_code_settings_with_payload(
     payload: serde_json::Value,
     args: &InstallHooksArgs,
+    data_dir: &Path,
     capture_prompts: bool,
 ) -> Result<()> {
     let path = claude_settings_target(args)?;
@@ -1882,7 +1949,9 @@ fn apply_to_claude_code_settings_with_payload(
         .and_then(|v| v.as_object())
         .context("internal: build_claude_code_payload didn't return a hooks object")?
         .clone();
-    let outcome = apply_atomic(&path, |existing| {
+    let private_backup =
+        (args.scope == HookInstallScope::Project).then(|| project_settings_backup(data_dir, &path));
+    let outcome = apply_atomic_with_backup(&path, private_backup.as_ref(), |existing| {
         mutate_json(existing, |root| {
             // Get-or-create the top-level `hooks` table, then merge our
             // event keys in via `overlay_event_hooks`: our entries replace
@@ -1903,16 +1972,38 @@ fn apply_to_claude_code_settings_with_payload(
             Ok(())
         })
     })?;
+    let backup_note = match &private_backup {
+        Some(backup) => format!("backup written under {}", backup.dir.display()),
+        None => "backup written next to it".to_string(),
+    };
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
         path.display(),
         match outcome {
             ApplyOutcome::Created => "new file",
-            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::Updated => &backup_note,
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    // Claude Code runs the hooks of both scopes. Identical handlers dedupe, but
+    // installs that differ (capture flags, project strategy) capture twice.
+    if args.config_file.is_none()
+        && let Some(other) = match args.scope {
+            HookInstallScope::Project => claude_settings_path().ok(),
+            HookInstallScope::Global => std::env::current_dir()
+                .ok()
+                .map(|cwd| project_claude_settings_local(&cwd)),
+        }
+        && other != path
+        && settings_file_carries_ai_memory_hooks(&other)
+    {
+        eprintln!(
+            "[ai-memory] note: {} also carries ai-memory hooks; Claude Code runs both, so keep \
+             one scope or install both with the same flags.",
+            other.display()
+        );
+    }
     // Claude Code adds `**/.claude/settings.local.json` to the global git
     // excludes only when it creates the file itself; a file ai-memory created
     // has no such guarantee, and its hook commands carry machine-specific
@@ -1921,7 +2012,7 @@ fn apply_to_claude_code_settings_with_payload(
         && ai_memory_consolidate::path_is_git_ignored(&path) == Some(false)
     {
         eprintln!(
-            "[ai-memory] warning: {} is not ignored by git. Add `.claude/settings.local.json` \
+            "[ai-memory] warning: {} is not ignored by git. Add `**/.claude/settings.local.json` \
              to this repository's .gitignore (or your global excludes) so the machine-specific \
              hook commands are never committed.",
             path.display()
@@ -8662,9 +8753,10 @@ model = "gpt-5"
 
     /// `--scope project` lands where Claude Code reads the file: the git root
     /// of the checkout, even from a subdirectory. A plain directory is its own
-    /// root.
+    /// root. On Windows, and when the repository root is the home directory,
+    /// Claude Code reads the launch directory instead.
     #[test]
-    fn project_claude_settings_local_resolves_to_the_repo_root_or_cwd() {
+    fn project_claude_settings_local_resolves_where_claude_code_reads_it() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
         let sub = repo.join("crates").join("x");
@@ -8675,20 +8767,92 @@ model = "gpt-5"
             .status()
             .unwrap();
         assert!(status.success(), "git init failed");
-
-        let from_sub = project_claude_settings_local(&sub);
-        assert!(from_sub.ends_with(Path::new(".claude").join("settings.local.json")));
+        let local = |dir: &Path| dir.join(".claude").join("settings.local.json");
+        let unrelated_home = tmp.path().join("home");
+        std::fs::create_dir_all(&unrelated_home).unwrap();
         // libgit2 reports the real path; compare canonicalised so a
         // /private/var vs /var prefix on macOS does not trip the assertion.
-        let root = from_sub.parent().and_then(Path::parent).unwrap();
-        assert_eq!(root.canonicalize().unwrap(), repo.canonicalize().unwrap());
+        let root_of = |file: PathBuf| {
+            assert!(file.ends_with(Path::new(".claude").join("settings.local.json")));
+            file.parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        };
+        let repo_root = repo.canonicalize().unwrap();
+
+        assert_eq!(
+            root_of(project_claude_settings_local_for(
+                &sub,
+                false,
+                Some(&unrelated_home)
+            )),
+            repo_root
+        );
+        assert_eq!(
+            root_of(project_claude_settings_local_for(&sub, false, None)),
+            repo_root,
+            "an unknown home does not change the git-root rule"
+        );
+        assert_eq!(
+            project_claude_settings_local_for(&sub, true, Some(&unrelated_home)),
+            local(&sub),
+            "Windows reads the launch directory, not the git root"
+        );
+        assert_eq!(
+            project_claude_settings_local_for(&sub, false, Some(&repo)),
+            local(&sub),
+            "a repository rooted at home reads the launch directory"
+        );
 
         let plain = tmp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
+        for is_windows in [false, true] {
+            assert_eq!(
+                project_claude_settings_local_for(&plain, is_windows, Some(&unrelated_home)),
+                local(&plain)
+            );
+        }
+    }
+
+    /// A project settings backup lands under the data dir with a stem that
+    /// names the checkout, is a single safe file-name component, and keeps
+    /// checkouts that flatten to the same text apart.
+    #[test]
+    fn project_settings_backup_stays_under_the_data_dir_per_checkout() {
+        let data = Path::new("/data");
+        let settings = |checkout: &str| {
+            Path::new(checkout)
+                .join(".claude")
+                .join("settings.local.json")
+        };
+        let backup = project_settings_backup(data, &settings("/home/u/work/my repo"));
         assert_eq!(
-            project_claude_settings_local(&plain),
-            plain.join(".claude").join("settings.local.json")
+            backup.dir,
+            data.join("backups").join("claude-settings-local")
         );
+        assert!(
+            backup.stem.starts_with("home-u-work-my-repo-"),
+            "{}",
+            backup.stem
+        );
+        assert!(
+            backup
+                .stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')),
+            "{}",
+            backup.stem
+        );
+        assert_ne!(
+            project_settings_backup(data, &settings("/a/b-c")).stem,
+            project_settings_backup(data, &settings("/a-b/c")).stem
+        );
+        let deep = format!("/{}/repo", "x".repeat(300));
+        let stem = project_settings_backup(data, &settings(&deep)).stem;
+        assert!(stem.len() <= 64 + 13, "{stem}");
+        assert!(stem.contains("repo-"), "the repository end is kept: {stem}");
     }
 
     /// `upgrade` and the `run` auto-wire use this to tell a `--scope project`

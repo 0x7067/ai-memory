@@ -136,8 +136,9 @@ fn install_then_uninstall_round_trip_claude_hooks() {
 }
 
 /// `--scope project` writes the checkout's gitignored
-/// `.claude/settings.local.json` (at the git root, from any subdirectory) and
-/// leaves the user-level file alone. `uninstall` from inside the checkout
+/// `.claude/settings.local.json` (at the git root from any subdirectory; in
+/// the launch directory on Windows) and leaves the user-level file alone, and
+/// keeps its backup out of the checkout. `uninstall` from inside the checkout
 /// sweeps exactly our entries; from anywhere else it leaves the file untouched.
 #[test]
 fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
@@ -152,7 +153,14 @@ fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
     assert!(status.success(), "git init failed");
     let sub = project.path().join("crates").join("x");
     std::fs::create_dir_all(&sub).unwrap();
-    let local = project.path().join(".claude").join("settings.local.json");
+    // Claude Code reads the launch directory on Windows, the git root elsewhere.
+    let local = if cfg!(windows) {
+        sub.as_path()
+    } else {
+        project.path()
+    }
+    .join(".claude")
+    .join("settings.local.json");
     // Pre-seed a third-party hook we must NOT touch.
     write_file(
         &local,
@@ -194,11 +202,40 @@ fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
         !home.path().join(".claude").join("settings.json").exists(),
         "project scope must not touch the user-level settings"
     );
+    // The pre-seeded file was updated, so a backup exists, and it must sit
+    // under the data dir: Claude Code's ignore rule does not cover a sibling
+    // `.bak-<ts>`, which would carry the hook commands into `git status`.
+    let backups = home
+        .path()
+        .join(".ai-memory-data")
+        .join("backups")
+        .join("claude-settings-local");
+    let no_backup_in_checkout = |when: &str| {
+        let leaked: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".bak-"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{when}: backup left in the checkout: {leaked:?}"
+        );
+    };
+    no_backup_in_checkout("install");
+    let saved: Vec<_> = std::fs::read_dir(&backups).unwrap().flatten().collect();
+    assert_eq!(saved.len(), 1, "one backup under {}", backups.display());
+    assert!(
+        std::fs::read_to_string(saved[0].path())
+            .unwrap()
+            .contains("/usr/bin/n.sh"),
+        "the backup holds the prior file"
+    );
 
     // With an ignore rule in place the warning goes away.
     write_file(
         &project.path().join(".gitignore"),
-        ".claude/settings.local.json\n",
+        "**/.claude/settings.local.json\n",
     );
     let output = install(&sub);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -234,6 +271,11 @@ fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
         output.status.success(),
         "uninstall failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    no_backup_in_checkout("uninstall");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("used `install-hooks --scope project`"),
+        "uninstall must point at the checkouts it cannot reach"
     );
     let swept: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();

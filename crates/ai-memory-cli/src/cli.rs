@@ -2917,9 +2917,11 @@ pub struct InstallHooksArgs {
     #[arg(long)]
     pub config_file: Option<PathBuf>,
     /// Where to write the hook configuration. `project` targets the
-    /// repository's `.claude/settings.local.json` (at the git root, else the
-    /// current directory) so capture is opted in per checkout instead of for
-    /// every session; Claude Code reads it alongside the user-level hooks.
+    /// repository's `.claude/settings.local.json` (at the git root; in the
+    /// current directory outside a repository, on Windows, or when the
+    /// repository root is the home directory) so capture is opted in per
+    /// checkout instead of for every session; Claude Code reads it alongside
+    /// the user-level hooks.
     /// Claude Code only; ignores `CLAUDE_CONFIG_DIR`. Cannot be combined
     /// with `--config-file`, which names the target file directly.
     #[arg(

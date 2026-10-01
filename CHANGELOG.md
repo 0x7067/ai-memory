@@ -10,12 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
-  (at the git root, where Claude Code reads it) instead of the user-level
-  `settings.json`, so capture is opted in per repository. The installer warns
-  when that file is not ignored by git and refuses the inline-token fallback
-  for it; `uninstall` run inside the checkout sweeps it; `upgrade` and the
+  (where Claude Code reads it: the git root, or the launch directory on
+  Windows and when the repository root is the home directory) instead of the
+  user-level `settings.json`, so capture is opted in per repository. The
+  installer warns when that file is not ignored by git, refuses the
+  inline-token fallback for it, notes when the other scope also carries
+  ai-memory hooks, and keeps its backups under the data dir instead of the
+  checkout; `uninstall` run inside the checkout sweeps it and reminds you to
+  do the same in other project-scoped checkouts; `upgrade` and the
   `ai-memory run` auto-wire no longer add user-level Claude Code hooks on top
-  of a project-scoped install. (#NNN)
+  of a project-scoped install. (#1034)
 - Added explicit MCP behavior annotations (title, read-only, destructive,
   idempotent, and open-world hints) to all 23 tools. Reordered the MCP server
   instructions so scope selection, untrusted-memory handling, deliberate

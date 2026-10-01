@@ -251,8 +251,10 @@ per repository instead, run from inside the checkout:
 ai-memory install-hooks --agent claude-code --scope project --apply
 ```
 
-This writes the repository's gitignored `.claude/settings.local.json` (at the
-git root, where Claude Code reads it) and leaves the user-level file alone.
+This writes the repository's gitignored `.claude/settings.local.json` where
+Claude Code reads it (the git root; the current directory on Windows or when
+the repository root is your home directory) and leaves the user-level file
+alone. Backups of an updated file go under the data dir, not the checkout.
 Pick one scope per machine: Claude Code merges project and user hooks. The
 installer warns when the file is not git-ignored, and `ai-memory uninstall
 --only hooks --apply` from inside the checkout removes the entries again.

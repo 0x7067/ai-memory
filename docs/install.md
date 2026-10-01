@@ -102,19 +102,30 @@ ai-memory install-hooks --agent claude-code --scope project --apply
 This writes the repository's gitignored `.claude/settings.local.json` at the
 git root (the main checkout's root from a worktree), which is where Claude Code
 reads that file even when launched from a subdirectory — see
-[where Claude Code looks for each file](https://code.claude.com/docs/en/settings#where-claude-code-looks-for-each-file);
-on Windows it reads the launch directory instead, so launch from the root
-there. The user-level file is left alone. Claude Code merges the project
-file's hooks with any user-level ones, so pick one scope per machine.
-The installer warns when the file is not ignored by git (Claude Code adds it
-to your global excludes only when it creates the file itself) and refuses to
-embed a bearer token in it when the token cannot be persisted under the data
-dir. `ai-memory uninstall --only hooks --apply` run from inside the checkout
+[where Claude Code looks for each file](https://code.claude.com/docs/en/settings#where-claude-code-looks-for-each-file).
+On Windows, and when the repository root is your home directory, Claude Code
+reads the launch directory instead, so the installer writes to the current
+directory there: run it, and launch Claude Code, from the same directory.
+The user-level file is left alone. Claude Code merges the project file's
+hooks with any user-level ones, so pick one scope per machine; the installer
+notes when the other scope already carries ai-memory hooks.
+The installer warns when the file is not ignored by git (Claude Code adds
+`**/.claude/settings.local.json` to your global excludes only when it creates
+the file itself) and refuses to embed a bearer token in it when the token
+cannot be persisted under the data dir. When it updates an existing file, the
+backup goes to `<data_dir>/backups/claude-settings-local/` (owner-only), not
+next to the file, so nothing new appears in `git status`.
+`ai-memory uninstall --only hooks --apply` run from inside the checkout
 removes the entries again; run elsewhere it does not reach into the
-repository. `upgrade` and the `ai-memory run` auto-wire leave the user-level
-file alone while a project-scoped install is the only one present.
-`setup-agent` and `backup-agents` only know the user-level file. Claude Code
-only; other agents keep their user-level hook files.
+repository, so run it in every project-scoped checkout before removing
+ai-memory — those files otherwise keep calling the removed binary and data
+dir. `upgrade` and the `ai-memory run` auto-wire leave the user-level file
+alone while a project-scoped install is the only one present. `upgrade`
+replaces the binary the hook commands call but does not rewrite project
+files; re-run `install-hooks --scope project --apply` in each checkout to pick
+up hook-command changes. `setup-agent` and `backup-agents` only know the
+user-level file. Claude Code only; other agents keep their user-level hook
+files.
 
 `--session-aware` is an optional Claude Code MCP mode:
 

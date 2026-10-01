@@ -831,9 +831,10 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
         && let Some(settings) = claude_user_level_install_absent()
     {
         println!(
-            "    (no ai-memory hooks in {} — skipping the user-level re-apply; a \
-             `--scope project` install keeps pointing at the staged scripts, so those are \
-             refreshed here)",
+            "    (no ai-memory hooks in {} — skipping the user-level re-apply; the staged \
+             scripts are refreshed, but `--scope project` files are not rewritten: re-run \
+             `ai-memory install-hooks --agent {name} --scope project --apply` in each such \
+             checkout to pick up hook-command changes)",
             settings.display()
         );
         match install_hooks::restage_claude_code_scripts(&config.data_dir, None) {
