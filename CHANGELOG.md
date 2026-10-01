@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added machine-authenticated `GET /identity`, available with the web UI
+  disabled, and `ai-memory doctor` diagnostics for caller identity, external
+  capture ownership and sessions with multiple capture sources (native events
+  or distinct extensions, including backfill).
+  Mixed-source counts preserve scope, session ownership and time-window filters;
+  older servers leave unsupported fields unknown. (#1010)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added

@@ -882,6 +882,8 @@ pub struct AgentSessionCount {
     pub agent: String,
     /// Sessions this agent opened in the window, ended or still open.
     pub sessions: u64,
+    /// Sessions with multiple admitted capture namespaces in this scope.
+    pub mixed_capture_sessions: u64,
 }
 
 /// How a `SessionEnd` event should treat its target session — see
@@ -3164,7 +3166,12 @@ impl ReaderPool {
                 ""
             };
             let sql = format!(
-                "SELECT agent_kind, COUNT(*) AS n FROM sessions \
+                "SELECT agent_kind, COUNT(*) AS n, \
+                 SUM((SELECT COUNT(DISTINCT CASE WHEN o.extension IS NULL \
+                     THEN 'native' ELSE 'extension:' || o.extension END) \
+                     FROM observations o WHERE o.session_id = sessions.id \
+                       AND o.workspace_id = :ws AND o.project_id = :proj) > 1) \
+                 FROM sessions \
                  WHERE workspace_id = :ws AND project_id = :proj\
                  {since_clause}{owner_clause} \
                  GROUP BY agent_kind \
@@ -3186,14 +3193,15 @@ impl ReaderPool {
             let rows = stmt.query_map(named.as_slice(), |row| {
                 let agent: String = row.get(0)?;
                 let n: i64 = row.get(1)?;
-                Ok((agent, n))
+                Ok((agent, n, row.get::<_, i64>(2)?))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (agent, n) = row?;
+                let (agent, n, mixed) = row?;
                 out.push(AgentSessionCount {
                     agent,
                     sessions: u64::try_from(n).unwrap_or(0),
+                    mixed_capture_sessions: u64::try_from(mixed).unwrap_or(0),
                 });
             }
             Ok(out)

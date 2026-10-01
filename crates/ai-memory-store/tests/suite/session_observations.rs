@@ -566,3 +566,68 @@ async fn session_summary_scoped_narrows_the_listing_predicates() {
         "unknown id",
     );
 }
+
+#[tokio::test]
+async fn mixed_capture_count_scopes_observations_and_preserves_owner_and_window() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE observations SET extension = 'external' WHERE id = ?1",
+        params![&id(23)[..]],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE observations SET extension = 'external' WHERE id = ?1",
+        params![&id(25)[..]],
+    )
+    .unwrap();
+    // Session 10 has native rows in A and external only in B: neither is mixed.
+    let counts = store
+        .reader
+        .session_counts_by_agent(ws(), proj_a(), OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert!(counts.iter().all(|count| count.mixed_capture_sessions == 0));
+    conn.execute(
+        "UPDATE observations SET extension = 'external' WHERE id = ?1",
+        params![&id(22)[..]],
+    )
+    .unwrap();
+    let counts = store
+        .reader
+        .session_counts_by_agent(ws(), proj_a(), OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        counts
+            .iter()
+            .find(|c| c.agent == "claude-code")
+            .unwrap()
+            .mixed_capture_sessions,
+        1
+    );
+    // Alice's B session has native only there. A's extension cannot mix it.
+    let counts = store
+        .reader
+        .session_counts_by_agent(ws(), proj_b(), filter_for("alice"), None)
+        .await
+        .unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].mixed_capture_sessions, 0);
+    assert!(
+        store
+            .reader
+            .session_counts_by_agent(ws(), proj_b(), filter_for("bob"), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .reader
+            .session_counts_by_agent(ws(), proj_a(), OwnerFilter::Any, Some(NOW + 1000))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

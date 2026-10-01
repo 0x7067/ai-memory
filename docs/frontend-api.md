@@ -29,7 +29,7 @@
   Bearer fails closed rather than falling back. Before human auth activates,
   deprecated Basic/cookie compatibility is evaluated for GET requests; after
   activation, Basic and unknown schemes do not suppress a valid web session.
-- `/mcp`, hooks, handoffs, and workstream routes are machine-only. A web-session
+- `/mcp`, `/identity`, hooks, handoffs, and workstream routes are machine-only. A web-session
   cookie cannot authenticate them.
 - A disallowed `Host` header receives `403 Forbidden` before auth evaluation
   (DNS-rebinding guard).
@@ -68,6 +68,18 @@ deprecated GET-only browser compatibility may accept the root bearer through
 HTTP Basic and an HttpOnly `ai_memory_auth` cookie. Human activation disables
 that path immediately. See [`docs/users.md`](users.md) for bootstrap, password
 rotation, recovery, roles, session expiry, and API-key lifecycle.
+
+Machine clients can call `GET /identity` with their bearer key, even when the
+web UI is disabled. It reports only the authenticated caller and server version:
+
+```json
+{"version":"2.5.2","level":"user","operator":"user:alice","distinguishes_operators":true}
+```
+
+`level` is `root`, `user` or `anonymous`; `operator` is the qualified identity
+key, or `null` on an unauthenticated single-user server. Web-session cookies
+cannot authenticate this route. Its response uses `Cache-Control: private,
+no-store`. See [users.md](users.md) for machine keys and identity types.
 
 ## 3. Error model
 

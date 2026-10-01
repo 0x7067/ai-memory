@@ -250,6 +250,12 @@ for provenance and stable, namespaced `ingest_key` values for retries. See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
 
+`GET /identity` is a machine-authenticated route mounted independently of the
+web UI. `ai-memory doctor` uses it to show caller identity and capture ownership;
+its per-agent counts flag sessions with multiple capture sources (native events
+or distinct extensions, including backfill).
+The mixed-source count is computed in the same scoped, owner-filtered SQL query.
+
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at
 16 KiB; notification and tool excerpts are capped at 2 KB. Native

@@ -53,6 +53,12 @@ installed ai-memory integrations; it must manage finer capture ownership itself.
 `admits_capture: false` when this context is active. It performs no ingestion or
 handoff delivery. The producer namespace itself is not printed or authenticated.
 
+`ai-memory doctor` reports whether this invocation delegates native capture and
+shows its authenticated machine identity. Its per-agent counts flag sessions
+with multiple capture sources (native events or distinct extensions, including
+backfill). An older server leaves those
+fields unknown; a mixed count is a diagnostic signal, not proof of duplicates.
+
 ## Reuse the public event contract
 
 For a live harness, send its actual wire `agent` (such as `claude-code` or `codex`)
