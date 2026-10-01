@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
-  provider.
+  provider. (#1026)
 
 ## [2.5.2] - 2026-10-01
 
