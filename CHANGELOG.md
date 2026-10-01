@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed the recommended Linux/macOS Docker-wrapper `install-hooks` path
+  silently installing shell hooks that cannot enforce client-side capture
+  controls such as `[capture] ignore_paths` and allowlist mode. The wrapper now
+  uses its existing checksum-verified native host client for hook installation
+  and refresh, while an explicit `AI_MEMORY_HOOK_PLATFORM=posix|windows` keeps
+  the documented compatibility fallback and warning. Wrapper upgrades refresh
+  that stable native client before rewriting existing hook registrations.
+  (#1002)
 - Fixed managed Codex sessions losing their startup continuity when a shared
   Codex app-server daemon reports a finished run's stale `AI_MEMORY_RUN_ID`.
   SessionStart now recovers only the sole live, undelivered Codex run in the
