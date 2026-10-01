@@ -548,6 +548,9 @@ pub struct Config {
     /// Both approve validated proposals by default unless `require_approval` is
     /// set. The SessionEnd trigger stays off by default.
     pub auto_improve: AutoImproveSettings,
+    /// Session-start handoff delivery (design: #959). Default keeps today's
+    /// automatic-claim behavior unchanged.
+    pub handoff: HandoffSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
     pub sanitize: ai_memory_core::SanitizeConfig,
@@ -979,6 +982,7 @@ impl Default for Config {
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
+            handoff: HandoffSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
@@ -1025,6 +1029,39 @@ impl Default for ConsolidationSettings {
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
                 ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        }
+    }
+}
+
+/// `[handoff]` session-start handoff delivery settings (design: #959).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HandoffSettings {
+    /// When `true` (default — unchanged behavior), a `SessionStart` that
+    /// finds a pending handoff claims it automatically, exactly as before
+    /// this setting existed.
+    ///
+    /// When `false`, `SessionStart` does not claim the handoff. It instead
+    /// renders a non-consuming notice naming the exact `handoff_id`, the
+    /// `from_agent`, and its age — mirroring the existing inbox notice
+    /// (`render_inbox_notice`): metadata only, never the stored summary
+    /// text, since a handoff's summary is written by whatever agent or
+    /// operator ended the prior session and a non-consuming notice cannot be
+    /// deliberately skipped the way `memory_handoff_accept` can be left
+    /// uncalled. The agent (or operator) picks it up explicitly with
+    /// `memory_handoff_accept` using that id. This fixes an unrelated next
+    /// session (or a non-interactive launch) silently consuming a baton
+    /// meant for a different session (#959).
+    ///
+    /// Server-wide: applies to every operator on this server. A per-project
+    /// override is intentionally left for a follow-up change.
+    pub claim_on_session_start: bool,
+}
+
+impl Default for HandoffSettings {
+    fn default() -> Self {
+        Self {
+            claim_on_session_start: true,
         }
     }
 }

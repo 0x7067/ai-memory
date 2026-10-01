@@ -74,6 +74,35 @@ If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_begin`. Cancelling marks the handoff expired, so the next
 session-start hook will not consume stale context.
 
+### Offering instead of claiming at session start
+
+By default, `SessionStart` claims a pending handoff automatically — the
+behavior described above. With several concurrent lines of work in the same
+project, an unrelated session (a different task, a different harness, or a
+non-interactive launch) can consume a baton meant for a specific follow-up
+session. Set `claim_on_session_start = false` under `[handoff]` in
+`config.toml` to stop that:
+
+```toml
+[handoff]
+claim_on_session_start = false
+```
+
+`SessionStart` then leaves the handoff open and renders a non-consuming
+notice instead, naming the exact `handoff_id`, the agent that left it, and
+its age — never the stored summary, open questions, or next steps (same
+security bar as the inbox notice: that content is written by whatever agent
+or operator ended the prior session, and a notice injected into the on-start
+context cannot be deliberately skipped the way leaving `memory_handoff_accept`
+uncalled can). Pick it up explicitly:
+
+```
+> memory_handoff_accept handoff_id=<the id from the notice>
+```
+
+This is server-wide — every operator on the server gets the same behavior.
+The default (`true`) is unchanged for every existing install.
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the

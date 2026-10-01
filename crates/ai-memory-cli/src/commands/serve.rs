@@ -1341,6 +1341,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 capture_assistant_enabled: config.capture_assistant,
+                claim_handoff_on_session_start: config.handoff.claim_on_session_start,
                 per_user_slots: config.slots.per_user,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     ai_memory_hooks::SubagentSessionSet::default(),
