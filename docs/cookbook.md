@@ -240,6 +240,24 @@ ai-memory run --yolo claude
 See [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) for the
 full contract.
 
+## Recipe: capture only some repositories
+
+`install-hooks --agent claude-code --apply` wires the hooks user-wide
+(`~/.claude/settings.json`), so every Claude Code session is captured and you
+exclude paths with `[capture] ignore_paths` in `.ai-memory.toml`. To opt in
+per repository instead, run from inside the checkout:
+
+```bash
+ai-memory install-hooks --agent claude-code --scope project --apply
+```
+
+This writes the repository's gitignored `.claude/settings.local.json` (at the
+git root, where Claude Code reads it) and leaves the user-level file alone.
+Pick one scope per machine: Claude Code merges project and user hooks. The
+installer warns when the file is not git-ignored, and `ai-memory uninstall
+--only hooks --apply` from inside the checkout removes the entries again.
+Claude Code only; other harnesses keep their user-level hook files.
+
 ## Recipe: send different repositories to different servers
 
 One machine, several organisations, each with its own ai-memory server.
