@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
+  `[capture]` section is invalid. This fails closed today — every file and
+  shell tool event is reduced to metadata until the marker is fixed, nothing
+  leaks — but nothing surfaced that it had happened, so an operator could
+  believe `ignore_paths` was excluding paths it no longer was. The check is
+  based on the same resolution state the live hook path uses (not just
+  whether the TOML parses), so it also catches a `[capture]` table that
+  parses fine but is still rejected at compile time, e.g. an unsupported glob
+  character in `ignore_paths`.
+
 ## [2.5.2] - 2026-10-01
 
 ### Added
