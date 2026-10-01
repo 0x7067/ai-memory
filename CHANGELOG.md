@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory doctor` now reports Claude Code's native `memory/` store for
+  the current checkout (location, file count, and whether the nearest
+  marker's `ignore_paths` would exclude a read of it), so an operator can
+  see whether the harness's own auto-memory is being captured without
+  reading it themselves (harness-issue #1003). Resolved by repository root,
+  so a worktree or a subdirectory reports the same store as the main
+  checkout. Shell/PowerShell hook installs (the Docker-wrapper default) do
+  not enforce this exclusion at all; the report says so.
+
 ### Fixed
 - `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
   `[capture]` section is invalid. This fails closed today — every file and
