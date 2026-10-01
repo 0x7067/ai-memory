@@ -364,6 +364,7 @@ config home.
 ```bash
 ai-memory run claude
 ai-memory run codex --yolo   # later: same workstream, different harness
+ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
 ```
 

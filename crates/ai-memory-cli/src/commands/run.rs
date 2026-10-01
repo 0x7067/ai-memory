@@ -330,8 +330,19 @@ async fn run_once_with_wiring(
     let yolo_requested = yolo_modes.yolo;
     let force_fresh = args.fresh || trailing_fresh;
     let no_autowire = args.no_autowire || trailing_no_autowire;
-    let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
-        .context("resolving --env/--env-file for the managed run")?;
+    let profile = args
+        .profile
+        .as_deref()
+        .map(|name| {
+            config
+                .run
+                .profiles
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown run profile {name:?}"))
+        })
+        .transpose()?;
+    let run_env = resolve_run_env(profile, args.env_file.as_deref(), &args.env)
+        .context("resolving --profile/--env-file/--env for the managed run")?;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -1829,10 +1840,16 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
 /// `--env` entry override a same-key `--env-file` line. Values are taken
 /// literally; neither source is expanded or interpreted.
 fn resolve_run_env(
+    profile: Option<&crate::config::RunProfile>,
     env_file: Option<&Path>,
     env_args: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
     let mut merged: Vec<(String, String)> = Vec::new();
+    if let Some(profile) = profile {
+        for (key, value) in &profile.env {
+            upsert_env(&mut merged, key.clone(), value.clone());
+        }
+    }
     if let Some(path) = env_file {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading --env-file {}", path.display()))?;
@@ -2842,7 +2859,7 @@ mod tests {
     }
 
     fn parse_run(argv: &[&str]) -> RunArgs {
-        let CliCommand::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+        let CliCommand::Run(args) = crate::cli::try_parse_from(argv).unwrap().command else {
             panic!("expected run command");
         };
         args
@@ -3169,6 +3186,7 @@ mod tests {
             no_jail: true,
             fresh: true,
             no_autowire: true,
+            profile: Some("work".into()),
             env: vec![("MODEL_HOME".into(), "custom".into())],
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
@@ -4344,27 +4362,92 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_env_merges_file_then_overrides_with_cli_pairs() {
+    fn resolve_run_env_merges_profile_file_then_cli_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vars.env");
         std::fs::write(&path, "# a comment\n\n  \nFOO=from-file\nBAR=keep\n").unwrap();
 
+        let profile = crate::config::RunProfile {
+            env: [
+                ("FOO".to_string(), "from-profile".to_string()),
+                ("PROFILE_ONLY".to_string(), "present".to_string()),
+            ]
+            .into(),
+        };
         let cli_pairs = vec![("FOO".to_string(), "from-cli".to_string())];
-        let merged = resolve_run_env(Some(&path), &cli_pairs).unwrap();
+        let merged = resolve_run_env(Some(&profile), Some(&path), &cli_pairs).unwrap();
 
         assert_eq!(
             merged,
             vec![
                 ("FOO".to_string(), "from-cli".to_string()),
+                ("PROFILE_ONLY".to_string(), "present".to_string()),
                 ("BAR".to_string(), "keep".to_string()),
             ]
         );
     }
 
     #[test]
+    fn wrapper_profile_parses_before_harness_without_stealing_native_profile() {
+        let wrapper = parse_run(&[
+            "ai-memory",
+            "run",
+            "--profile",
+            "work",
+            "claude",
+            "--model",
+            "opus",
+        ]);
+        assert_eq!(wrapper.profile.as_deref(), Some("work"));
+        assert_eq!(wrapper.native_args, ["--model", "opus"].map(OsString::from));
+
+        let native = parse_run(&["ai-memory", "run", "omp", "--profile", "omp-work"]);
+        assert_eq!(native.profile, None);
+        assert_eq!(
+            native.native_args,
+            ["--profile", "omp-work"].map(OsString::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_run_profile_fails_before_server_or_child_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::load(None, Some(tmp.path().join("data"))).unwrap();
+        config.server_url = "http://127.0.0.1:1".into();
+        let args = RunArgs {
+            workspace: None,
+            project: None,
+            workstream: None,
+            new_workstream: None,
+            executable: Some(PathBuf::from("definitely-not-a-harness")),
+            yolo: false,
+            true_yolo: false,
+            jail: None,
+            no_jail: true,
+            fresh: false,
+            no_autowire: true,
+            profile: Some("missing".into()),
+            env: Vec::new(),
+            env_file: None,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: Vec::new(),
+        };
+
+        let error = run_from_with_wiring(
+            &config,
+            args,
+            tmp.path(),
+            &super::super::run_autowire::WireOverrides::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unknown run profile \"missing\"");
+    }
+
+    #[test]
     fn resolve_run_env_without_a_file_returns_only_cli_pairs() {
         let cli_pairs = vec![("A".to_string(), "1".to_string())];
-        let merged = resolve_run_env(None, &cli_pairs).unwrap();
+        let merged = resolve_run_env(None, None, &cli_pairs).unwrap();
         assert_eq!(merged, vec![("A".to_string(), "1".to_string())]);
     }
 
@@ -4373,7 +4456,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.env");
         std::fs::write(&path, "NOVALUE\n").unwrap();
-        let error = resolve_run_env(Some(&path), &[]).unwrap_err();
+        let error = resolve_run_env(None, Some(&path), &[]).unwrap_err();
         assert!(
             error.to_string().contains("expected KEY=VALUE"),
             "unexpected error: {error}"
@@ -4453,7 +4536,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf 'FOO=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
+                "#!/bin/sh\nprintf 'FOO=%s\\nPROFILE_ONLY=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$PROFILE_ONLY\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
                 captured.display()
             ),
         )
@@ -4472,6 +4555,17 @@ mod tests {
         config.home_dir = Some(home.path().to_string_lossy().into_owned());
         config.server_url = format!("http://{address}");
         config.run_autowire = false;
+        config.run.profiles.insert(
+            "work".into(),
+            crate::config::RunProfile {
+                env: [
+                    ("FOO".into(), "from-profile".into()),
+                    ("PROFILE_ONLY".into(), "from-profile".into()),
+                    ("CLAUDE_CONFIG_DIR".into(), "/from/profile".into()),
+                ]
+                .into(),
+            },
+        );
 
         let args = RunArgs {
             workspace: Some("ws".into()),
@@ -4485,6 +4579,7 @@ mod tests {
             no_jail: false,
             fresh: false,
             no_autowire: true,
+            profile: Some("work".into()),
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
             harness: Some(RunHarnessChoice::Claude),
@@ -4500,7 +4595,11 @@ mod tests {
         let captured_env = std::fs::read_to_string(&captured).unwrap();
         assert!(
             captured_env.contains("FOO=from-file"),
-            "an --env-file entry not overridden by --env must reach the spawned child: {captured_env}"
+            "--env-file must override the profile and reach the spawned child: {captured_env}"
+        );
+        assert!(
+            captured_env.contains("PROFILE_ONLY=from-profile"),
+            "a profile-only entry must reach the spawned child: {captured_env}"
         );
         assert!(
             captured_env.contains("CLAUDE_CONFIG_DIR=/from/cli"),
@@ -4973,6 +5072,7 @@ mod tests {
             no_jail: false,
             fresh: false,
             no_autowire: false,
+            profile: None,
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
@@ -5128,6 +5228,7 @@ mod tests {
             no_jail: false,
             fresh: false,
             no_autowire: false,
+            profile: None,
             env,
             env_file: None,
             harness: Some(harness),

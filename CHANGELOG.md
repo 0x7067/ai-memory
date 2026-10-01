@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added env-only named launch profiles for `ai-memory run --profile NAME` via
+  `[run.profiles.<name>.env]` in `config.toml`. Profile values feed the same
+  native-session, auto-wire, and child-process environment path as `--env`;
+  precedence is profile, then `--env-file`, then repeated `--env`. Unknown or
+  invalid profiles fail before a workstream lease or child process. (#922)
 - Added cross-project attribution for native lifecycle file-tool events whose
   harness keeps reporting the parent session's cwd. A bounded, recognized
   absolute target reroutes only when every path proves the same repository or

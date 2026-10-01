@@ -6,6 +6,88 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 
+/// Parse the process argv while making the documented `run` boundary real:
+/// once the harness positional appears, every later token is native argv.
+///
+/// Clap normally keeps recognizing known wrapper flags after a positional,
+/// even with `trailing_var_arg`. That would steal OMP's native `--profile`
+/// as the launch-profile selector. Inserting clap's ordinary `--` delimiter
+/// after the harness keeps the public no-delimiter UX and makes all existing
+/// wrapper-after-harness recovery (`--yolo`, `--fresh`, etc.) explicit in the
+/// run command rather than dependent on clap's option-name knowledge.
+pub(crate) fn parse_process() -> Cli {
+    try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+}
+
+pub(crate) fn try_parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let mut args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    delimit_run_native_args(&mut args);
+    Cli::try_parse_from(args)
+}
+
+fn delimit_run_native_args(args: &mut Vec<OsString>) {
+    let mut index = 1;
+    let run_index = loop {
+        let Some(raw) = args.get(index).and_then(|arg| arg.to_str()) else {
+            return;
+        };
+        if matches!(raw, "--data-dir" | "--config") {
+            index += 2;
+            continue;
+        }
+        if raw.starts_with("--data-dir=") || raw.starts_with("--config=") {
+            index += 1;
+            continue;
+        }
+        if raw == "run" {
+            break index;
+        }
+        return;
+    };
+
+    index = run_index + 1;
+    while index < args.len() {
+        let Some(raw) = args[index].to_str() else {
+            return;
+        };
+        if raw == "--" {
+            return;
+        }
+        let key = raw.split_once('=').map_or(raw, |(key, _)| key);
+        let takes_separate_value = matches!(
+            key,
+            "--workspace"
+                | "--project"
+                | "--workstream"
+                | "--new"
+                | "--executable"
+                | "--profile"
+                | "--env"
+                | "--env-file"
+                | "--data-dir"
+                | "--config"
+        ) && !raw.contains('=');
+        if takes_separate_value {
+            index += 2;
+            continue;
+        }
+        if raw.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        // No trailing tokens means there is nothing for clap to steal.
+        if index + 1 < args.len() {
+            args.insert(index + 1, OsString::from("--"));
+        }
+        return;
+    }
+}
+
 /// Top-level CLI for the `ai-memory` binary.
 #[derive(Debug, Parser)]
 #[command(name = "ai-memory", version, about, long_about = None)]
@@ -343,6 +425,11 @@ pub struct RunArgs {
     /// `AI_MEMORY_RUN_AUTOWIRE=false`) to launch without touching harness config.
     #[arg(long)]
     pub no_autowire: bool,
+    /// Apply a named env-only launch profile from
+    /// `[run.profiles.<name>.env]` in config.toml. Must precede `harness`;
+    /// a later `--env-file` or `--env` entry wins on the same key.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
     /// Extra environment variable for the spawned harness, `KEY=VALUE`.
     /// Repeatable; wrapper-owned like `--yolo`/`--executable`, so it must
     /// precede `harness`. Reaches the spawned process, ai-memory's own

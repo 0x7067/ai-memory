@@ -6,6 +6,7 @@
 //! guard read `process.env` while the rest of the codebase used
 //! `getMergedEnv()`, masking the bug for weeks).
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -406,6 +407,11 @@ pub struct Config {
     /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
+    /// Named, env-only presets for `ai-memory run --profile NAME`.
+    /// Profiles deliberately do not carry executable paths, native argv, or
+    /// permission-bypass flags. Configure them under `[run.profiles.<name>.env]`.
+    #[serde(default)]
+    pub run: RunSettings,
     /// Off by default. When true, a Claude `ai-memory run --yolo` additionally
     /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo),
     /// injecting `--settings` that forces `bypassPermissions` over any
@@ -971,6 +977,7 @@ impl Default for Config {
             capture_assistant: false,
             backfill_on_start: true,
             run_autowire: true,
+            run: RunSettings::default(),
             claude_true_yolo: false,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
@@ -1004,6 +1011,68 @@ impl Default for Config {
             runtime_env: RuntimeEnv::default(),
         }
     }
+}
+
+/// `[run]` settings for the managed harness launcher.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunSettings {
+    /// Persisted env-only launch profiles, selected with `run --profile`.
+    pub profiles: BTreeMap<String, RunProfile>,
+}
+
+/// One named managed-launch preset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfile {
+    /// Environment overrides applied before `--env-file` and `--env`.
+    pub env: BTreeMap<String, String>,
+}
+
+fn validate_run_profiles(run: &RunSettings) -> Result<()> {
+    const MAX_PROFILES: usize = 128;
+    const MAX_PROFILE_NAME: usize = 64;
+    const MAX_ENV_PER_PROFILE: usize = 128;
+    const MAX_ENV_KEY: usize = 256;
+    const MAX_ENV_VALUE: usize = 64 * 1024;
+
+    if run.profiles.len() > MAX_PROFILES {
+        anyhow::bail!("run.profiles may contain at most {MAX_PROFILES} profiles");
+    }
+    for (name, profile) in &run.profiles {
+        if name.is_empty()
+            || name.len() > MAX_PROFILE_NAME
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            anyhow::bail!(
+                "invalid run profile name {name:?}; use 1-{MAX_PROFILE_NAME} ASCII letters, digits, '.', '_' or '-'"
+            );
+        }
+        if profile.env.len() > MAX_ENV_PER_PROFILE {
+            anyhow::bail!(
+                "run profile {name:?} may contain at most {MAX_ENV_PER_PROFILE} environment entries"
+            );
+        }
+        let mut folded = HashSet::with_capacity(profile.env.len());
+        for (key, value) in &profile.env {
+            if key.is_empty() || key.len() > MAX_ENV_KEY || key.contains(['=', '\0']) {
+                anyhow::bail!("run profile {name:?} has invalid environment key {key:?}");
+            }
+            if value.len() > MAX_ENV_VALUE || value.contains('\0') {
+                anyhow::bail!(
+                    "run profile {name:?} environment value for {key:?} is invalid or exceeds {MAX_ENV_VALUE} bytes"
+                );
+            }
+            if !folded.insert(key.to_ascii_uppercase()) {
+                anyhow::bail!(
+                    "run profile {name:?} repeats environment key {key:?} with different ASCII case"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `[consolidation]` LLM consolidation prompt sizing.
@@ -1745,6 +1814,8 @@ impl Config {
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
+
+        validate_run_profiles(&config.run)?;
 
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
@@ -4914,6 +4985,34 @@ mod tests {
     #[test]
     fn llm_provider_chain_none_when_no_llm_is_configured() {
         assert!(Config::default().llm_provider_chain().unwrap().is_none());
+    }
+
+    #[test]
+    fn run_profiles_parse_from_config_and_reject_ambiguous_names_and_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nCLAUDE_CONFIG_DIR = '/accounts/work'\nMODEL = 'opus'\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap();
+        assert_eq!(
+            config.run.profiles["work"].env["CLAUDE_CONFIG_DIR"],
+            "/accounts/work"
+        );
+
+        std::fs::write(&config_path, "[run.profiles.'bad name'.env]\nFOO = 'bar'\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("invalid run profile name"));
+
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nPATH = '/one'\nPath = '/two'\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("different ASCII case"));
     }
 
     #[test]

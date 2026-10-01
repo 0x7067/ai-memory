@@ -230,6 +230,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             no_jail: false,
             fresh: args.fresh,
             no_autowire: false,
+            profile: None,
             env: Vec::new(),
             env_file: None,
             harness: Some(harness),

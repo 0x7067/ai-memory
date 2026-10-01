@@ -16,7 +16,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
 use tracing::info;
 
 mod auth_bearer;
@@ -43,7 +42,7 @@ pub async fn run() -> Result<()> {
         data_dir,
         config: config_path,
         command,
-    } = Cli::parse();
+    } = cli::parse_process();
 
     // Hooks fire on every tool call: they must be cheap and must emit ONLY
     // their JSON object to stdout. Short-circuit before config load and
