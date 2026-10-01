@@ -500,6 +500,27 @@ protocol](managed-harness-contributions.md), including read-only extraction,
 pre-turn context delivery, migration invariants, deterministic tests, and an
 opt-in real-harness acceptance pass.
 
+### Known issue: Codex's shared daemon and stale run ids (#987)
+
+Recent Codex releases run sessions through a shared background app-server
+daemon (`codex agents` lists it). The daemon keeps the environment it started
+with, and the lifecycle hooks it launches inherit that environment — including
+the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. A later
+`ai-memory run codex` then reports that finished run, gets no continuity
+context, and the server logs `managed SessionStart has no active run`.
+
+Until the server-side fix lands, launch managed Codex sessions without the
+daemon. Native arguments after the harness are forwarded to Codex:
+
+```bash
+ai-memory run codex --no-daemon
+```
+
+`--no-daemon` makes that one session run without the shared background server
+even if one is already running; it is available on Codex's interactive and
+`resume` commands (checked on Codex 0.156). Sessions started without it keep
+the daemon behavior described above.
+
 ## Installation and recovery
 
 Managed runs need current ai-memory lifecycle hooks so SessionStart can receive
@@ -662,7 +683,19 @@ On a normal exit, ai-memory imports the transcript and closes the lease before
 returning. Handled setup, launch, or import failures cancel the lease
 immediately. A new launch retries an active-workstream conflict briefly so a
 previous launcher can finish; if another harness is genuinely still running,
-the conflict remains and concurrent writers are still rejected. Terminal
+the conflict remains and concurrent writers are still rejected.
+
+A launcher that dies without releasing its lease — killed, its terminal
+closed, or a sandbox such as ai-jail torn down — leaves the workstream held
+until that lease lapses. An interactive relaunch (stdin and stderr are
+terminals) no longer fails on that: the conflict reports the lease's expiry, so
+ai-memory says who holds it and waits for it to lapse (at most one lease,
+~90 seconds; `Ctrl+C` aborts), then starts normally. If the holder renews the
+lease while you wait, it is a launcher that is still running, and you get an
+error instead — stop it, or pass `--new <name>` for a separate workstream. The
+server's busy check stays the only arbiter: the waiting launcher never forces
+another run off. Non-interactive launches (scripts, hooks, CI) keep the short
+retry window and fail fast rather than hanging. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
 
