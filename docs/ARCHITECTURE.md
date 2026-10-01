@@ -72,6 +72,11 @@ from hook paths.
    wiki commit, durable provider job, and pending key without appending another
    observation. `log.md` gets an appended
    `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
+   Inline `/hook/batch` ACKs include an outcome per acknowledged index.
+   Process-lifetime counters distinguish stored events, replays, recovery and
+   ignored endings. `last_persisted_ms` advances after a durable write or terminal
+   effect; retries and no-op endings do not advance it. Normal checkpoints reuse
+   the observation write timestamp; only recovery checks for a new page version.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
    `Handoff` row for the next agent. One SQLite transaction inserts that
