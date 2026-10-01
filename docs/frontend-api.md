@@ -476,11 +476,18 @@ an unnamed caller sees unattributed ones only. Never cached (`no-store`).
       "started_at": "2026-08-16T09:12:03.412Z",
       "ended_at": "2026-08-16T10:47:55.001Z",
       "observation_count": 143,
-      "actor_user": null
+      "actor_user": null,
+      "consolidation": {"state": "completed", "attempts": 1}
     }
   ]
 }
 ```
+
+`consolidation` is `null` when no job exists for that session in the requested
+project. Otherwise it contains the latest generation's state (`pending`,
+`running`, `completed`, `failed` or `superseded`) and attempt count. Jobs are
+selected in the same scope and query as the owner-filtered sessions; provider
+errors are omitted. This reports the job state, not every page's freshness.
 
 ### 4.12 Session observations
 
@@ -516,7 +523,8 @@ historical text. Never cached (`no-store`). Same payload as the MCP tool
     "started_at": "2026-08-16T09:12:03.412Z",
     "ended_at": "2026-08-16T10:47:55.001Z",
     "observation_count": 143,
-    "actor_user": null
+    "actor_user": null,
+    "consolidation": null
   },
   "observations": [
     {

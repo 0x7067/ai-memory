@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event eligibility, sanitized routing hints and server-remapping information.
   Partial scope, excluded events, rejected profiles and oversized hints refuse
   capture. Inspection neither ingests events nor claims handoffs. (#1019)
+- Added the latest scoped consolidation job's state and attempt count to HTTP
+  session summaries and MCP `memory_read_session_observations`. The field is
+  `null` when no job exists; provider errors remain private and existing session
+  ownership filters are preserved. (#1018)
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`

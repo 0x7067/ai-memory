@@ -566,3 +566,60 @@ async fn session_summary_scoped_narrows_the_listing_predicates() {
         "unknown id",
     );
 }
+
+#[tokio::test]
+async fn consolidation_summary_latest_generation_is_scope_and_owner_bound() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    for (sid, proj, generation, state, attempts) in [
+        (10, proj_a(), 1, "superseded", 1),
+        (10, proj_a(), 2, "pending", 2),
+        (12, proj_b(), 1, "completed", 1),
+    ] {
+        conn.execute("INSERT INTO session_consolidation_jobs
+            (session_id, workspace_id, project_id, generation, state, requested_at, next_attempt_at, attempts)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+            params![session(sid).as_bytes(), ws().as_bytes(), proj.as_bytes(), generation, state, NOW, attempts]).unwrap();
+    }
+    let summary = store
+        .reader
+        .session_summary_scoped(ws(), proj_a(), session(10), OwnerFilter::Any)
+        .await
+        .unwrap()
+        .unwrap();
+    let job = summary.consolidation.unwrap();
+    assert_eq!((job.state.as_str(), job.attempts), ("pending", 2));
+    let summary = store
+        .reader
+        .session_summary_scoped(ws(), proj_a(), session(12), filter_for("alice"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        summary.consolidation.is_none(),
+        "foreign job must not leak through cross-project observations"
+    );
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_a(), session(12), filter_for("bob"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_b(), session(13), OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let summary = store
+        .reader
+        .session_summary_scoped(ws(), proj_b(), session(12), filter_for("alice"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.consolidation.unwrap().state, "completed");
+}
