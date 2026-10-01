@@ -116,6 +116,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
+- Fixed interrupted launchers blocking an immediate managed-workstream restart
+  by adding explicit `ai-memory run --force-unlock` recovery. The server
+  atomically expires and replaces only a lease attributed to the same
+  authenticated operator (or another unattributed lease in single-user
+  operation), while cross-operator eviction remains refused; the command does
+  not kill a native process. (#795)
 - Fixed Unix release archives potentially carrying macOS AppleDouble sidecars
   outside the native upgrader's strict path allowlist. Release packing now
   disables sidecar generation, and packaging tests lock the staged top-level
