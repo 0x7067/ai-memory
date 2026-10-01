@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-10-01
+
 ### Fixed
 - Fixed `ai-memory run --yolo`'s ai-jail re-exec aborting when the wrapped
   command carried a flag that ai-jail also defines: `run claude --yolo --env
@@ -7575,7 +7577,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...HEAD
+[2.5.1]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...v2.4.1
