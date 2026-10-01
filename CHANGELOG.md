@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether the TOML parses), so it also catches a `[capture]` table that
   parses fine but is still rejected at compile time, e.g. an unsupported glob
   character in `ignore_paths`. (#1021)
+- Fixed the shell and PowerShell hook scripts mishandling a `$HOME` that ends
+  in a separator: the shell walks missed a marker between the checkout and
+  home, and the PowerShell walks went past home and read a marker above it.
+  Both now match the native `ai-memory hook` walk. (#1023)
 
 ## [2.5.2] - 2026-10-01
 

@@ -88,6 +88,28 @@ assert_eq "outside HOME plain dir rejects parent marker" "" \
 HOME="$TMP"
 export HOME
 
+# A trailing slash on $HOME does not move the boundary.
+mkdir -p "$TMP/slash-home/org/repo/.git" "$TMP/slash-home/plain/src"
+printf 'workspace = "org"\n' >"$TMP/slash-home/org/.ai-memory.toml"
+printf 'workspace = "above-home"\nserver = "team-b"\n' >"$TMP/.ai-memory.toml"
+for slash_home in "$TMP/slash-home" "$TMP/slash-home/" "$TMP/slash-home//"; do
+    HOME="$slash_home"
+    export HOME
+    assert_eq "HOME=$slash_home: marker above the checkout root" \
+        "$TMP/slash-home/org/.ai-memory.toml" \
+        "$(ai_memory_find_marker "$TMP/slash-home/org/repo")"
+    assert_eq "HOME=$slash_home: settings marker above the checkout root" \
+        "$TMP/slash-home/org/.ai-memory.toml" \
+        "$(ai_memory_find_settings_marker "$TMP/slash-home/org/repo")"
+    assert_eq "HOME=$slash_home: walk stops at HOME" "" \
+        "$(ai_memory_find_marker "$TMP/slash-home/plain/src")"
+    assert_eq "HOME=$slash_home: server walk stops at HOME" "no" \
+        "$(ai_memory_server_routed "$TMP/slash-home/plain/src" && echo yes || echo no)"
+done
+rm -f "$TMP/.ai-memory.toml"
+HOME="$TMP"
+export HOME
+
 # --- extract_cwd ------------------------------------------------------
 PAYLOAD='{"session_id":"x","cwd":"/home/u/foo","tool":"Read"}'
 assert_eq "extract cwd from payload"     "/home/u/foo" "$(ai_memory_extract_cwd "$PAYLOAD")"
