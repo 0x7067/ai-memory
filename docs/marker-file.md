@@ -670,6 +670,19 @@ Two guarantees hold in **both** modes:
 Session-creating events are unaffected in both modes: opening a session in a
 plain non-git folder still names the project after that folder.
 
+Some harnesses keep reporting the parent session's cwd when a subagent uses a
+file tool in another checkout. Native `ai-memory hook` commands compensate for
+that case before applying `follow-cwd` or `sticky`: a fixture-backed file-tool
+schema with absolute target paths is routed from the target when every path
+proves the same repository or marker boundary. The destination's capture
+policy and `server` profile are authoritative, so a cross-project call cannot
+use the source repository's policy or credentials. Relative paths,
+mixed-project calls, unknown schemas, and absolute paths outside a recognized
+repository/marker keep the payload cwd. Free-form shell commands are not
+reinterpreted as project routing instructions. This changes raw observation
+attribution only; the session row and its compiled session page remain in the
+project where the session began.
+
 Independently of this setting, under `project_strategy = "repo-root"` a
 mid-session event whose cwd is outside any git repo *and* any marker (agent
 scratch directories, `/tmp`, data folders) already inherits the session's

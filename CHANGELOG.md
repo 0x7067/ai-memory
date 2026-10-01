@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added cross-project attribution for native lifecycle file-tool events whose
+  harness keeps reporting the parent session's cwd. A bounded, recognized
+  absolute target reroutes only when every path proves the same repository or
+  marker boundary; destination capture exclusions and server profiles are
+  resolved before the event is spooled. Relative, mixed-project, unsupported,
+  and arbitrary non-project paths keep the original route. (#932)
 - Added `serve --enable-api` / `AI_MEMORY_ENABLE_API=true` to mount the
   authenticated read-only `/api/v1` surface without the browser UI. Existing
   `--enable-web` behavior is unchanged and still includes the API. Documented

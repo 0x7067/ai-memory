@@ -236,6 +236,14 @@ normalises them to exactly one of these `ObservationKind` values:
 | `session-end` | Agent session ended; summary/handoff path may run. |
 | `other` | Unknown or unsupported hook event. |
 
+Native hook clients correct one otherwise invisible cross-project case before
+spooling: if a recognized file-tool payload names only absolute paths in one
+other repository/marker boundary, that destination becomes the event cwd.
+Destination capture policy, server profile, and scope therefore travel
+together. Relative, mixed-project, unsupported, and non-project targets keep
+the harness cwd. Session identity and compiled-session ownership do not move;
+only the raw observations are attributed to the touched project (#932).
+
 Antigravity CLI has no native SessionStart event. Its `PreInvocation` hook
 fires before every model call, so the bridge maps only the documented
 `invocationNum = 0` payload to `session-start`; later invocations are ignored

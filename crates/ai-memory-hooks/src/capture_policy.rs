@@ -875,6 +875,34 @@ fn extract_paths(name: &str, args: &Value) -> Option<Vec<String>> {
         }))
     .then_some(paths)
 }
+
+/// Return the bounded, normalized absolute paths named by a recognized file
+/// tool call.
+///
+/// Native hook clients use this only to notice a file operation that targets
+/// another checkout while the harness keeps reporting the parent session's
+/// cwd. Relative paths are intentionally excluded: joining them to any cwd
+/// other than the payload's would be ambiguous, and they cannot independently
+/// prove a cross-project target. Unknown schemas and mixed/oversized inputs
+/// fail closed with `None`, matching capture-policy extraction.
+#[must_use]
+pub fn absolute_file_tool_paths(agent: AgentKind, raw: &Value, cwd: &str) -> Option<Vec<String>> {
+    let extracted = extract(agent, raw);
+    if extracted.family != ToolFamily::File {
+        return None;
+    }
+    let paths = extracted.paths?;
+    paths
+        .iter()
+        .map(|path| {
+            is_absolute(path)
+                .then(|| normalize_candidate(path, cwd))
+                .flatten()
+                .map(|candidate| candidate.path)
+        })
+        .collect()
+}
+
 fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     let mut paths = Vec::new();
     for key in [

@@ -19,7 +19,8 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDisposition, CaptureMode, HookEvent, PolicyState, repository_admits_capture,
+    CaptureDisposition, CaptureMode, HookEvent, PolicyState, absolute_file_tool_paths,
+    repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -638,10 +639,31 @@ where
     {
         payload = serde_json::to_string(&json)?;
     }
-    let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let tool_event = is_tool_event(&args.event);
+    // Some harnesses keep a subagent's parent cwd in every payload even when
+    // a file tool operates in another checkout (#932). A recognized absolute
+    // target may select that checkout, but only when every path proves the
+    // same repository/marker boundary. This must precede capture policy and
+    // server-profile resolution so the destination's privacy and credentials
+    // remain authoritative.
+    let file_routing_cwd = payload_cwd.as_deref().and_then(|cwd| {
+        tool_event
+            .then(|| file_tool_routing_cwd(agent_kind, &json, cwd))
+            .flatten()
+    });
+    if let Some(cwd) = file_routing_cwd.as_deref()
+        && let Some(object) = json.as_object_mut()
+    {
+        // `HookEnvelope` deliberately gives the native body cwd precedence
+        // over the query fallback. Stamp the proven destination into that
+        // canonical field too, or a URL-only reroute would be cosmetic.
+        object.insert("cwd".into(), cwd.into());
+        payload = serde_json::to_string(&json)?;
+    }
+    let policy_cwd = file_routing_cwd.or(payload_cwd);
     let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
-    let tool_event = is_tool_event(&args.event);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
         policy.inspect(
             AgentKind::from_wire(&args.agent),
@@ -765,10 +787,15 @@ where
         }
     }
 
-    let qs = cwd_query_suffix(
-        &args.agent,
-        &json,
-        args.project_strategy.and_then(|s| s.baked()),
+    let qs = policy_cwd.as_deref().map_or_else(
+        || {
+            cwd_query_suffix(
+                &args.agent,
+                &json,
+                args.project_strategy.and_then(|s| s.baked()),
+            )
+        },
+        |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
     let spool = hook_spool::spool_dir(&dd);
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
@@ -1086,6 +1113,65 @@ fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option
             session_id,
         )
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileRouteAnchor {
+    marker: Option<PathBuf>,
+    repository: Option<PathBuf>,
+}
+
+/// Find the existing directory that can establish routing for a file target.
+/// New files may name one or more not-yet-created parent directories.
+fn existing_target_dir(path: &Path) -> Option<PathBuf> {
+    let mut candidate = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        candidate = candidate.parent()?.to_path_buf();
+    }
+}
+
+fn file_route_anchor(cwd: &Path) -> FileRouteAnchor {
+    let cwd_text = cwd.to_string_lossy();
+    FileRouteAnchor {
+        marker: crate::marker::find_marker(&cwd_text),
+        repository: ai_memory_consolidate::discover_main_repo_root(cwd).ok(),
+    }
+}
+
+/// Pick a destination cwd only when absolute file-tool paths prove a single
+/// repository/marker boundary different from the payload cwd.
+fn file_tool_routing_cwd(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    payload_cwd: &str,
+) -> Option<String> {
+    let paths = absolute_file_tool_paths(agent, raw, payload_cwd)?;
+    let source_dir = existing_target_dir(Path::new(payload_cwd))?;
+    let source_anchor = file_route_anchor(&source_dir);
+    let mut selected: Option<(FileRouteAnchor, PathBuf)> = None;
+    for path in paths {
+        let dir = existing_target_dir(Path::new(&path))?;
+        let anchor = file_route_anchor(&dir);
+        // An arbitrary absolute path is not a project and must not mint a new
+        // scope merely because a file tool happened to inspect it.
+        if anchor.marker.is_none() && anchor.repository.is_none() {
+            return None;
+        }
+        match &selected {
+            Some((expected, _)) if *expected != anchor => return None,
+            Some(_) => {}
+            None => selected = Some((anchor, dir)),
+        }
+    }
+    let (target_anchor, dir) = selected?;
+    (target_anchor != source_anchor).then(|| dir.to_string_lossy().into_owned())
 }
 
 /// Where one event is delivered (#992).
@@ -2323,6 +2409,170 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         assert!(!called.get());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn absolute_file_target_uses_destination_scope_and_capture_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"source\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"destination\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let excluded = serde_json::json!({
+            "session_id": "cross-project",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("secret/private.txt")},
+            "tool_response": {"content": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+        });
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            excluded.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a dropped tool event must not start a drainer"),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(&data_dir);
+        assert_eq!(hook_spool::spool_len(&spool), 0);
+
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let public = serde_json::json!({
+            "session_id": "cross-project",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("public.txt")},
+            "tool_response": {"content": "public"}
+        });
+        run_with_payload(
+            Some(data_dir),
+            args,
+            public.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a tool event below the threshold must only spool"),
+        )
+        .await
+        .unwrap();
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(query_param(&entries[0].url, "workspace"), Some("shared"));
+        assert_eq!(query_param(&entries[0].url, "project"), Some("destination"));
+        assert_eq!(
+            query_param(&entries[0].url, "cwd"),
+            Some(url_encode(destination.to_str().unwrap()).as_str())
+        );
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["cwd"], destination.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn absolute_file_target_cannot_escape_a_destination_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"source\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "server = \"unregistered\"\nworkspace = \"shared\"\nproject = \"destination\"\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let raw = serde_json::json!({
+            "session_id": "cross-profile",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("public.txt")}
+        });
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a refused destination route must not start a drainer"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)),
+            0,
+            "the event must not fall back to the source repository's server"
+        );
+    }
+
+    #[test]
+    fn file_target_routing_refuses_relative_external_and_mixed_project_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(source.join(".ai-memory.toml"), "project = \"source\"\n").unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "project = \"destination\"\n",
+        )
+        .unwrap();
+        let cwd = source.to_str().unwrap();
+        let relative = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "../destination/file.txt"}
+        });
+        assert_eq!(
+            file_tool_routing_cwd(AgentKind::ClaudeCode, &relative, cwd),
+            None,
+            "a relative path cannot independently prove a destination"
+        );
+
+        let external_dir = tmp.path().join("not-a-project");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let external = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": external_dir.join("file.txt")}
+        });
+        assert_eq!(
+            file_tool_routing_cwd(AgentKind::ClaudeCode, &external, cwd),
+            None,
+            "an arbitrary absolute path must not mint a project"
+        );
+
+        let mixed = serde_json::json!({
+            "tool_name": "read",
+            "tool_input": {"paths": [
+                source.join("one.txt"),
+                destination.join("two.txt")
+            ]}
+        });
+        assert_eq!(
+            file_tool_routing_cwd(AgentKind::ClaudeCode, &mixed, cwd),
+            None,
+            "one event cannot be attributed to two projects"
+        );
     }
 
     #[tokio::test]
