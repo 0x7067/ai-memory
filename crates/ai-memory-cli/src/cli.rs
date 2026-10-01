@@ -1635,6 +1635,17 @@ pub enum InstallSkillsScope {
     Global,
 }
 
+/// Where `install-hooks` writes Claude Code's hook configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HookInstallScope {
+    /// The user-level settings file (`~/.claude/settings.json`, or
+    /// `$CLAUDE_CONFIG_DIR/settings.json`): hooks fire in every project.
+    Global,
+    /// This repository's gitignored `.claude/settings.local.json`: hooks fire
+    /// only for sessions started in this checkout.
+    Project,
+}
+
 /// Agent skill directory family for `install-skills`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum InstallSkillsAgent {
@@ -2905,6 +2916,19 @@ pub struct InstallHooksArgs {
     /// For OpenClaw, this is the generated plugin package directory.
     #[arg(long)]
     pub config_file: Option<PathBuf>,
+    /// Where to write the hook configuration. `project` targets the
+    /// repository's `.claude/settings.local.json` (at the git root, else the
+    /// current directory) so capture is opted in per checkout instead of for
+    /// every session; Claude Code reads it alongside the user-level hooks.
+    /// Claude Code only; ignores `CLAUDE_CONFIG_DIR`. Cannot be combined
+    /// with `--config-file`, which names the target file directly.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = HookInstallScope::Global,
+        conflicts_with = "config_file"
+    )]
+    pub scope: HookInstallScope,
     /// Default project strategy to bake into the installed hooks.
     /// `repo-root` makes every session resolve its project from the main
     /// git repo root (collapsing subdirectories and worktrees) without a
@@ -3686,6 +3710,45 @@ mod tests {
                 args.agent
             );
         }
+    }
+
+    #[test]
+    fn install_hooks_scope_defaults_to_global_and_conflicts_with_config_file() {
+        let cli =
+            Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "claude-code"]).unwrap();
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks command");
+        };
+        assert_eq!(args.scope, HookInstallScope::Global);
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--scope",
+            "project",
+        ])
+        .unwrap();
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks command");
+        };
+        assert_eq!(args.scope, HookInstallScope::Project);
+
+        // Both name the target file; accepting them together would silently
+        // pick one.
+        let err = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--scope",
+            "project",
+            "--config-file",
+            "settings.json",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

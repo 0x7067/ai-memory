@@ -273,6 +273,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
         as_user: None,
         apply: true,
         config_file,
+        scope: crate::cli::HookInstallScope::Global,
         project_strategy: None,
         capture_assistant: false,
         capture_mode: None,

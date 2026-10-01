@@ -38,7 +38,7 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use crate::cli::{AgentChoice, InstallHooksArgs, UpgradeArgs};
+use crate::cli::{AgentChoice, HookInstallScope, InstallHooksArgs, UpgradeArgs};
 use crate::commands::install_hooks;
 use crate::config::Config;
 use crate::install_layout::{HOOKS_DIR_NAME, shipped_binary_name};
@@ -844,6 +844,7 @@ fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
         as_user: None,
         apply: true,
         config_file: None,
+        scope: HookInstallScope::Global,
         project_strategy: None,
         capture_assistant: false,
         capture_mode: None,

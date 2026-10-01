@@ -200,6 +200,14 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
         .into_iter()
         .map(|path| (path, HookConfigShape::NestedHooksKey))
         .collect();
+        // A `--scope project` install lives in the checkout's gitignored
+        // `.claude/settings.local.json`; sweep the one for the current
+        // directory, as the Kiro project configs below are.
+        let cwd = std::env::current_dir().context("getting CWD for hook removal")?;
+        let project_local = install_hooks::project_claude_settings_local(&cwd);
+        if !hook_files.iter().any(|(path, _)| *path == project_local) {
+            hook_files.push((project_local, HookConfigShape::NestedHooksKey));
+        }
         hook_files.extend([
             (
                 install_hooks::codex_hooks_path()?,
@@ -255,7 +263,6 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
 
         let mut kiro_configs =
             install_hooks::list_kiro_cli_agent_configs(&install_hooks::kiro_cli_agents_dir()?)?;
-        let cwd = std::env::current_dir().context("getting CWD for Kiro hook removal")?;
         kiro_configs.extend(install_hooks::list_kiro_cli_agent_configs(
             &cwd.join(".kiro/agents"),
         )?);
