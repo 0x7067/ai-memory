@@ -584,6 +584,11 @@ function Invoke-AiMemoryHook {
         if ($GrokPostTool -and -not $BriefQS) {
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
         }
+        # A session-start handoff GET carries the `[briefing]` opt-in on every
+        # start, as in the native hook. Kiro keeps its own once-per-session gate.
+        if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
+            $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
+        }
         try {
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
