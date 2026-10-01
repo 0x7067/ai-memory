@@ -1014,10 +1014,23 @@ fn normalize_candidate(candidate: &str, cwd: &str) -> Option<Normalized> {
         return None;
     }
     let cwd = normalize_root(cwd).ok()?;
+    // Flavor must come from the host (the cwd), never from the candidate
+    // string alone: on a POSIX host a leading `//` is an ordinary doubled
+    // separator, not a UNC root, but `flavor_of` cannot tell the two apart
+    // from the string in isolation. Collapsing it first keeps a POSIX
+    // candidate POSIX-flavored so it still matches a POSIX `ignore_paths`
+    // pattern instead of silently escaping every pattern via a flavor
+    // mismatch (GHSA-vh98). A genuine Windows/UNC host is unaffected: the
+    // collapse only runs when the cwd itself is not windows-flavored.
     let raw = if is_absolute(candidate) {
         candidate.to_owned()
     } else {
         join(&cwd, candidate)
+    };
+    let raw = if flavor_of(&cwd) == Flavor::Posix && raw.starts_with("//") {
+        format!("/{}", raw.trim_start_matches('/'))
+    } else {
+        raw
     };
     let flavor = flavor_of(&raw);
     Some(Normalized {
@@ -1325,6 +1338,69 @@ mod tests {
         }
         assert!(CaptureProtocol::parse(&fixture["protocol"]["accept"]).is_some());
         assert!(CaptureProtocol::parse(&fixture["protocol"]["reject"]).is_none());
+    }
+    /// Adversarial regression for GHSA-vh98 / security-boundaries.md row
+    /// 11b: a POSIX-host candidate spelled with a leading `//` used to be
+    /// classified `Flavor::Windows` purely from the string, so it matched
+    /// zero POSIX `ignore_paths` patterns (flavor mismatch in `match_paths`'
+    /// filter) and was captured instead of dropped. `flavor_of` cannot tell
+    /// a doubled POSIX separator from a UNC root by itself; only the host
+    /// (the cwd) can. This attempts the violation, proves a plain-looking
+    /// control still drops normally, and proves a genuine Windows-hosted UNC
+    /// candidate still matches (so the fix didn't just blanket-collapse
+    /// every `//`).
+    #[test]
+    fn a_leading_double_slash_candidate_does_not_escape_posix_ignore_paths_via_flavor_mismatch() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        // The violation attempt: on the unfixed code this normalized to a
+        // Windows-flavored candidate and matched no POSIX pattern, so it
+        // came back `Keep` (captured) instead of `Drop`.
+        let attack =
+            json!({"tool_name":"Edit","tool_input":{"file_path":"//repo/secret/token.txt"}});
+        assert_eq!(
+            policy
+                .inspect(AgentKind::ClaudeCode, &attack, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop,
+            "a leading `//` must not escape a POSIX host's ignore_paths"
+        );
+        // Legitimate control: an ordinary single-slash candidate under the
+        // same pattern must keep being dropped.
+        let control =
+            json!({"tool_name":"Edit","tool_input":{"file_path":"/repo/secret/token.txt"}});
+        assert_eq!(
+            policy
+                .inspect(AgentKind::ClaudeCode, &control, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        // Windows-UNC control: a genuine UNC candidate on a Windows host
+        // must still match a UNC pattern — the fix is host-derived, not an
+        // unconditional `//` -> `/` collapse.
+        let windows_policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["\\\\server\\share\\**".into()],
+            }),
+            "C:/",
+            None,
+        );
+        let unc = json!({"tool_name":"Edit","tool_input":{"file_path":"//SERVER/SHARE/token.txt"}});
+        assert_eq!(
+            windows_policy
+                .inspect(AgentKind::ClaudeCode, &unc, "C:/")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop,
+            "a genuine UNC candidate on a Windows host must still match"
+        );
     }
     #[test]
     fn all_states_and_strict_protocol_are_reachable() {
