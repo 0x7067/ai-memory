@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-10-01
+
+### Added
+- Added `ai-memory run --jail[=TOGGLES]` and `--no-jail`, and an interactive
+  checklist after the `--yolo` ai-jail offer, to choose which ai-jail
+  credentials and capabilities the jailed session gets. Bare `--jail` re-runs
+  inside ai-jail without asking, using smart defaults: every credential present
+  on the host (`~/.config/gh`, `~/.aws`, `~/.kube`, `~/.config/gcloud`,
+  `~/.docker/config.json`), SSH when `origin` is an SSH remote, and worktree
+  metadata in a linked worktree; host capabilities (`docker`, `gpu`,
+  `display`, `pictures`, `tailscale`) stay off, and anything else is left to
+  the user's own ai-jail config. `--jail=github,aws,no-mise` is exact: it
+  passes every checklist row it does not name as `--no-X`, so a global
+  `~/.ai-jail` cannot add to it (`all` and `none` also work); the checklist
+  likewise passes unchecked rows as `--no-X`. `--jail` works without `--yolo`
+  and in scripts, and fails instead of running unjailed when ai-jail is not
+  usable. Only toggles the installed ai-jail advertises in its
+  `--help` are offered or passed; the credential mounts need ai-jail 2.5.0.
+  ai-jail's security switches (`seccomp`, `landlock`, `private-home`, …) are
+  never accepted. `--no-jail` skips the offer while keeping the `--yolo`
+  warning. A project `.ai-jail` in the launch directory replaces the checklist
+  and the bare-`--jail` defaults (ai-jail loads it under its own trust rules;
+  `--jail=…` still applies on top), and every jailed re-run now passes
+  `--no-save-config`, so ai-jail no longer writes ai-memory's `--network` /
+  `--agent-state` / credential flags into the repository's `.ai-jail`.
+
 ### Fixed
 - Fixed the shell and PowerShell session-start hooks for Claude Code, Codex,
   Cursor, Gemini CLI, OpenCode, Command Code, Devin, and Antigravity CLI not
@@ -7616,7 +7642,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...HEAD
+[2.5.2]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...v2.4.2
