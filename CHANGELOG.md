@@ -268,6 +268,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself (named, chosen before the spawn, or linked during the run) is closed,
   including again after it was resumed; if finalizing fails, the run prints
   the exact command to run and keeps the harness's exit code. (#941)
+- After an interactive managed `ai-memory run` session exits successfully, a
+  default-quit prompt can switch to another installed harness or re-run the
+  current one in the same workstream. The prompt is limited to terminal
+  session launches without `--executable`; utility, failed, interrupted, and
+  non-interactive runs keep their existing exit behavior. (#909)
 - `[consolidation] input_token_safety_margin` (float, default `0.8`, validated
   to `(0.0, 1.0]`) scales the approximate char-count input budget. The
   `max_input_tokens` budget uses a flat chars-per-token heuristic that

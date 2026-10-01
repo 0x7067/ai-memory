@@ -270,7 +270,7 @@ pub enum Command {
 
 /// Arguments for `run`. Wrapper-owned flags must precede `harness`; the
 /// trailing native argv is deliberately opaque to clap.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 #[command(trailing_var_arg = true)]
 pub struct RunArgs {
     /// Workspace containing the managed workstream. Defaults to the nearest
@@ -363,7 +363,7 @@ pub struct RunArgs {
 }
 
 /// Harnesses supported by managed workstreams.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RunHarnessChoice {
     /// Anthropic Claude Code (`claude`). Any `claude*`-prefixed name (e.g.
     /// `claude-corp`, `claude-personal`) also selects this harness — see
