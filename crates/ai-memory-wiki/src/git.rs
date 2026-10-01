@@ -74,9 +74,18 @@ const UNREPORTED_SAMPLE: usize = 5;
 const RACY_READ_ATTEMPTS: u32 = 4;
 const RACY_READ_BACKOFF: Duration = Duration::from_millis(25);
 
-/// libgit2's "file changed before we could read it": a writer was mid-write.
+/// A staging read that raced a writer outside the commit lock: libgit2's
+/// "file changed before we could read it" (mid-write), or a file that was
+/// listed by the walk but gone by the time libgit2 streamed it in (an `Os`
+/// "failed to read file into stream" — e.g. an atomic writer's temp file
+/// renamed away between the scan and the read). Both settle within
+/// milliseconds; a rescan no longer sees a vanished file.
 fn is_racy_read(e: &git2::Error) -> bool {
-    e.class() == git2::ErrorClass::Filesystem && e.message().contains("changed before")
+    match e.class() {
+        git2::ErrorClass::Filesystem => e.message().contains("changed before"),
+        git2::ErrorClass::Os => e.message().contains("failed to read file into stream"),
+        _ => false,
+    }
 }
 
 /// Writes that reached the tree without a report: a writer bypassed the wiki.
@@ -1446,6 +1455,33 @@ mod tests {
 
     /// Two session ends at once used to collide on libgit2's index lock and
     /// one of them lost its snapshot; now they queue.
+    /// The CI flake behind `concurrent_commits_queue_instead_of_failing`: a
+    /// walk listed a file that was gone when libgit2 read it, and libgit2
+    /// reports that as an `Os`-class "failed to read file into stream" — not
+    /// the "changed before" the retry recognized — so the commit failed
+    /// instead of retrying. Unrelated errors must still fail fast.
+    #[test]
+    fn a_file_vanishing_mid_walk_is_a_racy_read_but_other_errors_are_not() {
+        let err =
+            |class, message: &str| git2::Error::new(git2::ErrorCode::GenericError, class, message);
+        assert!(is_racy_read(&err(
+            git2::ErrorClass::Os,
+            "failed to read file into stream: "
+        )));
+        assert!(is_racy_read(&err(
+            git2::ErrorClass::Filesystem,
+            "file changed before we could read it"
+        )));
+        assert!(!is_racy_read(&err(
+            git2::ErrorClass::Os,
+            "failed to open file"
+        )));
+        assert!(!is_racy_read(&err(
+            git2::ErrorClass::Index,
+            "failed to read file into stream: "
+        )));
+    }
+
     #[test]
     fn concurrent_commits_queue_instead_of_failing() {
         let tmp = tempdir();
