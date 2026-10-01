@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed managed Codex sessions losing their startup continuity when a shared
+  Codex app-server daemon reports a finished run's stale `AI_MEMORY_RUN_ID`.
+  SessionStart now recovers only the sole live, undelivered Codex run in the
+  already-authorized repository, checkout cwd, and operator bucket, and links
+  it atomically to the new native session. Active boundary mismatches,
+  concurrent matching runs, cross-project or cross-worktree candidates,
+  cross-operator candidates, and a second linker all fail closed instead of
+  guessing or rebinding a run. (#987)
 - `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
   `[capture]` section is invalid. This fails closed today — every file and
   shell tool event is reduced to metadata until the marker is fixed, nothing
