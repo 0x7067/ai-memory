@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added explicit MCP behavior annotations (title, read-only, destructive,
+  idempotent, and open-world hints) to all 23 tools. Reordered the MCP server
+  instructions so scope selection, untrusted-memory handling, deliberate
+  cross-project broadening, capture policy, and handoff safety remain complete
+  within the first 2,048 characters used by truncating clients. The longer
+  per-tool routing reference remains available to clients that accept it.
+  (#920)
 - Added env-only named launch profiles for `ai-memory run --profile NAME` via
   `[run.profiles.<name>.env]` in `config.toml`. Profile values feed the same
   native-session, auto-wire, and child-process environment path as `--env`;
