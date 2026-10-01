@@ -340,7 +340,7 @@ async fn run_once_with_wiring(
                 .run
                 .profiles
                 .get(name)
-                .ok_or_else(|| anyhow!("unknown run profile {name:?}"))
+                .ok_or_else(|| unknown_run_profile(&config.run, name))
         })
         .transpose()?;
     let run_env = resolve_run_env(profile, args.env_file.as_deref(), &args.env)
@@ -1842,6 +1842,26 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     let before = args.len();
     args.retain(|arg| arg != OsStr::new("--no-autowire"));
     args.len() != before
+}
+
+/// The error for a `--profile` name `config.toml` does not define: it names
+/// the profiles that do exist, or, with none defined, prints a table to paste.
+fn unknown_run_profile(run: &crate::config::RunSettings, name: &str) -> anyhow::Error {
+    if !run.profiles.is_empty() {
+        let known = run.profiles.keys().map(String::as_str).collect::<Vec<_>>();
+        return anyhow!(
+            "unknown run profile {name:?}; defined profiles: {}",
+            known.join(", ")
+        );
+    }
+    // Quoted when needed: a valid profile name may contain `.`, which a bare
+    // TOML key would split into nested tables.
+    let key = toml_edit::Key::new(name);
+    anyhow!(
+        "unknown run profile {name:?}; none are defined. Add to your config.toml:\n\n  \
+         [run.profiles.{}.env]\n  CLAUDE_CONFIG_DIR = \"/absolute/path\"",
+        key.display_repr()
+    )
 }
 
 /// Merge `--env-file` lines with `--env` entries into the final key/value
@@ -4467,12 +4487,15 @@ mod tests {
         assert_eq!(wrapper.profile.as_deref(), Some("work"));
         assert_eq!(wrapper.native_args, ["--model", "opus"].map(OsString::from));
 
-        let native = parse_run(&["ai-memory", "run", "omp", "--profile", "omp-work"]);
-        assert_eq!(native.profile, None);
-        assert_eq!(
-            native.native_args,
-            ["--profile", "omp-work"].map(OsString::from)
-        );
+        for (harness, native_profile) in [("omp", "omp-work"), ("codex", "codex-work")] {
+            let native = parse_run(&["ai-memory", "run", harness, "--profile", native_profile]);
+            assert_eq!(native.profile, None, "{harness}");
+            assert_eq!(
+                native.native_args,
+                ["--profile", native_profile].map(OsString::from),
+                "{harness}'s own --profile must reach the child"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4508,7 +4531,34 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.to_string(), "unknown run profile \"missing\"");
+        assert_eq!(
+            error.to_string(),
+            "unknown run profile \"missing\"; none are defined. Add to your config.toml:\n\n  \
+             [run.profiles.missing.env]\n  CLAUDE_CONFIG_DIR = \"/absolute/path\""
+        );
+    }
+
+    #[test]
+    fn unknown_run_profile_names_the_defined_profiles_in_sorted_order() {
+        let mut run = crate::config::RunSettings::default();
+        for name in ["work", "personal"] {
+            run.profiles
+                .insert(name.into(), crate::config::RunProfile::default());
+        }
+        assert_eq!(
+            unknown_run_profile(&run, "wrok").to_string(),
+            "unknown run profile \"wrok\"; defined profiles: personal, work"
+        );
+    }
+
+    #[test]
+    fn unknown_run_profile_hint_quotes_a_dotted_name_as_one_toml_key() {
+        let hint =
+            unknown_run_profile(&crate::config::RunSettings::default(), "work.v2").to_string();
+        assert!(
+            hint.contains("[run.profiles.\"work.v2\".env]"),
+            "a bare dotted key would paste as nested tables: {hint}"
+        );
     }
 
     #[test]
@@ -5360,6 +5410,85 @@ mod tests {
             "MCP missing in {}",
             mcp.display()
         );
+
+        server.abort();
+    }
+
+    /// Two accounts of one harness on one machine: each `--profile` must reach
+    /// the child and auto-wire its own config home on its own first launch.
+    /// The autowire sentinel is keyed by install target, so the second
+    /// profile is not skipped as "already wired" by the first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_run_profile_launches_and_autowires_its_own_config_home() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let work_home = data.path().join("claude-work");
+        let personal_home = data.path().join("claude-personal");
+        for dir in [&work_home, &personal_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut config = launch_config(home.path(), data.path(), address);
+        for (name, dir) in [("work", &work_home), ("personal", &personal_home)] {
+            config.run.profiles.insert(
+                name.to_string(),
+                crate::config::RunProfile {
+                    env: [("CLAUDE_CONFIG_DIR".to_string(), dir.display().to_string())].into(),
+                },
+            );
+        }
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(data.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+
+        for (name, dir, other) in [
+            ("work", &work_home, &personal_home),
+            ("personal", &personal_home, &work_home),
+        ] {
+            let mut args = run_args(
+                RunHarnessChoice::Claude,
+                script.clone(),
+                vec![],
+                &["--version"],
+            );
+            args.profile = Some(name.to_string());
+            let other_before = std::fs::read_dir(other).unwrap().count();
+            let exit = run_from_with_wiring(&config, args, repo.path(), &overrides)
+                .await
+                .unwrap_or_else(|error| panic!("profile {name} run fails: {error:#}"));
+            assert_eq!(exit, 0);
+            assert_eq!(
+                std::fs::read_to_string(&captured).unwrap(),
+                dir.display().to_string(),
+                "profile {name} must reach the spawned child"
+            );
+            let settings = dir.join("settings.json");
+            assert!(
+                std::fs::read_to_string(&settings)
+                    .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory")),
+                "profile {name}: hooks missing in {}",
+                settings.display()
+            );
+            let mcp = dir.join(".claude.json");
+            assert!(
+                std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
+                "profile {name}: MCP missing in {}",
+                mcp.display()
+            );
+            assert_eq!(
+                std::fs::read_dir(other).unwrap().count(),
+                other_before,
+                "profile {name} must not wire the other account's config home"
+            );
+        }
 
         server.abort();
     }

@@ -151,6 +151,19 @@ ai-memory run --env CODEX_HOME="$HOME/.codex-work" codex   # the dir must exist
   (provider keys, an account's config dir) can write it to a file and pass
   `--env-file <path>`, one `KEY=VALUE` per line. Values are taken literally, so
   use absolute paths in the file.
+- To name an account once instead of repeating `--env`, add a profile to
+  `config.toml` and select it with `--profile` (before the harness name):
+
+  ```toml
+  [run.profiles.work.env]
+  CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+  ```
+
+  Then `ai-memory run --profile work claude`. Use absolute paths: profile
+  values are not expanded. `--env-file` and `--env` still override a profile
+  entry, and an unknown name fails before anything is wired or launched. A
+  `--profile` after the harness name belongs to the harness (OMP and Codex
+  have their own).
 - Auto-wire runs once per config home, so the second account gets its hooks +
   MCP on its own first launch. To wire one by hand, export the variable for the
   installers: `CLAUDE_CONFIG_DIR="$HOME/.claude-work" ai-memory install-hooks
