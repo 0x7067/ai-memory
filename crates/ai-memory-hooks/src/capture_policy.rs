@@ -1086,10 +1086,11 @@ fn compile(
             validate_glob(source)
                 .map_err(|reason| format!("ignore_paths entry {source:?} {reason}"))?;
             let expanded = if let Some(rest) = source.strip_prefix("~/") {
-                join(
-                    home.as_deref().expect("needs_home found this pattern"),
-                    rest,
-                )
+                let home = home.as_deref().ok_or_else(|| {
+                    "a pattern starts with '~/' but no home directory is available to expand it"
+                        .to_owned()
+                })?;
+                join(home, rest)
             } else if is_absolute(source) {
                 source.clone()
             } else {
