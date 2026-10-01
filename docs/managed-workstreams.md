@@ -500,6 +500,27 @@ protocol](managed-harness-contributions.md), including read-only extraction,
 pre-turn context delivery, migration invariants, deterministic tests, and an
 opt-in real-harness acceptance pass.
 
+### Known issue: Codex's shared daemon and stale run ids (#987)
+
+Recent Codex releases run sessions through a shared background app-server
+daemon (`codex agents` lists it). The daemon keeps the environment it started
+with, and the lifecycle hooks it launches inherit that environment — including
+the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. A later
+`ai-memory run codex` then reports that finished run, gets no continuity
+context, and the server logs `managed SessionStart has no active run`.
+
+Until the server-side fix lands, launch managed Codex sessions without the
+daemon. Native arguments after the harness are forwarded to Codex:
+
+```bash
+ai-memory run codex --no-daemon
+```
+
+`--no-daemon` makes that one session run without the shared background server
+even if one is already running; it is available on Codex's interactive and
+`resume` commands (checked on Codex 0.156). Sessions started without it keep
+the daemon behavior described above.
+
 ## Installation and recovery
 
 Managed runs need current ai-memory lifecycle hooks so SessionStart can receive
