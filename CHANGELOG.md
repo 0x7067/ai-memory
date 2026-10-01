@@ -10,17 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added per-event outcomes to `/hook/batch` acknowledgements and process-lifetime
   ingest counters for stored events, replays, recovery, ignored endings,
-  collisions and failures. Legacy acknowledgement fields were preserved. (#1010)
+  collisions and failures. Legacy acknowledgement fields were preserved. (#1015)
 - Added receipt outcomes and delivery counts to the companion relay. Opening a
   schema 1 queue now upgrades it atomically to schema 2; older relay binaries
   refuse schema 2, so downgrade requires a pre-upgrade backup with all queue
   users stopped. Pending order and existing delivery metadata were preserved.
-  Receipts now retain their first known outcome. (#1010)
+  Receipts now retain their first known outcome. (#1015)
 
 ### Fixed
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
-  timestamp when it commits a new page or terminal effect. (#1010)
+  timestamp when it commits a new page or terminal effect. (#1015)
 
 ## [2.5.2] - 2026-10-01
 
