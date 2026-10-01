@@ -1,7 +1,15 @@
 # Design proposal: offer, don't claim, at session start (#959)
 
 **Status: accepted design (maintainer review folded in, 2026-10-01). Option 1
-is implemented on `release/2.6`; options 2 and 3 remain follow-up work.** The
+(offer mode) is implemented on `release/2.6` and resolves #959. Options 2 and 3
+are not being pursued** (decided 2026-10-02): offer mode already removes the
+destructive automatic claim. A per-execution opt-out (option 2, prototyped in
+#1032) only helps users who keep auto-claim on, and it cannot be done by
+skipping the session-start request, because that request also delivers the
+managed-run continuity packet, the compiled brief, and the inbox notice; if the
+need resurfaces, the safe shape is a server-side `handoff=off` parameter that
+claims nothing and delivers everything else. `to_agent` targeting (option 3) is
+not needed once nothing is claimed automatically. The
 maintainer marked #959 design-first: it touches the single-claim contract (invariant #16 — a handoff
 is claimed exactly once by two independent `state='open'` guards) in several
 places at once, so this is the design pass requested before any code lands.
