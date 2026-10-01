@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server showed every checkpointed page as `MM` (staged and unstaged changes
   that cancel out). A checkpoint that found nothing to commit left a stale
   index file in place the same way. The history itself was always correct.
-  Not specific to Windows. (#983)
+  Not specific to Windows. (#983, #1006)
 
 ## [2.5.0] - 2026-09-30
 
