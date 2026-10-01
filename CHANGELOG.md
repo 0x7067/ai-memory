@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added scope and policy preflight to `ai-memory hook --check-capture`, including
+  event eligibility, sanitized routing hints and server-remapping information.
+  Partial scope, excluded events, rejected profiles and oversized hints refuse
+  capture. Inspection neither ingests events nor claims handoffs. (#1010)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added
