@@ -1,5 +1,6 @@
 //! Checkout-local discovery for managed workstreams.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -56,9 +57,55 @@ pub(super) async fn list_for_checkout(
             repo_fingerprint: repository.repo_fingerprint,
             worktree_fingerprint: repository.worktree_fingerprint,
             limit,
+            offset: 0,
         },
     )
     .await
+}
+
+/// Fetch every checkout-local page without changing the server's per-page cap.
+pub(super) async fn list_all_for_checkout(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    checkout: &Path,
+) -> Result<Vec<ManagedWorkstreamSummary>> {
+    let repository =
+        inspect_repository(checkout).context("inspecting managed workstream checkout")?;
+    let mut request = ListManagedWorkstreamsRequest {
+        workspace: workspace.to_owned(),
+        project: project.to_owned(),
+        repo_fingerprint: repository.repo_fingerprint,
+        worktree_fingerprint: repository.worktree_fingerprint,
+        limit: 100,
+        offset: 0,
+    };
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        let page: Vec<ManagedWorkstreamSummary> =
+            post_json(endpoint, "/workstream/recent", &request).await?;
+        let count = page.len();
+        let before = summaries.len();
+        summaries.extend(
+            page.into_iter()
+                .filter(|row| seen.insert(row.workstream_id)),
+        );
+        if count < request.limit {
+            break;
+        }
+        // Older servers ignore offset. Do not loop forever or silently show
+        // only their first page when the user requested all workstreams.
+        anyhow::ensure!(
+            summaries.len() > before,
+            "server did not advance workstream pagination; upgrade the ai-memory server and retry"
+        );
+        request.offset = request
+            .offset
+            .checked_add(count)
+            .context("workstream pagination offset overflow")?;
+    }
+    Ok(summaries)
 }
 
 fn render_human(summaries: &[ManagedWorkstreamSummary], workspace: &str, project: &str) -> String {

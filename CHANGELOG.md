@@ -118,6 +118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- Scoped `ai-memory resume` to the current checkout instead of every linked
+  project, removed its default result cutoff with bounded server pagination,
+  and added `--search` plus immediate type-to-filter name search while preserving
+  Left/Right harness selection. Explicit limits now apply after the initial
+  search; `continue` retained its cross-directory behavior. (#534)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-

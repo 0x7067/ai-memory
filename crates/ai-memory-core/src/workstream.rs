@@ -276,6 +276,10 @@ pub struct ListManagedWorkstreamsRequest {
     pub worktree_fingerprint: String,
     /// Maximum number of workstreams to return.
     pub limit: usize,
+    /// Number of workstreams to skip in the same stable checkout-local order.
+    /// Omitted by older clients for the first page.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 /// One checkout-local managed workstream returned by discovery reads.
@@ -358,6 +362,19 @@ pub struct WorkstreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workstream_listing_without_offset_defaults_to_the_first_page() {
+        let request: ListManagedWorkstreamsRequest = serde_json::from_value(serde_json::json!({
+            "workspace": "default",
+            "project": "app",
+            "repo_fingerprint": "repo",
+            "worktree_fingerprint": "tree",
+            "limit": 20,
+        }))
+        .unwrap();
+        assert_eq!(request.offset, 0);
+    }
 
     #[test]
     fn older_run_status_reads_as_nothing_linked() {

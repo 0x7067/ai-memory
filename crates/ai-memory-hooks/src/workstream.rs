@@ -573,12 +573,13 @@ async fn list_recent_workstreams(
     };
     let summaries = match state
         .reader
-        .recent_workstreams(
+        .recent_workstreams_page(
             scope.workspace_id,
             scope.project_id,
             request.repo_fingerprint,
             request.worktree_fingerprint,
             request.limit.clamp(1, 100),
+            request.offset,
         )
         .await
     {
@@ -1342,6 +1343,7 @@ mod tests {
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
                 limit: 20,
+                offset: 0,
             }),
         )
         .await;
@@ -1368,6 +1370,7 @@ mod tests {
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "other-worktree".into(),
                 limit: 20,
+                offset: 0,
             }),
         )
         .await;
@@ -1389,10 +1392,113 @@ mod tests {
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
                 limit: 20,
+                offset: 0,
             }),
         )
         .await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn recent_workstream_pages_reach_older_rows_without_crossing_checkout_or_scope() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        for index in 0..105 {
+            store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::New(format!("local-{index:03}")),
+                    ..prepare_input(workspace_id, project_id, AgentKind::Codex, "launcher")
+                })
+                .await
+                .unwrap();
+        }
+        let other_workspace = store.writer.get_or_create_workspace("other").await.unwrap();
+        let sibling_project = store
+            .writer
+            .get_or_create_project(workspace_id, "sibling", None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(other_workspace, "managed", None)
+            .await
+            .unwrap();
+        for (workspace, project, repo, worktree, name) in [
+            (
+                workspace_id,
+                sibling_project,
+                "repo",
+                "worktree",
+                "foreign-project",
+            ),
+            (
+                workspace_id,
+                project_id,
+                "other-repo",
+                "worktree",
+                "foreign-repo",
+            ),
+            (
+                workspace_id,
+                project_id,
+                "repo",
+                "other-worktree",
+                "foreign-worktree",
+            ),
+            (
+                other_workspace,
+                other_project,
+                "repo",
+                "worktree",
+                "foreign-workspace",
+            ),
+        ] {
+            store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::New(name.into()),
+                    repo_fingerprint: repo.into(),
+                    worktree_fingerprint: worktree.into(),
+                    ..prepare_input(workspace, project, AgentKind::Codex, "foreign")
+                })
+                .await
+                .unwrap();
+        }
+        let mut rows = Vec::<ManagedWorkstreamSummary>::new();
+        for (offset, expected) in [(0, 100), (100, 5), (105, 0), (usize::MAX, 0)] {
+            let response = list_recent_workstreams(
+                State(state.clone()),
+                None,
+                None,
+                Json(ListManagedWorkstreamsRequest {
+                    workspace: "default".into(),
+                    project: "managed".into(),
+                    repo_fingerprint: "repo".into(),
+                    worktree_fingerprint: "worktree".into(),
+                    limit: 100,
+                    offset,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+            let page: Vec<ManagedWorkstreamSummary> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(page.len(), expected);
+            assert!(page.iter().all(|row| row.name.starts_with("local-")));
+            rows.extend(page);
+        }
+        let ids = rows
+            .iter()
+            .map(|row| row.workstream_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 105);
+        assert_eq!(rows[0].name, "local-104");
+        assert!(rows[0].current);
+        assert_eq!(rows.iter().filter(|row| row.current).count(), 1);
+        assert!(rows.iter().any(|row| row.name == "local-000"));
     }
 
     #[tokio::test]

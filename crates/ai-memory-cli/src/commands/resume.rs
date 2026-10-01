@@ -1,18 +1,18 @@
-//! `ai-memory resume` — pick a managed workstream across local checkouts.
+//! `ai-memory resume` — pick a managed workstream in the current checkout.
 //!
 //! The server deliberately cannot list client filesystem paths. This command
-//! joins its checkout-local registry to each checkout's privacy-preserving
-//! workstream listing, revalidates every path before use, and delegates the
+//! uses only the current checkout's privacy-preserving workstream listing,
+//! revalidates the path before use, and delegates the
 //! selected launch to `run --workstream`.
 
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ai_memory_core::ManagedWorkstreamSummary;
 use anyhow::{Context as _, Result, bail};
 
 use crate::cli::{ResumeArgs, RunArgs, RunHarnessChoice};
-use crate::commands::project_registry::{self, ProjectLink};
+use crate::commands::project_registry::ProjectLink;
 use crate::commands::show::{
     Choice, HorizontalDirection, available_harnesses, harness_name, select_with_horizontal,
     terminal_text,
@@ -21,13 +21,14 @@ use crate::commands::{continue_session, workstreams};
 use crate::config::Config;
 use crate::http_client::ServerEndpoint;
 
+#[derive(Debug)]
 struct Candidate {
     link: ProjectLink,
     target: PathBuf,
     summary: ManagedWorkstreamSummary,
 }
 
-/// Interactively select a workstream from every valid locally linked checkout.
+/// Interactively select a workstream in the current checkout only.
 pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!(
@@ -36,91 +37,8 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
     }
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let mut links = project_registry::links_for_server(config, &endpoint)?;
-    match current_checkout_link(config, &endpoint) {
-        Ok(current) => {
-            if !links.iter().any(|link| {
-                link.workspace == current.workspace
-                    && link.project == current.project
-                    && link.path == current.path
-            }) {
-                links.insert(0, current);
-            }
-        }
-        Err(error) => eprintln!(
-            "skipping current checkout: {}",
-            terminal_text(&format!("{error:#}"))
-        ),
-    }
-    let mut candidates = Vec::new();
-    let mut skipped = 0usize;
-
-    for link in links.into_iter().filter(|link| {
-        args.workspace
-            .as_deref()
-            .is_none_or(|workspace| link.workspace == workspace)
-    }) {
-        let target = match continue_session::resolve_target(config, &link) {
-            Ok(target) => target,
-            Err(error) => {
-                eprintln!(
-                    "skipping {}: {}",
-                    scope_label(&link),
-                    terminal_text(&error.to_string())
-                );
-                skipped += 1;
-                continue;
-            }
-        };
-        let summaries = match workstreams::list_for_checkout(
-            &endpoint,
-            &link.workspace,
-            &link.project,
-            &target,
-            usize::from(args.limit),
-        )
-        .await
-        {
-            Ok(summaries) => summaries,
-            Err(error) => {
-                eprintln!(
-                    "skipping {}: could not list managed workstreams ({})",
-                    scope_label(&link),
-                    terminal_text(&format!("{error:#}"))
-                );
-                skipped += 1;
-                continue;
-            }
-        };
-        for summary in summaries {
-            if candidates.iter().any(|candidate: &Candidate| {
-                candidate.summary.workstream_id == summary.workstream_id
-            }) {
-                continue;
-            }
-            candidates.push(Candidate {
-                link: link.clone(),
-                target: target.clone(),
-                summary,
-            });
-        }
-    }
-
-    order_candidates(&mut candidates);
-    candidates.truncate(usize::from(args.limit));
-    if candidates.is_empty() {
-        let detail = if skipped == 0 {
-            "no local managed checkout has a saved workstream yet".to_owned()
-        } else {
-            format!(
-                "{skipped} local checkout{} could not be queried",
-                if skipped == 1 { "" } else { "s" }
-            )
-        };
-        bail!(
-            "no managed workstreams are available ({detail}); launch one with `ai-memory run <harness>` first"
-        );
-    }
+    let cwd = std::env::current_dir().context("reading the current checkout")?;
+    let candidates = candidates_for_checkout(config, &endpoint, &args, &cwd).await?;
 
     let harnesses = available_harnesses();
     let mut harness_indices = vec![0usize; candidates.len()];
@@ -132,6 +50,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
         "Resume workstream",
         &mut choices,
         "left/right harness",
+        args.search.as_deref(),
         &mut |index, direction, choice| {
             let harness =
                 cycle_selected_harness(&mut harness_indices, index, &harnesses, direction);
@@ -142,6 +61,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
         return Ok(0);
     };
     let selected = &candidates[index];
+    let target = continue_session::resolve_target(config, &selected.link)?;
     let harness = selected_harness(harness_indices[index], &harnesses);
     eprintln!(
         "resuming workstream '{}' with harness '{}' in {} at {}",
@@ -173,14 +93,69 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             harness,
             native_args: Vec::new(),
         },
-        &selected.target,
+        &target,
     )
     .await
 }
 
-fn current_checkout_link(config: &Config, endpoint: &ServerEndpoint) -> Result<ProjectLink> {
-    let path = std::env::current_dir()
-        .context("reading the current checkout")?
+async fn candidates_for_checkout(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    args: &ResumeArgs,
+    cwd: &Path,
+) -> Result<Vec<Candidate>> {
+    let link = current_checkout_link(config, endpoint, cwd)?;
+    if args
+        .workspace
+        .as_deref()
+        .is_some_and(|workspace| workspace != link.workspace)
+    {
+        bail!(
+            "current checkout belongs to {}, not workspace '{}'",
+            scope_label(&link),
+            terminal_text(args.workspace.as_deref().unwrap_or_default())
+        );
+    }
+    let summaries =
+        workstreams::list_all_for_checkout(endpoint, &link.workspace, &link.project, &link.path)
+            .await?;
+    if summaries.is_empty() {
+        bail!(
+            "no managed workstreams for the current checkout ({}); launch one here with `ai-memory run <harness>` first",
+            scope_label(&link)
+        );
+    }
+    let mut candidates = summaries
+        .into_iter()
+        .map(|summary| Candidate {
+            target: link.path.clone(),
+            link: link.clone(),
+            summary,
+        })
+        .collect::<Vec<_>>();
+    order_candidates(&mut candidates);
+    // A requested limit applies after search, so an older matching row is
+    // never hidden behind newer non-matching workstreams.
+    if let Some(limit) = args.limit {
+        let search = args.search.as_deref().unwrap_or_default().to_lowercase();
+        candidates.retain(|candidate| candidate.summary.name.to_lowercase().contains(&search));
+        candidates.truncate(limit as usize);
+        if candidates.is_empty() {
+            bail!(
+                "no workstreams match '{}' in the current checkout",
+                terminal_text(&search)
+            );
+        }
+    }
+    Ok(candidates)
+}
+
+fn current_checkout_link(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    cwd: &Path,
+) -> Result<ProjectLink> {
+    let path = cwd
         .canonicalize()
         .context("canonicalizing the current checkout")?;
     let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
@@ -282,9 +257,237 @@ fn scope_label(link: &ProjectLink) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ai_memory_core::{AgentKind, WorkstreamId};
+    use crate::commands::project_registry;
+    use ai_memory_core::{AgentKind, ListManagedWorkstreamsRequest, WorkstreamId};
+    use axum::{Json, Router, routing::post};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    fn args() -> ResumeArgs {
+        ResumeArgs {
+            workspace: None,
+            limit: None,
+            search: None,
+            yolo: false,
+            true_yolo: false,
+            fresh: false,
+        }
+    }
+
+    fn checkout(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/shared.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(
+            path.join(".ai-memory.toml"),
+            "workspace = \"work\"\nproject = \"app\"\n",
+        )
+        .unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    async fn listing_server(
+        local: &Path,
+        rows: Vec<ManagedWorkstreamSummary>,
+        paginate: bool,
+    ) -> (
+        ServerEndpoint,
+        Arc<Mutex<Vec<ListManagedWorkstreamsRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let repository = ai_memory_workstream::inspect_repository(local).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let foreign = candidate("foreign-workstream", false, "2026-09-01T00:00:00Z").summary;
+        let app = Router::new().route(
+            "/workstream/recent",
+            post(move |Json(request): Json<ListManagedWorkstreamsRequest>| {
+                let recorded = recorded.clone();
+                let rows = rows.clone();
+                let repository = repository.clone();
+                let foreign = foreign.clone();
+                async move {
+                    recorded.lock().unwrap().push(request.clone());
+                    let rows = if request.workspace == "work"
+                        && request.project == "app"
+                        && request.repo_fingerprint == repository.repo_fingerprint
+                        && request.worktree_fingerprint == repository.worktree_fingerprint
+                    {
+                        rows
+                    } else {
+                        vec![foreign]
+                    };
+                    Json(
+                        rows.into_iter()
+                            .skip(if paginate { request.offset } else { 0 })
+                            .take(request.limit)
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = ServerEndpoint::from_pair(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            None,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (endpoint, requests, server)
+    }
+
+    #[tokio::test]
+    async fn resume_lists_all_current_checkout_rows_not_registered_foreign_checkouts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let local = checkout(&tmp.path().join("local"));
+        let foreign = checkout(&tmp.path().join("foreign"));
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let rows = (0..125)
+            .map(|index| {
+                candidate(
+                    &format!("local-{index:03}"),
+                    index == 0,
+                    "2026-09-01T00:00:00Z",
+                )
+                .summary
+            })
+            .collect();
+        let (endpoint, requests, server) = listing_server(&local, rows, true).await;
+        project_registry::record_prepared_checkout(&config, &endpoint, "work", "app", &foreign)
+            .unwrap();
+        let candidates = candidates_for_checkout(&config, &endpoint, &args(), &local)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 125);
+        assert!(
+            candidates
+                .iter()
+                .all(|row| row.summary.name.starts_with("local-") && row.target == local)
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.offset)
+                .collect::<Vec<_>>(),
+            [0, 100]
+        );
+        assert!(candidates[0].summary.current);
+        // Resume must not depend on even a readable project registry.
+        std::fs::write(config.data_dir.join("client-projects.json"), "not json").unwrap();
+        let mut searched = args();
+        searched.search = Some("LOCAL-124".into());
+        searched.limit = Some(1);
+        let matching = candidates_for_checkout(&config, &endpoint, &searched, &local)
+            .await
+            .unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].summary.name, "local-124");
+        searched.workspace = Some("elsewhere".into());
+        let before = requests.lock().unwrap().len();
+        assert!(
+            candidates_for_checkout(&config, &endpoint, &searched, &local)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("current checkout belongs to work/app")
+        );
+        assert_eq!(requests.lock().unwrap().len(), before);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_current_checkout_does_not_fall_back_to_the_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let local = checkout(&tmp.path().join("local"));
+        let foreign = checkout(&tmp.path().join("foreign"));
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let (endpoint, requests, server) = listing_server(&local, Vec::new(), true).await;
+        project_registry::record_prepared_checkout(&config, &endpoint, "work", "app", &foreign)
+            .unwrap();
+        let error = candidates_for_checkout(&config, &endpoint, &args(), &local)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no managed workstreams for the current checkout")
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_server_ignoring_pagination_fails_instead_of_silently_truncating() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let local = checkout(&tmp.path().join("local"));
+        let rows = (0..100)
+            .map(|index| candidate(&format!("local-{index}"), false, "invalid").summary)
+            .collect();
+        let (endpoint, requests, server) = listing_server(&local, rows, false).await;
+        let error = candidates_for_checkout(&Config::default(), &endpoint, &args(), &local)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("upgrade the ai-memory server"));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn current_checkout_resolves_subdirectories_and_symlinks_without_registry_links() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = checkout(&tmp.path().join("local"));
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let endpoint = ServerEndpoint::from_pair(None, None);
+        let config = Config::default();
+        for cwd in [&root, &nested] {
+            let link = current_checkout_link(&config, &endpoint, cwd).unwrap();
+            assert_eq!((&*link.workspace, &*link.project), ("work", "app"));
+            let identity = ai_memory_workstream::inspect_repository(&link.path).unwrap();
+            let expected = ai_memory_workstream::inspect_repository(&root).unwrap();
+            assert_eq!(identity.repo_fingerprint, expected.repo_fingerprint);
+            assert_eq!(identity.worktree_fingerprint, expected.worktree_fingerprint);
+        }
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(
+                current_checkout_link(&config, &endpoint, &alias)
+                    .unwrap()
+                    .path,
+                root
+            );
+        }
+    }
 
     fn candidate(name: &str, current: bool, last_active_at: &str) -> Candidate {
         Candidate {

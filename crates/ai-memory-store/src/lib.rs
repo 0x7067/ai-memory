@@ -6645,6 +6645,23 @@ mod tests {
             limited[0].linked_harnesses,
             [AgentKind::ClaudeCode, AgentKind::Codex]
         );
+        let second_page = store
+            .reader
+            .recent_workstreams_page(ws, proj, "repo".into(), "worktree".into(), 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].workstream_id, older.workstream_id);
+        assert_eq!(second_page[0].linked_harnesses, [AgentKind::OpenCode]);
+        assert!(!second_page[0].current);
+        assert!(
+            store
+                .reader
+                .recent_workstreams_page(ws, proj, "repo".into(), "worktree".into(), 1, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

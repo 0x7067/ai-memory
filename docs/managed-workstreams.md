@@ -261,36 +261,57 @@ directory, including automatic harness selection. `continue` therefore accepts
 
 ## Picking a workstream
 
-`ai-memory resume` is the interactive counterpart to `continue`: it presents
-recent workstreams from every valid client-local managed checkout, then launches
-the selected named workstream without needing a `cd` first.
+`ai-memory resume` presents all managed workstreams belonging to the **current
+checkout**, then launches the selected named workstream there. Other repositories
+and sibling Git worktrees are not included, even when they share a workspace,
+project name, or remote URL. Running from a subdirectory of a checkout uses that
+checkout's Git fingerprints and the nearest scope marker. To resume the newest
+linked checkout from any directory, use `ai-memory continue` instead.
 
 ```bash
 ai-memory resume
+ai-memory resume --search auth
 ai-memory resume --workspace work --limit 50
 ```
 
-Use Up/Down (or `j`/`k`) to move between workstreams and Left/Right to cycle the
+Use Up/Down to move between workstreams and Left/Right to cycle the
 launch harness for the highlighted row. Each row remembers its choice while you
 navigate. `auto` is the initial choice and preserves bare `ai-memory run`'s
 discovery of the newest usable session; the remaining choices are supported
 harness executables detected in the host `PATH`. Enter launches the displayed
-workstream/harness combination, while Escape or `q` cancels.
+workstream/harness combination. Escape clears a non-empty search, then cancels
+when the search is empty; Ctrl-C always cancels.
 
-The current selection for each checkout leads the picker, followed by recent
+Just type to filter workstream names with a case-insensitive substring search;
+there is no search mode or prefix key. Results update immediately, and every
+printable character (including `j`, `k`, `q`, and `/`) is literal search text.
+Backspace removes a character and Ctrl-U clears the query. Enter launches the
+highlighted result directly. Arrow keys navigate and switch harnesses without
+leaving the search.
+An empty result is not selectable; edit or clear the search to recover.
+
+There is no default cutoff: the CLI fetches successive bounded server pages,
+and the picker scrolls with Up/Down, PageUp/PageDown, Home, and End. `--search`
+sets the initial query. An explicit `--limit N` caps results **after** that
+initial search; clear or change the search without the limit to browse all rows.
+`--workspace` checks the current checkout's resolved workspace, rather than
+switching to another checkout.
+
+The current selection leads the picker, followed by recent
 activity. Each row identifies its workspace/project, activity age, selected
 launch harness, and already linked harnesses. Choosing a different harness is
 how an existing workstream can be continued in another agent. `--yolo` and
 `--fresh` are forwarded to the eventual managed launch.
 
-The picker seeds discovery with the current checkout and paths from this host's
-private `client-projects.json` registry. It revalidates both the canonical path
-and resolved scope before it asks the server for that checkout's workstreams,
-and deduplicates the same workstream reached through both sources. The server
+The picker does not read the private `client-projects.json` registry or fall back
+to another checkout when this one has no workstreams. It revalidates the canonical
+path and resolved scope before launching the selection. The server
 receives only the repository/worktree fingerprints required for the existing
 checkout-local listing, never a host path. It needs an interactive terminal;
 scripts can continue to use `ai-memory workstreams --json` after selecting a
-checkout themselves.
+checkout themselves. Pagination requires an updated server; if an older server
+ignores the page offset, the CLI reports that an upgrade is needed instead of
+looping forever or silently presenting a truncated list.
 
 ## Automatic harness selection
 
