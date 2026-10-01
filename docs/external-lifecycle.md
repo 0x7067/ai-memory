@@ -4,6 +4,9 @@ An orchestrator that observes its agents can send lifecycle events to one shared
 ai-memory server through `/hook/batch`. Framework adapters belong outside core;
 the server continues to own storage, retrieval, consolidation and durable memory.
 
+For deliberate writes, queries and handoffs without lifecycle capture, start
+with the [programmatic memory guide](programmatic-memory.md).
+
 ## Choose one capture path before launching
 
 Set `AI_MEMORY_CAPTURE_OWNER` to your producer namespace in the environment of

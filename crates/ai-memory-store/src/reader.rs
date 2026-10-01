@@ -8107,6 +8107,59 @@ impl ReaderPool {
         .await
     }
 
+    /// Bounded incremental latest-page summaries, ordered by timestamp and path.
+    /// Expired pages are omitted; this is an update listing, not a deletion feed.
+    /// `since_us` is exclusive; `after` resumes strictly after a returned pair.
+    ///
+    /// # Errors
+    /// Propagates SQL and pool errors.
+    pub async fn incremental_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        since_us: i64,
+        after: Option<(i64, String)>,
+        limit: usize,
+    ) -> StoreResult<Vec<PageSummary>> {
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let (after_us, after_path) = after.unwrap_or((since_us, String::new()));
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT pg.path, pg.title, {kind_expr}, pg.tier, pg.updated_at
+                 FROM pages pg WHERE pg.workspace_id = ?1 AND pg.project_id = ?2
+                   AND pg.is_latest = 1 AND pg.updated_at > ?3
+                   AND (pg.updated_at > ?4 OR (pg.updated_at = ?4 AND pg.path > ?5))
+                   AND (pg.expires_at IS NULL OR pg.expires_at > ?6)
+                 ORDER BY pg.updated_at ASC, pg.path ASC LIMIT ?7"
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    since_us,
+                    after_us,
+                    after_path,
+                    jiff::Timestamp::now().as_microsecond(),
+                    limit.clamp(1, 100) as i64 + 1
+                ],
+                |row| {
+                    let updated_us: i64 = row.get(4)?;
+                    Ok(PageSummary {
+                        path: row.get(0)?,
+                        title: row.get(1)?,
+                        kind: row.get(2)?,
+                        tier: row.get(3)?,
+                        updated_at: jiff::Timestamp::from_microsecond(updated_us)
+                            .map(|ts| ts.to_string())
+                            .unwrap_or_default(),
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
     /// Full page metadata for the page-view template (body comes from
     /// `Wiki::read_page`). Returns `None` when no `is_latest = 1` row
     /// matches the given path.

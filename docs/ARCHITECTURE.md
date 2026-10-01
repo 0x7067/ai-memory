@@ -255,6 +255,10 @@ attempt count, selected in the same scoped, owner-filtered query. HTTP session
 reads and MCP `memory_read_session_observations` share that summary type; neither
 response includes provider diagnostics.
 
+Tools can use MCP directly to write pages, query knowledge and claim handoffs.
+With `--enable-web`, incremental `recent` pages use a bounded `(updated_at, path)`
+query in the authorized scope. See [programmatic memory](programmatic-memory.md).
+
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at
 16 KiB; notification and tool excerpts are capped at 2 KB. Native

@@ -255,7 +255,7 @@ Every reader surface uses the same `kind` contract. An explicit frontmatter
 `rule`, `slot`, `session`, `decision`, `gotcha`, `concept`, `procedure`, and
 `note`, respectively. Other paths fall back to `fact`.
 
-**Response:** a bare JSON array, `[BriefingPage, …]`
+**Legacy response:** a bare JSON array of `PageSummary` objects.
 
 ```json
 [
@@ -267,6 +267,30 @@ Every reader surface uses the same `kind` contract. An explicit frontmatter
   }
 ]
 ```
+
+Supply `updated_since` (RFC 3339) or `cursor` to opt into incremental paging:
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/recent?updated_since=2026-09-30T00%3A00%3A00Z&limit=20
+```
+
+```json
+{"pages": [], "next_cursor": null}
+```
+
+The cutoff is exclusive (`updated_at > updated_since`). Results are ordered
+by `(updated_at, path)` ascending and fetched with a bounded SQL query. Pass
+`next_cursor` unchanged to continue; an optional cutoff must match the cursor's
+cutoff. Cursors use versioned URL-safe base64 without padding, are opaque to
+clients, and are limited to 8192 characters (6144 decoded bytes). They are bound
+to the workspace and project. Invalid, foreign-scope or conflicting cursors
+return 400. Each request rechecks authorization and uses
+`Cache-Control: private, no-store`.
+
+Incremental results omit superseded and expired pages, including expired pinned
+pages. They provide no snapshot or deletion feed: concurrent changes can appear
+on a later page, and deleted or expired pages are absent. Calls without either
+parameter retain the legacy array, descending order and cache behavior.
 
 ### 4.7 Briefing (structured snapshot)
 
