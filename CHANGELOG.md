@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a NixOS module exposed as `nixosModules.default`, with a dedicated
+  non-login service user, a hardened systemd unit, declarative non-secret
+  settings, agenix/sops/environment-file secret sources, and opt-in web,
+  firewall, and resource settings. Non-loopback binds require exactly one
+  secret source; expensive Darwin and privileged container checks run only in
+  the full CI tier. (#989)
 - Added `ai-memory doctor` reporting for Claude Code's default native
   `memory/` store for the current repository: location, file count, and whether
   the nearest marker's `ignore_paths` would exclude a read. Repository-root
@@ -50,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
+
 ### Fixed
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
@@ -74,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added
@@ -190,7 +198,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenCode/OMP/Pi/OpenClaw TypeScript integrations
   (`ai-memory-cli` `render_shared.rs`); a genuine Windows/UNC host's UNC
   candidates are unaffected.
-
 ## [2.5.0] - 2026-09-30
 
 ### Added

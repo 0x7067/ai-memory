@@ -310,7 +310,11 @@ no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
-  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
+  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`,
+  `scripts/check-nix-packaging.sh` (Nix flake output).
+- `.github/workflows/nix.yml` runs the Linux package and NixOS module eval for
+  affected changes. Darwin and the privileged systemd-container smoke run on
+  schedule, manual dispatch, or a `full-ci` pull request.
 - CI additionally runs `cargo build --release --bin ai-memory` on
   Linux/macOS, a Docker image smoke test, `cargo audit` (with the ignores
   listed in `ci.yml`), and differential gitleaks scanning.

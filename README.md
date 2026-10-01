@@ -106,6 +106,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Area | Status |
 | --- | --- |
 | Linux | Supported |
+| NixOS module | Supported |
 | macOS | Supported |
 | Windows via WSL2 | Supported |
 | Native Windows | Experimental |
@@ -368,6 +369,62 @@ and only what it installed. It also clears `ai-memory run`'s auto-wire
 record, so the next managed launch wires that harness again; to keep it
 unwired, launch with `--no-autowire` or set `AI_MEMORY_RUN_AUTOWIRE=false`. Install commands are idempotent and write
 timestamped backups next to any file they touch.
+
+### NixOS
+
+This flake ships a NixOS module (`nixosModules.default`) with a
+`systemd.services.ai-memory` unit. It creates a dedicated `ai-memory` system
+user (`nologin`, no linger) and applies a NixOS-specific systemd sandbox
+(`ProtectSystem = "strict"`, empty capability sets,
+`MemoryDenyWriteExecute`, `RestrictAddressFamilies`, and the rest — see
+[`nix/systemd-sandbox.nix`](nix/systemd-sandbox.nix)).
+
+```nix
+{
+  inputs.ai-memory.url = "github:akitaonrails/ai-memory";
+
+  outputs = { nixpkgs, ai-memory, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ai-memory.nixosModules.default
+        {
+          services.ai-memory = {
+            enable = true;
+            # enableWeb = true;  # off by default — the web UI is opt-in
+            settings = {
+              allowed_hosts = [ "localhost" "127.0.0.1" "::1" "homelab.example" ];
+              log_level = "info";
+            };
+            # Loopback (default): secrets optional; missing env file is tolerated.
+            # Non-loopback: set one of ageSecret, sopsSecret, or environmentFile.
+            # ageSecret = "ai-memory-env";  # config.age.secrets.<name> (agenix)
+            # sopsSecret = "ai-memory/env"; # config.sops.secrets.<name> (sops-nix)
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Declarative non-secret config lives in `services.ai-memory.settings`. Common
+keys are typed for discoverability and the TOML freeform type keeps every
+other current and future `config.toml` key usable without duplicating the Rust
+schema. The module renders a generated TOML file and passes `--config`;
+network and web-listener controls stay in the module's top-level options.
+
+Secrets such as `AI_MEMORY_AUTH_TOKEN` never go in `settings` or the
+world-readable Nix store. This includes `llm_headers`, which can carry API
+credentials; set `AI_MEMORY_LLM_HEADERS` in `ageSecret`, `sopsSecret`, or
+`environmentFile` instead. These three secret sources are mutually exclusive.
+Non-loopback binds require one; loopback may omit them and tolerates a missing
+environment file (systemd `EnvironmentFile=-…`). Put TLS in front of a LAN/WAN
+bind — see [`docs/https-via-proxy.md`](docs/https-via-proxy.md).
+
+All options and defaults are in [`nix/nixos-module.nix`](nix/nixos-module.nix).
+Entirely opt-in — `nix build`, `nix run`, `nix develop`, and the CLI are
+unchanged if you don't import it.
 
 ## Everyday use
 

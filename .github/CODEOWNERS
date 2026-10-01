@@ -1,0 +1,7 @@
+# Nix packaging and module maintenance.
+/nix/ @rubenlr
+/flake.nix @rubenlr
+/flake.lock @rubenlr
+/.github/workflows/nix.yml @rubenlr
+/scripts/check-nix-packaging.sh @rubenlr
+/scripts/test-nixos-systemd-container.sh @rubenlr

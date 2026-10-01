@@ -11,6 +11,8 @@ page covers everything else:
   (systemd system service or user service)
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
+- [Nix / NixOS](#nix--nixos)
+  (flake package, NixOS module, maintainer test ladder)
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
@@ -734,6 +736,61 @@ Useful knobs:
 AI_MEMORY_NATIVE_TEST_BOX=ai-memory-native-test scripts/test-native-arch-systemd-distrobox.sh
 AI_MEMORY_NATIVE_TEST_KEEP_BOX=1 scripts/test-native-arch-systemd-distrobox.sh
 AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-native-arch-systemd-distrobox.sh
+```
+
+---
+
+## Nix / NixOS
+
+User-facing NixOS module setup lives in the [README NixOS
+section](../README.md#nixos) (`nixosModules.default`,
+`services.ai-memory.enable`). This section is the maintainer test ladder
+for the flake and module — what CI runs, and what each tier proves.
+
+### Maintainer test ladder
+
+1. **Package smoke** — `nix build .#packages.<system>.default` then
+   `scripts/check-nix-packaging.sh ./result` (binary `--version`, hooks
+   tree, config template, `nix run`). Linux runs on affected pushes and pull
+   requests. Darwin runs on schedule, manual dispatch, or a `full-ci` PR.
+2. **Eval contracts** — `nix build .#checks.x86_64-linux.nixos-module-eval`
+   runs cheap Linux-only assertions for enable/bind/`--config`/secrets wiring,
+   literal loopback handling, IPv6 address formatting, mutually exclusive
+   secret sources, secrets in `settings.auth`, forbidden `settings.bind`,
+   escaped `ExecStart`, default `StateDirectory`, custom `dataDir` tmpfiles,
+   `ReadWritePaths`, and the NixOS sandbox keys.
+3. **Toplevel → OCI → container smoke** — one closure path. Building
+   `packages.x86_64-linux.nixos-ai-memory-docker` builds
+   `system.build.toplevel` once (via the nixpkgs docker-image tarball);
+   there is no separate bare-toplevel CI job. Then:
+
+```bash
+scripts/test-nixos-systemd-container.sh
+```
+
+   That script imports the rootfs, runs a privileged systemd container,
+   checks `systemctl is-active ai-memory` and in-container `curl /healthz`
+   (the module's default loopback bind is unreachable via Docker `-p`),
+   writes a
+   marker under `/var/lib/ai-memory`, restarts the unit, and (by default)
+   remounts a named volume once. It is privileged, so it runs only on schedule,
+   manual dispatch, or a `full-ci` pull request.
+
+**Non-goals** (do not treat these as covered by the ladder above):
+
+- A→B flake/package upgrade or SQLite-wiki migration matrices
+- Exhaustive typed settings coverage (unknown TOML keys use `freeformType`)
+- Soft/fake systemd without a real unit start
+- Claiming the published app Docker image covers the NixOS module path
+- Darwin / multi-arch NixOS OCI (Linux x86_64 only by design)
+
+Useful knobs for the container smoke:
+
+```bash
+AI_MEMORY_NIXOS_TEST_KEEP=1 scripts/test-nixos-systemd-container.sh
+AI_MEMORY_NIXOS_TEST_VOLUME=0 scripts/test-nixos-systemd-container.sh
+AI_MEMORY_NIXOS_TEST_IMAGE=ai-memory-nixos-test scripts/test-nixos-systemd-container.sh
+AI_MEMORY_DOCKER=podman scripts/test-nixos-systemd-container.sh
 ```
 
 ---
