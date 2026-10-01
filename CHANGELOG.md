@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory doctor` reporting for Claude Code's default native
+  `memory/` store for the current repository: location, file count, and whether
+  the nearest marker's `ignore_paths` would exclude a read. Repository-root
+  resolution keeps worktrees and subdirectories on the same report, and the
+  output warns that shell/PowerShell compatibility hooks do not enforce the
+  exclusion. (#1003)
 - Added per-event outcomes to `/hook/batch` acknowledgements and process-lifetime
   ingest counters for stored events, replays, recovery, ignored endings,
   collisions and failures. Legacy acknowledgement fields were preserved. (#1015)
@@ -44,7 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
-
 ### Fixed
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the

@@ -320,7 +320,13 @@ ai-memory serve                      # run the server
   every harness that has local sessions in this project and whether the server
   captured them — so a harness you rotated in without installing its hook (a
   silent gap: it keeps its own local history while capturing nothing) shows up
-  as a warning with the exact `install-hooks` command to fix it.
+  as a warning with the exact `install-hooks` command to fix it. For Claude
+  Code it also reports the detected default auto-memory directory and whether
+  the repository's capture exclusions cover it. A custom
+  `autoMemoryDirectory` is not discoverable from Claude's session transcripts
+  and is not reported. An `excluded` verdict applies only to native/generated
+  hooks; shell and PowerShell compatibility hooks do not enforce capture-policy
+  exclusions.
 - **I just installed hooks in a project I've worked in for a while**: the first
   time you open the project after installing, ai-memory imports your existing
   local session history once (bounded, sanitized on the server, only into an
