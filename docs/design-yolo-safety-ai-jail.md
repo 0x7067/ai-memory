@@ -193,8 +193,8 @@ arguments too, like `--yolo`; neither ever reaches the harness):
 | Form | Meaning |
 |---|---|
 | `--jail` | Re-run inside ai-jail now, without the "Re-run inside it?" question or the checklist, using the smart defaults below. |
-| `--jail=github,aws,no-mise` | Same, enabling exactly the listed toggles; `no-X` forces one off (`--no-X`). Nothing unlisted is enabled. |
-| `--jail=all` / `--jail=none` | Every checklist row this host shows / no toggles at all. Lists are applied left to right, so `all,no-docker` works. |
+| `--jail=github,aws,no-mise` | Same, with exactly the listed toggles; `no-X` forces one off (`--no-X`), and every checklist row this host shows that the list does not name is forced off too. |
+| `--jail=all` / `--jail=none` | Every checklist row this host shows on / every one of them off. Lists are applied left to right, so `all,no-docker` works. |
 | `--no-jail` | Never re-run inside ai-jail; the `--yolo` warning still shows. Conflicts with `--jail`. |
 
 `--jail` needs `=` for its list (`require_equals`), so `ai-memory run --jail
@@ -239,11 +239,28 @@ where without its metadata mounted writable the agent cannot commit. The host
 capabilities stay off: they widen the sandbox without being needed for the
 usual task.
 
-**Semantics.** Unchecked rows (and toggles a list does not name) emit
-nothing, so ai-jail's own default — off for every checklist toggle — and the
-user's own ai-jail configuration stay in charge; `no-X` is the explicit way to
-force one off. The chosen toggles are emitted as `--X` / `--no-X` after the
-`--network --agent-state --no-save-config --env …` baseline and before the `--` separator.
+**Semantics: an explicit selection is exact.** ai-jail's own config can
+enable toggles too — the trusted global `~/.ai-jail` may turn on, say,
+`docker`. So whenever the user makes a selection, ai-memory states every
+visible row explicitly, and ai-jail's CLI flags override its config:
+
+- **Interactive checklist:** every row the user saw is passed as marked —
+  checked `--X`, unchecked `--no-X` (`marked_choices`). An unchecked
+  `[ ] Docker socket` stays off even when `~/.ai-jail` enables it; the
+  checklist is what-you-see-is-what-you-get.
+- **`--jail=LIST`, including `none`:** the named entries, in order (later
+  entries win), then `--no-X` for every visible checklist row the list did
+  not name. "Exactly what it names" holds against any ai-jail config, and
+  `none` means none of the checklist rows. Rows that are not visible are never
+  forced: an absent credential mounts nothing either way, and CLI-only toggles
+  stay out of the invocation unless named.
+- **Bare `--jail`:** the user saw no selection, so it only enables the
+  smart-default rows (`checked_choices`) and emits nothing for the rest; the
+  user's own ai-jail configuration still decides those.
+
+The chosen toggles are emitted after the
+`--network --agent-state --no-save-config --env …` baseline and before the `--`
+separator.
 
 **A project `.ai-jail` replaces the checklist.** ai-jail reads its project
 config only from the invocation directory, which the re-exec inherits from
@@ -251,9 +268,9 @@ ai-memory. When a regular file `.ai-jail` exists there:
 
 | | no project `.ai-jail` | project `.ai-jail` present |
 |---|---|---|
-| offer accepted (no flag) | checklist, smart defaults | no checklist, no toggles: the file is loaded as-is |
-| bare `--jail` | smart defaults | no toggles: the file is loaded as-is |
-| `--jail=LIST` | exactly the list | the list, on top of the file (CLI flags override config in ai-jail) |
+| offer accepted (no flag) | checklist; every row passed as marked | no checklist, no toggles: the file is loaded as-is |
+| bare `--jail` | smart-default rows on; the rest left to ai-jail config | no toggles: the file is loaded as-is |
+| `--jail=LIST` | exactly the list; unnamed visible rows `--no-X` | the same exact list, on top of the file (CLI flags override config in ai-jail) |
 
 A project file is untrusted — it lives in the repository the agent works on.
 ai-jail lets it disable capabilities but never enable credentials, `docker`,
@@ -295,7 +312,9 @@ Enter (or EOF) accepts as marked; row numbers (spaces or commas) flip rows and
 redraw the list; `all` / `none` set every row. An unrecognized answer changes
 nothing and re-prompts; the third one aborts the launch rather than guessing
 what to mount. One summary line then names what the jail gets, grouped into
-credentials, capabilities, and forced-off toggles. With no visible row the
+credentials, capabilities, and the user's own `no-X` entries, then "everything
+else in the checklist off" for the rows an explicit selection left out (rather
+than spelling out each `--no-X`). With no visible row the
 checklist is skipped. The reader takes injected `BufRead`/`Write`, like the §1
 prompt, so its grammar is unit-tested without a TTY.
 

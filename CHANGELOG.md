@@ -15,10 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the host (`~/.config/gh`, `~/.aws`, `~/.kube`, `~/.config/gcloud`,
   `~/.docker/config.json`), SSH when `origin` is an SSH remote, and worktree
   metadata in a linked worktree; host capabilities (`docker`, `gpu`,
-  `display`, `pictures`, `tailscale`) stay off. `--jail=github,aws,no-mise`
-  enables exactly the listed toggles (`all` and `none` also work), works
-  without `--yolo` and in scripts, and fails instead of running unjailed when
-  ai-jail is not usable. Only toggles the installed ai-jail advertises in its
+  `display`, `pictures`, `tailscale`) stay off, and anything else is left to
+  the user's own ai-jail config. `--jail=github,aws,no-mise` is exact: it
+  passes every checklist row it does not name as `--no-X`, so a global
+  `~/.ai-jail` cannot add to it (`all` and `none` also work); the checklist
+  likewise passes unchecked rows as `--no-X`. `--jail` works without `--yolo`
+  and in scripts, and fails instead of running unjailed when ai-jail is not
+  usable. Only toggles the installed ai-jail advertises in its
   `--help` are offered or passed; the credential mounts need ai-jail 2.5.0.
   ai-jail's security switches (`seccomp`, `landlock`, `private-home`, …) are
   never accepted. `--no-jail` skips the offer while keeping the `--yolo`

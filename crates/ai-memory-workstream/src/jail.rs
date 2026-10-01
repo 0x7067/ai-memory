@@ -574,6 +574,11 @@ pub struct JailToggleChoice {
     pub stem: &'static str,
     /// `true` emits `--<stem>`, `false` emits `--no-<stem>`.
     pub enable: bool,
+    /// Off only because an explicit selection left this visible row out
+    /// (an unchecked checklist row, or a row a `--jail=…` list did not
+    /// name), as opposed to a `no-X` the user typed. The flag is the same;
+    /// the summary line groups these as "everything else in the checklist".
+    pub implied: bool,
 }
 
 impl JailToggleChoice {
@@ -588,9 +593,9 @@ impl JailToggleChoice {
     }
 }
 
-/// The checked rows as choices: what Enter, or a bare `--jail`, enables.
-/// Unchecked rows emit nothing, leaving ai-jail's own default (off for every
-/// checklist toggle) and the user's ai-jail config in charge.
+/// The checked rows as choices: what a bare `--jail` enables. The user saw no
+/// selection there, so unchecked rows emit nothing and their own ai-jail
+/// configuration (e.g. a global `~/.ai-jail`) still applies to the rest.
 #[must_use]
 pub fn checked_choices(items: &[JailChecklistItem]) -> Vec<JailToggleChoice> {
     items
@@ -599,6 +604,23 @@ pub fn checked_choices(items: &[JailChecklistItem]) -> Vec<JailToggleChoice> {
         .map(|item| JailToggleChoice {
             stem: item.toggle.stem,
             enable: true,
+            implied: false,
+        })
+        .collect()
+}
+
+/// Every row's state as the user saw it, for the interactive checklist:
+/// checked emits `--X`, unchecked `--no-X`. The checklist is
+/// what-you-see-is-what-you-get — an unchecked `[ ] Docker socket` stays off
+/// even when the user's global `~/.ai-jail` enables it.
+#[must_use]
+pub fn marked_choices(items: &[JailChecklistItem]) -> Vec<JailToggleChoice> {
+    items
+        .iter()
+        .map(|item| JailToggleChoice {
+            stem: item.toggle.stem,
+            enable: item.checked,
+            implied: !item.checked,
         })
         .collect()
 }
@@ -647,8 +669,16 @@ impl std::error::Error for JailToggleError {}
 /// Parse a `--jail=…` list: comma-separated stems, each optionally prefixed
 /// `no-` to force it off, plus `all` (every row of `checklist`) and `none`
 /// (clear everything listed so far). Later entries win, so `all,no-docker`
-/// works. An empty list means the smart defaults; any other list is exactly
-/// what it names — nothing else is enabled.
+/// works.
+///
+/// An empty list means a bare `--jail`: the smart defaults only
+/// ([`checked_choices`]), deferring to the user's ai-jail config for the
+/// rest. Any other list is an explicit selection and exact: after the named
+/// entries (in order), every visible `checklist` row the list did not name is
+/// forced off with `--no-X`, so nothing else is enabled even when a global
+/// `~/.ai-jail` would, and `none` turns every checklist row off. Rows not in
+/// `checklist` (absent credentials, CLI-only toggles) are never forced: they
+/// stay out of the invocation unless named.
 pub fn parse_jail_toggles(
     spec: &str,
     checklist: &[JailChecklistItem],
@@ -677,6 +707,7 @@ pub fn parse_jail_toggles(
                         JailToggleChoice {
                             stem: row.toggle.stem,
                             enable: true,
+                            implied: false,
                         },
                     );
                 }
@@ -709,8 +740,18 @@ pub fn parse_jail_toggles(
             JailToggleChoice {
                 stem: toggle.stem,
                 enable,
+                implied: false,
             },
         );
+    }
+    for row in checklist {
+        if !choices.iter().any(|choice| choice.stem == row.toggle.stem) {
+            choices.push(JailToggleChoice {
+                stem: row.toggle.stem,
+                enable: false,
+                implied: true,
+            });
+        }
     }
     Ok(choices)
 }
@@ -1256,8 +1297,16 @@ mod tests {
             Vec::<String>::new(),
             "bare --jail defers to the file"
         );
-        assert_eq!(parse("github,gpu"), ["--github", "--gpu"]);
-        assert_eq!(parse("all").len(), checklist.len());
+        let listed = parse("github,gpu");
+        assert_eq!(listed[..2], ["--github", "--gpu"]);
+        assert!(
+            listed[2..].iter().all(|flag| flag.starts_with("--no-")),
+            "an explicit list forces the unnamed rows off even with a project file: {listed:?}"
+        );
+        assert_eq!(listed.len(), checklist.len());
+        let all = parse("all");
+        assert_eq!(all.len(), checklist.len());
+        assert!(all.iter().all(|flag| !flag.starts_with("--no-")));
     }
 
     #[test]
@@ -1283,32 +1332,47 @@ mod tests {
         let checklist = sample_checklist(home.path());
         let support = support_2_5_0();
         let parse = |spec: &str| flags(&parse_jail_toggles(spec, &checklist, &support).unwrap());
+        // The visible rows of `sample_checklist`, in order.
+        let rows = [
+            "github",
+            "aws",
+            "ssh",
+            "docker",
+            "gpu",
+            "display",
+            "pictures",
+            "tailscale",
+        ];
+        // The named flags, then `--no-X` for every visible row not named.
+        let exact = |named: &[&str]| -> Vec<String> {
+            let mut expected: Vec<String> = named.iter().map(|flag| (*flag).to_owned()).collect();
+            for row in rows {
+                let mentioned = named
+                    .iter()
+                    .any(|flag| *flag == format!("--{row}") || *flag == format!("--no-{row}"));
+                if !mentioned {
+                    expected.push(format!("--no-{row}"));
+                }
+            }
+            expected
+        };
 
-        assert_eq!(parse(""), ["--github", "--aws"], "empty = smart defaults");
         assert_eq!(
-            parse("gpu, ssh"),
-            ["--gpu", "--ssh"],
-            "exactly what is listed"
+            parse(""),
+            ["--github", "--aws"],
+            "empty = smart defaults only, nothing forced"
         );
+        assert_eq!(parse("gpu, ssh"), exact(&["--gpu", "--ssh"]));
         assert_eq!(
             parse("github,aws,no-mise"),
-            ["--github", "--aws", "--no-mise"]
+            exact(&["--github", "--aws", "--no-mise"])
         );
-        assert_eq!(parse("GPU"), ["--gpu"], "case-insensitive");
-        assert_eq!(parse("gpu,no-gpu"), ["--no-gpu"], "later wins");
+        assert_eq!(parse("GPU"), exact(&["--gpu"]), "case-insensitive");
+        assert_eq!(parse("gpu,no-gpu"), exact(&["--no-gpu"]), "later wins");
         assert_eq!(
             parse("all"),
-            [
-                "--github",
-                "--aws",
-                "--ssh",
-                "--docker",
-                "--gpu",
-                "--display",
-                "--pictures",
-                "--tailscale"
-            ],
-            "all = every visible checklist row"
+            rows.map(|row| format!("--{row}")),
+            "all = every visible checklist row, nothing left to force"
         );
         assert_eq!(
             parse("all,no-docker"),
@@ -1323,13 +1387,64 @@ mod tests {
                 "--no-docker"
             ]
         );
-        assert_eq!(parse("none"), Vec::<String>::new());
-        assert_eq!(parse("all,none,toolchains"), ["--toolchains"]);
+        assert_eq!(parse("none"), exact(&[]), "none = every visible row off");
+        assert_eq!(parse("all,none,toolchains"), exact(&["--toolchains"]));
         assert_eq!(
             parse("kube"),
-            ["--kube"],
-            "an absent credential may still be named"
+            exact(&["--kube"]),
+            "an absent credential may still be named; it is never forced"
         );
+        assert!(
+            !parse("gpu")
+                .iter()
+                .any(|flag| flag.contains("mise") || flag.contains("kube")),
+            "rows outside the checklist are never forced off"
+        );
+    }
+
+    /// Adversarial: an explicit selection must be exact even when the user's
+    /// global `~/.ai-jail` enables something. An unchecked Docker row and
+    /// `--jail=none` must both emit `--no-docker` (and `none`, a `--no-X` for
+    /// every visible row) — emitting nothing would let that config mount the
+    /// host-root Docker socket behind an unchecked box.
+    #[test]
+    fn explicit_selections_force_every_unselected_visible_row_off() {
+        let home = tempfile::tempdir().unwrap();
+        let checklist = sample_checklist(home.path());
+        let docker = checklist
+            .iter()
+            .find(|item| item.toggle.stem == "docker")
+            .expect("docker row visible");
+        assert!(!docker.checked, "docker is unchecked by default");
+        let marked = flags(&marked_choices(&checklist));
+        assert_eq!(
+            marked,
+            [
+                "--github",
+                "--aws",
+                "--no-ssh",
+                "--no-docker",
+                "--no-gpu",
+                "--no-display",
+                "--no-pictures",
+                "--no-tailscale"
+            ],
+            "the checklist emits every row as the user saw it"
+        );
+        assert!(
+            !flags(&checked_choices(&checklist)).contains(&"--no-docker".to_owned()),
+            "control: bare --jail (no selection shown) defers the rest to ai-jail config"
+        );
+
+        let none = flags(&parse_jail_toggles("none", &checklist, &support_2_5_0()).unwrap());
+        assert_eq!(none.len(), checklist.len());
+        for item in &checklist {
+            assert!(
+                none.contains(&format!("--no-{}", item.toggle.stem)),
+                "--jail=none must force {} off: {none:?}",
+                item.toggle.stem
+            );
+        }
     }
 
     #[test]
@@ -1374,7 +1489,8 @@ mod tests {
     #[test]
     fn toggle_list_names_the_ai_jail_release_a_missing_flag_needs() {
         let home = tempfile::tempdir().unwrap();
-        let checklist = sample_checklist(home.path());
+        let facts = facts_with(home.path(), &[".config/gh", ".ssh"]);
+        let checklist = jail_checklist(&facts, &support_2_4_1());
         let error = parse_jail_toggles("ssh,github", &checklist, &support_2_4_1()).unwrap_err();
         assert_eq!(
             error,
@@ -1387,7 +1503,15 @@ mod tests {
         assert!(parse_jail_toggles("no-toolchains", &checklist, &support_2_4_1()).is_err());
         assert_eq!(
             flags(&parse_jail_toggles("ssh,gpu", &checklist, &support_2_4_1()).unwrap()),
-            ["--ssh", "--gpu"]
+            [
+                "--ssh",
+                "--gpu",
+                "--no-docker",
+                "--no-display",
+                "--no-pictures",
+                "--no-tailscale"
+            ],
+            "2.4.1 has no github row to force"
         );
     }
 
@@ -1398,10 +1522,12 @@ mod tests {
             JailToggleChoice {
                 stem: "gpu",
                 enable: true,
+                implied: false,
             },
             JailToggleChoice {
                 stem: "mise",
                 enable: false,
+                implied: false,
             },
         ];
         let forwarded = ["run", "claude", "--jail=gpu,no-mise"].map(OsString::from);

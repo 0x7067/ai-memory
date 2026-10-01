@@ -187,12 +187,15 @@ ai-memory run --yolo claude
   Docker socket (grants host root), GPU, display, Pictures, and Tailscale are
   listed unchecked. Type row numbers to flip them (`2 4`), or `all` / `none`.
   A mounted credential is usable by the unsupervised agent, so uncheck what it
-  should not touch.
+  should not touch. What you see is what you get: unchecked rows are passed
+  as `--no-X`, so they stay off even if your global `~/.ai-jail` enables them.
 - **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
-  ai-jail straight away with those defaults — with or without `--yolo`, and in
-  scripts too; it fails rather than running unjailed if ai-jail is not usable.
-  `--jail=github,ssh,no-mise` enables exactly the listed toggles (`no-X`
-  forces one off), plus `all` / `none`. `--no-jail` never jails and skips the
+  ai-jail straight away, turning on those pre-marked defaults and leaving
+  everything else to your own ai-jail config — with or without `--yolo`, and
+  in scripts too; it fails rather than running unjailed if ai-jail is not
+  usable. `--jail=github,ssh,no-mise` is exact: the listed toggles (`no-X`
+  forces one off), with every other checklist row forced off; `all` turns
+  every row on and `none` turns every row off. `--no-jail` never jails and skips the
   offer (the `--yolo` warning stays). There are no bare `--github`-style
   flags on purpose: they would collide with the harness's own flags (Claude
   Code has a `--worktree`). The credential mounts need ai-jail 2.5.0; toggles

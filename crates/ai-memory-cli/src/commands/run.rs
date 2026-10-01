@@ -16,13 +16,14 @@ use ai_memory_workstream::{
     JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode, LaunchPlan,
     LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env, checked_choices, crush_global_config_path,
+    build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
     discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
     inspect_repository, jail_checklist, jail_toggle, kiro_explicit_session_id,
     kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
     kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    native_session_exists, native_session_in_checkout, omp_profile_flag, omp_profile_flag_env,
-    parse_jail_toggles, store_override_vars, usable_ai_jail_here, wait_for_transcript_flush,
+    marked_choices, native_session_exists, native_session_in_checkout, omp_profile_flag,
+    omp_profile_flag_env, parse_jail_toggles, store_override_vars, usable_ai_jail_here,
+    wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -1133,7 +1134,9 @@ fn render_checklist(
 
 /// The interactive toggle checklist (docs/design-yolo-safety-ai-jail.md §5),
 /// line-based with injected `input`/`output` like [`read_yolo_confirmation`].
-/// Enter or EOF accepts the marks; the result enables every checked row.
+/// Enter or EOF accepts the marks. The result is every row as the user saw
+/// it ([`marked_choices`]): checked rows `--X`, unchecked rows `--no-X`, so an
+/// unchecked row stays off even if the user's own ai-jail config enables it.
 fn read_jail_checklist(
     items: &[JailChecklistItem],
     input: &mut impl io::BufRead,
@@ -1170,12 +1173,14 @@ fn read_jail_checklist(
             checked,
         })
         .collect();
-    Ok(checked_choices(&marked))
+    Ok(marked_choices(&marked))
 }
 
 /// The one-line account of what the jailed re-run enables, grouped the way
-/// the risk differs: credentials the agent can use, host capabilities, and
-/// toggles forced off — and whether the project `.ai-jail` supplies the rest.
+/// the risk differs: credentials the agent can use, host capabilities, the
+/// user's own `no-X` entries, and — for an explicit selection — the visible
+/// rows it left out (forced off, summarized rather than spelled out) — and
+/// whether the project `.ai-jail` supplies the rest.
 fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
     let labels = |kind: JailToggleKind| -> Vec<&'static str> {
         toggles
@@ -1198,11 +1203,14 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
     }
     let off: Vec<String> = toggles
         .iter()
-        .filter(|choice| !choice.enable)
+        .filter(|choice| !choice.enable && !choice.implied)
         .map(JailToggleChoice::flag)
         .collect();
     if !off.is_empty() {
         parts.push(format!("forced off: {}", off.join(" ")));
+    }
+    if toggles.iter().any(|choice| choice.implied) {
+        parts.push("everything else in the checklist off".to_owned());
     }
     if project_config {
         parts.push("plus the project .ai-jail".to_owned());
@@ -2743,7 +2751,11 @@ mod tests {
     #[test]
     fn checklist_enter_and_eof_accept_the_smart_defaults() {
         let (enter, printed) = run_checklist("\n");
-        assert_eq!(enter.unwrap(), ["--github", "--aws"]);
+        assert_eq!(
+            enter.unwrap(),
+            ["--github", "--aws", "--no-ssh", "--no-docker"],
+            "every row as seen: unchecked rows are forced off"
+        );
         assert!(printed.contains("Enable in the jail (Enter = as marked"));
         assert!(printed.contains("[x] 1) GitHub CLI credentials"));
         assert!(printed.contains("[x] 2) AWS credentials"));
@@ -2751,25 +2763,40 @@ mod tests {
         assert!(printed.contains("[ ] 4) Docker socket"));
         assert!(printed.contains("⚠ grants host root"));
         let (eof, _) = run_checklist("");
-        assert_eq!(eof.unwrap(), ["--github", "--aws"]);
+        assert_eq!(
+            eof.unwrap(),
+            ["--github", "--aws", "--no-ssh", "--no-docker"]
+        );
     }
 
     #[test]
     fn checklist_numbers_flip_rows_and_all_none_set_every_row() {
         let (flipped, printed) = run_checklist("2 4\n\n");
-        assert_eq!(flipped.unwrap(), ["--github", "--docker"]);
+        assert_eq!(
+            flipped.unwrap(),
+            ["--github", "--no-aws", "--no-ssh", "--docker"]
+        );
         assert!(
             printed.contains("[ ] 2) AWS credentials") && printed.contains("[x] 4) Docker socket"),
             "the list is shown again after a flip:\n{printed}"
         );
         let (commas, _) = run_checklist("1,3\n\n");
-        assert_eq!(commas.unwrap(), ["--aws", "--ssh"]);
+        assert_eq!(
+            commas.unwrap(),
+            ["--no-github", "--aws", "--ssh", "--no-docker"]
+        );
         let (all, _) = run_checklist("all\n\n");
         assert_eq!(all.unwrap(), ["--github", "--aws", "--ssh", "--docker"]);
         let (none, _) = run_checklist("NONE\n\n");
-        assert_eq!(none.unwrap(), Vec::<String>::new());
+        assert_eq!(
+            none.unwrap(),
+            ["--no-github", "--no-aws", "--no-ssh", "--no-docker"]
+        );
         let (none_then_one, _) = run_checklist("none\n3\n");
-        assert_eq!(none_then_one.unwrap(), ["--ssh"]);
+        assert_eq!(
+            none_then_one.unwrap(),
+            ["--no-github", "--no-aws", "--ssh", "--no-docker"]
+        );
     }
 
     #[test]
@@ -2777,14 +2804,17 @@ mod tests {
         let (recovered, printed) = run_checklist("9\nyes\n2\n\n");
         assert_eq!(
             recovered.unwrap(),
-            ["--github"],
+            ["--github", "--no-aws", "--no-ssh", "--no-docker"],
             "invalid lines change nothing; the later valid flip applies"
         );
         assert!(printed.contains("`9` is not a row number between 1 and 4"));
         assert!(printed.contains("`yes` is not a row number"));
         // `2 9` is rejected whole: row 2 must not flip.
         let (partial, _) = run_checklist("2 9\n\n");
-        assert_eq!(partial.unwrap(), ["--github", "--aws"]);
+        assert_eq!(
+            partial.unwrap(),
+            ["--github", "--aws", "--no-ssh", "--no-docker"]
+        );
 
         let (gave_up, _) = run_checklist("x\nx\nx\n\n");
         assert!(
@@ -2795,7 +2825,16 @@ mod tests {
 
     #[test]
     fn jail_summary_groups_credentials_capabilities_and_forced_off() {
-        let choice = |stem, enable| JailToggleChoice { stem, enable };
+        let choice = |stem, enable| JailToggleChoice {
+            stem,
+            enable,
+            implied: false,
+        };
+        let implied_off = |stem| JailToggleChoice {
+            stem,
+            enable: false,
+            implied: true,
+        };
         assert_eq!(
             jail_summary(
                 &[
@@ -2821,6 +2860,25 @@ mod tests {
             jail_summary(&[choice("gpu", true)], true),
             "ai-memory: re-running inside ai-jail (capabilities: GPU devices; plus the \
              project .ai-jail)"
+        );
+        // An explicit selection: the user's own `no-X` is named, the rows it
+        // left out are summarized, never claimed as "no extra mounts" only.
+        assert_eq!(
+            jail_summary(
+                &[
+                    choice("github", true),
+                    choice("mise", false),
+                    implied_off("docker"),
+                    implied_off("gpu"),
+                ],
+                false
+            ),
+            "ai-memory: re-running inside ai-jail (credentials: GitHub CLI credentials; \
+             forced off: --no-mise; everything else in the checklist off)"
+        );
+        assert_eq!(
+            jail_summary(&[implied_off("docker")], false),
+            "ai-memory: re-running inside ai-jail (everything else in the checklist off)"
         );
     }
 

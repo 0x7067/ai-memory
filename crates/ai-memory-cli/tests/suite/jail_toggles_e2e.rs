@@ -257,6 +257,31 @@ fn toggles(flags: &[String]) -> Vec<String> {
     rest.to_vec()
 }
 
+/// The checklist rows an empty fixture `$HOME` shows with the 2.4.1 help:
+/// only the opt-in capabilities (GPU and display are Linux-only).
+fn visible_capability_rows() -> Vec<&'static str> {
+    if cfg!(target_os = "linux") {
+        vec!["docker", "gpu", "display", "pictures", "tailscale"]
+    } else {
+        vec!["docker", "pictures", "tailscale"]
+    }
+}
+
+/// What an explicit selection emits: the named flags in order, then `--no-X`
+/// for every visible checklist row the selection did not mention.
+fn exact(named: &[&str]) -> Vec<String> {
+    let mut expected: Vec<String> = named.iter().map(|flag| (*flag).to_owned()).collect();
+    for row in visible_capability_rows() {
+        let mentioned = named
+            .iter()
+            .any(|flag| *flag == format!("--{row}") || *flag == format!("--no-{row}"));
+        if !mentioned {
+            expected.push(format!("--no-{row}"));
+        }
+    }
+    expected
+}
+
 fn exe() -> String {
     Path::new(BIN)
         .canonicalize()
@@ -299,7 +324,11 @@ async fn jail_list_reexecs_under_ai_jail_with_exactly_the_listed_toggles() {
             .any(|pair| pair == ["--env", "AI_MEMORY_SERVER_URL"]),
         "the server URL is forwarded into the jail: {flags:?}"
     );
-    assert_eq!(toggles(flags), ["--gpu", "--ssh"]);
+    assert_eq!(
+        toggles(flags),
+        exact(&["--gpu", "--ssh"]),
+        "exactly the list: every other visible row is forced off"
+    );
     assert_eq!(
         wrapped,
         [
@@ -421,7 +450,7 @@ async fn jail_list_overrides_a_project_ai_jail() {
     assert!(output.status.success(), "{}", stderr(&output));
     let argv = fixture.jail_argv().expect("ai-jail exec'd");
     let (flags, _) = split_at_separator(&argv);
-    assert_eq!(toggles(flags), ["--gpu", "--no-docker"]);
+    assert_eq!(toggles(flags), exact(&["--gpu", "--no-docker"]));
     handle.abort();
 }
 
@@ -590,10 +619,21 @@ async fn yolo_offer_then_checklist_execs_ai_jail_on_a_terminal() {
         .jail_argv()
         .unwrap_or_else(|| panic!("ai-jail exec'd:\n{output}"));
     let (flags, _) = split_at_separator(&argv);
+    let expected: Vec<String> = visible_capability_rows()
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if index == 1 {
+                format!("--{row}")
+            } else {
+                format!("--no-{row}")
+            }
+        })
+        .collect();
     assert_eq!(
         toggles(flags),
-        ["--gpu"],
-        "row 2 (GPU) was flipped on; the rest stay as marked"
+        expected,
+        "row 2 was flipped on; every other row is passed as the user saw it (off)"
     );
     assert!(!fixture.claude_ran.exists());
     let requests = requests.lock().unwrap();

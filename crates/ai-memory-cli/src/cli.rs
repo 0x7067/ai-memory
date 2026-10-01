@@ -302,7 +302,8 @@ pub struct RunArgs {
     /// the smart defaults (credentials present on this host, SSH for an SSH
     /// `origin`, worktree metadata in a linked worktree); `--jail=LIST` enables
     /// exactly the comma-separated ai-jail toggles listed (`github`, `aws`,
-    /// `ssh`, `gpu`, `docker`, …; `no-X` forces one off; `all`; `none`). A
+    /// `ssh`, `gpu`, `docker`, …; `no-X` forces one off; `all`; `none`) and
+    /// forces every other checklist row off, so it is exact. A
     /// project `.ai-jail` in the launch directory replaces the smart defaults
     /// (a list still applies on top). Fails when ai-jail is not usable here;
     /// ignored inside ai-jail. Wrapper-owned
