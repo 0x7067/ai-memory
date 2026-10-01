@@ -439,6 +439,10 @@ readable wiki pages; the next session starts with a handoff.
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
   the wiki and a JSON API under `/api/v1`.
+- Back up host-side harness configuration with
+  `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
+  `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only
+  after reviewing the active skills, plugins, instructions, and destinations.
 
 The full tour — search modes, entities, feedback, briefings, the web
 API — is in [`docs/usage.md`](docs/usage.md) and
@@ -528,6 +532,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
 | [`docs/backup.md`](docs/backup.md) | Backing up the wiki + data dir to a remote git repository: what to include, what to exclude, scheduled push pattern, restore, and security posture. Companion to `docs/lifecycle-ops.md` (which covers the on-box `ai-memory backup` snapshot). |
+| [`docs/design-backup-agent-assets.md`](docs/design-backup-agent-assets.md) | Host agent-asset backup/restore: supported paths, filtering, redaction limits, archive bounds, active-content warning, and rollback behavior. |
 | [`docs/llm-providers.md`](docs/llm-providers.md) | Provider configuration for consolidation and embeddings. |
 | [`docs/security.md`](docs/security.md) | The full security model. |
 | [`docs/support-matrix.md`](docs/support-matrix.md) | The full agent/platform matrix with notes. |

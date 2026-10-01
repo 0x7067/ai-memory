@@ -139,8 +139,10 @@ pub async fn run() -> Result<()> {
             commands::reclaim_ledger_versions::run(&config, args).await
         }
         Command::Backup(args) => commands::backup::run(&config, args).await,
+        Command::BackupAgents(args) => commands::backup_agents::run(&config, args),
         Command::ExportOkf(args) => commands::export_okf::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),
+        Command::RestoreAgents(args) => commands::restore_agents::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),
         // `Hook` is handled in the fast-path above (before config/tracing).

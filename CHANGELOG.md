@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory backup-agents` and dry-run-by-default
+  `ai-memory restore-agents` commands for host agent configurations, skills,
+  plugins, and project instructions. Archives are written atomically with
+  private Unix permissions, MCP config text is sanitized by default, and
+  restore bounds archive input, verifies manifest checksums and completeness,
+  refuses duplicate or symlink-escaping targets, and keeps overwritten files
+  as timestamped backups. Other asset types are copied verbatim and may contain
+  secrets or active instructions/code. (#962)
 - Added a NixOS module exposed as `nixosModules.default`, with a dedicated
   non-login service user, a hardened systemd unit, declarative non-secret
   settings, agenix/sops/environment-file secret sources, and opt-in web,
