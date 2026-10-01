@@ -2994,7 +2994,15 @@ async fn handle_send_message(
         .await
     {
         Ok(ctx) => ctx,
-        Err(e) => return internal_err(e.to_string()),
+        // A refusal by policy, as on the MCP path — not a server fault.
+        Err(e) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": format!("message send refused by admission: {e}")
+                })),
+            );
+        }
     };
     match state.writer.insert_message(message).await {
         Ok(id) => {
@@ -8923,7 +8931,7 @@ mod tests {
         let (_tmp, store, router, ws, recipient, mut rx, _release, server) =
             message_send_fixture(true).await;
         let response = router.oneshot(message_send_request()).await.unwrap();
-        assert!(!response.status().is_success());
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let (_, committed_count) = rx.recv().await.unwrap();
         assert_eq!(committed_count, 0);
         assert!(
