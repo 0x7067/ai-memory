@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclude expired and superseded pages and recheck authorization on each
   request. Calls without incremental arguments retain their existing array
   response. Added a generic MCP/HTTP integration guide. (#1017)
+- Added machine-authenticated `GET /identity`, available with the web UI
+  disabled, and `ai-memory doctor` diagnostics for caller identity, external
+  capture ownership and sessions with multiple capture sources (native events
+  or distinct extensions, including backfill).
+  Mixed-source counts preserve scope, session ownership and time-window filters;
+  older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`

@@ -66,6 +66,12 @@ bytes each; oversized hints are omitted and preflight fails closed.
 unavailable scope. `server_may_remap` warns that the server may choose different
 coordinates. Native routing values are unaffected by the inspection bound.
 
+`ai-memory doctor` reports whether this invocation delegates native capture and
+shows its authenticated machine identity. Its per-agent counts flag sessions
+with multiple capture sources (native events or distinct extensions, including
+backfill). An older server leaves those
+fields unknown; a mixed count is a diagnostic signal, not proof of duplicates.
+
 ## Reuse the public event contract
 
 For a live harness, send its actual wire `agent` (such as `claude-code` or `codex`)
