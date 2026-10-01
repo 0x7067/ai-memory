@@ -659,6 +659,42 @@ unset AI_MEMORY_DATA_DIR GROK_LOG
 PATH=${PATH#"$TMP/bin:"}
 export PATH
 
+# --- session-start bundles that must never fetch a handoff (#998) ------
+# grok, kimi-code and pool each document in their own session-start.sh why
+# SessionStart must not call /handoff at all: Grok and Kimi discard its
+# stdout, and Pool's own comment says fetching there would be destructive
+# and silently lose an undelivered handoff. #1001 (the real [briefing]
+# delivery fix for #998) only touches the eight session-start bundles that
+# DO fetch a handoff; these three are deliberately not among them, and a
+# regression here would silently burn a single-use handoff with nothing to
+# show for it on the harness side. A PATH curl shim runs the real shipped
+# scripts, so what is asserted is what ships.
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SSTART_LOG"
+exit 0
+EOF
+chmod +x "$TMP/bin/curl"
+PATH="$TMP/bin:$PATH"
+export PATH
+
+for bundle in grok kimi-code pool; do
+    SSTART_LOG="$TMP/session-start-$bundle.log"
+    : >"$SSTART_LOG"
+    export SSTART_LOG
+    printf '{"cwd":"%s","session_id":"sstart-%s"}' "$TMP" "$bundle" \
+        | sh "$(dirname "$0")/../../hooks/$bundle/session-start.sh" >/dev/null 2>&1
+    assert_eq "$bundle: session-start posts the capture event" "1" \
+        "$(wc -l <"$SSTART_LOG" | tr -d ' ')"
+    assert_eq "$bundle: session-start never fetches a handoff" "0" \
+        "$(grep -c '/handoff' "$SSTART_LOG")"
+done
+
+unset SSTART_LOG
+PATH=${PATH#"$TMP/bin:"}
+export PATH
+
 # --- grok PowerShell bundle parity -------------------------------------
 # The PS lib is the documented fallback when the native binary is absent.
 # Static parity first (no pwsh needed): the child-session key set must
