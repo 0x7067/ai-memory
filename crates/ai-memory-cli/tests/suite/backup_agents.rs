@@ -268,7 +268,7 @@ fn backup_agents_sanitizes_secrets_by_default() {
     fs::create_dir_all(claude_settings.parent().unwrap()).unwrap();
     fs::write(
         &claude_settings,
-        r#"{"mcpServers":{"remote":{"env":{"GITHUB_TOKEN":"ghp_1234567890abcdef1234567890abcdef1234"}}}}"#,
+        r#"{"mcpServers":{"remote":{"env":{"GITHUB_TOKEN":"ghp_FAKEfakeFAKEfakeFAKEfake012345678"}}}}"#,
     )
     .unwrap();
 
@@ -307,7 +307,7 @@ fn backup_agents_sanitizes_secrets_by_default() {
 
     let restored = fs::read_to_string(restore_home.path().join(".claude/settings.json")).unwrap();
     assert!(
-        !restored.contains("ghp_1234567890abcdef1234567890abcdef1234"),
+        !restored.contains("ghp_FAKEfakeFAKEfakeFAKEfake012345678"),
         "raw secret token must be redacted"
     );
     assert!(
