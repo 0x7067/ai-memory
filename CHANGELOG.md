@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a default-quit prompt after a successful interactive managed run so the
+  operator can re-run the current harness or switch to another installed
+  harness in the same workstream. Utility, failed, interrupted,
+  non-interactive, and custom-`--executable` runs keep their existing exit
+  behavior. Resolves #909. (#975)
 - Added `ai-memory backup-agents` and dry-run-by-default
   `ai-memory restore-agents` commands for host agent configurations, skills,
   plugins, and project instructions. Archives are written atomically with
@@ -27,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the nearest marker's `ignore_paths` would exclude a read. Repository-root
   resolution keeps worktrees and subdirectories on the same report, and the
   output warns that shell/PowerShell compatibility hooks do not enforce the
-  exclusion. (#1003)
+  exclusion. Resolves #1003. (#1005)
 - Added per-event outcomes to `/hook/batch` acknowledgements and process-lifetime
   ingest counters for stored events, replays, recovery, ignored endings,
   collisions and failures. Legacy acknowledgement fields were preserved. (#1015)
