@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- `ai-memory upgrade` no longer corrupts every hook command with the kernel's
+  ` (deleted)` path suffix. The upgrade replaced its own binary and then
+  re-rendered the staged hook configs from the same, now exe-deleted process:
+  on Linux `/proc/<pid>/exe` came back as `<path> (deleted)` and that string
+  was embedded verbatim, so every hook failed with `not found` until the
+  suffix was stripped from the settings file by hand. The refresh now re-runs
+  `install-hooks --apply` from the freshly installed binary in a child
+  process, and hook rendering strips the kernel marker — falling back to the
+  bare `ai-memory` command name when the resolved path is missing — instead of
+  embedding a dead absolute path. (#1027)
 - `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
   `[capture]` section is invalid. This fails closed today — every file and
   shell tool event is reduced to metadata until the marker is fixed, nothing

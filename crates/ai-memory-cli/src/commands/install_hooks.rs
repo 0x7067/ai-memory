@@ -33,7 +33,8 @@ use crate::commands::render_shared::{
     build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_script_for_claude_code, hook_script_for_current_platform, kimi_code_hook_commands,
-    local_hook_policy_v1_supported, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    local_hook_policy_v1_supported, strip_deleted_suffix, ts_capture_policy_v1, ts_string_literal,
+    ts_timeout_signal,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -3244,8 +3245,12 @@ fn build_opencode2_plugin(
     // path as invoked, like every other native hook config: a canonicalized
     // one pins the target behind a versioned symlink or junction.
     let native_hook = if capture_assistant {
-        let exe =
-            std::env::current_exe().context("cannot locate ai-memory native hook executable")?;
+        // Strip the kernel's ` (deleted)` readlink marker before baking: a
+        // re-apply from a process whose binary was just replaced under it must
+        // not bake the artifact into the generated module.
+        let exe = strip_deleted_suffix(
+            std::env::current_exe().context("cannot locate ai-memory native hook executable")?,
+        );
         ts_string_literal(&strip_windows_verbatim_prefix(&exe.to_string_lossy()))
     } else {
         "undefined".to_string()

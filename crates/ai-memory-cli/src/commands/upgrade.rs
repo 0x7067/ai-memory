@@ -37,7 +37,7 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use crate::cli::{AgentChoice, InstallHooksArgs, UpgradeArgs};
+use crate::cli::{AgentChoice, UpgradeArgs};
 use crate::commands::install_hooks;
 use crate::config::Config;
 use crate::install_layout::{HOOKS_DIR_NAME, shipped_binary_name};
@@ -72,7 +72,7 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
     apply_extracted_release(extract_root.path(), &exe)?;
 
     // Sync FS after await is intentional for this CLI one-shot path.
-    refresh_staged_hooks(config)?;
+    refresh_staged_hooks(config, &exe)?;
     warn_remote_server(config);
     println!("✓ upgraded to {tag}");
     info!(%tag, path = %exe.display(), "native upgrade complete");
@@ -701,7 +701,17 @@ fn list_staged_agents(hooks_root: &Path) -> Result<(StagedAgentList, Vec<String>
     Ok((agents, unknown))
 }
 
-fn refresh_staged_hooks(config: &Config) -> Result<()> {
+/// Re-run `install-hooks --apply` for every staged agent — through the freshly
+/// installed binary, as child processes.
+///
+/// This must not render hook configs from THIS process: it has just replaced
+/// its own executable on disk, so a `current_exe()` here resolves against the
+/// unlinked old inode. On Linux the kernel then reports `/proc/<pid>/exe` as
+/// `<path> (deleted)`, and that string used to be embedded verbatim into every
+/// hook command, breaking them all with `not found` until the suffix was
+/// stripped by hand. A child process started from the new binary resolves its
+/// own valid exe instead.
+fn refresh_staged_hooks(config: &Config, exe: &Path) -> Result<()> {
     let hooks_root = staged_hooks_root(config);
     if !hooks_root.is_dir() {
         println!("→ no staged hook scripts found at {}", hooks_root.display());
@@ -716,7 +726,7 @@ fn refresh_staged_hooks(config: &Config) -> Result<()> {
         );
         return Ok(());
     }
-    refresh_agent_list(config, &agents);
+    refresh_agent_list(exe, &agents);
     Ok(())
 }
 
@@ -736,39 +746,37 @@ fn collect_refreshable_agents(hooks_root: &Path) -> Result<StagedAgentList> {
     Ok(agents)
 }
 
-fn refresh_agent_list(config: &Config, agents: &StagedAgentList) {
+fn refresh_agent_list(exe: &Path, agents: &StagedAgentList) {
     let names: Vec<_> = agents.iter().map(|(n, _)| n.as_str()).collect();
     println!("→ refreshing staged hook scripts for: {}", names.join(" "));
-    for (name, agent) in agents {
-        apply_staged_agent_hooks(config, name, *agent);
+    for (name, _) in agents {
+        apply_staged_agent_hooks(exe, name);
     }
 }
 
-fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
+fn apply_staged_agent_hooks(exe: &Path, name: &str) {
     println!("    ai-memory install-hooks --agent {name} --apply");
-    if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
-        println!(
-            "      (skipped — {err:#}; re-run with the same --server-url / --auth-token used originally)"
-        );
+    let mut command = refresh_agent_command(exe, name);
+    match command.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => println!(
+            "      (skipped — install-hooks exited with {status}; re-run with the same \
+             --server-url / --auth-token used originally)"
+        ),
+        Err(error) => println!(
+            "      (skipped — {error}; re-run with the same --server-url / --auth-token used \
+             originally)"
+        ),
     }
 }
 
-fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
-    InstallHooksArgs {
-        agent,
-        hooks_dir: None,
-        server_url: None,
-        auth_token: None,
-        as_user: None,
-        apply: true,
-        config_file: None,
-        project_strategy: None,
-        capture_assistant: false,
-        capture_mode: None,
-        no_capture_prompts: false,
-        capture_prompts: false,
-        profile: None,
-    }
+/// Refresh through the installed binary's own path, never a bare name: `PATH`
+/// may hold an older copy (or nothing), while the just-installed release lives
+/// at `exe`.
+fn refresh_agent_command(exe: &Path, agent_name: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command.args(["install-hooks", "--agent", agent_name, "--apply"]);
+    command
 }
 
 fn warn_remote_server(config: &Config) {
@@ -916,6 +924,28 @@ mod tests {
     use tar::Header;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn refresh_command_targets_the_installed_binary_with_apply() {
+        // The refresh must go through the just-installed binary's own path —
+        // a bare name could resolve to an older copy on PATH — and must ask
+        // for a full --apply so the staged hook configs are re-rendered.
+        let command = refresh_agent_command(Path::new("/opt/ai-memory/ai-memory"), "claude-code");
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/opt/ai-memory/ai-memory")
+        );
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("install-hooks"),
+                std::ffi::OsStr::new("--agent"),
+                std::ffi::OsStr::new("claude-code"),
+                std::ffi::OsStr::new("--apply"),
+            ]
+        );
+    }
 
     #[test]
     fn release_asset_name_for_covers_unix_and_windows_matrix() {
