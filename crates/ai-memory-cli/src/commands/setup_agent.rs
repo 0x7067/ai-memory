@@ -408,7 +408,7 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
 fn emit_pool(emit_root: &Path, args: &SetupAgentArgs) {
     let snippet = build_pool_settings_yaml(emit_root, &args.server_url, args.auth_token.as_deref());
     println!("# Pool (Poolside Agent CLI) — merge into the repo-root .poolside/settings.yaml");
-    println!("# of each project Pool runs in; ai-memory does not write project-local files.");
+    println!("# of each project Pool runs in; ai-memory does not write committed project files.");
     println!("# Hook scripts (must be reachable from the host that runs Pool):");
     println!("#   {}", emit_root.display());
     println!("# AI-memory server: {}", args.server_url);

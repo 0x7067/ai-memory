@@ -91,6 +91,42 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
+That wires the hooks user-wide (`~/.claude/settings.json`), so every Claude
+Code session is captured. To opt in per repository instead, run from inside
+the checkout:
+
+```bash
+ai-memory install-hooks --agent claude-code --scope project --apply
+```
+
+This writes the repository's gitignored `.claude/settings.local.json` at the
+git root (the main checkout's root from a worktree), which is where Claude Code
+reads that file even when launched from a subdirectory — see
+[where Claude Code looks for each file](https://code.claude.com/docs/en/settings#where-claude-code-looks-for-each-file).
+On Windows, and when the repository root is your home directory, Claude Code
+reads the launch directory instead, so the installer writes to the current
+directory there: run it, and launch Claude Code, from the same directory.
+The user-level file is left alone. Claude Code merges the project file's
+hooks with any user-level ones, so pick one scope per machine; the installer
+notes when the other scope already carries ai-memory hooks.
+The installer warns when the file is not ignored by git (Claude Code adds
+`**/.claude/settings.local.json` to your global excludes only when it creates
+the file itself) and refuses to embed a bearer token in it when the token
+cannot be persisted under the data dir. When it updates an existing file, the
+backup goes to `<data_dir>/backups/claude-settings-local/` (owner-only), not
+next to the file, so nothing new appears in `git status`.
+`ai-memory uninstall --only hooks --apply` run from inside the checkout
+removes the entries again; run elsewhere it does not reach into the
+repository, so run it in every project-scoped checkout before removing
+ai-memory — those files otherwise keep calling the removed binary and data
+dir. `upgrade` and the `ai-memory run` auto-wire leave the user-level file
+alone while a project-scoped install is the only one present. `upgrade`
+replaces the binary the hook commands call but does not rewrite project
+files; re-run `install-hooks --scope project --apply` in each checkout to pick
+up hook-command changes. `setup-agent` and `backup-agents` only know the
+user-level file. Claude Code only; other agents keep their user-level hook
+files.
+
 `--session-aware` is an optional Claude Code MCP mode:
 
 ```bash
@@ -111,7 +147,9 @@ own config resolution: `install-mcp` writes the MCP registration to
 (instead of `~/.claude/settings.json`), and `install-skills --scope global`
 uses `$CLAUDE_CONFIG_DIR/skills` (instead of `~/.claude/skills`). `uninstall`
 sweeps the active relocated paths alongside the home defaults. It cannot
-discover an older arbitrary `CLAUDE_CONFIG_DIR` that is no longer set. The
+discover an older arbitrary `CLAUDE_CONFIG_DIR` that is no longer set.
+`install-hooks --scope project` ignores the variable: Claude Code resolves
+project files from the checkout, not from the config dir. The
 Docker wrapper forwards the variable for config roots under its existing
 `$HOME` bind mount; use the native binary when the relocated root is outside
 `$HOME`.
@@ -1175,8 +1213,10 @@ Pool reads lifecycle hooks from a project-scoped `.poolside/settings.yaml` at
 the root of each repository it runs in — there is no user-global hook file for
 ai-memory to merge. `install-hooks --agent pool` (alias `poolside`) therefore
 stages the hook scripts to the stable user-global location and prints a
-ready-to-paste `hooks:` snippet; ai-memory deliberately does not write files
-inside your repositories.
+ready-to-paste `hooks:` snippet; ai-memory deliberately does not write
+committed files inside your repositories (the gitignored
+`.claude/settings.local.json` that `--scope project` writes for Claude Code is
+the one exception).
 
 ```bash
 # Stage the scripts and print the snippet to paste into
@@ -2248,7 +2288,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
 | `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
-| `install-hooks --agent` | `docker run --rm` | Hook-config snippet for an existing hooks dir |
+| `install-hooks --agent [--scope project]` | `docker run --rm` | Hook-config snippet for an existing hooks dir; `--scope project` targets the checkout's `.claude/settings.local.json` (Claude Code only) |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |
 | `install-instructions [--target] [--print] [--no-skills]` | same host environment used for the agent prompt files | Install or update the slim CLAUDE.md / AGENTS.md routing block and, by default, the managed ai-memory Agent Skills |
 | `install-skills [--scope] [--agent]` | same host environment used for the agent skill dirs | Install or update only the managed ai-memory Agent Skills |

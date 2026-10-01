@@ -701,7 +701,13 @@ async fn run_once_with_wiring(
                 home.join(".kiro").display().to_string(),
             );
         }
-        super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &wire_env);
+        super::run_autowire::ensure_wired_with(
+            config,
+            harness,
+            wire_overrides,
+            &wire_env,
+            &repository.cwd,
+        );
     }
     if plan.mode == LaunchMode::Session
         && let Some(native_session_id) = &plan.expected_session_id
