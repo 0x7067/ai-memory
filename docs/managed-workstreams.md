@@ -513,17 +513,23 @@ protocol](managed-harness-contributions.md), including read-only extraction,
 pre-turn context delivery, migration invariants, deterministic tests, and an
 opt-in real-harness acceptance pass.
 
-### Known issue: Codex's shared daemon and stale run ids (#987)
+### Codex shared-daemon recovery (#987)
 
 Recent Codex releases run sessions through a shared background app-server
 daemon (`codex agents` lists it). The daemon keeps the environment it started
 with, and the lifecycle hooks it launches inherit that environment — including
-the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. A later
-`ai-memory run codex` then reports that finished run, gets no continuity
-context, and the server logs `managed SessionStart has no active run`.
+the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. When a later
+managed Codex SessionStart reports that finished id, ai-memory ignores it as
+authority and searches only the request's already-resolved repository, exact
+checkout cwd, and operator bucket. The server adopts a replacement only when
+exactly one live, undelivered Codex run is waiting there, and it selects plus
+links that run in one writer transaction. Multiple candidates, an active id
+whose scope, checkout, or owner does not match, and a run already linked by
+another session all fail closed.
 
-Until the server-side fix lands, launch managed Codex sessions without the
-daemon. Native arguments after the harness are forwarded to Codex:
+Ordinary managed Codex launches therefore work with the shared daemon. For
+diagnosis, or when an intentionally concurrent pair of named workstreams makes
+recovery ambiguous, native arguments after the harness are still forwarded:
 
 ```bash
 ai-memory run codex --no-daemon
@@ -531,8 +537,8 @@ ai-memory run codex --no-daemon
 
 `--no-daemon` makes that one session run without the shared background server
 even if one is already running; it is available on Codex's interactive and
-`resume` commands (checked on Codex 0.156). Sessions started without it keep
-the daemon behavior described above.
+`resume` commands (checked on Codex 0.156). It remains a useful isolation
+switch, not a requirement for normal workstream continuity.
 
 ## Installation and recovery
 

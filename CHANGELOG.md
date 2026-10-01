@@ -69,6 +69,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
+- Fixed `ai-memory upgrade` rewriting native hook commands with Linux's
+  ` (deleted)` executable-path suffix after replacing its own binary. Every
+  hook renderer now keeps a still-existing literal path, otherwise strips the
+  kernel suffix only when the resulting installed binary exists, and finally
+  falls back to the bare `ai-memory` command instead of embedding a dead path.
+  The in-process refresh continues using the already-loaded CLI/config scope.
+  (#1027)
+- Fixed native `ai-memory upgrade` rejecting every current Linux, macOS, and
+  Windows release archive when it encountered the packaging, config-template,
+  or documentation entries shipped beside the binary. The extractor now
+  validates the exact support-file layout emitted by `release.yml`, ignores
+  those non-runtime files during self-upgrade, and still extracts only the
+  binary and hooks. Archive entry-count and expanded-size caps now complement
+  the existing compressed-download limit. (#1025)
+- Fixed the recommended Linux/macOS Docker-wrapper `install-hooks` path
+  silently installing shell hooks that cannot enforce client-side capture
+  controls such as `[capture] ignore_paths` and allowlist mode. The wrapper now
+  uses its existing checksum-verified native host client for hook installation
+  and refresh, while an explicit `AI_MEMORY_HOOK_PLATFORM=posix|windows` keeps
+  the documented compatibility fallback and warning. Wrapper upgrades refresh
+  that stable native client before rewriting existing hook registrations.
+  (#1002)
+- Fixed managed Codex sessions losing their startup continuity when a shared
+  Codex app-server daemon reports a finished run's stale `AI_MEMORY_RUN_ID`.
+  SessionStart now recovers only the sole live, undelivered Codex run in the
+  already-authorized repository, checkout cwd, and operator bucket, and links
+  it atomically to the new native session. Active boundary mismatches,
+  concurrent matching runs, cross-project or cross-worktree candidates,
+  cross-operator candidates, and a second linker all fail closed instead of
+  guessing or rebinding a run. (#987)
 - `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
   `[capture]` section is invalid. This fails closed today — every file and
   shell tool event is reduced to metadata until the marker is fixed, nothing
