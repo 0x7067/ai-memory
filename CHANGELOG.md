@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A wiki checkpoint now leaves `.git/index` matching the commit it made. A
+  path-scoped checkpoint wrote the index file only once every 50 commits, so
+  between writes `HEAD` and the working tree held the new page while the
+  index file still named the old blob, and `git status` from outside the
+  server showed every checkpointed page as `MM` (staged and unstaged changes
+  that cancel out). A checkpoint that found nothing to commit left a stale
+  index file in place the same way. The history itself was always correct.
+  Not specific to Windows. (#983)
+
 ## [2.5.0] - 2026-09-30
 
 ### Added
