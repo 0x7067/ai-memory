@@ -54,11 +54,35 @@ pub fn usable_ai_jail(os: JailOs, lookup: impl Fn(&str) -> Option<PathBuf>) -> O
 /// install location when that directory is not on `PATH`).
 #[must_use]
 pub fn usable_ai_jail_here() -> Option<PathBuf> {
-    usable_ai_jail(current_jail_os(), |name| match find_on_path(name) {
+    let candidate = usable_ai_jail(current_jail_os(), |name| match find_on_path(name) {
         Some(path) => Some(path),
+        None if name == "bwrap" => std::env::var_os("BWRAP_BIN").map(PathBuf::from),
         None if name == "ai-jail" => home_local_bin_ai_jail(),
         None => None,
-    })
+    })?;
+    preflighted_ai_jail(candidate, ai_jail_preflight)
+}
+
+fn preflighted_ai_jail(
+    candidate: PathBuf,
+    preflight: impl FnOnce(&Path) -> bool,
+) -> Option<PathBuf> {
+    preflight(&candidate).then_some(candidate)
+}
+
+/// Ask the installed ai-jail to validate its complete local launch boundary.
+/// `--dry-run` does not execute the child or write configuration, but it does
+/// apply ai-jail's own backend trust checks (including root ownership and the
+/// protected-Nix-store exception) so our offer cannot lead directly to a
+/// refusal that the shallower PATH probe missed.
+fn ai_jail_preflight(ai_jail: &Path) -> bool {
+    std::process::Command::new(ai_jail)
+        .args(["--dry-run", "--", "/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -870,6 +894,22 @@ mod tests {
             matches!(name, "ai-jail" | "bwrap").then(|| PathBuf::from(format!("/usr/bin/{name}")))
         };
         assert_eq!(usable_ai_jail(JailOs::MacOs, linux_backend_on_macos), None);
+    }
+
+    #[test]
+    fn failed_ai_jail_preflight_suppresses_the_offer() {
+        let candidate = PathBuf::from("/opt/bin/ai-jail");
+        assert_eq!(
+            preflighted_ai_jail(candidate.clone(), |path| {
+                assert_eq!(path, candidate);
+                false
+            }),
+            None
+        );
+        assert_eq!(
+            preflighted_ai_jail(candidate.clone(), |_| true),
+            Some(candidate)
+        );
     }
 
     /// ai-jail is unsupported on Windows: even a file named `ai-jail` on PATH

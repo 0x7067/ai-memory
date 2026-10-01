@@ -2301,6 +2301,7 @@ mod slow {
             .arg("upgrade")
             .env("PATH", path)
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .env("AI_MEMORY_DOCKER", &docker)
             .env(
                 "AI_MEMORY_WRAPPER_URL",
@@ -2726,6 +2727,7 @@ mod slow {
             .env("AI_MEMORY_SKIP_SELF_UPGRADE", "1")
             .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .output()
             .unwrap();
         assert!(

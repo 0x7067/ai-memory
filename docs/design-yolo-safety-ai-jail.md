@@ -58,9 +58,11 @@ scripts, hooks, and CI keep working unchanged.
 
 The offer appears only when accepting it can actually work
 (`usable_ai_jail`): on Linux or macOS, with the ai-jail binary on `PATH`
-(fallback `~/.local/bin/ai-jail`) **and** its sandbox backend on `PATH`
-(`bwrap` on Linux, `sandbox-exec` on macOS). It never appears on Windows, where
-ai-jail is unsupported, even if a file named `ai-jail` happens to be on `PATH`.
+(fallback `~/.local/bin/ai-jail`) **and** a sandbox backend candidate available
+(`bwrap` on Linux, including `BWRAP_BIN`; `sandbox-exec` on macOS). A no-exec
+`ai-jail --dry-run` preflight then applies ai-jail's own backend trust and local
+configuration checks before the offer is shown. It never appears on Windows,
+where ai-jail is unsupported, even if a file named `ai-jail` happens to be on `PATH`.
 When ai-jail is not usable there is no question at all — the run proceeds
 directly after the §1 warning. The re-exec runs the exact path this check
 resolved, never a bare `ai-jail` re-looked-up through `PATH` (which missed a
