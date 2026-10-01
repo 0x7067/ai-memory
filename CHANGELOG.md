@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a separator: the shell walks missed a marker between the checkout and
   home, and the PowerShell walks went past home and read a marker above it.
   Both now match the native `ai-memory hook` walk. (#1023)
+- Fixed `ai-memory run --jail` leaving the `ssh` toggle unchecked when
+  `git push` goes over SSH but `origin`'s fetch URL does not show it: an HTTPS
+  `origin` with an SSH `pushurl` or `pushInsteadOf`, or a `host:path` remote
+  using an `~/.ssh/config` alias. (#1024)
 
 ## [2.5.2] - 2026-10-01
 
