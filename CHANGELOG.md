@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed a wiki checkpoint failing instead of retrying when a full walk listed a
+  file that was gone by the time it was read (libgit2's `Os`-class "failed to
+  read file into stream", e.g. an atomic writer's temp file renamed away
+  mid-walk). It now takes the same bounded racy-read retry as a file changed
+  mid-write; unrelated I/O errors still fail fast. This was also the source of
+  an intermittent `concurrent_commits_queue_instead_of_failing` CI failure.
+
 ## [2.5.1] - 2026-10-01
 
 ### Fixed
