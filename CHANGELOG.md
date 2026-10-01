@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory list-projects [--workspace] [--json]`: a plain, scriptable
+  listing of every workspace/project pair the server knows about, sorted by
+  workspace then project. Previously the only way to see this from outside
+  an interactive `show` session was to call `GET /api/v1/projects` directly.
+
 ## [2.5.2] - 2026-10-01
 
 ### Added

@@ -289,6 +289,7 @@ ai-memory run <harness>              # launch a harness, hooks + MCP auto-wired
 ai-memory continue                   # resume the newest managed checkout
 ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
+ai-memory list-projects              # every workspace/project the server knows about
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
 ai-memory write-page …               # save a durable page
