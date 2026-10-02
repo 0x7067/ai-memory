@@ -42,7 +42,11 @@ Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
 prepended to the agent's context automatically. To make it apply to **all** your
-projects, ask for it as a global rule (`scope: "global"`).
+projects, ask for it as a global rule (`scope: "global"`). From another
+project's page, link to that standing page with `[[_global:path]]` — it always
+names the reserved `_global` project in the default workspace. Sibling projects
+use `[[project:path]]`; another workspace uses `[[workspace/project:path]]`.
+Bare `[[name]]` stays inside the current project.
 
 ## Recipe: have a project read a specific document before implementing
 
