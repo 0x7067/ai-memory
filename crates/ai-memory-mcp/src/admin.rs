@@ -7680,6 +7680,9 @@ struct WritePageAdminRequest {
     /// kind when absent.
     #[serde(default)]
     kind: Option<String>,
+    // The explicit legacy kind field consumes that key before flattening.
+    #[serde(flatten)]
+    metadata: ai_memory_core::page::PageWriteMetadata,
     /// Tier name (`working`, `episodic`, `semantic`, `procedural`).
     #[serde(default = "default_write_tier")]
     tier: String,
@@ -7715,6 +7718,12 @@ async fn handle_write_page(
     headers: HeaderMap,
     Json(req): Json<WritePageAdminRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let metadata = req.metadata.into_frontmatter().map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
     let tier: Tier = req.tier.parse().map_err(|_| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -7739,7 +7748,7 @@ async fn handle_write_page(
 
     let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
 
-    let mut fm = serde_json::Map::new();
+    let mut fm = metadata;
     if let Some(title) = &req.title {
         fm.insert("title".into(), serde_json::Value::String(title.clone()));
     }

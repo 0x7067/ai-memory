@@ -221,6 +221,55 @@ Markdown (`reindex` requires a clean derived database). `explain: true` exposes
 and the entity RRF contribution. Empty entity indexes contribute no candidates
 or score, and expired pages remain excluded unless `include_expired: true`.
 
+## Writing page metadata
+
+`memory_write_page` and `POST /admin/write-page` accept the same optional
+metadata fields at the top level of the request JSON:
+
+| Field | Accepted value and bound |
+| --- | --- |
+| `kind` | MCP: free-text semantic kind, up to 64 raw characters, then trimmed. Admin: the existing optional string adapter retains its original handling (trim and omit empty), without the new MCP kind checks. |
+| `entities` | Up to 10 input strings, each up to 64 raw characters; then trimmed, whitespace-collapsed, lowercased and deduplicated using the existing entity normalizer. |
+| `abstract` | L0 summary, up to 1,024 raw characters, then trimmed. |
+| `relations` | Object with only `causes`, `fixes`, or `contradicts` keys and arrays of page targets, up to 32 input targets total and 1,024 raw characters per target. |
+
+Character and list limits apply to raw input, before trimming, normalization
+or deduplication. For example, an entity with 60 characters followed by six
+spaces is refused even though normalization alone would produce 60 characters.
+The admin's existing top-level `kind` keeps its legacy behavior, including
+strings longer than 64 characters; the importer continues using that adapter.
+
+Relation targets use the existing wikilink grammar: `notes/page`,
+`project:notes/page.md`, or `workspace/project:notes/page.md`. Extensionless
+paths resolve with `.md`; invalid or non-portable page targets are refused.
+Scope components must already be trimmed: `other:notes/x` is valid, while
+`other :notes/x` is refused instead of creating an unresolved edge.
+Relations describe links; they do not grant access to their destinations.
+Malformed shapes, invalid entities and exceeded bounds in the new metadata
+fields fail before a write scope is created. Those fields and MCP `kind`
+reject non-whitespace control characters. Relation targets also
+refuse whitespace control characters. All metadata still passes through the
+wiki sanitizer and admission chain, and attribution comes from authentication.
+
+For example, these fields can be added to either surface's existing request:
+
+```json
+{
+  "kind": "decision",
+  "entities": ["SQLite", "Writer actor"],
+  "abstract": "One writer owns every SQLite mutation.",
+  "relations": {"fixes": ["gotchas/concurrent-writes.md"]}
+}
+```
+
+Both surfaces replace the whole page, including its editable metadata.
+Omitted fields do not inherit the previous version; empty entity lists and
+relation objects clear those fields. Empty `kind` or `abstract` strings omit
+those keys. Existing requests without the new fields remain valid, including
+the admin's existing top-level `kind`. Arbitrary frontmatter, scope and author
+fields are never copied from metadata. This is an unconditional replacement;
+it provides no patch or compare-and-write precondition.
+
 ## Install the routing snippet and Agent Skills
 
 From an agent, say:

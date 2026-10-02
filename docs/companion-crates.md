@@ -188,9 +188,12 @@ Re-home by kind:
 - Never open ai-memory's SQLite database or wiki directory directly.
 - Require an explicit destination workspace/project.
 - Preserve only metadata supported by the public write surface (`title`, `kind`,
-  `tier`, `tags`, `pinned`, and body) unless a future generic core seam adds
-  broader frontmatter support. Do not claim arbitrary frontmatter or author
-  preservation in companion imports.
+  `tier`, `tags`, `pinned`, body, and the bounded `entities`, `abstract`, and
+  `relations` documented in [usage](usage.md#writing-page-metadata)). The current
+  importer preserves the original title/kind/tier/tags/pin subset; broader
+  metadata needs an explicit importer consumer. Do not claim arbitrary
+  frontmatter or author preservation in companion imports. Writes replace the
+  whole page; omitted metadata is cleared.
 - Carry idempotency keys or source fingerprints in companion-side state so failed
   imports can be resumed safely.
 - Validate and sanitize a complete external-conversation envelope before the
