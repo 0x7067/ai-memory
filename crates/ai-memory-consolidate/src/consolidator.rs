@@ -516,12 +516,7 @@ impl Consolidator {
         }
     }
 
-    /// Latest page titles for duplicate-title avoidance on the session
-    /// page, seen through the same owner visibility as the slot
-    /// snapshots. The session's OWN page is excluded: re-consolidation
-    /// refreshing its own previous title is correct, not a collision.
-    /// Best-effort — a store hiccup degrades to "no context" rather
-    /// than failing consolidation.
+    /// See [`existing_session_page_titles`].
     async fn existing_page_titles(
         &self,
         workspace_id: WorkspaceId,
@@ -529,42 +524,8 @@ impl Consolidator {
         actor: &ai_memory_core::ActorContext,
         session_id: SessionId,
     ) -> Vec<String> {
-        let own_path = format!("sessions/{session_id}.md");
-        match self
-            .reader
-            .briefing_for_project(
-                workspace_id,
-                project_id,
-                EXISTING_TITLES_QUERY_LIMIT,
-                ai_memory_core::OwnerFilter::for_actor_context(actor),
-                false,
-            )
+        existing_session_page_titles(&self.reader, workspace_id, project_id, actor, session_id)
             .await
-        {
-            Ok(brief) => {
-                let from_briefing = brief
-                    .recent_pages
-                    .iter()
-                    .chain(brief.pinned.iter())
-                    .chain(brief.rules.iter())
-                    .chain(brief.slots.iter())
-                    .filter(|p| p.path != own_path)
-                    .map(|p| p.title.clone());
-                let from_settled = brief
-                    .settled
-                    .iter()
-                    .filter(|p| p.path != own_path)
-                    .map(|p| p.title.clone());
-                from_briefing.chain(from_settled).collect()
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "existing-title query failed; skipping duplicate-title context"
-                );
-                Vec::new()
-            }
-        }
     }
 
     async fn slot_snapshots(
@@ -1777,11 +1738,64 @@ fn render_title_uniqueness_section(titles: &[String]) -> String {
     )
 }
 
-/// Shared collision backstop for both session-page write paths.
+/// Latest page titles for duplicate-title avoidance on the session
+/// page, seen through the same owner visibility as the slot
+/// snapshots. The session's OWN page is excluded: re-consolidation
+/// refreshing its own previous title is correct, not a collision.
+/// Best-effort — a store hiccup degrades to "no context" rather
+/// than failing consolidation. Shared with the MCP `memory_write_page`
+/// session-page path, which writes the same page without a completion.
+pub async fn existing_session_page_titles(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    actor: &ai_memory_core::ActorContext,
+    session_id: SessionId,
+) -> Vec<String> {
+    let own_path = format!("sessions/{session_id}.md");
+    match reader
+        .briefing_for_project(
+            workspace_id,
+            project_id,
+            EXISTING_TITLES_QUERY_LIMIT,
+            ai_memory_core::OwnerFilter::for_actor_context(actor),
+            false,
+        )
+        .await
+    {
+        Ok(brief) => {
+            let from_briefing = brief
+                .recent_pages
+                .iter()
+                .chain(brief.pinned.iter())
+                .chain(brief.rules.iter())
+                .chain(brief.slots.iter())
+                .filter(|p| p.path != own_path)
+                .map(|p| p.title.clone());
+            let from_settled = brief
+                .settled
+                .iter()
+                .filter(|p| p.path != own_path)
+                .map(|p| p.title.clone());
+            from_briefing.chain(from_settled).collect()
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "existing-title query failed; skipping duplicate-title context"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Shared collision backstop for every session-page write path: the
+/// single-page and batch consolidations, and `memory_write_page` with a
+/// `session_id`.
 /// When `title` already names another latest page (case-insensitive,
 /// whitespace-collapsed — the M8 grouping), suffix the session short
 /// id and retitle a matching leading H1. `None` when the title is free.
-fn disambiguate_colliding_session_title(
+pub fn disambiguate_colliding_session_title(
     title: &str,
     body: &str,
     existing_titles: &[String],

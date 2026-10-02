@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added an optional `session_id` to `memory_write_page`, so an agent can
+  write a session's page with its own model and keep it traceable to the
+  session. The session must belong to the project the page is written to, and
+  the page records it as session evidence. A page that cites a session does
+  not overwrite a pinned page. Writing `sessions/<id>.md` also stamps the
+  frontmatter `memory_consolidate` writes there (`session_id`, `agent`,
+  `consolidated`, plus `consolidated_by: agent`), defaults the tier to
+  `episodic`, applies the same duplicate-title suffix, and marks the session's
+  queued SessionEnd consolidation job completed. (#1038)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
