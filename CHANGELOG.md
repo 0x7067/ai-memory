@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   router (`[retrieval] query_intent`), including accented and unaccented spellings of
   "última sessão", "onde paramos ontem", and "decisão anterior". Word
   boundaries and explicit history phrases keep technical session queries
-  unchanged; routing remains off by default.
+  unchanged; routing remains off by default. (#1056)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
