@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed the macOS menu-bar app showing only a red status item when the bundled
+  server cannot start (for example a port already in use, such as OpenCode v2's
+  default `127.0.0.1:49374`). The menu extra now surfaces the server's fatal
+  `stderr.log` line, and `docs/macos.md` documents the port collision and how to
+  move one side. (#1044)
 - Fixed interrupted launchers blocking an immediate managed-workstream restart
   by adding explicit `ai-memory run --force-unlock` recovery. The server
   atomically expires and replaces only a lease attributed to the same

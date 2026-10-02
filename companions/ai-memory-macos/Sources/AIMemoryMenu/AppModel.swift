@@ -108,7 +108,11 @@ final class AppModel {
                 lastHTTPStatus = code
                 fetchFailed = code != 401 && code != 403
             }
-            lastError = (error as? HealthError).map(Self.describe) ?? error.localizedDescription
+            lastError = StartFailure.message(
+                health: (error as? HealthError).map(Self.describe) ?? error.localizedDescription,
+                launchd: launchd,
+                logURL: logURL
+            )
         }
         let derived = IconState.derived(
             launchd: launchd,
