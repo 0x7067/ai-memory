@@ -107,6 +107,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event queued behind it waited. The server now acknowledges and drops it,
   counted as `dropped_invalid` in the ingest metrics, and keeps processing the
   rest of the batch. (#1062)
+- Fixed `drop_subagent_captures` discarding entire top-level Claude Code
+  sessions launched with `--agent`. An `agent_type` alone no longer marks a
+  session as a subagent; `agent_id` and Grok's `subagentType` still do, so
+  actual subagent filtering remains enabled. Claude Code reports a Task
+  subagent under its parent's session id, so a subagent's events no longer
+  mark that session as a subagent: the parent's Stop, SessionEnd, summary and
+  handoff are kept. (#1041, #1048)
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a

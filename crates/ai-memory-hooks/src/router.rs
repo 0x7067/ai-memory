@@ -228,7 +228,7 @@ struct SubagentSessionKey {
 /// Tracks the scoped session keys of subagent (nested/spawned) sessions so that
 /// the `drop_subagent_captures` gate can also drop the **unmarked tail** of those
 /// sessions (`user_prompt_submit` / `stop` / `session_end`), which the
-/// per-event marker (`subagentType` / `agent_type`) does not cover. A session
+/// per-event marker (`subagentType` / `agent_id`) does not cover. A session
 /// is seeded when a `SubagentStart` or any marker-bearing event arrives, and
 /// forgotten on `SessionEnd` after the tail has been dropped. Bounded LRU so a
 /// missed terminal event cannot leak memory.
@@ -1198,6 +1198,10 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
 /// `stop` / `session_end`) of a session already known to be a subagent. No-op
 /// (returns `false`) unless this event's project opted in via the per-event
 /// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
+///
+/// Claude Code is the exception to seeding: its subagent events carry the
+/// parent's `session_id` and differ only by `agent_id`, so seeding would drop
+/// the main session's own tail. Its marked events still drop one by one.
 async fn should_drop_subagent(
     state: &HookState,
     env: &HookEnvelope,
@@ -1233,7 +1237,9 @@ async fn should_drop_subagent(
     ) || body_is_subagent(&env.raw);
 
     if marked {
-        state.subagent_sessions.lock().await.insert(key);
+        if env.agent != AgentKind::ClaudeCode {
+            state.subagent_sessions.lock().await.insert(key);
+        }
         return true;
     }
 
@@ -7096,6 +7102,199 @@ mod tests {
                 .len(),
             1,
             "top-level capture is persisted as usual"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_keeps_top_level_claude_agent_sessions() {
+        for null_agent_id in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(make_state(&tmp).await);
+            let session = SessionId::new();
+            let child_session = SessionId::new();
+            let mut items = Vec::new();
+            for event in [
+                "session-start",
+                "user-prompt-submit",
+                "pre-tool-use",
+                "post-tool-use",
+                "stop",
+                "session-end",
+            ] {
+                let mut body = serde_json::json!({
+                    "session_id": session.to_string(),
+                    "prompt": "Review the patch for the main agent",
+                    "tool_name": "Bash",
+                    "tool_response": "Review complete",
+                });
+                // Keep the terminal tail unmarked to catch accidental seeding
+                // of the whole main session in subagent_sessions.
+                if !matches!(event, "stop" | "session-end") {
+                    body["agent_type"] = serde_json::json!("regulus:regulus");
+                    if null_agent_id {
+                        body["agent_id"] = serde_json::Value::Null;
+                    }
+                }
+                items.push(HookBatchItem {
+                    url: format!("http://h/hook?event={event}&agent=claude-code&drop_subagent=1"),
+                    body,
+                });
+            }
+            // OpenCode child sessions carry a parent ID as the subagent marker;
+            // both the marked event and its unmarked tail must still drop.
+            for body in [
+                serde_json::json!({
+                    "session_id": child_session.to_string(),
+                    "agent_type": "reviewer",
+                    "agent_id": session.to_string(),
+                    "tool_name": "Bash",
+                }),
+                serde_json::json!({
+                    "session_id": child_session.to_string(),
+                    "tool_name": "Bash",
+                }),
+            ] {
+                items.push(HookBatchItem {
+                    url: "http://h/hook?event=pre-tool-use&agent=opencode&drop_subagent=1".into(),
+                    body,
+                });
+            }
+            let response = handle_hook_batch(
+                State(state.clone()),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                Json(items),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(ack["accepted"], 8, "stored and dropped events are acked");
+
+            let metrics = state.ingest_metrics.snapshot();
+            assert_eq!(
+                metrics.accepted, 6,
+                "main session, null id: {null_agent_id}"
+            );
+            assert_eq!(metrics.dropped_by_policy, 2, "only the subagent is dropped");
+            assert_eq!(
+                state
+                    .reader
+                    .observations_for_session(session)
+                    .await
+                    .unwrap()
+                    .len(),
+                6,
+            );
+            assert!(
+                state
+                    .reader
+                    .observations_for_session(child_session)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let pages = session_pages(&state).await;
+            assert_eq!(pages.len(), 1, "the main session gets its durable summary");
+            assert!(
+                state
+                    .wiki
+                    .read_page(
+                        state.workspace_id,
+                        state.project_id,
+                        &ai_memory_core::PagePath::new(pages[0].clone()).unwrap(),
+                    )
+                    .unwrap()
+                    .body
+                    .contains("Review the patch for the main agent")
+            );
+            assert!(
+                open_handoff_exists(&state).await,
+                "the main session keeps its baton"
+            );
+        }
+    }
+
+    /// Claude Code reports a Task subagent under the parent's `session_id`,
+    /// told apart only by `agent_id`. The subagent's events drop, but they must
+    /// not mark the shared session as a subagent and take the main tail with it.
+    #[tokio::test]
+    async fn claude_subagent_events_drop_without_dropping_the_parent_tail() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let session = SessionId::new();
+        let main = |event: &str| HookBatchItem {
+            url: format!("http://h/hook?event={event}&agent=claude-code&drop_subagent=1"),
+            body: serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Ship the parent change",
+                "tool_name": "Bash",
+                "tool_response": "done",
+            }),
+        };
+        let subagent = |event: &str| HookBatchItem {
+            url: format!("http://h/hook?event={event}&agent=claude-code&drop_subagent=1"),
+            body: serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_id": "agent-task-1",
+                "agent_type": "Explore",
+                "tool_name": "Grep",
+                "tool_response": "subagent output",
+            }),
+        };
+        let items = vec![
+            main("session-start"),
+            main("user-prompt-submit"),
+            subagent("subagent-start"),
+            subagent("pre-tool-use"),
+            subagent("post-tool-use"),
+            subagent("subagent-stop"),
+            main("post-tool-use"),
+            main("stop"),
+            main("session-end"),
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 9, "stored and dropped events are acked");
+
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!(
+            metrics.dropped_by_policy, 4,
+            "only the subagent's events drop"
+        );
+        assert_eq!(metrics.accepted, 5, "the parent's events, tail included");
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+                .len(),
+            5,
+        );
+        let pages = session_pages(&state).await;
+        assert_eq!(pages.len(), 1, "the parent session keeps its summary");
+        assert!(
+            open_handoff_exists(&state).await,
+            "the parent session keeps its baton"
         );
     }
 
