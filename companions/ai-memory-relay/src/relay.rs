@@ -96,6 +96,9 @@ pub fn init(
     identity::check_actor(actor).map_err(anyhow::Error::msg)?;
     identity::check_scope("workspace", workspace).map_err(anyhow::Error::msg)?;
     identity::check_scope("project", project).map_err(anyhow::Error::msg)?;
+    ai_memory_client::reject_sensitive(&serde_json::json!({
+        "producer": producer, "actor": actor, "server_url": server_url,
+    }))?;
     let binding = Binding {
         server_url: http::normalize_server_url(server_url)?,
         producer: producer.to_owned(),
@@ -274,6 +277,8 @@ pub fn flush(dir: &Path, options: &FlushOptions) -> Result<Report> {
 fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     let mut queue = Queue::open(dir)?;
     let binding = queue.binding()?;
+    identity::check_scope("workspace", &binding.workspace).map_err(anyhow::Error::msg)?;
+    identity::check_scope("project", &binding.project).map_err(anyhow::Error::msg)?;
     queue.prune(crate::now_ms())?;
     let token = Token::from_env()?;
     let authenticated = token.is_some();
@@ -297,7 +302,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         let now = crate::now_ms();
         let base = binding.server_url.clone();
         let for_cost = binding.clone();
-        let batch: Batch =
+        let mut batch: Batch =
             queue.select_batch(MAX_BATCH_ITEMS, MAX_BATCH_BYTES, now, &deferred, |item| {
                 item_cost(&base, &for_cost, item)
             })?;
@@ -305,22 +310,42 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         if batch.items.is_empty() {
             break;
         }
+        let mut items = Vec::new();
+        for item in &batch.items {
+            let wire = serde_json::from_str(&item.body_json).ok().and_then(|body| {
+                ai_memory_client::reject_sensitive(&serde_json::json!([
+                    item.event_id,
+                    item.agent,
+                    item.event,
+                    item.session_id,
+                ]))
+                .ok()?;
+                ai_memory_client::check_body(&body).ok()?;
+                let url = http::item_url(&binding.server_url, &binding, item);
+                ai_memory_client::reject_sensitive(&serde_json::json!(url)).ok()?;
+                Some(BatchItem { url, body })
+            });
+            if let Some(wire) = wire {
+                items.push(wire);
+            } else {
+                queue.record_failure(&item.ingest_key, "privacy/validation")?;
+                deferred.insert(item.session());
+                failure.get_or_insert_with(|| {
+                    "privacy/validation: unsafe stored body retained; its session deferred".into()
+                });
+            }
+        }
+        batch
+            .items
+            .retain(|item| !deferred.contains(&item.session()));
+        if items.is_empty() {
+            continue;
+        }
         batches += 1;
         let keys: Vec<String> = batch.items.iter().map(|i| i.ingest_key.clone()).collect();
         // Durable, and before the request: a lost ack must not restart the
-        // 30-day clock on the next run.
+        // 30-day clock on the next run. Unsafe items were already excluded.
         queue.stamp_attempt(&keys, now)?;
-        let items: Vec<BatchItem> = batch
-            .items
-            .iter()
-            .map(|item| {
-                Ok(BatchItem {
-                    url: http::item_url(&binding.server_url, &binding, item),
-                    body: serde_json::from_str(&item.body_json)
-                        .context("stored body is no longer valid JSON")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         // Selection checked the retry window once; a retry inside this batch can
         // still cross it. Carry the batch's tightest expiry into the sender so
         // every attempt is re-checked against it.
@@ -473,7 +498,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     }
     if !deferred.is_empty() {
         summary.push(format!(
-            "{} session(s) deferred to a later flush (a failed or rate-limited head); \
+            "{} session(s) deferred to a later flush (an unsafe, failed or rate-limited head); \
              their later events were never sent ahead of it",
             deferred.len()
         ));

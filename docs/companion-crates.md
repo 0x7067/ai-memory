@@ -79,6 +79,17 @@ the public MCP write/delete tools. It must never open the wiki directory or
 SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
 MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
 
+## `ai-memory-client`: shared private capture privacy
+
+[`ai-memory-client`](../companions/ai-memory-client) supplies four privacy
+functions consumed by both the relay and external-conversation importer. New
+bodies are scrubbed before serialization, hashes and local persistence; native
+identities containing credentials are refused without being renamed. Unsafe
+legacy relay heads retain their exact bytes and retry metadata and defer only
+their own session. The package has its own workspace and focused tests, with no
+server dependency. Server authorization and capture exclusions remain the
+authoritative boundaries.
+
 ## `ai-memory-relay`: external lifecycle delivery
 
 [`ai-memory-relay`](../companions/ai-memory-relay) delivers events collected by

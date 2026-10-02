@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added shared private capture privacy helpers used by the relay and conversation
+  importer before body hashes, local persistence, previews and delivery. Sensitive
+  native identities were refused without renaming; nested credentials were scrubbed
+  with bounded body validation and an exact numeric token-metric allowlist. Unsafe
+  legacy relay heads retained their bytes and retry state while deferring only their
+  session, and importer byte caps preserved complete redaction markers. (#823)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on

@@ -1745,3 +1745,503 @@ fn results_match_sparse_partial_failure_and_empty_acks() {
         assert_eq!(ack::validate(len, &parsed).unwrap(), expected);
     }
 }
+
+#[test]
+fn sensitive_envelope_is_rejected_before_enqueue_with_clean_control() {
+    let root = fixture("sensitive-envelope");
+    let dir = bind(&root, "http://127.0.0.1:49374");
+    enqueue(
+        &dir,
+        &root,
+        "before.json",
+        serde_json::json!([event("opaque-界", "codex", "session-start", "sessão-界")]),
+    )
+    .unwrap();
+    assert_eq!(pending_count(&dir), 1);
+    for field in [
+        "session_id",
+        "cwd",
+        "producer",
+        "actor",
+        "event_id",
+        "agent",
+        "event",
+        "ingest_key",
+    ] {
+        let mut input = event("a", "codex", "session-start", "a");
+        input["body"][field] = "Bearer abcdefghijklmnop".into();
+        let error = enqueue(&dir, &root, "input.json", serde_json::json!([input])).unwrap_err();
+        assert!(!error.to_string().contains("abcdefghijklmnop"));
+        assert_eq!(pending_count(&dir), 1);
+    }
+    enqueue(
+        &dir,
+        &root,
+        "control.json",
+        serde_json::json!([event("a", "codex", "session-start", "a")]),
+    )
+    .unwrap();
+    assert_eq!(pending_count(&dir), 2);
+}
+
+#[test]
+fn new_native_bodies_are_sanitized_before_hash_enqueue_and_exact_retry() {
+    let root = fixture("ingress-sanitized-retry");
+    let server = stub(vec![Reply::Close, Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut raw = event("native-event", "codex", "post-tool-use", "native-session");
+    for (name, value) in [
+        ("producer", "example.runtime"),
+        ("event_id", "native-event"),
+        ("agent", "codex"),
+        ("event", "post-tool-use"),
+        ("ingest_key", "native-ingest-key"),
+    ] {
+        raw["body"][name] = value.into();
+    }
+    raw["body"]["output"] =
+        "\u{1b}[32mresult\u{1b}[0m\u{202e} token=getToken() Bearer abcdefghijklmnop".into();
+    raw["body"]["tool_input"] = serde_json::json!({"nested": {"password": "process.env.X", "api-key": "tiny", "items": ["password=abcdefghi", "token=abcdefghijklmnop[REDACTED]"]}});
+    raw["body"]["key_cases"] = serde_json::json!([{
+        "accessToken":"fixture-value", "refreshToken":"fixture-value", "clientSecret":"fixture-value", "privateKey":"fixture-value", "x-api-key":"fixture-value", "OPENAI_API_KEY":"fixture-value", "credentials":"fixture-value", "cookie":"fixture-value"
+    }]);
+    raw["body"]["key_forms"] = serde_json::json!([{"auth":"fixture-value","jwt":"fixture-value","pwd":"fixture-value","bearer":"fixture-value","sessionKey":"fixture-value","signature":"fixture-value"}]);
+    raw["body"]["plural_forms"] = serde_json::json!([{
+        "api_keys":"fixture-value", "access_keys":"fixture-value", "private_keys":"fixture-value", "session_keys":"fixture-value",
+        "apiKeys":["fixture-value"], "accessKeys":["fixture-value"], "privateKeys":["fixture-value"], "sessionKeys":["fixture-value"]
+    }]);
+    raw["body"]["controls"] = serde_json::json!({"author":"fixture-value","authority":"fixture-value","key":"fixture-value","keys":["fixture-value"]});
+    raw["body"]["numeric_cases"] = serde_json::json!({"token":123456,"access_tokens":123456,"private_token_count":123456,"auth_token_usage":123456,"token_usage":{"input_tokens":12}});
+    let metrics = serde_json::json!({"max_tokens":12,"input_tokens":34,"token_count":0,"token_usage":1.25,"output_tokens":9007199254740993_u64,"total_tokens":89,"totalTokens":89,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"prompt_tokens":5,"completion_tokens":7,"reasoning_tokens":11});
+    raw["body"]["metrics"] = metrics.clone();
+    enqueue(&dir, &root, "native.json", serde_json::json!([raw.clone()])).unwrap();
+    enqueue(&dir, &root, "repeat.json", serde_json::json!([raw])).unwrap();
+    assert_eq!(pending_count(&dir), 1);
+    let conn = rusqlite::Connection::open(dir.join(ai_memory_relay::fsguard::DB_FILE)).unwrap();
+    let (body, digest, key, id, agent, event, session): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT body_json,body_sha256,ingest_key,event_id,agent,event,session_id FROM pending",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    let safe: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (&id[..], &agent[..], &event[..], &session[..]),
+        ("native-event", "codex", "post-tool-use", "native-session")
+    );
+    assert_eq!(
+        key,
+        identity::ingest_key(
+            "example.runtime",
+            "operator-a",
+            &agent,
+            &session,
+            &event,
+            &id
+        )
+    );
+    for (name, value) in [
+        ("producer", "example.runtime"),
+        ("event_id", "native-event"),
+        ("agent", "codex"),
+        ("event", "post-tool-use"),
+        ("ingest_key", "native-ingest-key"),
+    ] {
+        assert_eq!(safe[name], value);
+    }
+    assert_eq!(safe["cwd"], "/work/app");
+    assert!(
+        !safe["output"]
+            .as_str()
+            .unwrap()
+            .contains(['\u{1b}', '\u{202e}'])
+    );
+    assert!(!body.contains("abcdefghijklmnop"));
+    assert!(!body.contains("process.env.X"));
+    assert!(!body.contains("tiny"));
+    assert_eq!(safe["tool_input"]["nested"]["api-key"], "[REDACTED]");
+    assert!(
+        safe["key_forms"][0]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(
+        safe["plural_forms"][0]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(
+        safe["numeric_cases"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(
+        safe["controls"]
+            == serde_json::json!({"author":"fixture-value","authority":"fixture-value","key":"fixture-value","keys":["fixture-value"]})
+    );
+    assert!(
+        safe["key_cases"][0]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(safe["metrics"] == metrics);
+    assert!(serde_json::to_vec(&safe["metrics"]).unwrap() == serde_json::to_vec(&metrics).unwrap());
+    assert_eq!(
+        safe["output"],
+        ai_memory_client::sanitize_external_text(
+            "\u{1b}[32mresult\u{1b}[0m\u{202e} token=getToken() Bearer abcdefghijklmnop"
+        )
+    );
+
+    ai_memory_client::check_body(&safe).unwrap();
+    let validated = identity::validate(
+        0,
+        InputEvent {
+            event_id: id,
+            agent,
+            event,
+            body: safe.clone(),
+        },
+        "example.runtime",
+        "operator-a",
+    )
+    .unwrap();
+    assert_eq!(validated.body_json, body);
+    assert_eq!(validated.body_sha256, digest);
+    assert!(flush(&dir).failure.is_none());
+    assert_eq!(pending_count(&dir), 0);
+    let sent = server.bodies();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0], sent[1]);
+    assert_eq!(sent[0][0]["body"], safe);
+    assert_eq!(serde_json::to_string(&sent[0][0]["body"]).unwrap(), body);
+    assert_eq!(
+        Queue::open(&dir)
+            .unwrap()
+            .stats(ai_memory_relay::now_ms())
+            .unwrap()
+            .receipts,
+        1
+    );
+}
+
+#[test]
+fn unsafe_legacy_pending_is_retained_exactly_and_never_sent() {
+    let root = fixture("unsafe-legacy-pending");
+    let server = stub(vec![Reply::AcceptAll, Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut legacy = valid("native-event", "codex", "session-start", "native-session");
+    legacy.body_json = "{ \"prompt\": \"Bearer abcdefghijklmnop\", \"cwd\": \"/native/path\", \"session_id\": \"native-session\" }".into();
+    let mut queue = Queue::open(&dir).unwrap();
+    queue
+        .enqueue(&[legacy.clone()], ai_memory_relay::now_ms())
+        .unwrap();
+    let first_attempt = ai_memory_relay::now_ms() - 1000;
+    queue
+        .stamp_attempt(&[legacy.ingest_key.clone()], first_attempt)
+        .unwrap();
+    queue
+        .stamp_attempt(&[legacy.ingest_key.clone()], first_attempt)
+        .unwrap();
+    let clean = valid("clean-event", "codex", "session-start", "clean-session");
+    queue
+        .enqueue(
+            &[
+                valid("later-dirty", "codex", "session-end", "native-session"),
+                clean.clone(),
+            ],
+            ai_memory_relay::now_ms(),
+        )
+        .unwrap();
+    drop(queue);
+    for _ in 0..2 {
+        let report = relay::flush(&dir, &FlushOptions::default()).unwrap();
+        assert!(
+            report
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.contains("privacy/validation"))
+        );
+        assert!(!format!("{report:?}").contains("abcdefghijklmnop"));
+        assert!(report.pending);
+        assert_eq!(pending_count(&dir), 2);
+    }
+    let sent = server.bodies();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0][0]["body"],
+        serde_json::from_str::<serde_json::Value>(&clean.body_json).unwrap()
+    );
+    assert_eq!(
+        Queue::open(&dir)
+            .unwrap()
+            .stats(ai_memory_relay::now_ms())
+            .unwrap()
+            .receipts,
+        1
+    );
+    let conn = rusqlite::Connection::open(dir.join(ai_memory_relay::fsguard::DB_FILE)).unwrap();
+    let preserved: (String, String, String, String, Option<i64>, i64) = conn
+        .query_row(
+            "SELECT ingest_key,session_id,body_json,body_sha256,first_attempt_ms,attempts FROM pending WHERE event_id=?1",
+            [&legacy.event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .unwrap();
+    assert!(
+        preserved
+            == (
+                legacy.ingest_key,
+                legacy.session_id,
+                legacy.body_json,
+                legacy.body_sha256,
+                Some(first_attempt),
+                2
+            ),
+        "unsafe legacy identity, bytes, digest and attempt state must remain unchanged"
+    );
+    let errors: Vec<(String, Option<String>, Option<i64>)> = conn
+        .prepare("SELECT event_id,last_error,first_attempt_ms FROM pending ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            (
+                "native-event".into(),
+                Some("privacy/validation".into()),
+                Some(first_attempt)
+            ),
+            ("later-dirty".into(), None, None)
+        ]
+    );
+}
+
+#[test]
+fn legacy_binding_scope_spaces_are_preserved_on_delivery() {
+    let root = fixture("legacy-scope-spaces");
+    let server = stub(vec![Reply::AcceptAll]);
+    let dir = queue_dir(&root);
+    relay::init(
+        &dir,
+        &server.url(),
+        "example.runtime",
+        "operator-a",
+        " team ",
+        " app ",
+    )
+    .unwrap();
+    enqueue(
+        &dir,
+        &root,
+        "native.json",
+        serde_json::json!([event("e", "codex", "session-start", "s")]),
+    )
+    .unwrap();
+    assert!(flush(&dir).failure.is_none());
+    let bodies = server.bodies();
+    let url = url::Url::parse(bodies[0][0]["url"].as_str().unwrap()).unwrap();
+    let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(pairs["workspace"], " team ");
+    assert_eq!(pairs["project"], " app ");
+}
+
+#[test]
+fn opaque_unicode_native_identity_ships_unchanged() {
+    let root = fixture("privacy-unicode-control");
+    let server = stub(vec![Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut input = event("event-界", "codex", "session-start", " sessão-界/opaque ");
+    input["body"]["cwd"] = "/work/界".into();
+    input["body"]["_ai_memory_capture"] =
+        serde_json::json!({"actor":"untrusted-label", "authority":"untrusted provenance"});
+    let original = input["body"].clone();
+    enqueue(&dir, &root, "input.json", serde_json::json!([input])).unwrap();
+    assert!(flush(&dir).failure.is_none());
+    assert_eq!(server.bodies()[0][0]["body"], original);
+    let bodies = server.bodies();
+    let url = url::Url::parse(bodies[0][0]["url"].as_str().unwrap()).unwrap();
+    assert_eq!(bodies[0][0]["body"]["session_id"], " sessão-界/opaque ");
+    assert_eq!(
+        url.query_pairs()
+            .find(|(key, _)| key == "ingest_key")
+            .unwrap()
+            .1,
+        identity::ingest_key(
+            "example.runtime",
+            "operator-a",
+            "codex",
+            " sessão-界/opaque ",
+            "session-start",
+            "event-界"
+        )
+    );
+    assert!(
+        server
+            .heads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|head| head.starts_with("POST /hook/batch "))
+    );
+}
+
+#[test]
+fn sensitive_outer_identity_and_body_authority_are_refused_before_enqueue() {
+    let root = fixture("privacy-outer-refusal");
+    let dir = bind(&root, "http://127.0.0.1:49374");
+    enqueue(
+        &dir,
+        &root,
+        "before.json",
+        serde_json::json!([event("before", "codex", "session-start", "control")]),
+    )
+    .unwrap();
+    for field in ["event_id", "agent", "event"] {
+        let mut attack = event("native", "codex", "session-start", "session");
+        attack[field] = "sk-1234567890abcdefghijklmnop".into();
+        let result = enqueue(&dir, &root, "attack.json", serde_json::json!([attack]));
+        assert!(result.is_err(), "sensitive outer identity must be refused");
+        assert!(!result.unwrap_err().to_string().contains("abcdefghijklmnop"));
+        assert_eq!(pending_count(&dir), 1);
+    }
+    for field in ["workspace", "project", "actor", "author_id", "headers"] {
+        let mut attack = event("native", "codex", "session-start", "session");
+        attack["body"][field] = "forged".into();
+        assert!(enqueue(&dir, &root, "attack.json", serde_json::json!([attack])).is_err());
+        assert_eq!(pending_count(&dir), 1);
+    }
+    enqueue(
+        &dir,
+        &root,
+        "after.json",
+        serde_json::json!([event("after", "codex", "session-end", "control")]),
+    )
+    .unwrap();
+    assert_eq!(pending_count(&dir), 2);
+}
+
+#[test]
+fn sensitive_binding_is_refused_before_queue_creation() {
+    let root = fixture("privacy-binding-refusal");
+    let safe = ["example.runtime", "operator-a", "team", "app"];
+    let before = root.join("control-before");
+    relay::init(
+        &before,
+        "http://127.0.0.1:49374",
+        safe[0],
+        safe[1],
+        safe[2],
+        safe[3],
+    )
+    .unwrap();
+    for field in 0..4 {
+        let mut attack = safe;
+        attack[field] = "sk-1234567890abcdefghijklmnop";
+        let dir = root.join(format!("attack-{field}"));
+        let result = relay::init(
+            &dir,
+            "http://127.0.0.1:49374",
+            attack[0],
+            attack[1],
+            attack[2],
+            attack[3],
+        );
+        assert!(result.is_err(), "sensitive binding must be refused");
+        assert!(!result.unwrap_err().to_string().contains("abcdefghijklmnop"));
+        assert!(!dir.exists(), "sensitive binding must not create the queue");
+    }
+    relay::init(
+        &root.join("control-after"),
+        "http://127.0.0.1:49374",
+        safe[0],
+        safe[1],
+        safe[2],
+        safe[3],
+    )
+    .unwrap();
+}
+
+#[test]
+fn unsafe_legacy_native_identity_defers_only_its_session() {
+    let root = fixture("privacy-legacy-native-id");
+    let server = stub(vec![Reply::AcceptAll, Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut legacy = valid("old-event", "codex", "session-start", "old-session");
+    legacy.event_id = "sk-1234567890abcdefghijklmnop".into();
+    let mut queue = Queue::open(&dir).unwrap();
+    let before = valid("before", "codex", "session-start", "clean-before");
+    queue
+        .enqueue(&[legacy.clone(), before.clone()], ai_memory_relay::now_ms())
+        .unwrap();
+    drop(queue);
+    let report = flush(&dir);
+    assert!(
+        report
+            .failure
+            .is_some_and(|failure| failure.contains("privacy/validation")),
+        "unsafe legacy native identity must be refused"
+    );
+    assert_eq!(pending_count(&dir), 1);
+    enqueue(
+        &dir,
+        &root,
+        "after.json",
+        serde_json::json!([event("after", "codex", "session-start", "clean-after")]),
+    )
+    .unwrap();
+    let report = flush(&dir);
+    assert!(report.failure.is_some());
+    assert_eq!(pending_count(&dir), 1);
+    let sent = server.bodies();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[0][0]["body"],
+        serde_json::from_str::<serde_json::Value>(&before.body_json).unwrap()
+    );
+    assert_eq!(sent[1][0]["body"]["session_id"], "clean-after");
+    let conn = rusqlite::Connection::open(dir.join(ai_memory_relay::fsguard::DB_FILE)).unwrap();
+    let stored: (String,String,String,String,String,Option<i64>,i64) = conn.query_row("SELECT event_id,session_id,ingest_key,body_json,body_sha256,first_attempt_ms,attempts FROM pending", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
+    assert_eq!(
+        stored,
+        (
+            legacy.event_id,
+            legacy.session_id,
+            legacy.ingest_key,
+            legacy.body_json,
+            legacy.body_sha256,
+            None,
+            0
+        )
+    );
+}
