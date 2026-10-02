@@ -60,10 +60,8 @@ workflow-specific behavior without widening ai-memory's default install.
 
 If a companion exposes browser writes, it must implement its own server-side
 mutation broker. Browsers should talk to the companion; the companion should talk
-to ai-memory with a server-held credential bound to the authenticated operator.
-That keeps CSRF, confirmation, audit, rate limits, and UI-specific policy outside
-the core server. The proposed editor's [browser boundary](#browser-boundary)
-details its DB-user-only broker and identity binding.
+to ai-memory with an operator token. That keeps CSRF, confirmation, audit, rate
+limits, and UI-specific policy outside the core server.
 
 Read-only companions can start ai-memory with `serve --enable-api` to mount
 `/api/v1` without the browser UI. `--enable-web` still implies the same API.
@@ -268,178 +266,159 @@ override is written only into the rendered LaunchAgent plist
 
 See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
 
-## `ai-memory-web-editor`: browser curation/editor companion
+## `ai-memory-web-editor`: browser chat/editor companion
 
-PR #123 motivated this companion shape. This fresh design proposal narrows
-it to reviewing and correcting stored memory, with implementation split into
-small dependent changes.
+This is the companion shape for PR #123.
 
-Status: **undecided**. Maintainer evaluation of this proposal is pending; neither
-the editor nor the proposed prerequisites below have upstream design acceptance
-by virtue of this document. The existing concern remains: a writable browser
-needs auth, concurrency control, confirmation, conflict handling, and audit.
-The review should weigh correction of wrong or stale memory against the cost of
-maintaining that product alongside the automatic improvement loop.
+Status: **undecided**. Do not implement this companion yet without a fresh design
+review. The useful writable version is larger than it first appears: it needs a
+safe core compare-and-write seam, a companion mutation broker, browser auth/CSRF,
+confirmation state, diffing, conflict handling, audit, and later LLM proposal
+policy. It is not clear that this complexity brings enough benefit for
+ai-memory's main goal. The system is meant to auto-improve its own memory through
+capture, consolidation, review, pending writes, and eval gates; manual memory
+editing may be less valuable than it seems, and could distract from improving the
+automatic loop.
 
 ### Goal
 
-Let an operator inspect the source of a claim, draft a correction, compare it
-with the stored revision, and deliberately submit it. Capture, consolidation,
-pending writes, and eval gates continue to own the automatic loop. Inspection,
-drafting, and editing must work without an LLM.
+Offer a richer browser product for chat, editing, and curation without turning
+the built-in `/web` browser into a write-capable application.
 
-The MVP does not execute procedures or introduce chat. Its views use only data
-available through current authorized reads; absent evidence stays absent. Core
-`/web` and `/api/v1` remain read-oriented. Canonical ADRs stay in their repository:
-the editor links to their source/revision instead of creating a second decision
-record in memory.
+The core built-in browser remains intentionally small: project list, tree view,
+markdown rendering, search, and other read-oriented inspection. A separate web
+editor can move faster and make stronger product decisions.
 
 ### Product shape
 
-The proposed location is `companions/ai-memory-web-editor`, a standalone Rust
-package with its own `[workspace]`, backend, browser assets, and integration/E2E
-tests. It is not a root Cargo workspace member. It has its own validation and
-release cadence and never opens ai-memory's wiki or SQLite directly.
+Prefer a separate repository with a backend plus frontend, for example:
 
-Public requests should use the proposed minimal client SDK, after it has two
-real consumers, relay and importer. The SDK and its capability contract are
-prerequisites proposed separately, not shipped editor APIs. An older server or
-an unavailable capability must leave the dependent feature disabled; the
-capability catalogue never grants access to a user or project.
+```text
+ai-memory-web-editor/
+├── crates/server/        # auth, CSRF, mutation broker, LLM orchestration
+├── crates/client/        # UI or generated assets
+├── src/                  # if kept as a single binary crate initially
+└── tests/e2e/
+```
 
-The companion may run beside ai-memory behind a reverse proxy, but owns a
-separate browser origin or explicitly isolated path and cookie namespace. It
-does not assume ai-memory's human-auth cookies authenticate the companion; the
-core [HTTP authentication classes](ARCHITECTURE.md#http-authentication-classes)
-still govern every upstream request.
+The companion can be deployed next to ai-memory and reverse-proxied under a
+separate path or host, for example `https://memory.example.com/editor`, while
+ai-memory remains at `/api/v1`, `/mcp`, `/admin`, `/hook`, and `/web`.
 
-### Browser boundary
+### How it talks to ai-memory
 
-The read-only shell already needs this boundary, before any editing is enabled:
+Read:
 
-- The companion implements its own login, session expiry/revocation, and CSRF
-  protection, including login and later state-changing draft/confirmation
-  requests. Session cookies are HttpOnly with appropriate Secure/SameSite and
-  path settings; origin checks and session-bound CSRF tokens protect mutations.
-- Bind the authenticated browser principal to the same server-authenticated
-  ai-memory identity. The broker exclusively holds that operator's own DB-user
-  API token server-side. Refuse missing, mismatched, or revoked
-  identity/credentials; never fall back to a shared credential. Provisioning and
-  secure credential storage are part of the shell's proposed design, not an
-  existing core login exchange.
-- Root/admin flows and admin proposal views/actions are excluded from this MVP.
-  Do not accept or store the shared static root bearer: it cannot identify which
-  human made a browser request. A DB-user token attached to a `role=root`
-  identity still authenticates as `AuthLevel::User`; it cannot authorize
-  `/admin/*`. Any future admin views need a separate design proposal.
-- The browser receives neither a machine credential nor an upstream bearer.
-  Build upstream requests from allowed fields with only the operator's own
-  DB-user token. Never act as an actor proxy or configure/use
-  `actor_proxy_bearer_token`. Never fabricate or forward `X-Memory-Actor-*` or
-  `X-Memory-Skip-Admission-Chain`, or forward browser-supplied `Authorization`.
-  The authenticated DB-user identity supplies real attribution and admission
-  context.
-- Reads also pass through the broker under the operator's credential. Send
-  explicit workspace/project pairs on project-scoped calls, preserve current
-  per-project access and ownership rules, and reauthorize each request. Drafts, caches, and
-  confirmations are isolated by operator, server, workspace, project, and path.
-  Changing account or scope must not expose another coordinate's state. Shared
-  pages remain shared; `author_id` must not become a page-read filter.
-- Honor projects' `open`/`restricted` modes and `read`/`write` grants (`write`
-  includes `read`) from the core [per-project access](users.md#per-project-access)
-  contract. An explicit request refused for a target or access level must
-  preserve the 403 response, never turn it into an empty result. Search, listings,
-  and graph reads retain the core's filtering of inaccessible projects.
+- use `/api/v1` for project lists, pages, recent pages, search, graph, briefing,
+  and overview data;
+- use the companion's own LLM provider for chat orchestration if it needs more
+  than raw page/search context.
 
-These requirements preserve `ScopeResolver`, `AuthLevel::authorize`, Wiki
-sanitization/admission/attribution, and the single-writer boundary. The companion
-may restrict its own targets further; UI filters never replace authorization.
+Write:
 
-### Proposed delivery sequence
+- browser requests go to the companion backend, not directly to ai-memory admin
+  routes;
+- the companion backend performs CSRF checks, user/session policy, rate limiting,
+  and confirmation state;
+- after approval, it calls ai-memory's existing write/delete surfaces with a
+  server-side token.
 
-Every stage below is proposed. A stage's unavailable prerequisites must be
-delivered and tested before that feature is enabled; this sequence defines no
-new shipped endpoint or wire field.
+Mutation flow:
 
-1. Read-only shell. Requires maintainer design evaluation and the proposed
-   client SDK with its two consumers. Deliver the browser boundary above and
-   browse the existing `/api/v1` and MCP reads. No wiki mutation is enabled.
-   Display explicit access refusals as 403, distinct from missing data.
-2. Draft, preview, and diff. Requires the shell and proposed bounded
-   retained-version reads. Keep a draft with its base revision, supported
-   metadata, and exact target. Render untrusted Markdown safely and show a
-   reproducible diff. There is no apply action; drafts never write to the wiki.
-   History must expose only eligible retained versions under current per-project access,
-   without recovering expired or purged content from Git.
-3. Confirmed conditional editing. Requires the proposed core patch and
-   compare-and-swap (CAS) seam. Confirmation binds the operator, target,
-   base revision, and exact patch/diff; a changed draft needs a new confirmation.
-   Preserve omitted metadata, distinguish explicit clears, and disallow editing
-   scope or authorship. Deletes remain disabled until the proposed conditional
-   delete seam has its own target/diff confirmation and tests.
-4. Graph and evidence views. Requires conditional editing and proposed
-   directed, bounded graph reads plus portable evidence. Show relation
-   direction, source revision, and evidence provenance from authorized data.
-   Authorize both ends and every hop; inaccessible nodes/edges cannot leak through
-   labels, counts, or expansion. ADR navigation follows the canonical reference.
-5. Attempts and procedure views. Requires conditional editing and proposed
-   attempt/result/revalidation/procedure contracts. Display incomplete
-   or failed attempts, result attribution, applicability, and missing evidence
-   explicitly. Narrated success is separate from a checker-verified result.
-   Procedure steps remain inspection-only. Split these views further if needed
-   to keep each implementation small.
+1. The LLM proposes a patch, create, or delete as a pending action.
+2. The UI shows an explicit diff and the target workspace/project/path.
+3. The user confirms or rejects the pending action.
+4. The companion re-reads the current page and verifies the expected base hash.
+5. The companion applies the write/delete through ai-memory's public mutation
+   path and records its own audit trail.
 
-### Confirmation and conflict handling
+### Safety requirements
 
-The proposed revision token must cover the latest version and editable stored
-metadata, so a metadata-only change also invalidates confirmation. Core must
-compare it in the writer transaction and coordinate disk divergence through the
-Wiki lock. A companion read followed by an unconditional write is insufficient;
-do not enable apply on servers lacking conditional writes. CAS does not promise
-coordination with arbitrary file editors that ignore the process's locking.
+- No auto-applied browser writes from an LLM response.
+- Deletes always require explicit confirmation.
+- Edits preserve existing metadata unless the user deliberately changes it.
+- Folder or search scope is a context limit, not a mutation boundary; the backend
+  must independently authorize the target page before applying a change.
+- If the UI advertises folder-scoped editing, the companion must enforce that
+  target paths stay inside the allowed folder or project on the server side.
+- The companion must not rely on cookie/basic auth to perform non-GET ai-memory
+  mutations from the browser. Use a server-side token and companion CSRF/session
+  protection.
+- In multi-user mode, `/admin/*` is root-only. A companion must either run with an
+  operator token or use MCP/tooling flows appropriate to the actor; it must not
+  assume normal user tokens can admin-write.
+- Propagate actor/author context where the public write surface supports it so
+  admission webhooks and audit stay meaningful.
+- Keep `/api/v1` read-only; do not ask core ai-memory to expose writable CORS
+  browser endpoints for this product.
 
-On a stale token, retain the draft and its base, fetch the currently authorized
-revision, and show the conflict. Reconcile explicitly and obtain a new
-confirmation; never retry as an unconditional overwrite. Admission remains in
-the normal Wiki path. Display transformed content and refusals according to the
-server's authoritative result. Webhook failures/timeouts follow the configured
-`failure_policy`: `reject` aborts the write, while `ignore` logs the failure and
-continues. Only report committed content after server confirmation. Direct
-admission does not create a pending approval; [auto-improvement pending
-writes](auto-improvement-loop.md#pending-review-ux) are a separate flow excluded
-from this MVP. Preserve drafts on rejection or uncertain delivery, and reconcile
-delivery status before retrying. Record operator, scope, base, confirmed diff,
-and outcome in the companion audit without retaining secrets.
+### Implementation plan
 
-### Required validation before implementation acceptance
+This plan is intentionally parked until the benefit is clearer.
 
-Each implementing change must add adversarial integration/browser tests with a
-legitimate control and prove failure with its guard removed. These are required
-tests, not coverage claimed by this documentation-only proposal:
+1. Build a read-only editor shell against `/api/v1` first.
+2. Add chat over selected page/search context, still read-only.
+3. Add pending edit proposals with diff preview, but no apply button.
+4. Add confirmed writes through the companion backend and ai-memory public write
+   endpoints.
+5. Add confirmed deletes last.
+6. Keep the built-in `/web` UI unchanged unless core ai-memory independently
+   needs a small read-only API enhancement.
 
-- XSS: hostile Markdown/HTML, link schemes, graph labels, and diffs cannot run
-  scripts or expose credentials; ordinary content still renders.
-- CSRF/session: missing or mismatched tokens, cross-origin requests, and expired
-  sessions cannot change drafts or apply edits; a valid same-session request can.
-- Two users/two projects: forged actor/skip headers, token identity mismatch,
-  root/proxy credentials, account switching, and foreign draft/version IDs fail
-  closed. Explicit restricted-project requests with insufficient or revoked
-  grants return 403; authorized shared-page reads and operator-attributed writes
-  succeed as controls.
-- Stale CAS: concurrent body or metadata changes refuse apply and preserve the
-  draft/current variant; an explicitly reconfirmed current revision succeeds.
-- Admission/recovery: transform, webhook failures/timeouts under both `reject`
-  and `ignore`, and interrupted writes keep truthful UI state and attribution.
-  Reject-policy failures leave the target unchanged; ignore-policy failures
-  allow the normal write. Prove core disk/SQL rollback and recovery, with an
-  admitted DB-user write as control. Direct-write tests must not expect pending
-  approval.
+### Appendix: browser constraints and prerequisites (not approved)
 
-The companion's standalone workspace needs its own fmt/clippy/tests plus real
-broker/browser checks against a temporary server. Implemented boundaries must
-be added to the [security inventory](security-boundaries.md) with enforcing code
-and guard-off evidence in the same change; proposed seams keep their own core
-regressions. Root workspace tests alone cannot validate the companion.
+These notes record constraints for a possible future design review. They do not
+approve the editor, an implementation sequence, or any new core interface. The
+undecided status, parked plan, concern about distracting from the automatic loop,
+and preference for a separate repository above remain unchanged.
+
+#### Browser constraints
+
+- Keep core `/web` and `/api/v1` read-only. Browser requests would go through the
+  companion's own backend, with its own login, session expiry/revocation, CSRF
+  protection, rate limits, confirmation state, and audit. Core human-auth cookies
+  do not establish a companion session.
+- Bind each authenticated browser operator to that operator's own DB-user API
+  token, held only on the backend. Refuse missing, mismatched, or revoked
+  credentials; never fall back to a shared credential. The browser receives no
+  upstream bearer. Secure provisioning and storage still need design review.
+- Exclude the shared static root token, `/admin/*` flows, and actor-proxy
+  credentials from this browser design. A DB-user token does not grant admin
+  access, including when the DB user has `role=root`. Do not forward
+  browser-supplied Authorization, actor, or skip-admission headers. These are
+  editor-specific constraints on the broader operator-token wording above.
+- Reads as well as any future writes must retain the operator's identity and
+  current project permissions. Use explicit workspace/project pairs, reauthorize
+  each request, and isolate drafts, caches, and confirmations by operator, server,
+  and target. UI filters cannot authorize a page; shared pages must not become
+  author-only reads. Preserve explicit access refusals rather than showing empty
+  results.
+- Safely render untrusted Markdown, links, and diffs. Any future mutation needs
+  confirmation bound to the operator, exact target, base revision, and proposed
+  change. No LLM response may apply a write automatically.
+
+#### Prerequisites requiring separate evaluation
+
+- A capability contract or shared client would need independent justification
+  from shipped callers, as discussed in PR #1058. This appendix neither requires
+  a particular SDK nor approves speculative endpoints or wire fields. A reported
+  capability would not replace authorization.
+- Conditional editing needs a safe core compare-and-write seam covering body
+  and editable metadata, coordinated with the normal Wiki and writer paths.
+  Re-reading a page and then writing unconditionally is insufficient. Without
+  that seam, applying edits must remain unavailable; stale revisions require a
+  fresh diff and confirmation. Conditional deletion needs its own evaluation.
+- Any retained-version or evidence reads need current access checks and bounded
+  retention semantics; they must not recover expired or purged content from Git.
+  No new history, graph, or procedure interface is approved here.
+- Mutations must retain sanitization, admission, attribution, and disk/SQL
+  recovery. Direct admission follows the configured failure policy; it is not
+  the automatic loop's separate pending-write approval flow. Uncertain delivery
+  must be reconciled before retrying or reporting success.
+- A future implementation would need adversarial browser and integration tests
+  for XSS, CSRF, identity/scope isolation, revoked access, stale revisions,
+  admission failures, and interrupted writes, with legitimate controls. These
+  are prerequisites, not tests or behavior supplied by this documentation.
 
 ## Two kinds of companion: data-seam vs. independent hook consumer
 
