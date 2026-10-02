@@ -122,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within one 10-second configuration budget, rechecking queue identity and
   schema version metadata before each attempt. Exhausted contention now asks
   callers to retry the same queue, preserving committed migrations and delivery
-  history. SQLite diagnostic causes were displayed once.
+  history. SQLite diagnostic causes were displayed once. (#1060)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
