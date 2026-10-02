@@ -19,6 +19,13 @@ use ai_memory_relay::identity::{self, InputEvent, ValidEvent};
 use ai_memory_relay::queue::Queue;
 use ai_memory_relay::relay::{self, FlushOptions};
 
+// Compile the same queue source with private test hooks; the shipped library
+// has no hook API. These hooks place a real SQLite holder at the WAL transition.
+use ai_memory_relay::fsguard;
+#[allow(dead_code)]
+#[path = "../src/queue.rs"]
+mod queue_under_test;
+
 // ---------------------------------------------------------------- fixtures
 
 /// A kept sandbox. The path is printed so a failure points at the evidence.
@@ -1480,6 +1487,398 @@ fn v1_migration_preserves_every_existing_value_and_concurrent_reopens() {
             .unwrap(),
         None
     );
+}
+
+#[test]
+fn journal_transition_retries_sqlite_lock_without_losing_v1_values() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("journal-transition");
+    let holder = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+    let before = snapshot(&holder);
+    let mut busy = 0;
+    let result = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_secs(10),
+        &mut |phase| match phase {
+            OpenPhase::BeforeJournal => holder.execute_batch("BEGIN IMMEDIATE;").unwrap(),
+            OpenPhase::JournalBusy => {
+                busy += 1;
+                holder.execute_batch("ROLLBACK;").unwrap();
+            }
+            _ => {}
+        },
+    );
+    assert_eq!(busy, 1, "the real holder must force SQLITE_BUSY");
+    let queue = result.unwrap();
+    assert_eq!(snapshot(&holder), before);
+    assert_eq!(queue.stats(200).unwrap().receipt_outcomes["unknown"], 1);
+    assert_eq!(
+        holder
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["relay.sqlite", "relay.sqlite-wal", "relay.sqlite-shm"] {
+            assert_eq!(
+                std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn a_foreign_identity_after_preflight_is_refused_without_mutation() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("foreign-after-preflight");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    let mut before = Vec::new();
+    let result = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_secs(10),
+        &mut |phase| {
+            if phase == OpenPhase::AfterPreflight {
+                holder
+                    .execute("UPDATE meta SET value='foreign' WHERE key='identity'", [])
+                    .unwrap();
+                before = std::fs::read(&path).unwrap();
+            }
+        },
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("not a usable relay queue"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    for name in fsguard::SIDECARS {
+        assert!(!dir.join(name).exists(), "foreign queue gained {name}");
+    }
+}
+
+#[test]
+fn journal_transition_has_one_bounded_wait_budget() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("journal-timeout");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    let before = snapshot(&holder);
+    let timeout = std::time::Duration::from_millis(40);
+    let start = std::time::Instant::now();
+    let mut busy = 0;
+    let error = queue_under_test::Queue::open_for_test(&dir, timeout, &mut |phase| match phase {
+        OpenPhase::BeforeJournal => holder.execute_batch("BEGIN IMMEDIATE;").unwrap(),
+        OpenPhase::JournalBusy => busy += 1,
+        _ => {}
+    })
+    .unwrap_err();
+    assert!(queue_under_test::is_lock_contention(&error), "{error:#}");
+    assert!(busy > 0);
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(snapshot(&holder), before);
+    assert_eq!(
+        holder
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    holder.execute_batch("ROLLBACK;").unwrap();
+    // The committed migration is usable after contention clears.
+    Queue::open(&dir).unwrap();
+}
+
+#[test]
+fn journal_reclassification_busy_preserves_committed_migration_and_retries_same_queue() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("exclusive-reclassification");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    let before = snapshot(&holder);
+    let mut committed = Vec::new();
+    let mut busy = 0;
+    let start = std::time::Instant::now();
+    let result = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_millis(40),
+        &mut |phase| match phase {
+            OpenPhase::BeforeJournal => {
+                assert_eq!(
+                    holder
+                        .query_row(
+                            "SELECT value FROM meta WHERE key='schema_version'",
+                            [],
+                            |r| r.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "2"
+                );
+                holder.prepare("SELECT outcome FROM receipt").unwrap();
+                committed = std::fs::read(&path).unwrap();
+                holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+            }
+            OpenPhase::JournalBusy => busy += 1,
+            _ => {}
+        },
+    );
+    let error = result.unwrap_err();
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(busy > 1, "one short budget must contain retries");
+    assert!(queue_under_test::is_lock_contention(&error));
+    let display = format!("{error:#}");
+    assert!(display.contains("queue busy"), "{display}");
+    assert!(
+        display.contains("retry opening the same queue"),
+        "{display}"
+    );
+    for misleading in [
+        "not a usable relay queue",
+        "nothing was modified",
+        "empty directory",
+        "restore",
+    ] {
+        assert!(!display.contains(misleading), "{display}");
+    }
+    let cause = error.downcast_ref::<rusqlite::Error>().unwrap().to_string();
+    assert_eq!(display.matches(&cause).count(), 1, "{display}");
+    assert!(std::fs::read(&path).unwrap() == committed);
+    assert_eq!(snapshot(&holder), before);
+    holder.execute_batch("ROLLBACK;").unwrap();
+    let queue = Queue::open(&dir).unwrap();
+    assert_eq!(queue.stats(200).unwrap().receipt_outcomes["unknown"], 1);
+    assert_eq!(snapshot(&holder), before);
+}
+
+#[test]
+fn classification_read_failures_display_the_sqlite_cause_once_and_preserve_foreign_bytes() {
+    for malformed_file in [false, true] {
+        let dir = if malformed_file {
+            let dir = fsguard::prepare_queue_dir(&queue_dir(&fixture("invalid-sqlite"))).unwrap();
+            let path = dir.join("relay.sqlite");
+            fsguard::create_private_file(&path).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"not a SQLite database")
+                .unwrap();
+            dir
+        } else {
+            let dir = v1_fixture("missing-meta");
+            let conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+            conn.execute_batch("DROP TABLE meta;").unwrap();
+            dir
+        };
+        let path = dir.join("relay.sqlite");
+        let before = std::fs::read(&path).unwrap();
+        let error = Queue::open(&dir).unwrap_err();
+        assert!(!queue_under_test::is_lock_contention(&error));
+        let display = format!("{error:#}");
+        assert!(display.contains("not a usable relay queue"), "{display}");
+        let cause = error.downcast_ref::<rusqlite::Error>().unwrap().to_string();
+        assert_eq!(display.matches(&cause).count(), 1, "{display}");
+        assert!(std::fs::read(&path).unwrap() == before);
+        for name in fsguard::SIDECARS {
+            assert!(!dir.join(name).exists());
+        }
+    }
+}
+
+#[test]
+fn a_foreign_database_with_a_writer_is_refused_before_write_coordination() {
+    let dir = v1_fixture("foreign-with-writer");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder
+        .execute_batch("UPDATE meta SET value='foreign' WHERE key='identity'; BEGIN IMMEDIATE;")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut reached_after_preflight = false;
+    let error = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_millis(40),
+        &mut |_| reached_after_preflight = true,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not a usable relay queue"),
+        "{error:#}"
+    );
+    assert!(!reached_after_preflight);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    holder.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn a_foreign_identity_during_journal_retry_is_refused_without_mutation() {
+    use queue_under_test::OpenPhase;
+    for begin in ["BEGIN IMMEDIATE;", "BEGIN EXCLUSIVE;"] {
+        let dir = v1_fixture("foreign-during-retry");
+        let path = dir.join("relay.sqlite");
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        let mut before = Vec::new();
+        let mut busy = 0;
+        let result = queue_under_test::Queue::open_for_test(
+            &dir,
+            std::time::Duration::from_secs(10),
+            &mut |phase| match phase {
+                OpenPhase::BeforeJournal => holder.execute_batch(begin).unwrap(),
+                OpenPhase::JournalBusy => {
+                    busy += 1;
+                    holder
+                        .execute_batch(
+                            "ROLLBACK; UPDATE meta SET value='foreign' WHERE key='identity';",
+                        )
+                        .unwrap();
+                    before = std::fs::read(&path).unwrap();
+                }
+                _ => {}
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("not a usable relay queue"));
+        assert!(!queue_under_test::is_lock_contention(&error));
+        assert_eq!(busy, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for name in fsguard::SIDECARS {
+            assert!(!dir.join(name).exists(), "foreign queue gained {name}");
+        }
+    }
+}
+
+#[test]
+fn only_sqlite_busy_and_locked_are_retryable() {
+    for (code, retry) in [
+        (5, true),
+        (6, true),
+        (517, true),
+        (262, true),
+        (1, false),
+        (8, false),
+        (11, false),
+        (17, false),
+        (26, false),
+    ] {
+        let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("database is locked".into()),
+        ))
+        .context("configure queue");
+        assert_eq!(
+            queue_under_test::is_lock_contention(&error),
+            retry,
+            "code {code}"
+        );
+    }
+    assert!(!queue_under_test::is_lock_contention(&anyhow::anyhow!(
+        "database is locked"
+    )));
+    assert!(!queue_under_test::is_lock_contention(
+        &rusqlite::Error::InvalidQuery.into()
+    ));
+}
+
+#[test]
+fn journal_retry_refuses_a_changed_version_or_empty_database_without_mutation() {
+    use queue_under_test::OpenPhase;
+    for mutation in [
+        "UPDATE meta SET value='1' WHERE key='schema_version';",
+        "DROP TABLE meta; DROP TABLE binding; DROP TABLE pending; DROP TABLE receipt; DROP TABLE session_agent;",
+    ] {
+        let dir = v1_fixture("changed-version-or-empty-db");
+        let path = dir.join("relay.sqlite");
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        let mut before = Vec::new();
+        let mut busy = 0;
+        let result = queue_under_test::Queue::open_for_test(
+            &dir,
+            std::time::Duration::from_secs(10),
+            &mut |phase| match phase {
+                OpenPhase::BeforeJournal => holder.execute_batch("BEGIN IMMEDIATE;").unwrap(),
+                OpenPhase::JournalBusy => {
+                    busy += 1;
+                    holder.execute_batch("ROLLBACK;").unwrap();
+                    holder.execute_batch(mutation).unwrap();
+                    before = std::fs::read(&path).unwrap();
+                }
+                _ => {}
+            },
+        );
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("changed before journal configuration")
+        );
+        assert_eq!(busy, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for name in fsguard::SIDECARS {
+            assert!(!dir.join(name).exists(), "changed queue gained {name}");
+        }
+    }
+}
+
+#[test]
+fn fresh_queue_init_and_v1_reopens_work_across_processes() {
+    for legacy in [false, true] {
+        let dir = if legacy {
+            v1_fixture("process-reopen")
+        } else {
+            fsguard::prepare_queue_dir(&queue_dir(&fixture("process-init"))).unwrap()
+        };
+        let before = legacy
+            .then(|| snapshot(&rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap()));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let mut command =
+                        std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory-relay"));
+                    if legacy {
+                        command.arg("status");
+                    } else {
+                        command.args([
+                            "init",
+                            "--server-url",
+                            "http://127.0.0.1:9/",
+                            "--producer",
+                            "example.runtime",
+                            "--actor",
+                            "operator-a",
+                            "--workspace",
+                            "team",
+                            "--project",
+                            "app",
+                        ]);
+                    }
+                    command.arg("--queue-dir").arg(dir);
+                    barrier.wait();
+                    command.output().unwrap()
+                })
+            })
+            .collect();
+        let outputs: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let queue = Queue::open(&dir).unwrap();
+        if let Some(before) = before {
+            assert_eq!(
+                snapshot(&rusqlite::Connection::open(queue.path()).unwrap()),
+                before
+            );
+        }
+        assert_eq!(queue.binding().unwrap().project, "app");
+    }
 }
 
 #[test]

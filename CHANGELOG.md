@@ -127,6 +127,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   labelled `nix` / `full-ci`. (#989)
 
 ### Fixed
+- Concurrent relay queue opens no longer report a locked queue as foreign:
+  journal setup now retries SQLite BUSY/LOCKED within one 10-second budget,
+  rechecking the queue's identity and schema version before each attempt.
+  (#1060)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
