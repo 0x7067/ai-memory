@@ -96,6 +96,9 @@ pub const DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS: usize = 5;
 pub const DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR: &str = "auto_improve";
 /// Default wiki-relative folder for pending proposal sidecar markdown.
 pub const DEFAULT_AUTO_IMPROVE_PENDING_PATH: &str = "_pending/auto-improve";
+/// Evidence label of the entry the eval gate adds to a passing proposal; its
+/// structured result attaches to this entry.
+const AUTO_IMPROVE_EVAL_EVIDENCE_PAGE: &str = "auto_improve_eval";
 
 /// Default target prefixes guarded by the optional external eval command.
 pub fn default_auto_improve_eval_targets() -> Vec<String> {
@@ -497,10 +500,11 @@ impl AutoImproveReport {
             result.status == EvalStatus::Success
                 && result.target_path == proposal.path
                 && result.after_body_sha256 == sha256_hex(proposal.body_markdown.as_bytes())
-        }) && let Some(entry) = evidence
-            .as_array_mut()
-            .and_then(|entries| entries.last_mut())
-        {
+        }) && let Some(entry) = evidence.as_array_mut().and_then(|entries| {
+            entries
+                .iter_mut()
+                .rfind(|entry| entry["page"] == AUTO_IMPROVE_EVAL_EVIDENCE_PAGE)
+        }) {
             entry["eval_result"] = serde_json::to_value(result)?;
         }
         Ok(evidence)
@@ -819,7 +823,7 @@ async fn apply_eval_gate_with_before_bodies(
                     result.status = EvalStatus::Success;
                     result.reason = outcome.reason.as_deref().map(sanitize_eval_reason);
                     proposal.evidence.push(AutoImproveEvidence {
-                        page: "auto_improve_eval".into(),
+                        page: AUTO_IMPROVE_EVAL_EVIDENCE_PAGE.into(),
                         quote: format_eval_evidence(&outcome, delta),
                     });
                     accepted.push(proposal);

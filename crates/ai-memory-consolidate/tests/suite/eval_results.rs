@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::{
-    AutoImproveEvalConfig, AutoImproveReport, AutoImproveReviewConfig, run_auto_improve_review,
+    AutoImproveEvalConfig, AutoImproveEvidence, AutoImproveReport, AutoImproveReviewConfig,
+    run_auto_improve_review,
 };
 
 struct ProposingLlm;
@@ -177,6 +178,17 @@ async fn eval_reason_is_sanitized_before_pending_storage_with_legitimate_control
                 .get("eval_result")
                 .is_none()
         );
+        // The result belongs to the checker's own evidence entry, wherever it
+        // sits, not to whichever entry happens to be last.
+        let mut reordered = candidate.clone();
+        reordered.evidence.push(AutoImproveEvidence {
+            page: "notes/later.md".into(),
+            quote: "later evidence".into(),
+        });
+        let evidence = report.proposal_evidence_json(&reordered).unwrap();
+        assert_eq!(evidence[1]["page"], "auto_improve_eval");
+        assert_eq!(evidence[1]["eval_result"], results[0]);
+        assert!(evidence[2].get("eval_result").is_none());
 
         let staged = store
             .writer
