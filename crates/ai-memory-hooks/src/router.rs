@@ -853,6 +853,20 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         }
+        // An event with no session id that is not a SessionStart can never be
+        // stored. Reporting it as failed made the drain retry it until its
+        // attempt budget ran out, stalling every item queued behind it (#1062),
+        // so it is acknowledged and dropped before it spends any capacity.
+        if resolve_session_id(&env).is_err() {
+            state.ingest_metrics.record_dropped_invalid();
+            warn!(
+                agent = %env.agent.as_str(),
+                event = ?env.event,
+                "hook batch item has no session id; dropped"
+            );
+            accepted_indices.push(idx);
+            continue;
+        }
         let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
             // The 429 rejects this item AND every item behind it, so count all
             // of them: on `/hook` one 429 is one shed event, and a batch that
@@ -7417,28 +7431,40 @@ mod tests {
         assert_eq!(ack["accepted_indices"], serde_json::json!([1]));
     }
 
+    /// The acknowledgement a drain charges after earlier rate-limited skips:
+    /// nothing committed, the empty index list kept explicit, and the failed
+    /// item named so the drain charges it rather than the first unaccepted one.
+    #[test]
+    fn hook_batch_ack_names_the_failed_item_after_skips() {
+        let ack = serde_json::to_value(HookBatchAck::indexed_failed(Vec::new(), 1)).unwrap();
+        assert_eq!(ack["accepted"], 0);
+        assert_eq!(ack["accepted_indices"], serde_json::json!([]));
+        assert_eq!(ack["failed_index"], 1);
+    }
+
+    /// #1062: a session-less event (not a SessionStart) can never be stored.
+    /// Failing it made the drain retry it ahead of every valid event queued
+    /// behind it, so it is acknowledged, counted, and dropped instead.
     #[tokio::test]
-    async fn handle_hook_batch_reports_failed_index_after_rate_limited_skip() {
+    async fn handle_hook_batch_drops_a_session_less_item_and_keeps_draining() {
         let tmp = TempDir::new().unwrap();
-        let mut state = make_state(&tmp).await;
-        let mut limiter = IngestRateLimiter::new(0.001, 1.0);
-        assert!(limiter.try_take("u:\ns:flooder", std::time::Instant::now()));
-        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(limiter));
+        let state = Arc::new(make_state(&tmp).await);
+        let metrics = state.ingest_metrics.clone();
 
         let response = handle_hook_batch(
-            State(Arc::new(state)),
+            State(state.clone()),
             None,
             None,
             None,
             HeaderMap::new(),
             Json(vec![
                 HookBatchItem {
-                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
-                    body: serde_json::json!({ "session_id": "flooder" }),
+                    url: "http://h/hook?event=post-tool-use&agent=hermes".into(),
+                    body: serde_json::json!({ "tool_name": "Read" }),
                 },
                 HookBatchItem {
                     url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
-                    body: serde_json::json!({ "prompt": "missing session fails" }),
+                    body: serde_json::json!({ "session_id": "behind-it", "prompt": "valid" }),
                 },
             ]),
         )
@@ -7449,9 +7475,56 @@ mod tests {
             .await
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(ack["accepted"], 0);
-        assert_eq!(ack["accepted_indices"], serde_json::json!([]));
-        assert_eq!(ack["failed_index"], 1);
+        assert_eq!(ack["accepted"], 2, "both items leave the spool");
+        assert!(ack.get("failed_index").is_none() || ack["failed_index"].is_null());
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_invalid, 1);
+        assert_eq!(snap.accepted, 1, "only the valid item spends capacity");
+        assert!(
+            state
+                .reader
+                .session_project_ids(SessionId::from_native("behind-it"))
+                .await
+                .unwrap()
+                .is_some(),
+            "the valid item behind the dropped one is stored"
+        );
+    }
+
+    /// Control: a SessionStart without a session id is still processed (the
+    /// server mints one), so it is never counted as an invalid drop.
+    #[tokio::test]
+    async fn handle_hook_batch_still_processes_a_session_less_session_start() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let metrics = state.ingest_metrics.clone();
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                body: serde_json::json!({}),
+            }]),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 1);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_invalid, 0);
+        assert_eq!(snap.accepted, 1);
+        assert!(
+            snap.last_persisted_ms.is_some(),
+            "it went through the writer"
+        );
     }
 
     #[tokio::test]

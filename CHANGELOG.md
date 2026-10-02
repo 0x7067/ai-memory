@@ -101,6 +101,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default `127.0.0.1:49374`). The menu extra now surfaces the server's fatal
   `stderr.log` line, and `docs/macos.md` documents the port collision and how to
   move one side. (#1044)
+- Fixed hook-spool drains stalling behind an event that has no session id.
+  `/hook/batch` reported such an event (anything but a session start) as a
+  failed item, so the drain retried it up to its attempt budget while every
+  event queued behind it waited. The server now acknowledges and drops it,
+  counted as `dropped_invalid` in the ingest metrics, and keeps processing the
+  rest of the batch. (#1062)
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a
