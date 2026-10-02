@@ -101,10 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The instructions now open with a self-contained core under that cap, and a
   regression test keeps it there. (#1035)
 - Fixed the macOS menu-bar app showing only a red status item when the bundled
-  server cannot start (for example a port already in use, such as OpenCode v2's
-  default `127.0.0.1:49374`). The menu extra now surfaces the server's fatal
-  `stderr.log` line, and `docs/macos.md` documents the port collision and how to
-  move one side. (#1044)
+  server cannot start (for example a port already in use; #1044 reports OpenCode
+  v2's background service on `127.0.0.1:49374`). The menu extra now surfaces a
+  fatal `stderr.log` line written since the last start, and `docs/macos.md`
+  documents the port collision and how to move one side. (#1044)
 - Fixed hook-spool drains stalling behind an event that has no session id.
   `/hook/batch` reported such an event (anything but a session start) as a
   failed item, so the drain retried it up to its attempt budget while every
