@@ -1037,23 +1037,18 @@ mod tests {
                 .all(|l| l.workspace.as_deref() == Some(DEFAULT_WORKSPACE_NAME)),
             "project-only _global must name the default workspace: {links:?}"
         );
-        assert!(
-            pinned
-                .iter()
-                .any(|l| l.path.as_str() == "python-env.md")
-        );
-        assert!(
-            pinned
-                .iter()
-                .any(|l| l.path.as_str() == "local-machine.md")
-        );
+        assert!(pinned.iter().any(|l| l.path.as_str() == "python-env.md"));
+        assert!(pinned.iter().any(|l| l.path.as_str() == "local-machine.md"));
 
         let sibling = extract_links("[[infra:runbooks/02.md]]", &page());
         let l = sibling
             .iter()
             .find(|l| l.is_cross_project())
             .expect("infra");
-        assert_eq!(l.workspace, None, "non-global project-only stays source-workspace");
+        assert_eq!(
+            l.workspace, None,
+            "non-global project-only stays source-workspace"
+        );
         assert_eq!(l.project.as_deref(), Some("infra"));
 
         let explicit = extract_links("[[other/_global:notes/x.md]]", &page());

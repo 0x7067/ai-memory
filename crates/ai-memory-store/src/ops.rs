@@ -10929,7 +10929,12 @@ pub(crate) mod tests {
         let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
         let other_proj = get_or_create_project(&mut conn, &other_ws, "embodied-ai", None).unwrap();
 
-        let mut source = page(other_ws, other_proj, "notes/here.md", "see the standing rule");
+        let mut source = page(
+            other_ws,
+            other_proj,
+            "notes/here.md",
+            "see the standing rule",
+        );
         source.links = vec![LinkTarget {
             workspace: None,
             project: Some(ai_memory_core::GLOBAL_SCOPE_PROJECT.into()),
@@ -11057,7 +11062,10 @@ pub(crate) mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(to_workspace, None, "non-global project-only stays NULL workspace");
+        assert_eq!(
+            to_workspace, None,
+            "non-global project-only stays NULL workspace"
+        );
         assert_eq!(resolved.as_deref(), Some(&target_id.as_bytes()[..]));
     }
 
