@@ -119,6 +119,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or distinct extensions, including backfill).
   Mixed-source counts preserve scope, session ownership and time-window filters;
   older servers leave unsupported fields unknown. (#1016)
+- Added Portuguese history phrases to the existing opt-in session-recall
+  router (`[retrieval] query_intent`), including accented and unaccented spellings of
+  "última sessão", "onde paramos ontem", and "decisão anterior". Word
+  boundaries and explicit history phrases keep technical session queries
+  unchanged; routing remains off by default. (#1056)
 
 ### Changed
 - Restricted managed-workstream provenance to scrubbed source labels and an

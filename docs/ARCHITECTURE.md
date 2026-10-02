@@ -871,8 +871,8 @@ enabled = false                  # true: skip low-information session pages from
 
 [retrieval]                       # opt-in ranking signals; all off by default
 query_intent = false              # lexical session-recall routing: queries phrased as
-                                  # "上次 / …的会话 / last time / yesterday" hand session
-                                  # pages back their default kind/tier authority penalty
+                                  # "上次 / …的会话 / last time / yesterday / última sessão"
+                                  # hand session pages back their default kind/tier authority penalty
 session_recall_bonus = 0.25       # extra authority on top of the cancelled penalty;
                                   # lower it (e.g. 0.15) if rank drift on
                                   # "之前/上次"-prefixed fact queries matters more
@@ -954,6 +954,16 @@ idle_window_secs = 300            # operator must be quiet this long before a ru
 # max_clusters_per_run = 8        # bounded fan-out per run (invariant #5; 0 ⇒ default 8)
 # min_cold_pages = 2             # events-accrued gate: skip a run below this many cold pages
 ```
+
+The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese
+history phrases: "o que fizemos na última sessão", "onde paramos ontem", and
+"lembre a decisão anterior", plus "sessão anterior".
+Accented and unaccented spellings are accepted, including "ultima sessao" and
+"decisao anterior". Latin markers match whole words. Technical queries such as
+"erro na sessão do usuário", "sessão expira", "antes de salvar", and bare
+"sessão" or "antes" do not trigger routing. It remains off by default; enabling
+it reuses the existing session authority adjustment without changing FTS
+stopwords or adding a ranking signal.
 
 **LLM provider env** (opt-in):
 ```
