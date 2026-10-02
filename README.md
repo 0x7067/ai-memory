@@ -136,6 +136,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Zed | MCP-only |
 | Muse Code | MCP-only |
 | Hermes Agent | Supported |
+| GrizzyBot | Supported |
 | LLM/auth providers | Supported |
 | Embedding providers | Supported |
 

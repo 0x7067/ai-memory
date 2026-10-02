@@ -725,6 +725,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Hermes
             | AgentKind::Pool
             | AgentKind::Zcode
+            | AgentKind::Grizzybot
     )
 }
 
@@ -2090,6 +2091,30 @@ mod tests {
         assert_eq!(env.session_id.as_deref(), Some("sess_4fc06da3"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/zcode-capture"));
         assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+    }
+
+    #[test]
+    fn grizzybot_tool_title_is_a_closed_family() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write_file",
+            "tool_input": {"path": "notes.md", "content": "untrusted"},
+            "tool_response": "ok",
+            "session_id": "gb-session",
+            "cwd": "/bot/home"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("grizzybot".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Grizzybot);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("gb-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
     }
 
     /// Body is well-formed JSON but the expected `session_id` /
