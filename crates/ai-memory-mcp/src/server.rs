@@ -1557,6 +1557,9 @@ struct DeletePageArgs {
     workspace: Option<String>,
 }
 
+/// Write one durable wiki page. Optional metadata (`kind`, `entities`,
+/// `abstract`, `relations`) replaces the page's previous metadata; omitted
+/// fields are cleared, not inherited.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct WritePageArgs {
     #[serde(flatten)]
@@ -11821,6 +11824,17 @@ mod tests {
             assert!(!required.iter().any(|v| v == field), "{field}");
         }
         assert!(schema["properties"].get("metadata").is_none());
+        // The flattened core type's internal docs must not become the tool's
+        // top-level description that every MCP client reads.
+        let description = schema["description"].as_str().unwrap_or_default();
+        for internal in [
+            "legacy adapter",
+            "Admin consumes",
+            "public page-write surfaces",
+        ] {
+            assert!(!description.contains(internal), "{description}");
+        }
+        assert_ne!(schema["title"], "PageWriteMetadata");
     }
 
     #[tokio::test]
