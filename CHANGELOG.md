@@ -130,7 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed watcher reindexing racing with writes and batches to the same page by
   sharing their per-page mutex from disk read through SQLite upsert. Both
   mutation guards were released before embedding; external editors remained
-  outside this coordination.
+  outside this coordination. (#1059)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
