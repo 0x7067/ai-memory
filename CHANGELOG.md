@@ -118,6 +118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- Made concurrent relay queue opens retry SQLite BUSY/LOCKED during WAL setup
+  within one 10-second configuration budget, rechecking queue identity and
+  schema version metadata before each attempt. Exhausted contention now asks
+  callers to retry the same queue, preserving committed migrations and delivery
+  history. SQLite diagnostic causes were displayed once.
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
