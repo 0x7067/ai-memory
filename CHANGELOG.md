@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `grizzybot` as a recognised agent (wire value `grizzybot`, alias
   `grizzy-bot`), so GrizzyBot's lifecycle events are attributed to it instead
   of `other` and its tool calls are captured as closed-schema tool families,
-  like other Claude Code-shaped agents. Adds migration V72 to extend the
-  `sessions.agent_kind` CHECK constraint.
+  like other Claude Code-shaped agents. GrizzyBot posts to `/hook` and
+  `/mcp` itself, so there is nothing to install. Adds migration V72 to extend
+  the `sessions.agent_kind` CHECK constraint. (#1036)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
