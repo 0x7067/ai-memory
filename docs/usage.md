@@ -221,14 +221,6 @@ Markdown (`reindex` requires a clean derived database). `explain: true` exposes
 and the entity RRF contribution. Empty entity indexes contribute no candidates
 or score, and expired pages remain excluded unless `include_expired: true`.
 
-Watcher reindexing shares the per-page mutex used by writes and batches on the
-same Wiki handle and its clones. It waits before reading the file, holds that
-mutex through the SQLite upsert, and releases both page and global mutation
-guards before embedding. Different paths can proceed concurrently, and the
-watcher never rewrites the page. External editors and independently constructed
-Wiki handles do not take these locks; external edits can still race with a
-server write or reindex.
-
 ## Install the routing snippet and Agent Skills
 
 From an agent, say:
@@ -493,6 +485,14 @@ docker cp ai-memory:/data/wiki ./my-ai-memory-wiki
 # Time-travel:
 docker exec ai-memory git -C /data/wiki log --oneline
 ```
+
+Watcher reindexing shares the per-page mutex used by writes and batches on the
+same Wiki handle and its clones. It waits before reading the file, holds that
+mutex through the SQLite upsert, and releases both page and global mutation
+guards before embedding. Different paths can proceed concurrently, and the
+watcher never rewrites the page. External editors and independently constructed
+Wiki handles do not take these locks; external edits can still race with a
+server write or reindex.
 
 ## Move a session to another project
 
