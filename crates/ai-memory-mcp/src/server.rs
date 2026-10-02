@@ -3701,7 +3701,8 @@ impl AiMemoryServer {
                 title: p.title.clone(),
                 confidence: f64::from(p.confidence),
                 rationale: p.rationale.clone(),
-                evidence_json: serde_json::to_value(&p.evidence)
+                evidence_json: report
+                    .proposal_evidence_json(p)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?,
                 body_markdown: p.body_markdown.clone(),
                 artifact_sha256: None,
@@ -3743,6 +3744,7 @@ impl AiMemoryServer {
                         "max_rule_page_tokens": cfg.max_rule_page_tokens,
                         "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
                         "eval": cfg.eval,
+                        "eval_results": report.eval_results(),
                     }),
                     proposal_actor: ai_memory_core::ActorContext {
                         agent: Some(cfg.proposal_actor.clone()),
