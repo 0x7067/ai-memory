@@ -16,14 +16,14 @@ use ai_memory_workstream::{
     JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode, LaunchPlan,
     LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
-    discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
-    inspect_repository, jail_checklist, jail_toggle, kiro_explicit_session_id,
-    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    marked_choices, native_session_exists, native_session_in_checkout, omp_profile_flag,
-    omp_profile_flag_env, parse_jail_toggles, store_override_vars, usable_ai_jail_here,
-    wait_for_transcript_flush,
+    build_launch_plan, build_launch_plan_with_env, claude_attached_background_session,
+    crush_global_config_path, discover_native_session, export_transcript,
+    has_native_session_selector, inside_ai_jail_here, inspect_repository, jail_checklist,
+    jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
+    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
+    kiro_v3_resume_uses_default_store, list_native_sessions, marked_choices, native_session_exists,
+    native_session_in_checkout, omp_profile_flag, omp_profile_flag_env, parse_jail_toggles,
+    store_override_vars, usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -1386,6 +1386,47 @@ fn own_native_session(
     Ok(in_checkout.then(|| linked.to_string()))
 }
 
+/// A Claude session that attached to a background session (`/resume` on one
+/// the Claude Code daemon hosts) went on in that session's transcript, so the
+/// workstream follows it. Otherwise the next launch resumes the foreground
+/// session, which holds none of the conversation.
+fn follow_claude_background_session(
+    plan: &LaunchPlan,
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    own: String,
+    started_at: SystemTime,
+) -> String {
+    if harness != ManagedHarness::Claude {
+        return own;
+    }
+    match claude_attached_background_session(
+        home,
+        cwd,
+        plan.session_dir.as_deref(),
+        &own,
+        started_at,
+    ) {
+        Ok(Some(background)) => {
+            eprintln!(
+                "ai-memory: Claude session {} continued in background session {}; the workstream now follows it",
+                display_session_id(&own),
+                display_session_id(&background)
+            );
+            background
+        }
+        Ok(None) => own,
+        Err(error) => {
+            eprintln!(
+                "ai-memory: could not check whether Claude session {} moved to a background session ({error}); keeping it",
+                display_session_id(&own)
+            );
+            own
+        }
+    }
+}
+
 async fn resolve_native_session_after_run(
     plan: &LaunchPlan,
     harness: ManagedHarness,
@@ -1398,7 +1439,9 @@ async fn resolve_native_session_after_run(
         return Ok(None);
     }
     if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status) {
-        return Ok(Some(own));
+        return Ok(Some(follow_claude_background_session(
+            plan, harness, home, cwd, own, started_at,
+        )));
     }
     let linked = server_status
         .filter(|status| status.native_session_linked)
@@ -4325,6 +4368,58 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
+    }
+
+    #[tokio::test]
+    async fn a_claude_run_that_attached_to_a_background_session_follows_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let project = temp.path().join(".claude/projects/-repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - std::time::Duration::from_secs(60);
+        let record = |session: &str, kind: Option<&str>| {
+            let mut value = serde_json::json!({
+                "type": "user",
+                "sessionId": session,
+                "session_id": "fg",
+                "cwd": cwd,
+            });
+            if let Some(kind) = kind {
+                value["sessionKind"] = serde_json::json!(kind);
+            }
+            format!("{value}\n")
+        };
+        std::fs::write(project.join("fg.jsonl"), record("fg", None)).unwrap();
+        let mut plan =
+            build_launch_plan(ManagedHarness::Claude, None, Vec::new(), Some("fg")).unwrap();
+        // CLAUDE_CONFIG_DIR in the developer's environment would point the
+        // scan away from the transcripts planted under `temp`.
+        plan.session_dir = None;
+        assert_eq!(plan.expected_session_id.as_deref(), Some("fg"));
+        let resolve = |plan: &LaunchPlan| {
+            let plan = plan.clone();
+            let home = temp.path().to_path_buf();
+            let cwd = cwd.clone();
+            async move {
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Claude,
+                    &home,
+                    &cwd,
+                    started_at,
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(resolve(&plan).await.as_deref(), Some("fg"));
+
+        // `/resume` on a daemon-hosted session: the conversation continues in
+        // that transcript, so the workstream must not stay on "fg".
+        std::fs::write(project.join("bg.jsonl"), record("bg", Some("bg"))).unwrap();
+        assert_eq!(resolve(&plan).await.as_deref(), Some("bg"));
     }
 
     /// A session linked during the run was reported by this run's child, so

@@ -419,6 +419,17 @@ Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
 
+Claude Code background sessions run inside the Claude Code daemon, not in the
+process `ai-memory run` spawned, so their hooks never carry the run's id. When a
+managed Claude session attaches to one (`/resume` on a session shown as
+"running in the background"), the conversation goes on in the background
+session's transcript. At the end of the run, ai-memory looks for a transcript
+written during the run whose `sessionKind: "bg"` records name the run's own
+session as the attached client and this checkout as `cwd`, and finishes the run
+on that background session, so the next launch resumes it instead of the empty
+foreground session. A background session attached by another launch is never
+taken. (#1050)
+
 Crush has no hooks to link its session: a fresh Crush launch claims the one top-level session
 created while it ran (its title and sub-agent sessions do not count), and
 imports nothing, with a warning, when another launch on the same store created
