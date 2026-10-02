@@ -22,7 +22,7 @@ use ai_memory_core::{
     SessionId, Tier,
 };
 use ai_memory_llm::{Embedder, SyntheticEmbedder};
-use ai_memory_store::Store;
+use ai_memory_store::{RetrievalTuning, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use tempfile::TempDir;
 
@@ -105,6 +105,124 @@ const PROBES: &[(&str, &str)] = &[
 ];
 
 const RECALL_FLOOR: f64 = 0.70;
+
+#[tokio::test]
+async fn portuguese_session_recall_is_opt_in_and_preserves_fact_queries() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mut store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "eval", None)
+        .await
+        .expect("proj");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+    // Identical searchable content isolates the existing session authority
+    // penalty and its opt-in cancellation from differences in FTS matches.
+    let body = "Na última sessão fizemos a busca SQLite. Ontem paramos na revisão. \
+                A decisão anterior tratou do histórico. \
+                Erro na sessão do usuário: a sessão expira antes de salvar. \
+                A sessão passada para o middleware é nula; sessao passada como parametro.";
+    for (path, tier, kind) in [
+        ("notes/recall.md", Tier::Semantic, "note"),
+        ("sessions/recall.md", Tier::Episodic, "session"),
+    ] {
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).expect("path"),
+            frontmatter: serde_json::json!({"title": "Busca e sessões", "kind": kind}),
+            body: body.into(),
+            tier,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .expect("write page");
+    }
+
+    let probes = [
+        ("o que fizemos na última sessão", true),
+        ("o que fizemos na ultima sessao", true),
+        ("o que fizemos na última sessao", true),
+        ("o que fizemos na ultima sessão", true),
+        ("ONDE PARAMOS ONTEM?", true),
+        ("lembre a decisão anterior", true),
+        ("lembre a decisao anterior", true),
+        ("erro na sessão do usuário", false),
+        ("erro na sessao do usuario", false),
+        ("a sessão passada para o middleware é nula", false),
+        ("sessao passada como parametro", false),
+        ("sessão expira", false),
+        ("sessao expira", false),
+        ("antes de salvar", false),
+        ("sessão", false),
+        ("sessao", false),
+        ("antes", false),
+        ("penúltima sessão", false),
+        ("decisão anteriormente tomada", false),
+    ];
+    for (query, historical) in probes {
+        let mut baseline = Vec::new();
+        for mode in 0..3 {
+            store.reader.set_retrieval_tuning(if mode == 0 {
+                RetrievalTuning::default()
+            } else {
+                RetrievalTuning {
+                    session_recall_routing: mode == 2,
+                    session_recall_bonus: 0.15,
+                    ..RetrievalTuning::default()
+                }
+            });
+            let hits = store
+                .reader
+                .hybrid_search_explained(
+                    ws,
+                    proj,
+                    query.into(),
+                    None,
+                    String::new(),
+                    String::new(),
+                    0,
+                    5,
+                    None,
+                    false,
+                )
+                .await
+                .expect("search");
+            assert_eq!(hits.len(), 2, "query={query:?}, mode={mode}");
+            let ranking: Vec<_> = hits.iter().map(|(hit, _)| (hit.id, hit.rank)).collect();
+            if mode == 0 {
+                baseline = ranking;
+                assert_eq!(hits[0].0.path.as_str(), "notes/recall.md", "{query}");
+            } else if mode == 1 || !historical {
+                assert_eq!(ranking, baseline, "query={query:?}, mode={mode}");
+            } else {
+                assert_eq!(hits[0].0.path.as_str(), "sessions/recall.md", "{query}");
+                assert!(hits[0].1.intent_boost.expect("recall boost") > 1.0);
+            }
+            for (_, explain) in &hits {
+                let expected = (mode == 2 && historical).then_some("session_recall");
+                assert_eq!(explain.intent, expected, "query={query:?}, mode={mode}");
+                if expected.is_none() {
+                    assert_eq!(explain.intent_boost, None, "{query}");
+                }
+            }
+        }
+    }
+    eprintln!(
+        "portuguese_session_recall: {} probes checked off/on",
+        probes.len()
+    );
+}
 
 #[tokio::test]
 async fn recall_at_5_baseline() {
