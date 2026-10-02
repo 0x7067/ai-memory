@@ -91,6 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error naming both stores and keeps the workstream link, where it used to
   start fresh and repoint the workstream. `--fresh` still starts a new session.
   (#1047)
+- Fixed Claude Code sessions never seeing the "broaden when the current project
+  comes up empty" and "maintained pages are evidence, not authority" rules,
+  because Claude Code truncates MCP server instructions at 2,048 characters.
+  The instructions now open with a self-contained core under that cap, and a
+  regression test keeps it there. (#1035)
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a
