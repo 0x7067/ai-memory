@@ -81,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+- Fixed `continue`, `resume` and bare `ai-memory run` losing sessions launched
+  under a custom native store, such as a second Claude Code config home set
+  with `CLAUDE_CONFIG_DIR`. Automatic harness selection now scans the store the
+  launch resolves (`--env`, then the process environment) instead of always the
+  default one. The client records the store of every session it links, at
+  launch or when the run finishes, in `client-projects.json`. A later launch
+  that cannot find that session and resolves a different store now stops with
+  an error naming both stores and keeps the workstream link, where it used to
+  start fresh and repoint the workstream. `--fresh` still starts a new session.
+  (#1047)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added

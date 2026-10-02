@@ -3490,6 +3490,16 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
     }
 }
 
+/// The primary native store root a launch reads: `session_dir` when an
+/// override resolved one, otherwise the harness default under `home`.
+pub fn native_store_root(
+    harness: ManagedHarness,
+    home: &Path,
+    session_dir: Option<&Path>,
+) -> PathBuf {
+    session_root(harness, home, session_dir)
+}
+
 /// Kiro CLI 2.16.2 honored `KIRO_HOME` for its v2 store but wrote v3 sessions
 /// to the default home during acceptance. Scan the configured root first and
 /// the default root as a compatibility fallback; every result still passes

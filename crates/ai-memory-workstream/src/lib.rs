@@ -25,5 +25,6 @@ pub use transcript::{
     AmbiguousNativeSession, ExportedTranscript, NativeSessionCandidate,
     claude_attached_background_session, discover_native_session, export_transcript,
     kiro_harness_from_source_cursor, kiro_v3_resume_uses_default_store, list_native_sessions,
-    native_session_exists, native_session_in_checkout, wait_for_transcript_flush,
+    native_session_exists, native_session_in_checkout, native_store_root,
+    wait_for_transcript_flush,
 };
