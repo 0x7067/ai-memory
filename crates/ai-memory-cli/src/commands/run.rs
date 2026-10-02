@@ -16,14 +16,14 @@ use ai_memory_workstream::{
     JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode, LaunchPlan,
     LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
+    build_launch_plan, build_launch_plan_with_env, clean_path, crush_global_config_path,
     discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
     inspect_repository, jail_checklist, jail_toggle, kiro_explicit_session_id,
     kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
     kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    marked_choices, native_session_exists, native_session_in_checkout, omp_profile_flag,
-    omp_profile_flag_env, parse_jail_toggles, store_override_vars, usable_ai_jail_here,
-    wait_for_transcript_flush,
+    marked_choices, native_session_exists, native_session_in_checkout, native_store_root,
+    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, store_override_vars,
+    usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -153,7 +153,7 @@ pub(super) async fn run_from_with_wiring(
     }
     let auto_candidates = if automatic_harness {
         filter_usable_auto_sessions(
-            list_auto_sessions(&home, &repository.cwd).await?,
+            list_auto_sessions(&home, &repository.cwd, &run_env).await?,
             |harness| executable_available(OsStr::new(harness.executable())),
         )?
     } else {
@@ -334,6 +334,22 @@ pub(super) async fn run_from_with_wiring(
         &run_env,
     ));
     if let Some(orphaned_session) = orphaned_session {
+        let recorded = super::project_registry::recorded_session_store(
+            config,
+            &endpoint,
+            harness.as_str(),
+            &orphaned_session,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted"
+            );
+            None
+        });
+        let current = effective_store(harness, &home, &repository.cwd, plan.session_dir.as_deref());
+        if let Some(error) = store_mismatch_error(harness, &orphaned_session, recorded, &current) {
+            acquired_try!(Err(error));
+        }
         eprintln!(
             "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
             harness.as_str(),
@@ -498,6 +514,17 @@ pub(super) async fn run_from_with_wiring(
         }
         super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &wire_env);
     }
+    // A Kiro v3 resume that dropped `KIRO_HOME` runs against the default store.
+    let linked_store = effective_store(
+        harness,
+        &home,
+        &repository.cwd,
+        if remove_kiro_home {
+            None
+        } else {
+            plan.session_dir.as_deref()
+        },
+    );
     if plan.mode == LaunchMode::Session
         && let Some(native_session_id) = &plan.expected_session_id
     {
@@ -512,6 +539,7 @@ pub(super) async fn run_from_with_wiring(
             .await
             .context("linking the managed native session; the agent was not started")
         );
+        remember_session_store(config, &endpoint, harness, native_session_id, &linked_store);
     }
 
     let crush_context = if harness == ManagedHarness::Crush && plan.mode == LaunchMode::Session {
@@ -722,6 +750,14 @@ pub(super) async fn run_from_with_wiring(
         .await
     );
 
+    // Sessions whose id was unknown at launch (a fresh Codex session, say) are
+    // linked by the finish request above, so record their store here.
+    if plan.mode == LaunchMode::Session
+        && let Some(native_session_id) = native_session_id.as_deref()
+        && plan.expected_session_id.as_deref() != Some(native_session_id)
+    {
+        remember_session_store(config, &endpoint, harness, native_session_id, &linked_store);
+    }
     if plan.mode == LaunchMode::Session
         && prepared.sync_through > prepared.sync_after
         && !server_status.is_some_and(|status| status.context_delivered)
@@ -1434,11 +1470,26 @@ async fn resolve_native_session_after_run(
     }))
 }
 
-async fn list_auto_sessions(home: &Path, cwd: &Path) -> Result<Vec<AutoSessionCandidate>> {
+async fn list_auto_sessions(
+    home: &Path,
+    cwd: &Path,
+    env_overrides: &[(String, String)],
+) -> Result<Vec<AutoSessionCandidate>> {
     let mut found = Vec::new();
     let mut failures = Vec::new();
     for harness in AUTO_HARNESSES {
-        match list_native_sessions(harness, home, cwd, None, 1).await {
+        // Scan the store the launch would resume from. With a custom
+        // `CLAUDE_CONFIG_DIR` (or another store override) the default store
+        // holds none of this checkout's sessions, so scanning it either finds
+        // nothing or picks a session the launched harness cannot see.
+        let session_dir = match auto_session_dir(harness, home, cwd, env_overrides) {
+            Ok(session_dir) => session_dir,
+            Err(error) => {
+                failures.push(format!("{}: {error}", harness.as_str()));
+                continue;
+            }
+        };
+        match list_native_sessions(harness, home, cwd, session_dir.as_deref(), 1).await {
             Ok(candidates) => found.extend(
                 candidates
                     .into_iter()
@@ -1464,6 +1515,25 @@ async fn list_auto_sessions(home: &Path, cwd: &Path) -> Result<Vec<AutoSessionCa
             .then_with(|| left.harness.as_str().cmp(right.harness.as_str()))
     });
     Ok(found)
+}
+
+/// The native store a bare launch of `harness` resolves, the same way the
+/// launch plan does: `--env`/`--env-file` first, then the process environment.
+fn auto_session_dir(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    env_overrides: &[(String, String)],
+) -> Result<Option<PathBuf>> {
+    Ok(build_launch_plan_with_env(
+        harness,
+        None,
+        Vec::new(),
+        None,
+        env_overrides,
+        Some(LaunchRoots { home, cwd }),
+    )?
+    .session_dir)
 }
 
 fn unique_auto_agents(candidates: &[AutoSessionCandidate]) -> Vec<AgentKind> {
@@ -1782,6 +1852,103 @@ fn build_preflighted_launch_plan(
             Ok((plan, None))
         }
     }
+}
+
+/// The store a launch reads, absolute and normalized so the default store and
+/// an override spelling the same directory (relative, trailing slash,
+/// symlinked) compare equal. A relative override resolves against the checkout,
+/// where the harness runs.
+fn effective_store(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> PathBuf {
+    let root = native_store_root(harness, home, session_dir);
+    let absolute = if root.is_absolute() {
+        root
+    } else {
+        cwd.join(root)
+    };
+    std::fs::canonicalize(&absolute).unwrap_or_else(|_| canonical_prefix(&clean_path(&absolute)))
+}
+
+/// Canonicalize the deepest existing ancestor and keep the missing tail, so a
+/// store that does not exist yet still compares equal to the same directory
+/// once it does (on macOS, `/var` vs `/private/var`).
+fn canonical_prefix(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+fn remember_session_store(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    store: &Path,
+) {
+    if let Err(error) = super::project_registry::record_session_store(
+        config,
+        endpoint,
+        harness.as_str(),
+        native_session_id,
+        store,
+    ) {
+        eprintln!(
+            "ai-memory: could not record the client-local session store ({error:#}); continuing the managed run"
+        );
+    }
+}
+
+/// Refuse to replace a linked session that was launched under a different
+/// native store than this launch resolves.
+///
+/// Such a session most likely still exists in its own store; starting fresh
+/// would repoint the workstream and orphan it. With no record (or the same
+/// store) the session really is gone and replacing it stays the right call.
+fn store_mismatch_error(
+    harness: ManagedHarness,
+    native_session_id: &str,
+    recorded: Option<PathBuf>,
+    current: &Path,
+) -> Option<anyhow::Error> {
+    let recorded = recorded?;
+    if recorded == current {
+        return None;
+    }
+    // Native flags and profiles move some stores too, not only the variables.
+    let flags: &[&str] = match harness {
+        ManagedHarness::Pi => &["--session-dir"],
+        ManagedHarness::Omp => &["--session-dir", "--profile", "OMP_PROFILE"],
+        ManagedHarness::Crush => &["--data-dir"],
+        _ => &[],
+    };
+    let selectors = [store_override_vars(harness), flags].concat().join("/");
+    let hint = if selectors.is_empty() {
+        " from the original environment".to_owned()
+    } else {
+        format!(" with the same {selectors}")
+    };
+    Some(anyhow!(
+        "linked {} session {} was launched under {} but this launch resolves {}; relaunch{hint} to resume it, or pass --fresh to start a new session",
+        harness.as_str(),
+        display_session_id(native_session_id),
+        super::show::terminal_text(&recorded.to_string_lossy()),
+        super::show::terminal_text(&current.to_string_lossy()),
+    ))
 }
 
 fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsStr>) -> Result<()> {
@@ -4221,6 +4388,131 @@ mod tests {
         server.abort();
     }
 
+    /// A store mismatch must stop before `/link` and before the harness
+    /// spawns, release the prepared run, and leave the workstream link alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_store_mismatch_stops_before_linking_or_spawning_and_releases_the_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::commands::run_autowire::WireOverrides;
+        use crate::config::Config;
+
+        const LINKED: &str = "33333333-3333-4333-8333-333333333333";
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let links = Arc::new(AtomicUsize::new(0));
+        let cancel_hits = Arc::clone(&cancels);
+        let link_hits = Arc::clone(&links);
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(|| async {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: Some(LINKED.into()),
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/cancel",
+                post(move || {
+                    cancel_hits.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::NO_CONTENT }
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/link",
+                post(move || {
+                    link_hits.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::NO_CONTENT }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let spawned = repo.path().join("spawned");
+        let script = repo.path().join("marker-harness");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", spawned.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = false;
+
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let custom = home.path().join("claude-glm").join("projects");
+        let recorded = effective_store(
+            ManagedHarness::Claude,
+            home.path(),
+            repo.path(),
+            Some(&custom),
+        );
+        super::super::project_registry::record_session_store(
+            &config, &endpoint, "claude", LINKED, &recorded,
+        )
+        .unwrap();
+
+        let default_home = home.path().join(".claude");
+        let args = RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(script),
+            yolo: false,
+            true_yolo: false,
+            jail: None,
+            no_jail: false,
+            fresh: false,
+            force_unlock: false,
+            no_autowire: true,
+            // Pinned so a contributor's own CLAUDE_CONFIG_DIR cannot leak in.
+            env: vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                default_home.to_string_lossy().into_owned(),
+            )],
+            env_file: None,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: Vec::new(),
+        };
+
+        let error = run_from_with_wiring(&config, args, repo.path(), &WireOverrides::default())
+            .await
+            .expect_err("a session linked under another store must not be replaced");
+        let message = format!("{error:#}");
+        assert!(message.contains("--fresh"), "{message}");
+        assert!(!spawned.exists(), "the harness must not start");
+        assert_eq!(
+            links.load(Ordering::SeqCst),
+            0,
+            "the workstream link must not move"
+        );
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            1,
+            "the prepared run is released"
+        );
+
+        server.abort();
+    }
+
     #[test]
     fn missing_linked_session_starts_fresh_but_explicit_selectors_win() {
         let temp = tempfile::tempdir().unwrap();
@@ -4291,6 +4583,142 @@ mod tests {
         .unwrap();
         assert!(orphaned.is_none());
         assert_eq!(explicit.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    /// A linked session missing from this launch's store is only replaced
+    /// when it was linked under the same store (or nothing was recorded).
+    #[test]
+    fn a_missing_session_linked_under_another_store_is_not_replaced() {
+        let custom = PathBuf::from("/stores/claude-glm/projects");
+        let default = PathBuf::from("/home/me/.claude/projects");
+        let claude = ManagedHarness::Claude;
+
+        assert!(store_mismatch_error(claude, "linked", None, &default).is_none());
+        assert!(store_mismatch_error(claude, "linked", Some(custom.clone()), &custom).is_none());
+
+        let error = store_mismatch_error(claude, "linked", Some(custom.clone()), &default)
+            .expect("custom store recorded, default store resolved")
+            .to_string();
+        assert!(error.contains("/stores/claude-glm/projects"), "{error}");
+        assert!(error.contains("/home/me/.claude/projects"), "{error}");
+        assert!(error.contains("CLAUDE_CONFIG_DIR"), "{error}");
+        assert!(error.contains("--fresh"), "{error}");
+
+        let omp = store_mismatch_error(
+            ManagedHarness::Omp,
+            "linked",
+            Some(custom.clone()),
+            &default,
+        )
+        .expect("stores differ")
+        .to_string();
+        assert!(omp.contains("--profile"), "{omp}");
+        let crush = store_mismatch_error(
+            ManagedHarness::Crush,
+            "linked",
+            Some(custom.clone()),
+            &default,
+        )
+        .expect("stores differ")
+        .to_string();
+        assert!(crush.contains("with the same --data-dir"), "{crush}");
+        let command_code = store_mismatch_error(
+            ManagedHarness::CommandCode,
+            "linked",
+            Some(custom),
+            &default,
+        )
+        .expect("stores differ")
+        .to_string();
+        assert!(
+            command_code.contains("relaunch from the original environment"),
+            "{command_code}"
+        );
+    }
+
+    /// The default store and an override naming the same directory are one
+    /// store, however the override is spelled.
+    #[test]
+    fn effective_store_treats_equivalent_spellings_as_one_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let claude = ManagedHarness::Claude;
+        let default = effective_store(claude, &home, &cwd, None);
+
+        let explicit = home.join(".claude/projects");
+        assert_eq!(
+            effective_store(claude, &home, &cwd, Some(&explicit)),
+            default
+        );
+        let dotted = home.join("x/../.claude/./projects/");
+        assert_eq!(effective_store(claude, &home, &cwd, Some(&dotted)), default);
+        let relative = Path::new("../home/.claude/projects");
+        assert_eq!(
+            effective_store(claude, &home, &cwd, Some(relative)),
+            default
+        );
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(home.join(".claude"), &alias).unwrap();
+            assert_eq!(
+                effective_store(claude, &home, &cwd, Some(&alias.join("projects"))),
+                default
+            );
+        }
+
+        let other = temp.path().join("claude-glm/projects");
+        assert_ne!(effective_store(claude, &home, &cwd, Some(&other)), default);
+
+        let later = temp.path().join("later/projects");
+        let before = effective_store(claude, &home, &cwd, Some(&later));
+        std::fs::create_dir_all(&later).unwrap();
+        assert_eq!(effective_store(claude, &home, &cwd, Some(&later)), before);
+    }
+
+    /// Bare mode must scan the store the launch would resume from, not the
+    /// default one, or a custom `CLAUDE_CONFIG_DIR` session is never found.
+    #[tokio::test]
+    async fn auto_session_scan_follows_the_store_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        let custom = temp.path().join("claude-custom");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let write_session = |config_dir: &Path, id: &str| {
+            let bucket = config_dir
+                .join("projects")
+                .join(cwd.to_string_lossy().replace('/', "-"));
+            std::fs::create_dir_all(&bucket).unwrap();
+            let line = serde_json::json!({
+                "type": "user",
+                "sessionId": id,
+                "cwd": cwd,
+                "message": {"role": "user", "content": "hi"},
+            });
+            std::fs::write(bucket.join(format!("{id}.jsonl")), format!("{line}\n")).unwrap();
+        };
+        let default_id = "11111111-1111-4111-8111-111111111111";
+        let custom_id = "22222222-2222-4222-8222-222222222222";
+        write_session(&home.join(".claude"), default_id);
+        write_session(&custom, custom_id);
+        let overrides = [(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            custom.to_string_lossy().into_owned(),
+        )];
+
+        let found = list_auto_sessions(&home, &cwd, &overrides).await.unwrap();
+        let claude: Vec<&str> = found
+            .iter()
+            .filter(|candidate| candidate.harness == ManagedHarness::Claude)
+            .map(|candidate| candidate.session.native_session_id.as_str())
+            .collect();
+        assert_eq!(claude, [custom_id]);
     }
 
     #[test]

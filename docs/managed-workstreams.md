@@ -473,6 +473,19 @@ expand `$HOME` on the command line and write absolute paths in an
 `--env-file`. Manual `install-hooks` / `install-mcp` do not take `--env`; they
 read their own environment.
 
+Automatic harness selection (bare `run`, `continue` and `resume`) scans the
+store the launch resolves from that same environment, so a checkout whose
+sessions live under a custom `CLAUDE_CONFIG_DIR` is found when the variable is
+set. Whenever the client links a session, at launch or when the run finishes,
+it also records that session's store in the client-local `client-projects.json`.
+If a later launch cannot find the linked session in the store it resolves and
+the recorded store is a different directory, the launch stops with an error
+naming both directories instead of starting fresh and repointing the workstream
+away from a session that still exists. Relaunch with the same variable (or
+store flag) to resume it, or pass `--fresh` to start a new session. Sessions linked before this record
+existed, and a session missing from its own recorded store, still start fresh
+as before.
+
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never
