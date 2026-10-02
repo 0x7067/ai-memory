@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed watcher reindexing racing with writes and batches to the same page by
+  sharing their per-page mutex from disk read through SQLite upsert. Both
+  mutation guards are released before embedding; external editors remain
+  outside this coordination. (#1059)
 - Fixed a managed Claude Code run losing its conversation after `/resume` on a
   Claude Code background session. The run used to finish on the foreground
   session it started with, which held none of the conversation, so the next
