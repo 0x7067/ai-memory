@@ -807,6 +807,39 @@ async fn run_session_consolidation_worker(
         let session_id = job.session_id();
         let generation = job.generation();
         let attempts = job.attempts();
+        // An agent may have written the session page with its own model
+        // while the session was still open, before this job existed. Leave
+        // that page alone unless observations arrived after it.
+        match consolidator
+            .agent_page_covers_generation(session_id, generation)
+            .await
+        {
+            Ok(true) => {
+                match writer.complete_session_consolidation(job).await {
+                    Ok(()) => info!(
+                        session = %session_id,
+                        generation,
+                        "SessionEnd: agent-written session page already covers this generation; consolidation skipped",
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        session = %session_id,
+                        generation,
+                        "SessionEnd consolidation skip could not complete the queue job",
+                    ),
+                }
+                #[cfg(test)]
+                completed.notify_one();
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                session = %session_id,
+                generation,
+                "could not read the session page before SessionEnd consolidation; consolidating",
+            ),
+        }
         let consolidation = consolidator.consolidate_session(
             session_id,
             false,
@@ -4068,6 +4101,189 @@ mod tests {
                 .is_none(),
             "completed work must not be claimed again"
         );
+    }
+
+    /// An ended session with one observation and a queued SessionEnd job,
+    /// plus a session page carrying `frontmatter`, as `memory_write_page`
+    /// leaves it when the agent writes the page itself.
+    async fn session_with_written_page(
+        frontmatter: serde_json::Value,
+    ) -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, SessionId) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "complete the durable job".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id,
+            project_id,
+            path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+            frontmatter,
+            body: "# Agent page\n\nWritten by the agent before the session ended.".into(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+        (tmp, store, wiki, workspace_id, project_id, session_id)
+    }
+
+    /// Run the worker once over the queued job and return the session page body.
+    async fn run_worker_once(
+        store: &Store,
+        wiki: Wiki,
+        llm: Arc<dyn LlmProvider>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> String {
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            llm,
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should settle the queued job");
+        cancel.cancel();
+        task.await.unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a settled job must not be claimed again"
+        );
+        store
+            .reader
+            .page_body_by_ids(
+                workspace_id,
+                project_id,
+                &format!("sessions/{session_id}.md"),
+            )
+            .await
+            .unwrap()
+            .map(|page| page.body)
+            .unwrap_or_default()
+    }
+
+    /// The agent wrote the session page while the session was open, and no
+    /// observation arrived after it: the worker completes the job without a
+    /// completion (the provider panics if called) and keeps the page.
+    #[tokio::test]
+    async fn session_consolidation_worker_keeps_a_current_agent_page() {
+        let (_tmp, store, wiki, workspace_id, project_id, session_id) =
+            session_with_written_page(serde_json::json!({
+                "consolidated_by": "agent",
+                "observation_generation": 1,
+            }))
+            .await;
+        let body = run_worker_once(
+            &store,
+            wiki,
+            Arc::new(PanicLlm),
+            workspace_id,
+            project_id,
+            session_id,
+        )
+        .await;
+        assert!(body.contains("Written by the agent"), "{body}");
+    }
+
+    /// Controls: a page the agent wrote before the job's last observation,
+    /// and a page with a current generation that no agent wrote, are both
+    /// consolidated as before.
+    #[tokio::test]
+    async fn session_consolidation_worker_replaces_a_stale_or_non_agent_page() {
+        for frontmatter in [
+            serde_json::json!({"consolidated_by": "agent", "observation_generation": 0}),
+            serde_json::json!({"observation_generation": 1}),
+        ] {
+            let (_tmp, store, wiki, workspace_id, project_id, session_id) =
+                session_with_written_page(frontmatter.clone()).await;
+            let body = run_worker_once(
+                &store,
+                wiki,
+                Arc::new(SuccessfulConsolidationLlm),
+                workspace_id,
+                project_id,
+                session_id,
+            )
+            .await;
+            assert!(
+                body.contains("Durable worker completed"),
+                "{frontmatter}: {body}"
+            );
+        }
     }
 
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {

@@ -391,6 +391,43 @@ impl Consolidator {
         Ok(self.reader.session_project_ids(session_id).await?)
     }
 
+    /// Whether the session page was written by the calling agent through
+    /// `memory_write_page` and no observation has arrived since: the page's
+    /// `observation_generation` reaches the queued job's `generation`. The
+    /// SessionEnd worker then leaves the page alone instead of replacing it
+    /// with a completion from the server's provider. A page any other writer
+    /// produced, or one older than the job's observations, is consolidated
+    /// as before.
+    ///
+    /// # Errors
+    /// Propagates store and wiki errors other than a missing page.
+    pub async fn agent_page_covers_generation(
+        &self,
+        session_id: SessionId,
+        generation: u64,
+    ) -> ConsolidatorResult<bool> {
+        let (ws, proj) = self.resolve_target(session_id).await?;
+        let path = PagePath::new(format!("sessions/{session_id}.md"))?;
+        let frontmatter = match self.wiki.read_page(ws, proj, &path) {
+            Ok(md) => md.frontmatter,
+            Err(ai_memory_wiki::WikiError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(false);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let by_agent = frontmatter
+            .get("consolidated_by")
+            .and_then(serde_json::Value::as_str)
+            == Some("agent");
+        let covered = frontmatter
+            .get("observation_generation")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|written| written >= generation);
+        Ok(by_agent && covered)
+    }
+
     /// Resolve the session's creating harness from the persisted session row.
     /// This is deliberately independent of the actor or client performing the
     /// consolidation: `agent` in page frontmatter means origin, not writer.

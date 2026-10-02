@@ -127,6 +127,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- The SessionEnd consolidation worker leaves a session page alone when the
+  agent wrote it through `memory_write_page` and no observation arrived after
+  it: the page records the session's observation count as
+  `observation_generation`, and the worker completes a job whose generation
+  that count reaches instead of replacing the page with the server's
+  provider. A page written before the session's last observation is
+  consolidated as before. (#1038)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
