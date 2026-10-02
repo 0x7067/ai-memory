@@ -32,7 +32,6 @@ const MAX_EVENTS_PER_FINISH: usize = 4_096;
 const MAX_EVENT_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_ID_BYTES: usize = 512;
 const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
-const MAX_METADATA_BYTES: usize = 16 * 1024;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_CWD_BYTES: usize = 16 * 1024;
 
@@ -745,7 +744,12 @@ async fn search_events(
     }
     match state
         .reader
-        .search_workstream_events(workstream_id, query.q, query.limit.clamp(1, 100))
+        .search_workstream_events(
+            workstream_id,
+            query.q,
+            query.limit.clamp(1, 100),
+            state.sanitizer.clone(),
+        )
         .await
     {
         Ok(events) => Json(events).into_response(),
@@ -832,6 +836,13 @@ async fn finish_run(
         );
     }
     if request
+        .events
+        .iter()
+        .any(|event| event.event_id.starts_with("managed-run:"))
+    {
+        return error(StatusCode::BAD_REQUEST, "reserved workstream event id");
+    }
+    if request
         .native_session_id
         .as_deref()
         .is_some_and(|id| id.trim().is_empty() || id.len() > MAX_NATIVE_SESSION_ID_BYTES)
@@ -847,6 +858,7 @@ async fn finish_run(
         return match state
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: state.sanitizer.clone(),
                 run_id,
                 native_session_id: None,
                 source_cursor: None,
@@ -903,6 +915,7 @@ async fn finish_run(
         }
     };
     let input = FinishWorkstreamRun {
+        sanitizer: state.sanitizer.clone(),
         run_id,
         native_session_id: request.native_session_id.or(status.native_session_id),
         source_cursor: request.source_cursor,
@@ -976,14 +989,11 @@ fn sanitize_events(
         {
             return Err("invalid workstream message role".to_string());
         }
-        let raw_metadata = serde_json::to_string(&event.metadata).map_err(|e| e.to_string())?;
-        if raw_metadata.len() > MAX_METADATA_BYTES {
-            event.metadata = serde_json::json!({ "truncated": true });
-        } else {
-            let scrubbed = sanitizer.scrub(&raw_metadata);
-            event.metadata = serde_json::from_str(&scrubbed)
-                .unwrap_or_else(|_| serde_json::json!({ "redacted": true }));
-        }
+        (event.source_record_id, event.metadata) = ai_memory_core::scrub_workstream_provenance(
+            sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
     }
     Ok(())
 }
@@ -1164,6 +1174,266 @@ mod tests {
         (workspace_id, project_id)
     }
 
+    #[tokio::test]
+    async fn workstream_provenance_finish_scrubs_before_raw_segment_and_search() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        state.sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-correlation".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        let response = finish_run(
+            State(state.clone()), None, None, AxumPath(run.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-1".into()), source_cursor: None,
+                events: vec![NewWorkstreamEvent {
+                    event_id: "event-1".into(), agent: AgentKind::Codex,
+                    native_session_id: "native-1".into(),
+                    source_record_id: Some("private-correlation".into()),
+                    kind: WorkstreamEventKind::ToolResult, role: Some("tool".into()),
+                    content: "portable provenance sentinel".into(), occurred_at: None,
+                    metadata: serde_json::json!({"tool_call_id": "call-1", "parent_id": "private-correlation", "dump": "private payload"}),
+                }],
+                complete: false, checkpoint: Default::default(), exit_code: None, losses: Vec::new(),
+            }),
+        ).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(run.workstream_id.to_string())
+            .join("segments");
+        let path = std::fs::read_dir(segment_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !raw.contains("private-correlation"),
+            "raw segment leaked source id"
+        );
+        assert!(!raw.contains("private payload"));
+        for q in ["", "portable"] {
+            let response = search_events(
+                State(state.clone()),
+                None,
+                None,
+                AxumPath(run.workstream_id.to_string()),
+                Query(EventQuery {
+                    q: q.into(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(events[0]["source_record_id"], "[REDACTED:custom]");
+            assert_eq!(events[0]["metadata"]["parent_id"], "[REDACTED:custom]");
+            assert_eq!(events[0]["metadata"]["tool_call_id"], "call-1");
+            assert!(events[0]["metadata"].get("dump").is_none());
+        }
+        let original: NewWorkstreamEvent = serde_json::from_str(raw.trim()).unwrap();
+        let mut next = original.clone();
+        next.event_id = "event-2".into();
+        next.source_record_id = Some("record-2".into());
+        let mut collision = original.clone();
+        collision.kind = WorkstreamEventKind::Message;
+        let import = |events| {
+            finish_run(
+                State(state.clone()),
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(FinishManagedRunRequest {
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events,
+                    complete: false,
+                    checkpoint: Default::default(),
+                    exit_code: None,
+                    losses: Vec::new(),
+                }),
+            )
+        };
+        assert_eq!(
+            import(vec![next.clone(), collision]).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let read = || {
+            store.reader.search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                state.sanitizer.clone(),
+            )
+        };
+        assert_eq!(
+            read().await.unwrap().len(),
+            1,
+            "failed segment must not become indexed history"
+        );
+        let recovered = import(vec![next, original]).await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let body = to_bytes(recovered.into_body(), 64 * 1024).await.unwrap();
+        let recovered: FinishManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recovered.imported_events, 1);
+        assert_eq!(recovered.latest_sequence, 2);
+        assert_eq!(read().await.unwrap().len(), 2);
+        let original: NewWorkstreamEvent = serde_json::from_str(raw.trim()).unwrap();
+        let complete = |events| {
+            finish_run(
+                State(state.clone()),
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(FinishManagedRunRequest {
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events,
+                    complete: true,
+                    checkpoint: Default::default(),
+                    exit_code: None,
+                    losses: Vec::new(),
+                }),
+            )
+        };
+        assert_eq!(
+            complete(vec![original.clone()]).await.status(),
+            StatusCode::OK
+        );
+        let mut changed = original.clone();
+        changed.source_record_id = Some("different-record".into());
+        let mut late = original.clone();
+        late.event_id = "late-new-event".into();
+        assert_eq!(complete(vec![changed, late]).await.status(), StatusCode::OK);
+        assert_eq!(complete(vec![original]).await.status(), StatusCode::OK);
+        let hits = read().await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.kind == WorkstreamEventKind::Checkpoint)
+        );
+        assert!(!hits.iter().any(|hit| hit.event_id == "late-new-event"));
+    }
+
+    #[tokio::test]
+    async fn workstream_provenance_client_cannot_use_server_event_ids() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        let import = |id: String, complete| {
+            finish_run(
+                State(state.clone()),
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(FinishManagedRunRequest {
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events: vec![NewWorkstreamEvent {
+                        event_id: id,
+                        agent: AgentKind::Codex,
+                        native_session_id: "native-1".into(),
+                        source_record_id: Some("record-1".into()),
+                        kind: WorkstreamEventKind::Message,
+                        role: Some("assistant".into()),
+                        content: "legitimate native event".into(),
+                        occurred_at: None,
+                        metadata: serde_json::Value::Null,
+                    }],
+                    complete,
+                    checkpoint: Default::default(),
+                    exit_code: Some(0),
+                    losses: if complete {
+                        vec!["missing native record".into()]
+                    } else {
+                        Vec::new()
+                    },
+                }),
+            )
+        };
+        // Legitimate native ids work before and after the attempted forgery.
+        assert_eq!(
+            import("native-event".into(), false).await.status(),
+            StatusCode::OK
+        );
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(run.workstream_id.to_string())
+            .join("segments");
+        for id in [
+            format!("managed-run:{}:checkpoint", run.run_id),
+            format!("managed-run:{}:losses", run.run_id),
+            "managed-run:other-run:annotation".into(),
+        ] {
+            assert_eq!(import(id, false).await.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                std::fs::read_dir(&segment_dir).unwrap().count(),
+                1,
+                "reserved ids must be refused before writing raw segments"
+            );
+        }
+        assert_eq!(
+            import("native-event".into(), true).await.status(),
+            StatusCode::OK
+        );
+        let hits = store
+            .reader
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                state.sanitizer.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().any(|hit| hit.event_id == "native-event"));
+        for (suffix, kind) in [
+            ("checkpoint", WorkstreamEventKind::Checkpoint),
+            ("losses", WorkstreamEventKind::Annotation),
+        ] {
+            assert!(hits.iter().any(|hit| hit.event_id
+                == format!("managed-run:{}:{suffix}", run.run_id)
+                && hit.kind == kind
+                && hit.source_record_id.is_none()));
+        }
+        assert_eq!(
+            import("managed-run:late:checkpoint".into(), false)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     /// The launcher reads whether the run's child linked a session from the
     /// run status, so the route must carry it.
     #[tokio::test]
@@ -1321,6 +1591,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: prepared.run_id,
                 native_session_id: Some("private-native-id".into()),
                 source_cursor: None,
@@ -1414,6 +1685,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: claude.run_id,
                 native_session_id: Some("claude-current".into()),
                 source_cursor: Some("cursor".into()),
@@ -1492,6 +1764,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: prepared.run_id,
                 native_session_id: Some("session_abc".into()),
                 source_cursor: None,
@@ -1753,6 +2026,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: prepared.run_id,
                 native_session_id: Some("7c1d5698-204a-4c0f-ae9c-43db7fc4e41d".into()),
                 source_cursor: None,
@@ -1822,6 +2096,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: prepared.run_id,
                 native_session_id: Some("2cce5126-f57d-4ddd-8f66-e5bb409f60db".into()),
                 source_cursor: None,
@@ -1891,6 +2166,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: prepared.run_id,
                 native_session_id: Some("019f-session".into()),
                 source_cursor: None,
@@ -1963,6 +2239,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: prepared.run_id,
                 native_session_id: Some("a0d5ac62-2501-4780-b783-76d159c56cb3".into()),
                 source_cursor: None,
@@ -2085,6 +2362,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: codex.run_id,
                 native_session_id: Some("codex-native".into()),
                 source_cursor: None,
@@ -2272,6 +2550,30 @@ mod tests {
             .await
             .unwrap()
             .expect("the run was just prepared");
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: state.sanitizer.clone(),
+                run_id: prepared.run_id,
+                native_session_id: Some("claude-native".into()),
+                source_cursor: None,
+                events: vec![NewWorkstreamEvent {
+                    event_id: "scope-provenance".into(),
+                    agent: AgentKind::ClaudeCode,
+                    native_session_id: "claude-native".into(),
+                    source_record_id: Some("record-1".into()),
+                    kind: WorkstreamEventKind::ToolResult,
+                    role: Some("tool".into()),
+                    content: "scope provenance sentinel".into(),
+                    occurred_at: None,
+                    metadata: serde_json::json!({"tool_use_id": "call-1"}),
+                }],
+                complete: false,
+                segment_path: None,
+                exit_code: None,
+            })
+            .await
+            .unwrap();
 
         let human = |name: &'static str| {
             let writer = store.writer.clone();
@@ -2359,8 +2661,16 @@ mod tests {
                 Query(EventQuery::default()),
             )
         };
-        assert_eq!(events(as_viewer(bob)).await.status(), StatusCode::FORBIDDEN);
-        assert_eq!(events(as_viewer(carol)).await.status(), StatusCode::OK);
+        let refused = events(as_viewer(bob)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(refused.into_body(), 64 * 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("record-1"));
+        let allowed = events(as_viewer(carol)).await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let body = to_bytes(allowed.into_body(), 64 * 1024).await.unwrap();
+        let provenance: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(provenance[0]["source_record_id"], "record-1");
+        assert_eq!(provenance[0]["metadata"]["tool_use_id"], "call-1");
 
         // No viewer — an install with no database users, or root — is unchanged.
         assert_eq!(

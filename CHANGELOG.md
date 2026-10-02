@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added bounded, sanitized native-record and adapter correlation provenance to
+  managed-workstream search/tail results and the CLI's text/JSON output, with
+  compatible optional fields and sanitization of legacy provenance on reads. (#1057)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
@@ -118,6 +121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- Restricted managed-workstream provenance to scrubbed source labels and an
+  explicit scalar metadata allowlist, with 512-byte string bounds. Client event
+  ids beginning with `managed-run:` are reserved for server checkpoints and
+  extraction-loss annotations. Active-run retries reject changes to an existing
+  event's agent, native session or kind, and retain its first indexed content
+  and provenance across sanitizer changes. (#1057)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
