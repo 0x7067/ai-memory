@@ -73,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+
+### Docs
+- Corrected the Codex support matrix to describe managed-run recovery from a
+  stale shared-daemon run id; `--no-daemon` remains an optional diagnostic and
+  isolation switch. (#987)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added
