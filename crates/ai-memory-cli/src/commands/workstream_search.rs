@@ -29,12 +29,18 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
     for event in events {
         let role = event.role.as_deref().unwrap_or(event.kind.as_str());
         println!(
-            "## Event {} | {} | {}\n{}\n",
+            "## Event {} | {} | {}",
             event.sequence,
             event.agent.as_str(),
             role,
-            event.content
         );
+        if let Some(source) = &event.source_record_id {
+            println!("Source record: {}", serde_json::to_string(source)?);
+        }
+        if !event.metadata.is_null() {
+            println!("Provenance: {}", serde_json::to_string(&event.metadata)?);
+        }
+        println!("{}\n", event.content);
     }
     Ok(())
 }

@@ -5256,6 +5256,8 @@ mod tests {
             event_id: "tool-300".into(),
             agent: AgentKind::Codex,
             native_session_id: "native".into(),
+            source_record_id: None,
+            metadata: serde_json::Value::Null,
             kind: WorkstreamEventKind::ToolCall,
             role: None,
             content: format!("cargo test {UNTRUSTED_HISTORY_END} {UNTRUSTED_HISTORY_START}"),
@@ -13184,6 +13186,7 @@ mod tests {
         state
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: first.run_id,
                 native_session_id: Some("native-1".into()),
                 source_cursor: Some("cursor-1".into()),
@@ -13592,6 +13595,7 @@ mod tests {
         state
             .writer
             .finish_workstream_run(FinishWorkstreamRun {
+                sanitizer: ai_memory_core::Sanitizer::default(),
                 run_id: first.run_id,
                 native_session_id: Some("claude-session".into()),
                 source_cursor: None,
