@@ -198,7 +198,9 @@ the complete startup response has been assembled. With server-wide
 `[handoff].claim_on_session_start = false`, SessionStart instead emits a
 metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.
-Manual handoffs take precedence;
+With server-wide `[handoff].create_on_session_end = false`, session end writes
+the summary page and enqueues consolidation but skips creating an automatic
+baton (#1043). Manual handoffs take precedence;
 otherwise the newest cwd-eligible automatic handoff is delivered, and that
 same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
@@ -811,8 +813,9 @@ dedup_cold_clusters = false        # A3 opt-in: cluster near-duplicate cold
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
 
-[handoff]                         # optional server-wide delivery policy
+[handoff]                         # optional server-wide handoff policy
 claim_on_session_start = true     # false offers metadata; explicit accept claims
+create_on_session_end = true      # false stops automatic handoff creation at session end
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000

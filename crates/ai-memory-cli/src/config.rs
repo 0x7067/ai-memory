@@ -1111,7 +1111,7 @@ impl Default for ConsolidationSettings {
     }
 }
 
-/// `[handoff]` session-start handoff delivery settings (design: #959).
+/// `[handoff]` session handoff delivery and creation settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HandoffSettings {
@@ -1134,12 +1134,23 @@ pub struct HandoffSettings {
     /// Server-wide: applies to every operator on this server. A per-project
     /// override is intentionally left for a follow-up change.
     pub claim_on_session_start: bool,
+    /// When `true` (default — unchanged behavior), ending an unmanaged session
+    /// creates an automatic open handoff for the next session.
+    ///
+    /// When `false`, `SessionEnd` writes the session summary page and
+    /// enqueues consolidation as usual, but does not create an automatic
+    /// handoff (#1043). Explicit handoffs created via `memory_handoff_begin`
+    /// and managed runs are unaffected.
+    ///
+    /// Server-wide: applies to every operator on this server.
+    pub create_on_session_end: bool,
 }
 
 impl Default for HandoffSettings {
     fn default() -> Self {
         Self {
             claim_on_session_start: true,
+            create_on_session_end: true,
         }
     }
 }
@@ -3835,6 +3846,7 @@ mod tests {
 
             [handoff]
             claim_on_session_start = false
+            create_on_session_end = false
 
             [maintenance]
             enabled = false
@@ -3891,6 +3903,7 @@ mod tests {
         assert_eq!(cfg.contradiction_band_max, 0.8);
         assert!(cfg.auth.secure_cookie);
         assert!(!cfg.handoff.claim_on_session_start);
+        assert!(!cfg.handoff.create_on_session_end);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);
@@ -3931,6 +3944,11 @@ mod tests {
     #[test]
     fn handoff_claim_on_session_start_defaults_to_true() {
         assert!(Config::default().handoff.claim_on_session_start);
+    }
+
+    #[test]
+    fn handoff_create_on_session_end_defaults_to_true() {
+        assert!(Config::default().handoff.create_on_session_end);
     }
 
     #[test]

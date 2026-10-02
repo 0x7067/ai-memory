@@ -104,6 +104,17 @@ This is server-wide — every operator on the server gets the same behavior.
 Restart the server after changing `config.toml`; configuration is loaded once
 at startup. The default (`true`) is unchanged for every existing install.
 
+### Opting out of automatic handoff creation at session end
+
+By default, every unmanaged session end creates an open handoff for the next session. In a single-operator setup where consecutive sessions are part of the same continuous workflow or where batons are undesirable, automatic creation can be disabled while preserving the session summary page and consolidation:
+
+```toml
+[handoff]
+create_on_session_end = false
+```
+
+When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolidation as usual, but skips creating an open handoff row (#1043). Explicit batons created with `memory_handoff_begin` and managed workstream runs remain unaffected. Like `claim_on_session_start`, this setting is server-wide.
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the

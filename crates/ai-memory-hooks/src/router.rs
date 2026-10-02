@@ -507,6 +507,10 @@ pub struct HookState {
     /// handoff; it renders a non-consuming notice instead and leaves the
     /// claim to an explicit `memory_handoff_accept` (design: #959).
     pub claim_handoff_on_session_start: bool,
+    /// `[handoff].create_on_session_end` (default `true` — unchanged
+    /// behavior). When `false`, `SessionEnd` writes the summary page and
+    /// consolidates as usual, but skips automatic handoff creation (#1043).
+    pub create_handoff_on_session_end: bool,
     /// Scoped session keys known to be subagents (seeded by `SubagentStart` / any
     /// marker-bearing event). For a project that opted into
     /// `drop_subagent_captures` (via its `.ai-memory.toml`, forwarded as the
@@ -3491,7 +3495,9 @@ async fn process_authorized(
         // Other harnesses are not gated: Claude Code also sets `agent_type` on
         // a top-level `--agent` session, which still owns its baton.
         let child_session = env.agent == AgentKind::OpenCode && body_is_subagent(&env.raw);
-        let handoff = (!managed && !child_session).then(|| {
+        let should_create_handoff =
+            !managed && !child_session && (turn_checkpoint || state.create_handoff_on_session_end);
+        let handoff = should_create_handoff.then(|| {
             build_auto_handoff(
                 page_ws,
                 page_proj,
@@ -3624,6 +3630,12 @@ async fn process_authorized(
                     page = %new_page.path,
                     managed_run = ?managed_run,
                     "managed or child session ended; summary page written without legacy handoff",
+                );
+            } else if !state.create_handoff_on_session_end {
+                info!(
+                    session = %session_id,
+                    page = %new_page.path,
+                    "session ended; summary page written without a handoff (create_on_session_end disabled)",
                 );
             } else {
                 // Only reachable through the admission refusal above, which
@@ -4993,6 +5005,7 @@ mod tests {
             session_consolidation_notify: None,
             capture_assistant_enabled: false,
             claim_handoff_on_session_start: true,
+            create_handoff_on_session_end: true,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             home_dir: None,
@@ -11035,6 +11048,121 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "direct launches must retain the legacy SessionEnd handoff behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_with_create_on_session_end_disabled_writes_summary_page_without_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.create_handoff_on_session_end = false;
+        let state = Arc::new(state);
+
+        let session = SessionId::new();
+        for event in ["session-start", "user-prompt", "session-end"] {
+            let envelope = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session.to_string(),
+                    "cwd": tmp.path(),
+                }),
+            );
+            process(&state, envelope, None, Vec::new()).await.unwrap();
+        }
+
+        // Summary page was written to the wiki.
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.path.as_str().starts_with("sessions/")),
+            "SessionEnd must still write the session summary page when create_on_session_end is false"
+        );
+
+        // Session was ended in the database.
+        let disposition = state
+            .reader
+            .session_end_disposition(
+                session,
+                state.workspace_id,
+                state.project_id,
+                AgentKind::ClaudeCode,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            disposition,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
+            "session row must be marked ended"
+        );
+
+        // No open handoff was created.
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "create_on_session_end = false must not create an automatic handoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_with_create_on_session_end_enabled_creates_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        assert!(state.create_handoff_on_session_end, "default is true");
+        let state = Arc::new(state);
+
+        let session = SessionId::new();
+        for event in ["session-start", "user-prompt", "session-end"] {
+            let envelope = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session.to_string(),
+                    "cwd": tmp.path(),
+                }),
+            );
+            process(&state, envelope, None, Vec::new()).await.unwrap();
+        }
+
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "default create_on_session_end = true must create an automatic handoff"
         );
     }
 
