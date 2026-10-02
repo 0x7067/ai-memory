@@ -60,16 +60,33 @@ struct StartFailureTests {
         let message = StartFailure.message(
             health: "Could not read /admin/status",
             launchd: .stopped,
-            logURL: logURL
+            logURL: logURL,
+            notBefore: .distantPast
         )
         #expect(message.contains("Address already in use"))
+    }
+
+    @Test func ignoresAnErrorLoggedBeforeTheLastStart() throws {
+        let logURL = try makeLog("Error: binding 127.0.0.1:49374\n")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3600)],
+            ofItemAtPath: logURL.path
+        )
+        let message = StartFailure.message(
+            health: "Could not read /admin/status",
+            launchd: .stopped,
+            logURL: logURL,
+            notBefore: Date()
+        )
+        #expect(message == "Could not read /admin/status")
     }
 
     @Test func fallsBackToHealthWhenNotInstalled() {
         let message = StartFailure.message(
             health: "Connection refused",
             launchd: .notInstalled,
-            logURL: URL(fileURLWithPath: "/nonexistent/stderr.log")
+            logURL: URL(fileURLWithPath: "/nonexistent/stderr.log"),
+            notBefore: .distantPast
         )
         #expect(message == "Connection refused")
     }
@@ -79,7 +96,8 @@ struct StartFailureTests {
         let message = StartFailure.message(
             health: "Could not read /admin/status",
             launchd: .running,
-            logURL: logURL
+            logURL: logURL,
+            notBefore: .distantPast
         )
         #expect(message == "Could not read /admin/status")
     }

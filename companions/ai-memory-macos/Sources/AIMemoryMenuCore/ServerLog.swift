@@ -30,12 +30,26 @@ public enum ServerLog {
 
 /// Picks the message the menu extra shows when the server is unreachable.
 public enum StartFailure {
-    /// Only when the agent is installed but stopped: a log line left over from
-    /// an earlier attempt must not be misreported over the live health error.
-    public static func message(health: String, launchd: LaunchdState, logURL: URL) -> String {
+    /// Only when the agent is installed but stopped, and only from a log
+    /// written since `notBefore` (app launch or the last start): `stderr.log`
+    /// is append-only and a manual stop also reads as `.stopped`, so an error
+    /// left over from an earlier attempt must not be misreported.
+    public static func message(
+        health: String,
+        launchd: LaunchdState,
+        logURL: URL,
+        notBefore: Date
+    ) -> String {
         guard launchd == .stopped,
+              let modified = modificationDate(of: logURL),
+              modified >= notBefore,
               let logged = ServerLog.recentError(at: logURL)
         else { return health }
         return logged
+    }
+
+    private static func modificationDate(of url: URL) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return attributes?[.modificationDate] as? Date
     }
 }

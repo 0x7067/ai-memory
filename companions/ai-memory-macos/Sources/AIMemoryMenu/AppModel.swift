@@ -23,6 +23,7 @@ final class AppModel {
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var fetchFailed = false
     @ObservationIgnored private var startingDeadline: Date?
+    @ObservationIgnored private var logFreshSince = Date()
 
     init(
         settings: AppSettings = .load(),
@@ -111,7 +112,8 @@ final class AppModel {
             lastError = StartFailure.message(
                 health: (error as? HealthError).map(Self.describe) ?? error.localizedDescription,
                 launchd: launchd,
-                logURL: logURL
+                logURL: logURL,
+                notBefore: logFreshSince
             )
         }
         let derived = IconState.derived(
@@ -253,6 +255,7 @@ final class AppModel {
     }
 
     private func markStarting() {
+        logFreshSince = Date()
         startingDeadline = Date().addingTimeInterval(45)
         icon = .starting
         report = nil
