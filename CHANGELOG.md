@@ -130,6 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request shapes, entity normalization, authenticated attribution and the wiki
   write pipeline. Documented whole-page replacement, raw-input metadata bounds
   and trimmed relation scope components. (#1055)
+- Added structured results for the existing auto-improvement eval execution in
+  review reports, staged run metadata, and accepted proposal sidecars, with
+  server-generated eval IDs, evaluated request/body digests, checker invocation
+  identity, observed success/rejection/failure/timeout, and sanitized bounded
+  reasons. Report deserialization discarded supplied eval observations. (#1053)
 
 ### Changed
 - Restricted managed-workstream provenance to scrubbed source labels and an

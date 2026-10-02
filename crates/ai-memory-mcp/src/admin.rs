@@ -2362,7 +2362,8 @@ async fn auto_improve_new_proposals(
             title: p.title.clone(),
             confidence: f64::from(p.confidence),
             rationale: p.rationale.clone(),
-            evidence_json: serde_json::to_value(&p.evidence)
+            evidence_json: report
+                .proposal_evidence_json(p)
                 .map_err(|e| internal_err(e.to_string()))?,
             body_markdown: p.body_markdown.clone(),
             artifact_sha256: None,
@@ -2442,6 +2443,7 @@ async fn stage_auto_improve_report(
                     "max_rule_page_tokens": cfg.max_rule_page_tokens,
                     "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
                     "eval": cfg.eval,
+                    "eval_results": report.eval_results(),
                 }),
                 proposal_actor: ai_memory_core::ActorContext {
                     agent: Some(cfg.proposal_actor.clone()),
@@ -11391,6 +11393,22 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["rejected_candidates_count"], 1);
+        let run_id = json["run_id"]
+            .as_str()
+            .unwrap()
+            .parse::<ai_memory_core::AutoImproveRunId>()
+            .unwrap();
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let config: String = db.query_row(
+            "SELECT config_json FROM auto_improve_runs WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![run_id.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+            |row| row.get(0),
+        ).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["eval_results"].as_array().unwrap().len(), 1);
+        assert_eq!(config["eval_results"][0]["status"], "failure");
+        assert!(config["eval_results"][0]["passed"].is_null());
+        assert_eq!(config["eval_results"][0]["reason"], "eval command is empty");
         let proposals = json["proposals"].as_array().unwrap();
         assert_eq!(proposals.len(), 1);
         assert_eq!(
