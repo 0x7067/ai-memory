@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   review reports, staged run metadata, and accepted proposal sidecars, with
   server-generated eval IDs, evaluated request/body digests, checker invocation
   identity, observed success/rejection/failure/timeout, and sanitized bounded
-  reasons. Report deserialization discarded supplied eval observations.
+  reasons. Report deserialization discarded supplied eval observations. (#1053)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
