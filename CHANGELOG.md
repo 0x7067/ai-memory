@@ -19,8 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SessionStart` rather than Claude Code's envelope, so handoffs are not
   injected yet: recover them with `memory_handoff_accept`. The bare
   `install-mcp --client copilot` alias keeps meaning VS Code Copilot;
-  `install-mcp --client copilot-cli` and `ai-memory run copilot` follow
-  separately. (#1040)
+  `ai-memory run copilot` follows separately. (#1040)
+- Added `install-mcp --client copilot-cli`, which merges ai-memory's remote
+  entry (`type: "http"`, `url`, bearer `headers`, `tools: ["*"]`) into the root
+  `mcpServers` map of `$COPILOT_HOME/mcp-config.json` (default
+  `~/.copilot/mcp-config.json`), preserving other servers. `install-hooks
+  --agent copilot-cli` without `--server-url` now reads the server URL and
+  bearer back from that entry, and `uninstall` removes it. (#1040)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on

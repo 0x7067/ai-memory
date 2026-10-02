@@ -132,7 +132,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Kimi Code | Supported |
 | Kiro CLI | Supported |
 | Pool | Hooks-only |
-| GitHub Copilot CLI | Hooks-only |
+| GitHub Copilot CLI | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | Muse Code | MCP-only |

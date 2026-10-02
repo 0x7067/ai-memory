@@ -2495,6 +2495,14 @@ pub enum McpClient {
     /// Command Code CLI — `~/.commandcode/mcp.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
+    /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
+    /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
+    /// `install-hooks --agent copilot-cli` for lifecycle capture. Not to be
+    /// confused with `vscode-copilot` (alias `copilot`), the VS Code agent
+    /// mode client.
+    #[value(name = "copilot-cli")]
+    CopilotCli,
     /// Swival CLI — project-scoped `.swival/mcp.json` using native HTTP.
     /// This integration is MCP-only; Swival's lifecycle callback does not
     /// expose a stable session identifier for reliable capture correlation.
@@ -4196,6 +4204,20 @@ mod tests {
         // `copilot` already means the VS Code MCP client on `install-mcp`;
         // it must not silently select the CLI hook agent here.
         assert!(Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "copilot"]).is_err());
+
+        let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", "copilot-cli"])
+            .expect("install-mcp --client copilot-cli should parse");
+        let Command::InstallMcp(args) = mcp.command else {
+            panic!("expected install-mcp");
+        };
+        assert_eq!(args.client, McpClient::CopilotCli);
+        // ...while the bare word keeps selecting the VS Code client.
+        let vscode = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", "copilot"])
+            .expect("install-mcp --client copilot should parse");
+        let Command::InstallMcp(args) = vscode.command else {
+            panic!("expected install-mcp");
+        };
+        assert_eq!(args.client, McpClient::VsCodeCopilot);
     }
 
     #[test]

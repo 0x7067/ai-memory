@@ -1303,16 +1303,23 @@ No first-party `install-mcp` client and no managed workstream
 
 ### GitHub Copilot CLI
 
-Copilot CLI loads user-level hook files from `~/.copilot/hooks/` (or
-`$COPILOT_HOME/hooks/`). `install-hooks --agent copilot-cli` writes
-`ai-memory.json` there — Copilot's standalone `{"version": 1, "hooks": {…}}`
-format — merging around any third-party entries already in the file:
+Copilot CLI keeps its config in `~/.copilot` (or `$COPILOT_HOME`).
+`install-mcp --client copilot-cli` merges the remote server entry into
+`mcp-config.json` there, and `install-hooks --agent copilot-cli` writes
+`hooks/ai-memory.json` — Copilot's standalone `{"version": 1, "hooks": {…}}`
+format — merging around any third-party entries already in each file:
 
 ```bash
+ai-memory install-mcp --client copilot-cli --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
 ai-memory install-hooks --agent copilot-cli --apply \
     --server-url "http://homelab:49374" \
     --auth-token "$TOKEN"
 ```
+
+See [the MCP guide](mcp-install.md#github-copilot-cli) for the exact entry and
+the project-level `.mcp.json` / `.github/mcp.json` alternatives.
 
 The events are configured with PascalCase names (`SessionStart`,
 `PreToolUse`, …), which makes Copilot send the VS Code/Claude-compatible
@@ -1331,9 +1338,8 @@ not injected yet; recover it via MCP `memory_handoff_list` then
 `memory_handoff_accept` with that `handoff_id`. There is no `--scope project`:
 Copilot's repository hook files (`.github/hooks/*.json`) are shared with the
 team and loaded by the Copilot cloud agent, so they cannot carry per-machine
-script paths. `install-mcp --client copilot-cli` and `ai-memory run copilot`
-are not shipped yet; `install-mcp --client copilot` remains the VS Code
-Copilot client.
+script paths. `ai-memory run copilot` is not shipped yet;
+`install-mcp --client copilot` remains the VS Code Copilot client.
 
 ### Hermes Agent (Nous Research)
 

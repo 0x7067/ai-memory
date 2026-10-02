@@ -410,6 +410,7 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             KimiCode,
             KiroCli,
             CommandCode,
+            CopilotCli,
             Swival,
             Muse,
         ] {
@@ -1246,6 +1247,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::CopilotCli
         | McpClient::Swival
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
@@ -2150,6 +2152,25 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["servers"].get("ai-memory").is_none());
         assert!(v["servers"].get("other").is_some());
+    }
+
+    /// Copilot CLI keeps servers under the root `mcpServers` map; the strip
+    /// must remove only ai-memory's entry and leave e.g. a `github` server.
+    #[test]
+    fn strip_mcp_copilot_cli_root_mcp_servers() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp","tools":["*"]},"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::CopilotCli,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_none());
+        assert!(v["mcpServers"].get("github").is_some());
     }
 
     #[test]

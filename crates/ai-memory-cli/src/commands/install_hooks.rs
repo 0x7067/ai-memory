@@ -259,17 +259,13 @@ pub(crate) fn copilot_cli_hooks_path() -> anyhow::Result<std::path::PathBuf> {
     copilot_cli_hooks_path_in(std::env::var_os("COPILOT_HOME"))
 }
 
-/// The env value comes in as a parameter so tests can exercise both
-/// branches without mutating process env (mirrors [`codex_hooks_path_in`]).
+/// [`copilot_cli_hooks_path`] with the `COPILOT_HOME` value passed in. Resolves
+/// through the same config dir as `install-mcp --client copilot-cli`
+/// ([`install_mcp::copilot_home_in`]), so the two halves of one install agree.
 fn copilot_cli_hooks_path_in(
     env_override: Option<std::ffi::OsString>,
 ) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
-        return Ok(dir.join("hooks").join("ai-memory.json"));
-    }
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.copilot/hooks/ai-memory.json")?
-        .join(".copilot")
+    Ok(install_mcp::copilot_home_in(env_override)?
         .join("hooks")
         .join("ai-memory.json"))
 }
@@ -1433,7 +1429,7 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
         // Codex uses `http_headers`; Grok uses `headers`. The shared TOML
         // inferencer accepts both.
         McpClient::Codex => Ok(infer_toml_mcp_config(&content)),
-        McpClient::CommandCode => Ok(infer_json_mcp_config(
+        McpClient::CommandCode | McpClient::CopilotCli => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
             "url",
@@ -1588,9 +1584,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // No first-party Hermes MCP installer ships yet, so there is no config
         // file to infer a server URL or token from.
         AgentChoice::Hermes => None,
-        // `install-mcp --client copilot-cli` is tracked separately (#1040
-        // PR2); until it lands there is no config file to scrape.
-        AgentChoice::CopilotCli => None,
+        AgentChoice::CopilotCli => Some(McpClient::CopilotCli),
     }
 }
 
@@ -12022,6 +12016,28 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             mcp_client_for_agent(AgentChoice::KiroCliV3),
             Some(McpClient::KiroCli)
         );
+    }
+
+    /// `install-hooks --agent copilot-cli` without `--server-url` reads the
+    /// server URL and bearer back from an earlier `install-mcp --client
+    /// copilot-cli`, the same root `mcpServers.ai-memory.url` entry it wrote.
+    #[test]
+    fn copilot_cli_hooks_infer_the_copilot_cli_mcp_client() {
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::CopilotCli),
+            Some(McpClient::CopilotCli)
+        );
+        let inferred = infer_json_mcp_config(
+            r#"{"mcpServers":{"ai-memory":{"type":"http","url":"https://memory.example/mcp","headers":{"Authorization":"Bearer tok"},"tools":["*"]}}}"#,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )
+        .unwrap();
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("https://memory.example")
+        );
+        assert_eq!(inferred.auth_token.as_deref(), Some("tok"));
     }
 
     #[test]
