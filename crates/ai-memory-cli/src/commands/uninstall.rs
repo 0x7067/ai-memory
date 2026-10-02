@@ -8,9 +8,9 @@
 
 use crate::cli::McpClient;
 use crate::cli::UninstallArgs;
-use crate::commands::apply_shared::apply_atomic;
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
+use crate::commands::apply_shared::{PrivateBackup, apply_atomic_with_backup};
 use crate::commands::path_util::{
     agent_config_home, claude_config_dir, claude_config_paths, home_dir,
 };
@@ -200,6 +200,14 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
         .into_iter()
         .map(|path| (path, HookConfigShape::NestedHooksKey))
         .collect();
+        // A `--scope project` install lives in the checkout's gitignored
+        // `.claude/settings.local.json`; sweep the one for the current
+        // directory, as the Kiro project configs below are.
+        let cwd = std::env::current_dir().context("getting CWD for hook removal")?;
+        let project_local = install_hooks::project_claude_settings_local(&cwd);
+        if !hook_files.iter().any(|(path, _)| *path == project_local) {
+            hook_files.push((project_local, HookConfigShape::NestedHooksKey));
+        }
         hook_files.extend([
             (
                 install_hooks::codex_hooks_path()?,
@@ -255,7 +263,6 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
 
         let mut kiro_configs =
             install_hooks::list_kiro_cli_agent_configs(&install_hooks::kiro_cli_agents_dir()?)?;
-        let cwd = std::env::current_dir().context("getting CWD for Kiro hook removal")?;
         kiro_configs.extend(install_hooks::list_kiro_cli_agent_configs(
             &cwd.join(".kiro/agents"),
         )?);
@@ -576,7 +583,12 @@ fn print_plan(plan: &[PlannedChange]) {
 /// Re-run the planned strippers inside `apply_atomic` so the actual write is
 /// atomic + backed up. Planning records exact operations per file, so shared
 /// files such as `~/.gemini/settings.json` only apply the selected concerns.
-fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow::Result<()> {
+fn apply_change(
+    change: &PlannedChange,
+    private_backup: Option<&PrivateBackup>,
+    name: Option<&str>,
+    url: &str,
+) -> anyhow::Result<()> {
     match change {
         PlannedChange::DeleteFile { path, kind } => {
             if !path.exists() {
@@ -597,7 +609,7 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
             }
         }
         PlannedChange::Rewrite { path, ops, .. } => {
-            let outcome = apply_atomic(path, |existing| {
+            let outcome = apply_atomic_with_backup(path, private_backup, |existing| {
                 let mut out = existing.to_string();
                 for op in ops {
                     out = match *op {
@@ -670,6 +682,15 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     let plan = build_plan(&args, &config.data_dir)?;
     print_plan(&plan);
+    let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
+    if hooks_removed {
+        // Only the current checkout's project file is reachable from here.
+        println!(
+            "note: run `ai-memory uninstall --only hooks --apply` inside every other checkout that \
+             used `install-hooks --scope project`; their .claude/settings.local.json keeps calling \
+             this binary and data dir."
+        );
+    }
     if args.purge_data {
         for path in data_purge::purge_preview(&config.data_dir) {
             println!("would purge {}", path.display());
@@ -706,8 +727,20 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         }
     }
 
+    // The current checkout's `.claude/settings.local.json` keeps its backup
+    // under the data dir, as `install-hooks --scope project` does: a sibling
+    // `.bak-<ts>` would sit untracked in the repository.
+    let project_local = std::env::current_dir()
+        .ok()
+        .map(|cwd| install_hooks::project_claude_settings_local(&cwd));
     for change in &plan {
-        apply_change(change, name.as_deref(), &url)?;
+        let private_backup = match change {
+            PlannedChange::Rewrite { path, .. } if project_local.as_ref() == Some(path) => Some(
+                install_hooks::project_settings_backup(&config.data_dir, path),
+            ),
+            _ => None,
+        };
+        apply_change(change, private_backup.as_ref(), name.as_deref(), &url)?;
     }
 
     // Removing the hooks removes the only readers of the stored bearer, so
@@ -716,7 +749,6 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     // native hook, the shell hooks and the generated TypeScript integrations
     // (the Pi one also bridges MCP) all still read it. Best-effort: an
     // unremovable file must not fail a teardown that otherwise succeeded.
-    let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
     if hooks_removed && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
@@ -2450,6 +2482,7 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
                 removed: vec!["ai-memory".to_string()],
                 ops: vec![RewriteOp::McpJson(McpClient::KimiCode)],
             },
+            None,
             Some("ai-memory"),
             "http://127.0.0.1:49374/mcp",
         )

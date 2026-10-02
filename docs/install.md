@@ -11,6 +11,8 @@ page covers everything else:
   (systemd system service or user service)
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
+- [Nix / NixOS](#nix--nixos)
+  (flake package, NixOS module, maintainer test ladder)
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
@@ -89,6 +91,42 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
+That wires the hooks user-wide (`~/.claude/settings.json`), so every Claude
+Code session is captured. To opt in per repository instead, run from inside
+the checkout:
+
+```bash
+ai-memory install-hooks --agent claude-code --scope project --apply
+```
+
+This writes the repository's gitignored `.claude/settings.local.json` at the
+git root (the main checkout's root from a worktree), which is where Claude Code
+reads that file even when launched from a subdirectory — see
+[where Claude Code looks for each file](https://code.claude.com/docs/en/settings#where-claude-code-looks-for-each-file).
+On Windows, and when the repository root is your home directory, Claude Code
+reads the launch directory instead, so the installer writes to the current
+directory there: run it, and launch Claude Code, from the same directory.
+The user-level file is left alone. Claude Code merges the project file's
+hooks with any user-level ones, so pick one scope per machine; the installer
+notes when the other scope already carries ai-memory hooks.
+The installer warns when the file is not ignored by git (Claude Code adds
+`**/.claude/settings.local.json` to your global excludes only when it creates
+the file itself) and refuses to embed a bearer token in it when the token
+cannot be persisted under the data dir. When it updates an existing file, the
+backup goes to `<data_dir>/backups/claude-settings-local/` (owner-only), not
+next to the file, so nothing new appears in `git status`.
+`ai-memory uninstall --only hooks --apply` run from inside the checkout
+removes the entries again; run elsewhere it does not reach into the
+repository, so run it in every project-scoped checkout before removing
+ai-memory — those files otherwise keep calling the removed binary and data
+dir. `upgrade` and the `ai-memory run` auto-wire leave the user-level file
+alone while a project-scoped install is the only one present. `upgrade`
+replaces the binary the hook commands call but does not rewrite project
+files; re-run `install-hooks --scope project --apply` in each checkout to pick
+up hook-command changes. `setup-agent` and `backup-agents` only know the
+user-level file. Claude Code only; other agents keep their user-level hook
+files.
+
 `--session-aware` is an optional Claude Code MCP mode:
 
 ```bash
@@ -109,7 +147,9 @@ own config resolution: `install-mcp` writes the MCP registration to
 (instead of `~/.claude/settings.json`), and `install-skills --scope global`
 uses `$CLAUDE_CONFIG_DIR/skills` (instead of `~/.claude/skills`). `uninstall`
 sweeps the active relocated paths alongside the home defaults. It cannot
-discover an older arbitrary `CLAUDE_CONFIG_DIR` that is no longer set. The
+discover an older arbitrary `CLAUDE_CONFIG_DIR` that is no longer set.
+`install-hooks --scope project` ignores the variable: Claude Code resolves
+project files from the checkout, not from the config dir. The
 Docker wrapper forwards the variable for config roots under its existing
 `$HOME` bind mount; use the native binary when the relocated root is outside
 `$HOME`.
@@ -739,6 +779,65 @@ AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-nati
 
 ---
 
+## Nix / NixOS
+
+User-facing NixOS module setup lives in the [README NixOS
+section](../README.md#nixos) (`nixosModules.default`,
+`services.ai-memory.enable`). This section is the maintainer test ladder
+for the flake and module — what CI runs, and what each tier proves.
+
+### Maintainer test ladder
+
+1. **Package smoke** — `nix build .#packages.<system>.default` then
+   `scripts/check-nix-packaging.sh ./result` (binary `--version`, hooks
+   tree, config template, `nix run`). Linux runs on every path-filtered
+   `nix.yml` PR; Darwin is schedule / `workflow_dispatch` / `nix` or
+   `full-ci` label only.
+2. **Eval contracts** — `nix build .#checks.x86_64-linux.nixos-module-eval`
+   and `nixos-sandbox-parity`. Cheap Linux-only asserts for enable/bind/
+   `--config`/secrets wiring, API-only vs web mounts, refusal messages (age+sops mutex, secrets in
+   `settings.auth`, `settings.bind`), escaped `ExecStart` (`--data-dir`,
+   `serve`, `--transport http`), default `StateDirectory` vs custom
+   `dataDir` tmpfiles/`ReadWritePaths`, and sandbox key parity with
+   `nix/systemd-sandbox.nix`. Runs on path-filtered PRs with the Linux
+   package job.
+3. **Toplevel → OCI → container smoke** — one closure path. Building
+   `packages.x86_64-linux.nixos-ai-memory-docker` builds
+   `system.build.toplevel` once (via the nixpkgs docker-image tarball);
+   there is no separate bare-toplevel CI job. Then:
+
+```bash
+scripts/test-nixos-systemd-container.sh
+```
+
+   That script imports the rootfs, runs a privileged systemd container,
+   checks `systemctl is-active ai-memory` and in-container `curl /healthz`
+   (the module's default loopback bind is unreachable via Docker `-p`),
+   writes a
+   marker under `/var/lib/ai-memory`, restarts the unit, and (by default)
+   remounts a named volume once. Gated in `nix.yml` to schedule /
+   `workflow_dispatch` / `nix` or `full-ci` label (not every Cargo.lock
+   bump).
+
+**Non-goals** (do not treat these as covered by the ladder above):
+
+- A→B flake/package upgrade or SQLite-wiki migration matrices
+- Exhaustive typed settings coverage (unknown TOML keys use `freeformType`)
+- Soft/fake systemd without a real unit start
+- Claiming the published app Docker image covers the NixOS module path
+- Darwin / multi-arch NixOS OCI (Linux x86_64 only by design)
+
+Useful knobs for the container smoke:
+
+```bash
+AI_MEMORY_NIXOS_TEST_KEEP=1 scripts/test-nixos-systemd-container.sh
+AI_MEMORY_NIXOS_TEST_VOLUME=0 scripts/test-nixos-systemd-container.sh
+AI_MEMORY_NIXOS_TEST_IMAGE=ai-memory-nixos-test scripts/test-nixos-systemd-container.sh
+AI_MEMORY_DOCKER=podman scripts/test-nixos-systemd-container.sh
+```
+
+---
+
 ## macOS menu bar app
 
 On a Mac, the self-contained menu bar app is the GUI install: it bundles the
@@ -1114,8 +1213,10 @@ Pool reads lifecycle hooks from a project-scoped `.poolside/settings.yaml` at
 the root of each repository it runs in — there is no user-global hook file for
 ai-memory to merge. `install-hooks --agent pool` (alias `poolside`) therefore
 stages the hook scripts to the stable user-global location and prints a
-ready-to-paste `hooks:` snippet; ai-memory deliberately does not write files
-inside your repositories.
+ready-to-paste `hooks:` snippet; ai-memory deliberately does not write
+committed files inside your repositories (the gitignored
+`.claude/settings.local.json` that `--scope project` writes for Claude Code is
+the one exception).
 
 ```bash
 # Stage the scripts and print the snippet to paste into
@@ -1680,7 +1781,8 @@ The `serve` subcommand also accepts:
 
 | Flag | Env var | What it does |
 |---|---|---|
-| `--enable-web` | `AI_MEMORY_ENABLE_WEB=true` | Mount the read-only web browser + `/api/v1` JSON API. |
+| `--enable-web` | `AI_MEMORY_ENABLE_WEB=true` | Mount the read-only web browser and `/api/v1` JSON API. |
+| `--enable-api` | `AI_MEMORY_ENABLE_API=true` | Mount only the protected, read-only `/api/v1` JSON API for companions and other non-browser clients. |
 | `--base-path /wiki` | `AI_MEMORY_BASE_PATH` | Host the entire HTTP surface (`/mcp`, `/hook`, `/admin/*`, `/api/v1`, `/web`) under a configurable subpath — useful behind a reverse proxy sharing a hostname. `.` and `..` segments are rejected; unsafe chars cause a fallback to root with a warning. See [`docs/https-via-proxy.md`](https-via-proxy.md#hosting-under-a-subpath). |
 | `--web-slug /web` | `AI_MEMORY_WEB_SLUG` | Where the web UI mounts within the base-path. Default `/web`; set to `/` to mount the UI at the base-path root. |
 | `--web-ui-dir <path>` | `AI_MEMORY_WEB_UI_DIR` | Serve a custom SPA from `<path>` instead of the built-in browser. ai-memory injects `<base href>` and `<meta name="ai-memory-base-path">` so the SPA can build relative URLs and API calls under the configured prefix. |
@@ -2186,7 +2288,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
 | `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
-| `install-hooks --agent` | `docker run --rm` | Hook-config snippet for an existing hooks dir |
+| `install-hooks --agent [--scope project]` | `docker run --rm` | Hook-config snippet for an existing hooks dir; `--scope project` targets the checkout's `.claude/settings.local.json` (Claude Code only) |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |
 | `install-instructions [--target] [--print] [--no-skills]` | same host environment used for the agent prompt files | Install or update the slim CLAUDE.md / AGENTS.md routing block and, by default, the managed ai-memory Agent Skills |
 | `install-skills [--scope] [--agent]` | same host environment used for the agent skill dirs | Install or update only the managed ai-memory Agent Skills |

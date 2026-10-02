@@ -441,6 +441,23 @@ printf '%s\n' '{"session_id":"demo","cwd":"/example/workspace","tool_name":"Edit
       --server-url http://127.0.0.1:49374 --check-capture
 ```
 
+The same inspection also reports sanitized `scope` hints (`workspace`, `project`,
+`project_src`, `project_strategy`, `identity`, `identity_src`,
+`server_may_remap`) and `scope_resolution`. These are local hints, not a
+server lookup: inspection creates no project and may report server-derived
+coordinates that the server later remaps. Partial marker scope fails closed.
+`event_admits_capture` reports lifecycle eligibility. External producers use
+`policy_admits_capture`, which also checks exclusions and server-profile
+resolution while ignoring `AI_MEMORY_CAPTURE_OWNER`. The existing
+`admits_capture` field still reports native capture admission. Each scope hint
+is limited to 512 bytes. Oversized names are omitted (`null`), report
+`scope_resolution: "unavailable"` and refuse producer admission; native
+routing remains unchanged.
+The native hook can derive a project for a marker that declares only
+`workspace`. Producer preflight is stricter: declare both names, or provide
+`repo-root` so both resolve locally. An absent cwd also returns unavailable
+scope and refuses producer admission.
+
 The normal capture contract is intentionally narrow: supported Claude Code,
 OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
@@ -652,6 +669,19 @@ Two guarantees hold in **both** modes:
 
 Session-creating events are unaffected in both modes: opening a session in a
 plain non-git folder still names the project after that folder.
+
+Some harnesses keep reporting the parent session's cwd when a subagent uses a
+file tool in another checkout. Native `ai-memory hook` commands compensate for
+that case before applying `follow-cwd` or `sticky`: a fixture-backed file-tool
+schema with absolute target paths is routed from the target when every path
+proves the same repository or marker boundary. The destination's capture
+policy and `server` profile are authoritative, so a cross-project call cannot
+use the source repository's policy or credentials. Relative paths,
+mixed-project calls, unknown schemas, and absolute paths outside a recognized
+repository/marker keep the payload cwd. Free-form shell commands are not
+reinterpreted as project routing instructions. This changes raw observation
+attribution only; the session row and its compiled session page remain in the
+project where the session began.
 
 Independently of this setting, under `project_strategy = "repo-root"` a
 mid-session event whose cwd is outside any git repo *and* any marker (agent

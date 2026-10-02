@@ -20,8 +20,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::cli::{AgentChoice, CaptureModeArg, InstallHooksArgs, McpClient, ProjectStrategyArg};
-use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
+use crate::cli::{
+    AgentChoice, CaptureModeArg, HookInstallScope, InstallHooksArgs, McpClient, ProjectStrategyArg,
+};
+use crate::commands::apply_shared::{
+    ApplyOutcome, PrivateBackup, apply_atomic, apply_atomic_with_backup, mutate_json, mutate_toml,
+};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
 use crate::commands::path_util::{home_dir, strip_windows_verbatim_prefix};
@@ -61,6 +65,156 @@ fn claude_settings_path_in(
         .context("could not locate $HOME for ~/.claude/settings.json")?
         .join(".claude")
         .join("settings.json"))
+}
+
+/// The Claude Code settings file this invocation renders for or writes. An
+/// explicit `--config-file` wins; `--scope project` targets the checkout's
+/// `.claude/settings.local.json`; otherwise the user-level file.
+pub(crate) fn claude_settings_target(args: &InstallHooksArgs) -> Result<PathBuf> {
+    if let Some(path) = &args.config_file {
+        return Ok(path.clone());
+    }
+    match args.scope {
+        HookInstallScope::Global => claude_settings_path(),
+        HookInstallScope::Project => {
+            let cwd = std::env::current_dir().context(
+                "could not resolve current dir for the project-scoped Claude Code settings",
+            )?;
+            Ok(project_claude_settings_local(&cwd))
+        }
+    }
+}
+
+/// The `.claude/settings.local.json` Claude Code reads for a session launched
+/// in `cwd` (code.claude.com/docs/en/settings, "Where Claude Code looks for
+/// each file"): at the git repository root even when launched in a
+/// subdirectory (the *main* checkout's root from a linked worktree), but in
+/// the launch directory itself outside a repository, on Windows, and when the
+/// repository root is the home directory. `CLAUDE_CONFIG_DIR` relocates only
+/// the user-level files, so it plays no part here.
+pub(crate) fn project_claude_settings_local(cwd: &Path) -> PathBuf {
+    project_claude_settings_local_for(cwd, cfg!(windows), home_dir().as_deref())
+}
+
+/// [`project_claude_settings_local`] with the platform and home directory
+/// injected, so the Windows and home-repository rules are testable anywhere.
+fn project_claude_settings_local_for(cwd: &Path, is_windows: bool, home: Option<&Path>) -> PathBuf {
+    let base = if is_windows {
+        cwd.to_path_buf()
+    } else {
+        match ai_memory_consolidate::discover_main_repo_root(cwd) {
+            Ok(root) if !home.is_some_and(|home| same_directory(&root, home)) => root,
+            _ => cwd.to_path_buf(),
+        }
+    };
+    base.join(".claude").join("settings.local.json")
+}
+
+/// Whether two paths name the same directory. libgit2 reports the repository
+/// root resolved while the home path may not be (`/var` vs `/private/var` on
+/// macOS), so a lexical mismatch falls back to comparing resolved paths; the
+/// result only picks a directory and is never stored.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (fs::canonicalize(a), fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// Where an update to a project `.claude/settings.local.json` keeps the prior
+/// file: under the data dir, never in the checkout. Claude Code's ignore rule
+/// covers only that file name, so a sibling `.bak-<ts>` would show up in
+/// `git status` carrying the full hook commands.
+pub(crate) fn project_settings_backup(data_dir: &Path, settings: &Path) -> PrivateBackup {
+    PrivateBackup {
+        dir: data_dir.join("backups").join("claude-settings-local"),
+        stem: project_settings_backup_stem(settings),
+    }
+}
+
+/// A file-name stem naming the checkout `settings` sits in: its directory
+/// flattened to safe characters and bounded to the tail (the repository name
+/// end), plus a short hash of the full path so checkouts that flatten alike
+/// stay apart.
+fn project_settings_backup_stem(settings: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    let checkout = settings
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(settings)
+        .to_string_lossy();
+    let mut flat = String::with_capacity(checkout.len());
+    for c in checkout.chars() {
+        let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+            c
+        } else {
+            '-'
+        };
+        if !(c == '-' && flat.ends_with('-')) {
+            flat.push(c);
+        }
+    }
+    let flat = flat.trim_matches('-');
+    let tail = &flat[flat.len().saturating_sub(64)..];
+    let digest = format!("{:x}", Sha256::digest(checkout.as_bytes()));
+    format!("{}-{}", tail.trim_start_matches('-'), &digest[..12])
+}
+
+/// The `hooks` table of a Claude-shaped settings document (`hooks` → event →
+/// entries) when at least one entry in it is ours; `None` means the document
+/// is not an ai-memory install. Every "is this file one of ours" question
+/// goes through here so the walk cannot drift between callers.
+fn ai_memory_claude_hooks(
+    document: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    let hooks = document.get("hooks")?.as_object()?;
+    hooks
+        .values()
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .any(is_ai_memory_hook_entry)
+        .then_some(hooks)
+}
+
+/// Whether a parsed Claude-shaped settings document carries an ai-memory hook.
+/// `upgrade` and the `run` auto-wire use it to tell a `--scope project`
+/// install apart from a user-level one: both stage the same scripts, so the
+/// staged dir alone no longer says which file was written.
+pub(crate) fn document_carries_ai_memory_hooks(document: &serde_json::Value) -> bool {
+    ai_memory_claude_hooks(document).is_some()
+}
+
+/// [`document_carries_ai_memory_hooks`] over raw file content; unparsable
+/// content is not an install.
+pub(crate) fn settings_carry_ai_memory_hooks(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .is_some_and(|document| document_carries_ai_memory_hooks(&document))
+}
+
+/// [`settings_carry_ai_memory_hooks`] over a file; a missing or unreadable
+/// file is not an install.
+pub(crate) fn settings_file_carries_ai_memory_hooks(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .is_some_and(|content| settings_carry_ai_memory_hooks(&content))
+}
+
+/// Re-copy the Claude Code hook scripts into the stable staging dir the
+/// installed hook commands point at, without touching any settings file.
+/// `upgrade` uses it when the only Claude Code install is `--scope project`,
+/// so a platform whose hook commands run these scripts gets the new ones.
+/// Native-hook commands call the absolute `ai-memory` binary instead, which
+/// the upgrade replaces in place. Either way the project files themselves are
+/// not rewritten: a change to the hook commands reaches a checkout only when
+/// `install-hooks --scope project --apply` is re-run there.
+pub(crate) fn restage_claude_code_scripts(
+    data_dir: &Path,
+    hooks_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let hooks_dir = resolve_hooks_dir(hooks_dir, AgentChoice::ClaudeCode, data_dir)?;
+    stage_hook_scripts(&hooks_dir, "claude-code", data_dir)
 }
 
 /// Codex's hooks file — `$CODEX_HOME/hooks.json` when the var is set, else
@@ -373,6 +527,13 @@ fn kiro_cli_home_join(
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
 pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
+    if args.scope == HookInstallScope::Project && args.agent != AgentChoice::ClaudeCode {
+        anyhow::bail!(
+            "`--scope project` is only supported for `--agent claude-code`; ai-memory writes no \
+             project-local hook file for {}",
+            args.agent.kind().as_str()
+        );
+    }
     let inferred = if args.server_url.is_none() {
         infer_installed_mcp_config(args.agent)?
     } else {
@@ -407,6 +568,17 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         // path back.
         match crate::config::store_hook_auth_token(&config.data_dir, token) {
             Ok(()) => true,
+            // A project-local file sits inside a checkout where a commit could
+            // publish it, so the inline fallback is refused there outright.
+            Err(e) if args.scope == HookInstallScope::Project => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "could not persist the hook auth token under {}; refusing to embed it in the \
+                     project-local .claude/settings.local.json instead. Install with a writable \
+                     host data dir (e.g. `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for \
+                     the docker wrapper) or a native `ai-memory` binary, or use `--scope global`",
+                    config.data_dir.display()
+                )));
+            }
             Err(e) => {
                 eprintln!(
                     "[ai-memory] warning: could not persist the hook auth token under {} ({e}); \
@@ -666,17 +838,17 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         AgentChoice::ClaudeCode => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            let settings_path = match &args.config_file {
-                Some(p) => p.clone(),
-                None => claude_settings_path()?,
-            };
+            let settings_path = claude_settings_target(&args)?;
             render_claude_code(
                 &hooks_dir,
                 &server_url,
                 auth,
                 &config.data_dir,
                 strategy,
-                &settings_path,
+                ClaudeRenderTarget {
+                    settings_path: &settings_path,
+                    scope: args.scope,
+                },
                 ClaudeCaptureScope {
                     assistant: args.capture_assistant,
                     prompts: install_claude_prompt_capture(&args),
@@ -871,15 +1043,7 @@ fn install_claude_prompt_capture(args: &InstallHooksArgs) -> bool {
 /// `None` means this is not an existing ai-memory Claude Code install.
 fn baked_claude_prompt_capture(existing: &str) -> Option<bool> {
     let document: serde_json::Value = serde_json::from_str(existing).ok()?;
-    let hooks = document.get("hooks")?.as_object()?;
-    let has_ai_memory_hooks = hooks.values().any(|value| {
-        value
-            .as_array()
-            .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry))
-    });
-    if !has_ai_memory_hooks {
-        return None;
-    }
+    let hooks = ai_memory_claude_hooks(&document)?;
     Some(
         hooks
             .get(CLAUDE_PROMPT_EVENT)
@@ -950,7 +1114,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
         }
     } else {
         match args.agent {
-            AgentChoice::ClaudeCode => claude_settings_path().ok()?,
+            AgentChoice::ClaudeCode => claude_settings_target(args).ok()?,
             AgentChoice::Codex => codex_hooks_path().ok()?,
             AgentChoice::CommandCode => command_code_settings_path().ok()?,
             AgentChoice::Cursor => cursor_hooks_path().ok()?,
@@ -1679,9 +1843,6 @@ fn overlay_kiro_cli_event_hooks(
     map.insert(event.to_string(), serde_json::Value::Array(entries));
 }
 
-/// Mutate `~/.claude/settings.json` in place: replace the hook entries
-/// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
-/// user has wired up to other tools.
 /// Whether `--capture-assistant` may take effect for this agent + platform
 /// (#196, #743): Claude Code, Codex and OpenCode 2 on a native hook platform.
 /// OpenCode 2 forwards completed text through the same native Stop sanitizer.
@@ -1713,6 +1874,9 @@ fn configure_claude_prompt_capture(
     payload
 }
 
+/// Mutate the Claude Code settings file in place: replace the hook entries
+/// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
+/// user has wired up to other tools.
 fn apply_to_claude_code_settings(
     hooks_dir: &Path,
     server_url: &str,
@@ -1747,7 +1911,7 @@ fn apply_to_claude_code_settings_in(
         ),
         capture_prompts,
     );
-    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
+    apply_to_claude_code_settings_with_payload(payload, args, data_dir, capture_prompts)
 }
 
 fn apply_to_claude_code_settings_with_staged(
@@ -1770,24 +1934,24 @@ fn apply_to_claude_code_settings_with_staged(
         ),
         capture_prompts,
     );
-    apply_to_claude_code_settings_with_payload(payload, args, capture_prompts)
+    apply_to_claude_code_settings_with_payload(payload, args, data_dir, capture_prompts)
 }
 
 fn apply_to_claude_code_settings_with_payload(
     payload: serde_json::Value,
     args: &InstallHooksArgs,
+    data_dir: &Path,
     capture_prompts: bool,
 ) -> Result<()> {
-    let path = match &args.config_file {
-        Some(p) => p.clone(),
-        None => claude_settings_path()?,
-    };
+    let path = claude_settings_target(args)?;
     let our_hooks = payload
         .get("hooks")
         .and_then(|v| v.as_object())
         .context("internal: build_claude_code_payload didn't return a hooks object")?
         .clone();
-    let outcome = apply_atomic(&path, |existing| {
+    let private_backup =
+        (args.scope == HookInstallScope::Project).then(|| project_settings_backup(data_dir, &path));
+    let outcome = apply_atomic_with_backup(&path, private_backup.as_ref(), |existing| {
         mutate_json(existing, |root| {
             // Get-or-create the top-level `hooks` table, then merge our
             // event keys in via `overlay_event_hooks`: our entries replace
@@ -1808,16 +1972,52 @@ fn apply_to_claude_code_settings_with_payload(
             Ok(())
         })
     })?;
+    let backup_note = match &private_backup {
+        Some(backup) => format!("backup written under {}", backup.dir.display()),
+        None => "backup written next to it".to_string(),
+    };
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
         path.display(),
         match outcome {
             ApplyOutcome::Created => "new file",
-            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::Updated => &backup_note,
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    // Claude Code runs the hooks of both scopes. Identical handlers dedupe, but
+    // installs that differ (capture flags, project strategy) capture twice.
+    if args.config_file.is_none()
+        && let Some(other) = match args.scope {
+            HookInstallScope::Project => claude_settings_path().ok(),
+            HookInstallScope::Global => std::env::current_dir()
+                .ok()
+                .map(|cwd| project_claude_settings_local(&cwd)),
+        }
+        && other != path
+        && settings_file_carries_ai_memory_hooks(&other)
+    {
+        eprintln!(
+            "[ai-memory] note: {} also carries ai-memory hooks; Claude Code runs both, so keep \
+             one scope or install both with the same flags.",
+            other.display()
+        );
+    }
+    // Claude Code adds `**/.claude/settings.local.json` to the global git
+    // excludes only when it creates the file itself; a file ai-memory created
+    // has no such guarantee, and its hook commands carry machine-specific
+    // paths nobody wants committed.
+    if args.scope == HookInstallScope::Project
+        && ai_memory_consolidate::path_is_git_ignored(&path) == Some(false)
+    {
+        eprintln!(
+            "[ai-memory] warning: {} is not ignored by git. Add `**/.claude/settings.local.json` \
+             to this repository's .gitignore (or your global excludes) so the machine-specific \
+             hook commands are never committed.",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -5391,19 +5591,35 @@ struct ClaudeCaptureScope {
     prompts: bool,
 }
 
+/// The settings file a Claude Code preview is rendered for, and the scope that
+/// chose it.
+struct ClaudeRenderTarget<'a> {
+    settings_path: &'a Path,
+    scope: HookInstallScope,
+}
+
 fn render_claude_code(
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
-    settings_path: &Path,
+    target: ClaudeRenderTarget<'_>,
     capture: ClaudeCaptureScope,
 ) -> Result<()> {
+    let ClaudeRenderTarget {
+        settings_path,
+        scope,
+    } = target;
     let ClaudeCaptureScope {
         assistant: capture_assistant,
         prompts: capture_prompts,
     } = capture;
+    // A preview never persists the bearer (#552), so it would land inline in
+    // the snippet — and project scope tells the operator to paste that snippet
+    // into a checkout. Withhold it there; `--apply` persists it instead.
+    let token_withheld = scope == HookInstallScope::Project && auth_token.is_some();
+    let auth_token = if token_withheld { None } else { auth_token };
     // Soft check: warn (don't bail) if a script is missing. The user
     // may be running this command inside docker against a host path
     // that exists only on the host's filesystem — bailing would
@@ -5443,7 +5659,14 @@ fn render_claude_code(
     );
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
-    if auth_token.is_some() {
+    if token_withheld {
+        println!("# Auth: a bearer token is configured but NOT embedded below: this file");
+        println!("#       lives inside a checkout. Re-run with --apply, which persists the");
+        println!(
+            "#       token under {} (0600) where the hooks read it.",
+            data_dir.display()
+        );
+    } else if auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
         println!(
             "#       Treat {} as sensitive (chmod 600).",
@@ -6198,7 +6421,7 @@ fn render_pool_output(
     let mut out = String::new();
     out.push_str("# Pool (Poolside Agent CLI) hook config — merge into the repo-root\n");
     out.push_str("# .poolside/settings.yaml of each project Pool runs in. ai-memory\n");
-    out.push_str("# does not write project-local files, so paste this snippet manually\n");
+    out.push_str("# does not write committed project files, so paste this snippet manually\n");
     out.push_str("# (re-run with --apply first to stage the scripts to a stable path).\n");
     out.push_str(&format!("# Hook scripts: {}\n", hooks_dir.display()));
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
@@ -6736,6 +6959,7 @@ mod tests {
             as_user: None,
             apply: true,
             config_file: None,
+            scope: HookInstallScope::Global,
             project_strategy: Some(ProjectStrategyArg::Basename),
         }
     }
@@ -7283,7 +7507,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             None,
         );
         assert!(out.contains(".poolside/settings.yaml"));
-        assert!(out.contains("does not write project-local files"));
+        assert!(out.contains("does not write committed project files"));
         assert!(out.contains("finalize-session --agent pool"));
         assert!(out.contains("memory_handoff_accept"));
         assert!(out.contains("hooks:\n"));
@@ -8525,6 +8749,178 @@ model = "gpt-5"
             None,
             "the token must not have been persisted in the failure case"
         );
+    }
+
+    /// `--scope project` lands where Claude Code reads the file: the git root
+    /// of the checkout, even from a subdirectory. A plain directory is its own
+    /// root. On Windows, and when the repository root is the home directory,
+    /// Claude Code reads the launch directory instead.
+    #[test]
+    fn project_claude_settings_local_resolves_where_claude_code_reads_it() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let sub = repo.join("crates").join("x");
+        std::fs::create_dir_all(&sub).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        let local = |dir: &Path| dir.join(".claude").join("settings.local.json");
+        let unrelated_home = tmp.path().join("home");
+        std::fs::create_dir_all(&unrelated_home).unwrap();
+        // libgit2 reports the real path; compare canonicalised so a
+        // /private/var vs /var prefix on macOS does not trip the assertion.
+        let root_of = |file: PathBuf| {
+            assert!(file.ends_with(Path::new(".claude").join("settings.local.json")));
+            file.parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        };
+        let repo_root = repo.canonicalize().unwrap();
+
+        assert_eq!(
+            root_of(project_claude_settings_local_for(
+                &sub,
+                false,
+                Some(&unrelated_home)
+            )),
+            repo_root
+        );
+        assert_eq!(
+            root_of(project_claude_settings_local_for(&sub, false, None)),
+            repo_root,
+            "an unknown home does not change the git-root rule"
+        );
+        assert_eq!(
+            project_claude_settings_local_for(&sub, true, Some(&unrelated_home)),
+            local(&sub),
+            "Windows reads the launch directory, not the git root"
+        );
+        assert_eq!(
+            project_claude_settings_local_for(&sub, false, Some(&repo)),
+            local(&sub),
+            "a repository rooted at home reads the launch directory"
+        );
+
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        for is_windows in [false, true] {
+            assert_eq!(
+                project_claude_settings_local_for(&plain, is_windows, Some(&unrelated_home)),
+                local(&plain)
+            );
+        }
+    }
+
+    /// A project settings backup lands under the data dir with a stem that
+    /// names the checkout, is a single safe file-name component, and keeps
+    /// checkouts that flatten to the same text apart.
+    #[test]
+    fn project_settings_backup_stays_under_the_data_dir_per_checkout() {
+        let data = Path::new("/data");
+        let settings = |checkout: &str| {
+            Path::new(checkout)
+                .join(".claude")
+                .join("settings.local.json")
+        };
+        let backup = project_settings_backup(data, &settings("/home/u/work/my repo"));
+        assert_eq!(
+            backup.dir,
+            data.join("backups").join("claude-settings-local")
+        );
+        assert!(
+            backup.stem.starts_with("home-u-work-my-repo-"),
+            "{}",
+            backup.stem
+        );
+        assert!(
+            backup
+                .stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')),
+            "{}",
+            backup.stem
+        );
+        assert_ne!(
+            project_settings_backup(data, &settings("/a/b-c")).stem,
+            project_settings_backup(data, &settings("/a-b/c")).stem
+        );
+        let deep = format!("/{}/repo", "x".repeat(300));
+        let stem = project_settings_backup(data, &settings(&deep)).stem;
+        assert!(stem.len() <= 64 + 13, "{stem}");
+        assert!(stem.contains("repo-"), "the repository end is kept: {stem}");
+    }
+
+    /// `upgrade` and the `run` auto-wire use this to tell a `--scope project`
+    /// install from a user-level one; a third-party hook alone must not count.
+    #[test]
+    fn settings_carry_ai_memory_hooks_recognizes_only_our_entries() {
+        let ours = r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /home/u/.local/share/ai-memory/hooks/claude-code/stop.sh"}]}]}}"#;
+        assert!(settings_carry_ai_memory_hooks(ours));
+        let third_party = r#"{"hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#;
+        assert!(!settings_carry_ai_memory_hooks(third_party));
+        assert!(!settings_carry_ai_memory_hooks(r#"{"permissions":{}}"#));
+        assert!(!settings_carry_ai_memory_hooks("not json"));
+    }
+
+    /// Project scope names a Claude Code file; no other agent has a
+    /// project-local hook file ai-memory writes, so the install must fail
+    /// before it stages anything.
+    #[test]
+    fn project_scope_is_rejected_for_agents_without_a_project_file() {
+        let home = TempDir::new().unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Codex,
+            scope: HookInstallScope::Project,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            // Unreachable from the CLI (clap rejects the pair); set only so a
+            // regression writes into the temp dir, not the real ~/.codex.
+            config_file: Some(home.path().join("hooks.json")),
+            ..default_hook_args()
+        };
+        let err = run(&config, args).unwrap_err();
+        assert!(err.to_string().contains("--scope project"), "{err:#}");
+        assert!(
+            !config
+                .data_dir
+                .join(crate::install_layout::HOOKS_DIR_NAME)
+                .exists(),
+            "nothing may be staged after a refused install"
+        );
+    }
+
+    /// The inline-bearer fallback (F5 above) writes the token into the hook
+    /// config. Inside a checkout that file can be committed, so project scope
+    /// refuses the fallback instead of taking it.
+    #[test]
+    fn project_scope_refuses_the_inline_bearer_when_persisting_fails() {
+        let home = TempDir::new().unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        // Same EISDIR trick as the fallback test: only the secret write fails.
+        std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
+        let settings = home.path().join("settings.local.json");
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            scope: HookInstallScope::Project,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("PROJECT-BEARER".to_string()),
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            // Unreachable from the CLI (clap rejects the pair); set only so a
+            // regression writes into the temp dir, not this checkout.
+            config_file: Some(settings.clone()),
+            ..default_hook_args()
+        };
+        let err = run(&config, args).unwrap_err();
+        assert!(format!("{err:#}").contains("refusing to embed"), "{err:#}");
+        assert!(!settings.exists(), "no config may be written on refusal");
+        assert_eq!(crate::config::read_hook_auth_token(&config.data_dir), None);
     }
 
     fn claude_apply_args(
@@ -9910,6 +10306,7 @@ model = "gpt-5"
             as_user: None,
             apply: true,
             config_file: Some(tmp.path().join("extensions").join("ai-memory-omp.ts")),
+            scope: HookInstallScope::Global,
             project_strategy: Some(ProjectStrategyArg::Basename),
             profile: None,
         };
@@ -9943,6 +10340,7 @@ model = "gpt-5"
             as_user: None,
             apply: true,
             config_file: Some(path.clone()),
+            scope: HookInstallScope::Global,
             project_strategy: Some(ProjectStrategyArg::Basename),
             profile: None,
         };
@@ -10536,6 +10934,7 @@ model = "gpt-5"
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
+                scope: HookInstallScope::Global,
                 project_strategy: Some(ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
@@ -11030,6 +11429,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
+                scope: HookInstallScope::Global,
                 project_strategy: Some(ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
@@ -11592,6 +11992,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
+                scope: HookInstallScope::Global,
                 project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
@@ -11659,6 +12060,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
+                scope: HookInstallScope::Global,
                 project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
@@ -11715,6 +12117,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
             config_file: Some(hooks_v1_path.clone()),
+            scope: HookInstallScope::Global,
             project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
             as_user: None,
             apply: false,
@@ -11764,6 +12167,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
             config_file: Some(config_path.clone()),
+            scope: HookInstallScope::Global,
             project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
             as_user: None,
             apply: false,
@@ -11838,6 +12242,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
+                scope: HookInstallScope::Global,
                 project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
