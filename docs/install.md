@@ -1301,6 +1301,40 @@ ai-memory finalize-session --agent zcode --session-id <uuid>
 No first-party `install-mcp` client and no managed workstream
 (`ai-memory run zcode`) are claimed yet.
 
+### GitHub Copilot CLI
+
+Copilot CLI loads user-level hook files from `~/.copilot/hooks/` (or
+`$COPILOT_HOME/hooks/`). `install-hooks --agent copilot-cli` writes
+`ai-memory.json` there — Copilot's standalone `{"version": 1, "hooks": {…}}`
+format — merging around any third-party entries already in the file:
+
+```bash
+ai-memory install-hooks --agent copilot-cli --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The events are configured with PascalCase names (`SessionStart`,
+`PreToolUse`, …), which makes Copilot send the VS Code/Claude-compatible
+snake_case payload (`session_id`, `cwd`, `tool_name`, `tool_input`,
+`tool_result`), so ai-memory's existing extraction applies and native commands
+enforce `[capture] ignore_paths`. Ten events are wired: Claude Code's nine plus
+`PostToolUseFailure`, which Copilot fires instead of `PostToolUse` when a tool
+errors. Entries sit directly in each event array with no `matcher`: Copilot
+rejects `matcher` on `SessionStart`, `Stop`, `SessionEnd`, and the subagent
+events, and omitting it elsewhere means "every invocation". Tool output is
+read from `tool_result.text_result_for_llm`.
+
+Copilot reads a top-level `additionalContext` from `SessionStart` stdout, not
+Claude Code's `hookSpecificOutput` envelope, so the prior session's handoff is
+not injected yet; recover it via MCP `memory_handoff_list` then
+`memory_handoff_accept` with that `handoff_id`. There is no `--scope project`:
+Copilot's repository hook files (`.github/hooks/*.json`) are shared with the
+team and loaded by the Copilot cloud agent, so they cannot carry per-machine
+script paths. `install-mcp --client copilot-cli` and `ai-memory run copilot`
+are not shipped yet; `install-mcp --client copilot` remains the VS Code
+Copilot client.
+
 ### Hermes Agent (Nous Research)
 
 Hermes declares lifecycle hooks in the `hooks:` block of

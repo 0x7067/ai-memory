@@ -209,6 +209,12 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             hook_files.push((project_local, HookConfigShape::NestedHooksKey));
         }
         hook_files.extend([
+            // Copilot CLI's standalone file keeps flat entries under the usual
+            // `hooks` key next to its `version: 1`, like Cursor's.
+            (
+                install_hooks::copilot_cli_hooks_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
             (
                 install_hooks::codex_hooks_path()?,
                 HookConfigShape::NestedHooksKey,
