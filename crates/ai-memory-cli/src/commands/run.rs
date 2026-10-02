@@ -4734,9 +4734,12 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd = cwd.canonicalize().unwrap();
         let write_session = |config_dir: &Path, id: &str| {
-            let bucket = config_dir
-                .join("projects")
-                .join(cwd.to_string_lossy().replace('/', "-"));
+            // Flatten the whole path: on Windows the canonical cwd is an
+            // absolute `\\?\C:\…` path, and joining it would escape the store.
+            let bucket = config_dir.join("projects").join(
+                cwd.to_string_lossy()
+                    .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+            );
             std::fs::create_dir_all(&bucket).unwrap();
             let line = serde_json::json!({
                 "type": "user",
