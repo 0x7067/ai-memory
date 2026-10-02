@@ -16,14 +16,14 @@ use ai_memory_workstream::{
     JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode, LaunchPlan,
     LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
-    discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
-    inspect_repository, jail_checklist, jail_toggle, kiro_explicit_session_id,
-    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    marked_choices, native_session_exists, native_session_in_checkout, omp_profile_flag,
-    omp_profile_flag_env, parse_jail_toggles, store_override_vars, usable_ai_jail_here,
-    wait_for_transcript_flush,
+    build_launch_plan, build_launch_plan_with_env, claude_live_background_attach_id,
+    claude_session_ran_in_background, crush_global_config_path, discover_native_session,
+    export_transcript, has_native_session_selector, inside_ai_jail_here, inspect_repository,
+    jail_checklist, jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
+    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
+    kiro_v3_resume_uses_default_store, list_native_sessions, marked_choices, native_session_exists,
+    native_session_in_checkout, omp_profile_flag, omp_profile_flag_env, parse_jail_toggles,
+    store_override_vars, usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -50,6 +50,8 @@ const HELD_LEASE_EXPIRY_SLACK: Duration = Duration::from_secs(1);
 const IMPORT_BATCH_EVENTS: usize = 400;
 const IMPORT_BATCH_BYTES: usize = 1024 * 1024;
 const ADOPTION_CANDIDATE_LIMIT: usize = 8;
+/// Bound on `claude agents --json`, which only reads the daemon's session list.
+const CLAUDE_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTO_HARNESSES: [ManagedHarness; 9] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
@@ -333,6 +335,11 @@ pub(super) async fn run_from_with_wiring(
         &repository.cwd,
         &run_env,
     ));
+    let resumes_linked_session = !force_fresh
+        && orphaned_session.is_none()
+        && prepared.native_session_id.is_some()
+        && plan.expected_session_id == prepared.native_session_id
+        && !has_native_session_selector(harness, &native_args);
     if let Some(orphaned_session) = orphaned_session {
         eprintln!(
             "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
@@ -512,6 +519,30 @@ pub(super) async fn run_from_with_wiring(
             .await
             .context("linking the managed native session; the agent was not started")
         );
+    }
+    // Claude refuses `--resume` on a background session that is still running
+    // and points at `claude attach`, so open it that way instead. An attached
+    // terminal starts no native session of its own: SessionStart never fires
+    // in it, and native flags have nothing to apply to.
+    let attached_background = if harness == ManagedHarness::Claude
+        && plan.mode == LaunchMode::Session
+        && resumes_linked_session
+        && let Some(native_session_id) = plan.expected_session_id.as_deref()
+    {
+        claude_background_attach_id(&plan, &home, &repository.cwd, &run_env, native_session_id)
+            .await
+    } else {
+        None
+    };
+    if let Some(attach_id) = &attached_background {
+        eprintln!(
+            "ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
+            plan.expected_session_id
+                .as_deref()
+                .map(display_session_id)
+                .unwrap_or_default()
+        );
+        plan.args = vec![OsString::from("attach"), OsString::from(attach_id)];
     }
 
     let crush_context = if harness == ManagedHarness::Crush && plan.mode == LaunchMode::Session {
@@ -725,6 +756,7 @@ pub(super) async fn run_from_with_wiring(
     if plan.mode == LaunchMode::Session
         && prepared.sync_through > prepared.sync_after
         && !server_status.is_some_and(|status| status.context_delivered)
+        && attached_background.is_none()
     {
         eprintln!(
             "ai-memory: this harness did not acknowledge its managed context packet; refresh its ai-memory hooks before the next run"
@@ -1821,6 +1853,44 @@ fn executable_available(program: &OsStr) -> bool {
 /// to spawn with "program not found". Resolving to the concrete file keeps the
 /// availability check and the launch agreeing on one answer, and lets the
 /// launch use a path that works.
+/// The `claude attach` id for a linked Claude session that is still running in
+/// the background, or `None` to keep the native `--resume`. The transcript is
+/// checked first so a foreground session never costs a `claude agents` call;
+/// any failure of that call (an older Claude, a wrapper executable, a timeout)
+/// also keeps the resume.
+async fn claude_background_attach_id(
+    plan: &LaunchPlan,
+    home: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    native_session_id: &str,
+) -> Option<String> {
+    let background =
+        claude_session_ran_in_background(home, cwd, plan.session_dir.as_deref(), native_session_id)
+            .unwrap_or(false);
+    if !background {
+        return None;
+    }
+    let program = resolve_program(&plan.program).unwrap_or_else(|| plan.program.clone().into());
+    let mut command = Command::new(&program);
+    command
+        .args(["agents", "--json", "--cwd"])
+        .arg(cwd)
+        .current_dir(cwd)
+        .envs(env.iter().map(|(key, value)| (key, value)))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(CLAUDE_AGENTS_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    claude_live_background_attach_id(&output.stdout, native_session_id, cwd)
+}
+
 pub(super) fn resolve_program(program: &OsStr) -> Option<std::path::PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
@@ -4114,6 +4184,82 @@ mod tests {
             plan.session_dir.as_deref(),
             Some(Path::new("/accounts/work/projects"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_claude_background_session_is_attached_to_not_resumed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let project = temp
+            .path()
+            .join(".claude/projects")
+            .join(cwd.to_string_lossy().replace('/', "-"));
+        std::fs::create_dir_all(&project).unwrap();
+        let full = "94e41265-4001-431c-828e-1c54953e596b";
+        let calls = temp.path().join("calls");
+        let listing = temp.path().join("agents.json");
+        let script = temp.path().join("claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"$*\" >> \"$FAKE_CALLS\"\ncat \"$FAKE_AGENTS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = vec![
+            ("FAKE_CALLS".to_string(), calls.display().to_string()),
+            ("FAKE_AGENTS".to_string(), listing.display().to_string()),
+        ];
+        std::fs::write(
+            &listing,
+            serde_json::json!([{
+                "id": "94e41265", "sessionId": full, "kind": "background",
+                "status": "idle", "cwd": cwd,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut plan = build_launch_plan(
+            ManagedHarness::Claude,
+            Some(script.clone().into()),
+            Vec::new(),
+            Some(full),
+        )
+        .unwrap();
+        plan.session_dir = None;
+        let attach = || claude_background_attach_id(&plan, temp.path(), &cwd, &env, full);
+        let transcript = |kind: Option<&str>| {
+            let mut record = serde_json::json!({"type": "user", "sessionId": full, "cwd": cwd});
+            if let Some(kind) = kind {
+                record["sessionKind"] = serde_json::json!(kind);
+            }
+            std::fs::write(project.join(format!("{full}.jsonl")), format!("{record}\n")).unwrap();
+        };
+
+        // A foreground session keeps its resume without asking Claude at all.
+        transcript(None);
+        assert_eq!(attach().await, None);
+        assert!(
+            !calls.exists(),
+            "claude agents ran for a foreground session"
+        );
+
+        transcript(Some("bg"));
+        assert_eq!(attach().await.as_deref(), Some("94e41265"));
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().trim(),
+            format!("agents --json --cwd {}", cwd.display())
+        );
+
+        // Stopped (no longer listed), or a listing Claude could not produce:
+        // the native resume stays.
+        std::fs::write(&listing, "[]").unwrap();
+        assert_eq!(attach().await, None);
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(attach().await, None);
     }
 
     #[cfg(unix)]

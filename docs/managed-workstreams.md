@@ -419,6 +419,19 @@ Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
 
+When the linked Claude session is a Claude Code background session that is
+still running in the daemon, Claude refuses `--resume <id>` when another flag
+comes with it (seen with `--model`, `--effort` and
+`--dangerously-skip-permissions` on Claude Code 2.1.287; a bare `--resume`
+attaches) and points at `claude attach <id>`. Only when the
+transcript shows the session ran in the background (`sessionKind: "bg"`)
+does ai-memory ask `claude agents --json --cwd <checkout>`. When that lists the
+session as a live background one in this checkout, it launches
+`claude attach <id>` with the listing's short id instead. An attached terminal
+starts no native session of its own: native arguments are not passed, and the
+workstream context packet is not delivered (SessionStart does not fire). A
+failed or unexpected listing keeps the native resume. (#1052)
+
 Crush has no hooks to link its session: a fresh Crush launch claims the one top-level session
 created while it ran (its title and sub-agent sessions do not count), and
 imports nothing, with a warning, when another launch on the same store created
