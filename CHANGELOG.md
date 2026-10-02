@@ -195,6 +195,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+- Fixed watcher reindexing racing with writes and batches to the same page by
+  sharing their per-page mutex from disk read through SQLite upsert. Both
+  mutation guards were released before embedding; external editors remained
+  outside this coordination. (#1059)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added
