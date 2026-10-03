@@ -294,6 +294,15 @@ if command -v git >/dev/null 2>&1; then
     assert_eq "identity: an explicit identity outranks the project" \
         "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
+    # #1033: the path style rides along with a remote identity only.
+    printf 'identity_style = "path"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: the path style rides along with the remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=path" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'identity_style = "path"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: a declared identity sends no style" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
     rm -rf "$TMP/idrepo"
 fi
 

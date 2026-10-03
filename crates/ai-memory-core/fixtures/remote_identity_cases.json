@@ -41,5 +41,21 @@
     { "identity": "github.com/acme/api.git", "name": "acme-api.git" },
     { "identity": "acme platform", "name": "acme-platform" },
     { "identity": "ana/personal notes", "name": "ana-personal-notes" }
+  ],
+  "styled_key": [
+    { "identity": "github.com/akitaonrails/ai-memory", "source": "git_remote", "path": "akitaonrails/ai-memory", "host_path": "github.com/akitaonrails/ai-memory", "path_name": "akitaonrails-ai-memory" },
+    { "identity": "gitlab.com/acme/group/api", "source": "git_remote", "path": "acme/group/api", "host_path": "gitlab.com/acme/group/api", "path_name": "acme-group-api" },
+    { "identity": "ssh.dev.azure.com/v3/acme/proj/api", "source": "git_remote", "path": "v3/acme/proj/api", "host_path": "ssh.dev.azure.com/v3/acme/proj/api", "path_name": "v3-acme-proj-api" },
+    { "identity": "github.com/acme/my api", "source": "git_remote", "path": "acme/my api", "host_path": "github.com/acme/my api", "path_name": "acme-my-api" },
+    { "identity": "acme/platform", "source": "explicit", "path": "acme/platform", "host_path": "acme/platform", "path_name": null },
+    { "identity": "api", "source": "folder_name", "path": "api", "host_path": "api", "path_name": null }
+  ],
+  "identity_style": [
+    { "value": "path", "style": "path" },
+    { "value": "host_path", "style": "host_path" },
+    { "value": "  path  ", "style": "path" },
+    { "value": "Path", "style": null },
+    { "value": "host-path", "style": null },
+    { "value": "", "style": null }
   ]
 }

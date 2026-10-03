@@ -81,6 +81,7 @@ pub(crate) enum WriteCmd {
     ResolveProjectByIdentity {
         workspace_id: WorkspaceId,
         identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
         name: String,
         repo_path: Option<String>,
         candidate: Option<ProjectId>,
@@ -938,10 +939,12 @@ impl WriterHandle {
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
     /// propagates the SQL error.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resolve_project_by_identity(
         &self,
         workspace_id: WorkspaceId,
         identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
         name: impl Into<String>,
         repo_path: Option<String>,
         candidate: Option<ProjectId>,
@@ -951,6 +954,7 @@ impl WriterHandle {
         self.send(WriteCmd::ResolveProjectByIdentity {
             workspace_id,
             identity,
+            style,
             name: name.into(),
             repo_path,
             candidate,
@@ -3263,6 +3267,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ResolveProjectByIdentity {
                 workspace_id,
                 identity,
+                style,
                 name,
                 repo_path,
                 candidate,
@@ -3273,6 +3278,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &mut conn,
                     &workspace_id,
                     &identity,
+                    style,
                     &name,
                     repo_path.as_deref(),
                     candidate,

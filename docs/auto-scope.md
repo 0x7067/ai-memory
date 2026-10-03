@@ -116,6 +116,10 @@ pointers. The durable `SessionId` stored for hook observations remains global:
 if another owner reuses an already-owned id, ai-memory drops that hook before it
 can append observations or publish a pointer for the foreign actor.
 
+Pointers hold project ids, not names, so a project named from its repository
+path ([`identity_style = "path"`](marker-file.md#naming-new-projects-by-repository-path-identity_style),
+#1033) is published and resolved exactly like any other.
+
 Owner and agent are what identify a session; scope is not. The same operator's
 session legitimately produces events in another project when its cwd moves, so
 a differing `(workspace, project)` is recorded rather than rejected — see

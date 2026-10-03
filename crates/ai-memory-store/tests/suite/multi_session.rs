@@ -87,6 +87,83 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
     }
 }
 
+/// #1033 under invariant #16: two operators on two clones of one repository,
+/// in folders named differently, opt into the `path` style and capture at the
+/// same time. They must land in one project — the same name and the same row —
+/// so each reads what the other writes; a race must not split the repository.
+#[tokio::test]
+async fn two_operators_on_two_clones_of_one_repository_share_its_path_named_project() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("acme".to_string())
+        .await
+        .unwrap();
+    let repo = RepositoryIdentity {
+        identity: "github.com/acme/api".into(),
+        source: IdentitySource::GitRemote,
+    };
+    let clone = |folder: &'static str, path: &'static str| {
+        let writer = store.writer.clone();
+        let repo = repo.clone();
+        async move {
+            writer
+                .resolve_project_by_identity(
+                    ws,
+                    repo,
+                    IdentityStyle::Path,
+                    folder,
+                    Some(path.to_owned()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .0
+        }
+    };
+    let (alice, bob) = tokio::join!(
+        clone("api", "/home/alice/src/api"),
+        clone("api-main", "/srv/bob/worktrees/api-main"),
+    );
+    assert_eq!(alice, bob, "two clones of one repository share one project");
+    assert_eq!(
+        store
+            .reader
+            .find_project(ws, "acme-api".into())
+            .await
+            .unwrap(),
+        Some(alice)
+    );
+    for folder in ["api", "api-main"] {
+        assert!(
+            store
+                .reader
+                .find_project(ws, folder.into())
+                .await
+                .unwrap()
+                .is_none(),
+            "no per-folder fragment for {folder}"
+        );
+    }
+
+    store
+        .writer
+        .upsert_page(page(ws, alice, "notes/shared.md", "Shared", "alice's note"))
+        .await
+        .unwrap();
+    let seen = store
+        .reader
+        .page_body_by_ids(ws, bob, "notes/shared.md")
+        .await
+        .unwrap()
+        .expect("bob reads alice's page in the shared project");
+    assert!(seen.body.contains("alice's note"));
+}
+
 /// The collaboration guarantee, and the reason a team can use one server:
 /// what Alice writes, Carol reads.
 ///

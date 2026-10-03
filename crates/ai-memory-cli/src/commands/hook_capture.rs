@@ -328,6 +328,7 @@ pub struct HookScope {
     #[serde(serialize_with = "serialize_scope_hint")]
     identity: Option<String>,
     identity_src: Option<&'static str>,
+    identity_style: Option<&'static str>,
     server_may_remap: bool,
 }
 
@@ -398,11 +399,13 @@ fn hook_scope_from_marker(
     let mut project = None;
     let mut strategy = None;
     let mut explicit_identity = None;
+    let mut style = None;
     if let Some(marker) = marker {
         workspace = parse_toml_key(marker, "workspace");
         project = parse_toml_key(marker, "project");
         strategy = parse_toml_key(marker, "project_strategy");
         explicit_identity = parse_toml_key(marker, "identity");
+        style = parse_toml_key(marker, "identity_style");
     }
     let mut project_src = project.as_ref().map(|_| "marker");
     let identity = repository_identity(cwd, explicit_identity.as_deref(), project.as_deref());
@@ -413,6 +416,14 @@ fn hook_scope_from_marker(
         project = repo_root_project(cwd);
         project_src = project.as_ref().map(|_| "repo-root");
     }
+    // Only a remote has a host to drop, so the style travels with a remote
+    // identity and nothing else (#1033).
+    let identity_style = identity
+        .as_ref()
+        .filter(|identity| {
+            identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote
+        })
+        .and_then(|_| forwarded_identity_style(style.as_deref()));
     let (identity, identity_src) = match identity {
         Some(identity) => (Some(identity.identity), Some(identity.source.as_str())),
         None => (None, None),
@@ -425,8 +436,19 @@ fn hook_scope_from_marker(
         project_strategy: strategy,
         identity,
         identity_src,
+        identity_style,
         server_may_remap,
     }
+}
+
+/// The `identity_style` value to forward for a marker's raw setting: `path`
+/// or nothing, since `host_path` is the server's default. Every client makes
+/// this same decision, checked against the shared identity fixture.
+fn forwarded_identity_style(raw: Option<&str>) -> Option<&'static str> {
+    use ai_memory_core::repository_identity::IdentityStyle;
+    raw.and_then(IdentityStyle::from_str_opt)
+        .filter(|style| *style == IdentityStyle::Path)
+        .map(IdentityStyle::as_str)
 }
 
 fn marker_query_suffix_impl(
@@ -471,6 +493,9 @@ fn marker_query_suffix_impl(
             url_encode(&identity),
             source
         ));
+    }
+    if let Some(style) = scope.identity_style {
+        qs.push_str(&format!("&identity_style={style}"));
     }
     // Per-project `drop_subagent_captures` opt-in: forward the marker's value as
     // the `drop_subagent` flag so the server scopes the drop to this project.
@@ -1149,6 +1174,66 @@ mod tests {
             qs.contains("&identity=acme%2Fplatform&identity_src=explicit"),
             "{qs}"
         );
+    }
+
+    /// #1033: `identity_style = "path"` rides along with a remote identity,
+    /// and only with one — a declared project or identity has no host to drop,
+    /// and the default style sends nothing.
+    #[test]
+    fn marker_query_suffix_forwards_the_path_style_with_a_remote_identity() {
+        let Some(repo) = repo_with_remotes(&[("origin", "git@git.example.test:acme/api.git")])
+        else {
+            return;
+        };
+        let cwd = repo.path().to_str().unwrap();
+        let marker = repo.path().join(".ai-memory.toml");
+
+        std::fs::write(&marker, "identity_style = \"path\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity_src=git_remote&identity_style=path"),
+            "{qs}"
+        );
+        let scope = serde_json::to_value(hook_scope(cwd, None)).unwrap();
+        assert_eq!(scope["identity_style"], "path");
+
+        for (body, why) in [
+            (
+                "identity_style = \"host_path\"\n",
+                "the default sends nothing",
+            ),
+            (
+                "identity_style = \"Path\"\n",
+                "an unknown value sends nothing",
+            ),
+            (
+                "identity_style = \"path\"\nproject = \"api\"\n",
+                "a declared project routes by name",
+            ),
+            (
+                "identity_style = \"path\"\nidentity = \"acme/api\"\n",
+                "a declared identity keeps its own name",
+            ),
+        ] {
+            std::fs::write(&marker, body).unwrap();
+            let qs = marker_query_suffix(cwd, None);
+            assert!(!qs.contains("identity_style"), "{why}: {qs}");
+        }
+    }
+
+    /// The forwarding decision every client makes, against the shared fixture.
+    #[test]
+    fn forwarded_identity_style_matches_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../ai-memory-core/fixtures/remote_identity_cases.json"
+        ))
+        .unwrap();
+        for case in cases["identity_style"].as_array().unwrap() {
+            let value = case["value"].as_str().unwrap();
+            let expected = (case["style"].as_str() == Some("path")).then_some("path");
+            assert_eq!(forwarded_identity_style(Some(value)), expected, "{value:?}");
+        }
+        assert_eq!(forwarded_identity_style(None), None);
     }
 
     /// No repository, no remote, no declaration: nothing to send, and the

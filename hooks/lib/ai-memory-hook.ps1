@@ -275,12 +275,24 @@ function ConvertTo-AiMemoryRepositoryIdentity {
     return $id
 }
 
+# `&identity_style=path` when the marker's `identity_style` is `path`, else "":
+# `host_path` is the server's default (#1033). Mirrors
+# `forwarded_identity_style` in hook_capture.rs, checked against the shared
+# fixture.
+function Get-AiMemoryIdentityStyleQuery {
+    param([string] $Style)
+    if ($Style -and $Style.Trim() -ceq "path") { return "&identity_style=path" }
+    return ""
+}
+
 # `&identity=<v>&identity_src=<rung>` for the checkout at $Cwd, or "".
 # Mirrors `repository_identity` in hook_capture.rs: an explicit marker
 # `identity` is sent; a declared `project` outranks the remote and routes by
 # name, so git is not consulted; otherwise the `upstream` remote, else `origin`.
+# $Style (the marker's `identity_style`) is forwarded only with a remote
+# identity.
 function Get-AiMemoryIdentityQuery {
-    param([string] $Cwd, [string] $Explicit, [string] $Project)
+    param([string] $Cwd, [string] $Explicit, [string] $Project, [string] $Style)
     if ($Explicit -and $Explicit.Trim()) {
         $value = $Explicit.Trim().ToLowerInvariant()
         return "&identity=$([uri]::EscapeDataString($value))&identity_src=explicit"
@@ -293,7 +305,7 @@ function Get-AiMemoryIdentityQuery {
         if (-not $url) { continue }
         $value = ConvertTo-AiMemoryRepositoryIdentity -Url ([string]$url)
         if ($value) {
-            return "&identity=$([uri]::EscapeDataString($value))&identity_src=git_remote"
+            return "&identity=$([uri]::EscapeDataString($value))&identity_src=git_remote" + (Get-AiMemoryIdentityStyleQuery -Style $Style)
         }
     }
     return ""
@@ -312,6 +324,7 @@ function Get-AiMemoryMarkerQuery {
     # latter may yield to session-sticky attribution (#394).
     $projSrc = $null
     $explicitIdentity = $null
+    $identityStyle = $null
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
@@ -319,11 +332,12 @@ function Get-AiMemoryMarkerQuery {
         $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
         $dropSubagent = Get-AiMemoryTomlKey -File $marker -Key "drop_subagent_captures"
         $explicitIdentity = Get-AiMemoryTomlKey -File $marker -Key "identity"
+        $identityStyle = Get-AiMemoryTomlKey -File $marker -Key "identity_style"
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
     # the identity chain's declared-project rung means a name in the marker.
-    $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj
+    $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj -Style $identityStyle
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.

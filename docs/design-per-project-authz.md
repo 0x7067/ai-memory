@@ -220,3 +220,40 @@ flag. Opt-in would leave the same-basename grant hole open for anyone who did
 not opt in, defeating the authorization slices. The trade-off — that an upgrading
 install's captures re-bucket by repository identity (two same-name repos split; one
 repo opened from two folders converges) — is documented in the CHANGELOG.
+
+## Path-keyed coordinates (#1033 — staged)
+
+Identity routing already converges worktrees and clones of one repository into
+one project for **captures**. Two gaps remain: the project's **name** is still
+the first-seen folder basename, and MCP tools resolve `(workspace, project)` by
+that name, so a static client that passes a worktree folder misses the merged
+project. #1033 makes a remote-derived key the default name, landing in steps on
+`release/2.6`:
+
+1. **Normaliser and opt-in naming (landed first).** `repository_identity::
+   styled_key` spells an identity under `IdentityStyle`: `path` drops a git
+   remote's host (`github.com/acme/api` → `acme/api`); `host_path` is the #708
+   identity unchanged and stays the default. A marker's
+   `identity_style = "path"` is forwarded by all four capture clients
+   alongside a remote identity, and `resolve_project_by_identity` then names a
+   project it **creates** `path_style_name(identity)` (`acme-api`: `/` written
+   as `-`, today's split-name character rule). Captures keep routing by the
+   full identity. **Cross-forge collisions are detected, never merged:** the
+   path name is used only while no project in the workspace holds it, checked
+   in the same transaction as the identity match, so `gitlab.com/acme/api`
+   after `github.com/acme/api` falls back to the name it would otherwise get.
+   Existing projects — matched, claimed or unclaimed — are never renamed.
+   Checked against the `styled_key` and `identity_style` sections of
+   `fixtures/remote_identity_cases.json` (core plus shell, PowerShell and
+   TypeScript parity), store adversarial tests, and a two-operator
+   `multi_session.rs` case. Reporting the fallback in `doctor` is a follow-up.
+2. **Default naming chain** (`upstream` → `origin` → folder) for **new**
+   projects without opting in, with marker `project`/`identity` still
+   outranking remotes and the same collision fallback.
+3. **Dual-key resolve and in-place rename** (UUID foreign keys kept, no alias
+   table) until v3, so existing basename projects are renamed toward their
+   canonical key rather than split. Two operators on different clones of one
+   repository must land in one project (`multi_session.rs`).
+4. Marker `aliases`, then 5. identity- or path-keyed blocks in `~/.ai-memory.toml`.
+
+Paths stay lexically normalised throughout; nothing canonicalises.

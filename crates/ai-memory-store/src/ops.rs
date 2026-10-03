@@ -422,6 +422,16 @@ impl IdentityResolution {
 ///      the identity ([`ai_memory_core::repository_identity::split_name_base`],
 ///      then `-2`, `-3`, …).
 ///
+/// Under [`IdentityStyle::Path`](ai_memory_core::repository_identity::IdentityStyle)
+/// a project this call creates is named
+/// [`path_style_name`](ai_memory_core::repository_identity::path_style_name)
+/// instead (#1033), but only while no project in the workspace holds that
+/// name. A holder is necessarily a different repository — the identity match
+/// above already returned the same one — typically the same path on another
+/// forge, so the newcomer falls back to the name it would otherwise get and is
+/// never merged in. The style never renames, claims or splits an existing
+/// project: it only changes what a creation is called.
+///
 /// An identity already on a project is never overwritten. A created project
 /// records its creator in `created_by`, as [`get_or_create_project_as`] does. A
 /// split
@@ -436,6 +446,7 @@ pub fn resolve_project_by_identity(
     conn: &mut Connection,
     workspace_id: &ai_memory_core::WorkspaceId,
     identity: &ai_memory_core::repository_identity::RepositoryIdentity,
+    style: ai_memory_core::repository_identity::IdentityStyle,
     name: &str,
     repo_path: Option<&str>,
     candidate: Option<ai_memory_core::ProjectId>,
@@ -445,6 +456,26 @@ pub fn resolve_project_by_identity(
     let repo_path = repo_path.map(normalize_repo_path_key);
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    let name_is_free = |tx: &rusqlite::Transaction<'_>, name: &str| -> StoreResult<bool> {
+        Ok(tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                params![workspace_id.as_bytes(), name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none())
+    };
+    let path_name = match style {
+        ai_memory_core::repository_identity::IdentityStyle::Path => {
+            ai_memory_core::repository_identity::path_style_name(identity)
+        }
+        ai_memory_core::repository_identity::IdentityStyle::HostPath => None,
+    };
+    let path_name = match path_name {
+        Some(path_name) if name_is_free(&tx, &path_name)? => Some(path_name),
+        _ => None,
+    };
 
     let matched: Option<Vec<u8>> = tx
         .query_row(
@@ -477,6 +508,7 @@ pub fn resolve_project_by_identity(
         };
         match candidate_row {
             None => {
+                let name = path_name.as_deref().unwrap_or(name);
                 let id = insert_project_with_identity(
                     &tx,
                     workspace_id,
@@ -516,21 +548,21 @@ pub fn resolve_project_by_identity(
                 }
             }
             Some(_) => {
-                let base = ai_memory_core::repository_identity::split_name_base(&identity.identity);
-                let mut split_name = base.clone();
-                let mut n = 2_u32;
-                while tx
-                    .query_row(
-                        "SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2",
-                        params![workspace_id.as_bytes(), split_name],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some()
-                {
-                    split_name = format!("{base}-{n}");
-                    n += 1;
-                }
+                let split_name = match path_name {
+                    Some(path_name) => path_name,
+                    None => {
+                        let base = ai_memory_core::repository_identity::split_name_base(
+                            &identity.identity,
+                        );
+                        let mut split_name = base.clone();
+                        let mut n = 2_u32;
+                        while !name_is_free(&tx, &split_name)? {
+                            split_name = format!("{base}-{n}");
+                            n += 1;
+                        }
+                        split_name
+                    }
+                };
                 let id = insert_project_with_identity(
                     &tx,
                     workspace_id,

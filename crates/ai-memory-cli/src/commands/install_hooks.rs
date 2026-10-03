@@ -3875,7 +3875,7 @@ export default AiMemoryOpencode2;
 /// purpose: `findMarker` stays untouched, well-exercised, nearest-marker
 /// behavior for every other caller.
 pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(text: string): boolean {
-  for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures", "identity"]) {
+  for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures", "identity", "identity_style"]) {
     if (tomlKey(text, key) !== undefined) return true;
   }
   if (/^\s*server\s*=/m.test(text)) return true;
@@ -3939,7 +3939,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (managedRun) url.searchParams.set("managed_run", managedRun);
   const marker = findSettingsMarker(cwd);
   if (!marker || !cwd) {
-    applyIdentityParams(url, cwd, undefined, undefined);
+    applyIdentityParams(url, cwd, undefined, undefined, undefined);
     return;
   }
   url.searchParams.set("cwd", cwd);
@@ -3947,7 +3947,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const body = readFileSync(marker, "utf8");
     const workspace = tomlKey(body, "workspace");
     const project = tomlKey(body, "project");
-    applyIdentityParams(url, cwd, tomlKey(body, "identity"), project);
+    applyIdentityParams(url, cwd, tomlKey(body, "identity"), project, tomlKey(body, "identity_style"));
     const projectStrategy = tomlKey(body, "project_strategy");
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
     const defaultGlobal = tomlFlag(body, "default_global");
@@ -3982,6 +3982,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
   let explicitIdentity: string | undefined;
+  let identityStyle: string | undefined;
   const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
@@ -3994,11 +3995,12 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
       explicitIdentity = tomlKey(body, "identity");
+      identityStyle = tomlKey(body, "identity_style");
     } catch (_e) {
     }
   }
   // Before repo-root can fill `project`: a repo-root name is an inference.
-  applyIdentityParams(url, cwd, explicitIdentity, project);
+  applyIdentityParams(url, cwd, explicitIdentity, project, identityStyle);
   if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;
   if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
     const repoProject = repoRootProject(cwd);
@@ -4066,11 +4068,16 @@ pub(crate) const TS_IDENTITY: &str = r#"function normalizeRemote(raw: string): s
   return id && id.includes("/") ? id : undefined;
 }
 
+function identityStyleParam(style: string | undefined): string | undefined {
+  return style?.trim() === "path" ? "path" : undefined;
+}
+
 function applyIdentityParams(
   url: URL,
   cwd: string | undefined,
   explicit: string | undefined,
   project: string | undefined,
+  style: string | undefined,
 ): void {
   const declared = explicit?.trim();
   if (declared) {
@@ -4089,6 +4096,8 @@ function applyIdentityParams(
       if (identity) {
         url.searchParams.set("identity", identity);
         url.searchParams.set("identity_src", "git_remote");
+        const forwarded = identityStyleParam(style);
+        if (forwarded) url.searchParams.set("identity_style", forwarded);
         return;
       }
     } catch (_e) {
@@ -9527,7 +9536,7 @@ model = "gpt-5"
         assert!(plugin.contains("function declaresSettings"));
         assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
         assert!(plugin.contains(
-            "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\", \"identity\"])"
+            "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\", \"identity\", \"identity_style\"])"
         ));
         assert!(plugin.contains(
             "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\"])"
@@ -12712,6 +12721,41 @@ mod identity_parity_tests {
             .collect()
     }
 
+    /// The `identity_style` fixture: each marker value and whether a client
+    /// forwards `identity_style=path` for it (#1033).
+    fn style_cases() -> Vec<(String, bool)> {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        cases["identity_style"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| {
+                (
+                    case["value"].as_str().unwrap().to_owned(),
+                    case["style"].as_str() == Some("path"),
+                )
+            })
+            .collect()
+    }
+
+    /// Compare one port's forwarding decisions, one line per style case.
+    fn assert_styles_agree(port: &str, lines: &str) {
+        let got: Vec<&str> = lines.split('\n').collect();
+        for (i, (value, forwards)) in style_cases().iter().enumerate() {
+            let got = got
+                .get(i)
+                .copied()
+                .unwrap_or("<missing>")
+                .trim_end_matches('\r');
+            let expected = if *forwards {
+                "&identity_style=path"
+            } else {
+                ""
+            };
+            assert_eq!(got, expected, "{port} forwarded {value:?} differently");
+        }
+    }
+
     fn repo_file(relative: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -12756,6 +12800,17 @@ mod identity_parity_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_agrees("hooks/_lib.sh", &output.stdout);
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(r#". "$1"; shift; for v in "$@"; do printf '%s\n' "$(ai_memory_identity_style_qs "$v")"; done"#)
+            .arg("sh")
+            .arg(repo_file("hooks/_lib.sh"))
+            .args(style_cases().into_iter().map(|(value, _)| value))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_styles_agree("hooks/_lib.sh", &String::from_utf8_lossy(&output.stdout));
     }
 
     #[test]
@@ -12772,28 +12827,35 @@ mod identity_parity_tests {
         let script = tmp.path().join("parity.ps1");
         std::fs::write(
             &script,
-            "param([string] $Lib, [string] $Cases)\n\
+            "param([string] $Lib, [string] $Cases, [string] $Styles)\n\
              . $Lib\n\
              foreach ($u in (Get-Content -Raw $Cases | ConvertFrom-Json)) {\n\
                  $id = ConvertTo-AiMemoryRepositoryIdentity -Url $u\n\
                  if ($id) { [Console]::Out.Write(\"$id`n\") } else { [Console]::Out.Write(\"`n\") }\n\
              }\n\
              $decisions = @(\n\
-                 (Get-AiMemoryIdentityQuery -Cwd '' -Explicit ' Acme/Platform ' -Project 'proj'),\n\
+                 (Get-AiMemoryIdentityQuery -Cwd '' -Explicit ' Acme/Platform ' -Project 'proj' -Style 'path'),\n\
                  (Get-AiMemoryIdentityQuery -Cwd '' -Explicit '' -Project 'proj'),\n\
                  (Get-AiMemoryIdentityQuery -Cwd '' -Explicit '' -Project '')\n\
              )\n\
-             [Console]::Error.Write($decisions -join '|')\n",
+             [Console]::Error.Write($decisions -join '|')\n\
+             foreach ($s in (Get-Content -Raw $Styles | ConvertFrom-Json)) {\n\
+                 [Console]::Out.Write(\"S:$(Get-AiMemoryIdentityStyleQuery -Style $s)`n\")\n\
+             }\n",
         )
         .unwrap();
         let urls = tmp.path().join("urls.json");
         let list: Vec<String> = cases().into_iter().map(|(url, _)| url).collect();
         std::fs::write(&urls, serde_json::to_string(&list).unwrap()).unwrap();
+        let styles = tmp.path().join("styles.json");
+        let values: Vec<String> = style_cases().into_iter().map(|(value, _)| value).collect();
+        std::fs::write(&styles, serde_json::to_string(&values).unwrap()).unwrap();
         let output = Command::new(pwsh)
             .args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&script)
             .arg(repo_file("hooks/lib/ai-memory-hook.ps1"))
             .arg(&urls)
+            .arg(&styles)
             .output()
             .unwrap();
         assert!(
@@ -12801,7 +12863,14 @@ mod identity_parity_tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_agrees("hooks/lib/ai-memory-hook.ps1", &output.stdout);
+        // Style decisions are tagged `S:` so they can share stdout with the
+        // normalised URLs.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (styles, urls): (Vec<&str>, Vec<&str>) =
+            stdout.split('\n').partition(|line| line.starts_with("S:"));
+        assert_agrees("hooks/lib/ai-memory-hook.ps1", urls.join("\n").as_bytes());
+        let styles: Vec<&str> = styles.iter().map(|line| &line[2..]).collect();
+        assert_styles_agree("hooks/lib/ai-memory-hook.ps1", &styles.join("\n"));
         // Same decisions as the other clients: explicit wins over a declared
         // project; a declared project alone sends nothing; no cwd sends nothing.
         assert_eq!(
@@ -12822,20 +12891,27 @@ mod identity_parity_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let module = tmp.path().join("parity.ts");
         let list: Vec<String> = cases().into_iter().map(|(url, _)| url).collect();
+        let styles: Vec<String> = style_cases().into_iter().map(|(value, _)| value).collect();
         let source = format!(
             "import {{ execFileSync }} from \"node:child_process\";\n\
              void execFileSync;\n\
              {}\n\
              const urls: string[] = {};\n\
              process.stdout.write(urls.map((u) => normalizeRemote(u) ?? \"\").join(\"\\n\") + \"\\n\");\n\
+             const styles: string[] = {};\n\
+             for (const s of styles) {{\n\
+               const forwarded = identityStyleParam(s);\n\
+               process.stdout.write(`S:${{forwarded ? `&identity_style=${{forwarded}}` : \"\"}}\\n`);\n\
+             }}\n\
              const decide = (explicit?: string, project?: string): string => {{\n\
                const url = new URL(\"http://h/hook\");\n\
-               applyIdentityParams(url, undefined, explicit, project);\n\
+               applyIdentityParams(url, undefined, explicit, project, \"path\");\n\
                return url.search;\n\
              }};\n\
              process.stderr.write([decide(\" Acme/Platform \", \"proj\"), decide(undefined, \"proj\"), decide()].join(\"|\"));\n",
             super::TS_IDENTITY,
-            serde_json::to_string(&list).unwrap()
+            serde_json::to_string(&list).unwrap(),
+            serde_json::to_string(&styles).unwrap()
         );
         std::fs::write(&module, source).unwrap();
         let output = Command::new("node")
@@ -12848,9 +12924,15 @@ mod identity_parity_tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_agrees("TS_IDENTITY", &output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (styles, urls): (Vec<&str>, Vec<&str>) =
+            stdout.split('\n').partition(|line| line.starts_with("S:"));
+        assert_agrees("TS_IDENTITY", urls.join("\n").as_bytes());
+        let styles: Vec<&str> = styles.iter().map(|line| &line[2..]).collect();
+        assert_styles_agree("TS_IDENTITY", &styles.join("\n"));
         // An explicit identity wins over a declared project; a declared
-        // project alone sends nothing; no cwd sends nothing.
+        // project alone sends nothing; no cwd sends nothing. A requested
+        // `path` style never rides along with an explicit identity.
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
             "?identity=acme%2Fplatform&identity_src=explicit||"

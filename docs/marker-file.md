@@ -59,7 +59,8 @@ hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
 `identity` / `identity_src` when the checkout has a repository identity (see
-[Repository identity](#repository-identity)), with or without a marker.
+[Repository identity](#repository-identity)), with or without a marker, and
+`identity_style=path` alongside a remote identity when the marker opts in.
 
 ## Schema
 
@@ -86,6 +87,12 @@ project_strategy = "repo-root"
 # subdirectory that deserves its own. Case-folded. See "Repository
 # identity" below.
 identity = "acme/platform"
+
+# Optional. "path" names a NEW remote-backed project from its repository
+# path without the host ("acme-api" for github.com/acme/api) instead of the
+# folder name. Default "host_path". Never renames an existing project. See
+# "Naming new projects by repository path" below.
+identity_style = "path"
 
 # Optional. Opt this project into drop_subagent_captures: set it to "true"
 # and the server accepts but does NOT store this project's subagent-session
@@ -449,7 +456,7 @@ printf '%s\n' '{"session_id":"demo","cwd":"/example/workspace","tool_name":"Edit
 
 The same inspection also reports sanitized `scope` hints (`workspace`, `project`,
 `project_src`, `project_strategy`, `identity`, `identity_src`,
-`server_may_remap`) and `scope_resolution`. These are local hints, not a
+`identity_style`, `server_may_remap`) and `scope_resolution`. These are local hints, not a
 server lookup: inspection creates no project and may report server-derived
 coordinates that the server later remaps. Partial marker scope fails closed.
 `event_admits_capture` reports lifecycle eligibility. External producers use
@@ -587,6 +594,36 @@ The remote is normalised on the host, so credentials embedded in a remote
 URL never leave the machine. Other remote names (`fork`, `mine`) are
 ignored on purpose: they differ per person, and would give one repository a
 different identity for each of them.
+
+#### Naming new projects by repository path (`identity_style`)
+
+By default a new repository's project takes its folder name, so the first
+checkout to capture decides it (`main`, `fix-1025`, …). Opt in to naming it
+from the remote's repository path instead (#1033):
+
+```toml
+identity_style = "path"   # default: "host_path"
+```
+
+With `path`, a **new** project created from a remote is named from the whole
+repository path without the host, with `/` written as `-`
+(`git@github.com:acme/api.git` → `acme-api`,
+`https://gitlab.com/acme/group/api.git` → `acme-group-api`), so every
+worktree and clone agrees on the name. Only the name changes: captures still
+route by the full identity (`github.com/acme/api`), and the style rides along
+only with a remote identity — a declared `project` or `identity` keeps its
+own name.
+
+- **Existing projects are never renamed or re-keyed.** A repository that
+  already has a project, claimed or not, resolves exactly as before.
+- **Another forge is never merged in.** When the path name is already held by
+  a different repository — typically the same path on another forge
+  (`gitlab.com/acme/api` after `github.com/acme/api`) — the newcomer falls
+  back to the name it would get without the style.
+- Put it in `~/.ai-memory.toml` to apply it to every checkout under `$HOME`
+  that has no nearer marker, like any other marker key.
+- Static MCP clients still resolve by name, so pass the path name (`acme-api`)
+  as `project`.
 
 ### Single workspace, no per-repo overrides
 

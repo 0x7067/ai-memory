@@ -184,6 +184,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `consolidated`, plus `consolidated_by: agent`), defaults the tier to
   `episodic`, applies the same duplicate-title suffix, and marks the session's
   queued SessionEnd consolidation job completed. (#1038)
+- Added the opt-in `identity_style = "path"` marker key: a new project created
+  from a git remote is named from its repository path without the host
+  (`github.com/acme/api` → `acme-api`), so worktrees and clones in differently
+  named folders share one project. Captures still route by the full repository
+  identity, existing projects are never renamed, and when another repository
+  (such as the same path on another forge) already holds the name the newcomer
+  keeps the name it would otherwise get. The default stays `host_path`. (#1033)
 
 ### Changed
 - Scoped `ai-memory resume` to the current checkout by default instead of every

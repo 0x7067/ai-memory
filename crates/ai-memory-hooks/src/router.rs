@@ -1288,6 +1288,7 @@ async fn should_drop_subagent(
         env.project_override.as_deref(),
         env.project_strategy,
         env.identity.as_ref(),
+        env.identity_style,
         viewer,
     )
     .await
@@ -1372,6 +1373,9 @@ pub struct HandoffQuery {
     /// Rung that produced `identity`; see
     /// [`crate::payload::HookQuery::identity_src`].
     pub identity_src: Option<String>,
+    /// Naming style for a project this request creates; see
+    /// [`crate::payload::HookQuery::identity_style`].
+    pub identity_style: Option<String>,
 }
 
 impl HandoffQuery {
@@ -1383,6 +1387,14 @@ impl HandoffQuery {
             self.identity.as_deref()?,
             self.identity_src.as_deref()?,
         )
+    }
+
+    /// The requested naming style, the default when absent or unknown.
+    fn identity_style(&self) -> ai_memory_core::repository_identity::IdentityStyle {
+        self.identity_style
+            .as_deref()
+            .and_then(ai_memory_core::repository_identity::IdentityStyle::from_str_opt)
+            .unwrap_or_default()
     }
 }
 
@@ -1463,6 +1475,7 @@ async fn fetch_and_accept_handoff_at(
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
         query.repository_identity().as_ref(),
+        query.identity_style(),
         viewer,
     )
     .await?;
@@ -2382,6 +2395,7 @@ fn has_publishable_scope_hint(cwd: Option<&str>, project_override: Option<&str>)
 /// project_strategy)` so the same `cwd` resolved with and without an
 /// override (e.g. during a hook-script upgrade window) doesn't poison each
 /// other's slot.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_project_ids_inner(
     state: &HookState,
     cwd: Option<&str>,
@@ -2389,6 +2403,7 @@ async fn resolve_project_ids_inner(
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
     identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+    identity_style: ai_memory_core::repository_identity::IdentityStyle,
     creator: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_raw = cwd.filter(|s| !s.is_empty());
@@ -2610,6 +2625,7 @@ async fn resolve_project_ids_inner(
             .resolve_project_by_identity(
                 ws,
                 identity.clone(),
+                identity_style,
                 project_name,
                 repo_path,
                 parent.map(|(parent_id, _)| parent_id),
@@ -2672,6 +2688,7 @@ async fn resolve_project_ids(
         project_override,
         project_strategy,
         None,
+        Default::default(),
         None,
     )
     .await?;
@@ -3092,6 +3109,7 @@ async fn process_authorized(
                 env.project_override.as_deref(),
                 env.project_strategy,
                 env.identity.as_ref(),
+                env.identity_style,
                 viewer,
             )
             .await?
@@ -3245,6 +3263,7 @@ async fn process_authorized(
                     env.project_override.as_deref(),
                     env.project_strategy,
                     env.identity.as_ref(),
+                    env.identity_style,
                     viewer,
                 )
                 .await?;
@@ -4320,6 +4339,7 @@ mod tests {
             session_id: None,
             identity: None,
             identity_src: None,
+            identity_style: None,
         }
     }
 
@@ -4844,6 +4864,89 @@ mod tests {
             .await
             .unwrap()[0]
             .project_id
+    }
+
+    /// A git-remote capture whose marker asked for `identity_style`.
+    async fn capture_styled(
+        state: &HookState,
+        cwd: &std::path::Path,
+        identity: &str,
+        style: Option<&str>,
+    ) -> ProjectId {
+        let session = SessionId::new().to_string();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                identity: Some(identity.to_owned()),
+                identity_src: Some("git_remote".into()),
+                identity_style: style.map(str::to_owned),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session,
+                "cwd": cwd.to_string_lossy(),
+                "prompt": "hello",
+            }),
+        );
+        process_authorized(
+            state,
+            env,
+            None,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap()[0]
+            .project_id
+    }
+
+    /// #1033 end to end through `/hook`: `identity_style=path` names a new
+    /// repository from its path without the host, so a worktree in another
+    /// folder lands in it too. The same path on another forge keeps its folder
+    /// name instead of joining it, and an unknown style value is the default.
+    #[tokio::test]
+    async fn the_path_style_names_a_new_repository_and_never_merges_another_forge() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let main = tmp.path().join("acme").join("main");
+        let worktree = tmp.path().join("wt").join("fix-1025");
+        let other_forge = tmp.path().join("mirror").join("api");
+        let unknown = tmp.path().join("unknown").join("web");
+        for dir in [&main, &worktree, &other_forge, &unknown] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let name = |id| {
+            let reader = state.reader.clone();
+            let ws = state.workspace_id;
+            async move { reader.project_name_by_id(ws, id).await.unwrap() }
+        };
+
+        let repo = capture_styled(&state, &main, "github.com/acme/api", Some("path")).await;
+        assert_eq!(name(repo).await.as_deref(), Some("acme-api"));
+        let wt = capture_styled(&state, &worktree, "github.com/acme/api", Some("path")).await;
+        assert_eq!(wt, repo, "a worktree in another folder shares the project");
+
+        let mirror =
+            capture_styled(&state, &other_forge, "gitlab.com/acme/api", Some("path")).await;
+        assert_ne!(
+            mirror, repo,
+            "another forge's repository is never merged in"
+        );
+        assert_eq!(name(mirror).await.as_deref(), Some("api"));
+
+        let fallback = capture_styled(&state, &unknown, "github.com/acme/web", Some("Path")).await;
+        assert_eq!(
+            name(fallback).await.as_deref(),
+            Some("web"),
+            "an unknown style value keeps today's naming"
+        );
     }
 
     /// #708's collision, end to end: two unrelated repositories both checked
@@ -11566,6 +11669,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     identity_src: None,
+                    identity_style: None,
                 }),
                 Some(axum::Extension(ai_memory_core::ActorContext {
                     issuer: Some("https://idp.example".into()),
@@ -12178,6 +12282,7 @@ mod tests {
             session_id: None,
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
         let state = Arc::new(state);
         let session_start = |viewer: Option<ai_memory_core::UserId>| {
@@ -12261,6 +12366,7 @@ mod tests {
             session_id: None,
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
 
         let state = Arc::new(state);
@@ -12363,6 +12469,7 @@ mod tests {
             session_id: None,
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
         let (status, body) = read_handoff_response(
             handle_handoff(
@@ -12543,6 +12650,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     identity_src: None,
+                    identity_style: None,
                 }),
                 None,
                 None,
@@ -13430,6 +13538,7 @@ mod tests {
                 session_id: None,
                 identity: None,
                 identity_src: None,
+                identity_style: None,
             },
             None,
             Vec::new(),
@@ -13507,6 +13616,7 @@ mod tests {
                 session_id: None,
                 identity: None,
                 identity_src: None,
+                identity_style: None,
             },
             None,
             Vec::new(),
@@ -13576,6 +13686,7 @@ mod tests {
             session_id: Some(session_id.into()),
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
         let empty_sid = "empty-native-session";
         let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new(), None)
@@ -13727,6 +13838,7 @@ mod tests {
             session_id: Some("native-2".into()),
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
         let rendered = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new(), None)
             .await
@@ -13841,6 +13953,7 @@ mod tests {
             session_id: None,
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
 
         let named = ai_memory_core::ActorContext {
@@ -13919,6 +14032,7 @@ mod tests {
             session_id: None,
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
 
         let rendered =
@@ -13981,6 +14095,7 @@ mod tests {
             session_id: None,
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
@@ -14139,6 +14254,7 @@ mod tests {
             session_id: Some("kimi-session".into()),
             identity: None,
             identity_src: None,
+            identity_style: None,
         };
 
         let rendered =
@@ -14353,6 +14469,7 @@ mod tests {
                 session_id: None,
                 identity: None,
                 identity_src: None,
+                identity_style: None,
             },
             None,
             Vec::new(),

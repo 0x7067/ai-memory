@@ -90,7 +90,7 @@ ai_memory_parse_toml_flag() {
 ai_memory_marker_declares_settings() {
     file="$1"
     [ -f "$file" ] || return 1
-    for key in workspace project project_strategy drop_subagent_captures identity; do
+    for key in workspace project project_strategy drop_subagent_captures identity identity_style; do
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
     ai_memory_marker_declares_server "$file" && return 0
@@ -409,13 +409,24 @@ ai_memory_normalize_remote() {
     case "$_ai_rn_id" in */*) printf '%s' "$_ai_rn_id" ;; esac
 }
 
+# Print `&identity_style=path` when the marker's `identity_style` ("$1") is
+# `path`, else nothing: `host_path` is the server's default (#1033). Mirrors
+# `forwarded_identity_style` in hook_capture.rs, checked against the shared
+# fixture.
+ai_memory_identity_style_qs() {
+    _ai_is_value=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ "$_ai_is_value" = "path" ] && printf '&identity_style=path'
+    return 0
+}
+
 # Print `&identity=<v>&identity_src=<rung>` for the checkout at "$1", or
-# nothing. "$2" is the marker's `identity`, "$3" its declared `project`.
+# nothing. "$2" is the marker's `identity`, "$3" its declared `project`, "$4"
+# its `identity_style`, forwarded only with a remote identity.
 # Mirrors `repository_identity` in hook_capture.rs: an explicit identity is
 # sent; a declared project outranks the remote and routes by name, so git is
 # not consulted; otherwise the `upstream` remote, else `origin`.
 ai_memory_identity_qs() {
-    _ai_id_cwd="$1"; _ai_id_explicit="$2"; _ai_id_project="$3"
+    _ai_id_cwd="$1"; _ai_id_explicit="$2"; _ai_id_project="$3"; _ai_id_style="$4"
     _ai_id_explicit=$(printf '%s' "$_ai_id_explicit" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [ -n "$_ai_id_explicit" ]; then
         _ai_id_value=$(printf '%s' "$_ai_id_explicit" | tr '[:upper:]' '[:lower:]')
@@ -430,6 +441,7 @@ ai_memory_identity_qs() {
         _ai_id_value=$(ai_memory_normalize_remote "$_ai_id_url")
         if [ -n "$_ai_id_value" ]; then
             printf '&identity=%s&identity_src=git_remote' "$(ai_memory_url_encode "$_ai_id_value")"
+            ai_memory_identity_style_qs "$_ai_id_style"
             return 0
         fi
     done
@@ -459,6 +471,7 @@ ai_memory_marker_qs() {
     # latter may yield to session-sticky attribution (#394).
     ps=""
     idn=""
+    isty=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
     # capture-only marker (e.g. one that only sets ignore_paths) must not
     # shadow an outer marker's workspace/project/etc.
@@ -469,11 +482,12 @@ ai_memory_marker_qs() {
         st=$(ai_memory_parse_toml_key "$marker" project_strategy)
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
         idn=$(ai_memory_parse_toml_key "$marker" identity)
+        isty=$(ai_memory_parse_toml_key "$marker" identity_style)
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
     # the identity chain's declared-project rung means a name in the marker.
-    iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr")
+    iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr" "$isty")
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.
