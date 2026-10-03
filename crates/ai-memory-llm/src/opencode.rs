@@ -338,8 +338,10 @@ const ANTHROPIC_MESSAGES_MODELS: &[&str] = &[
     "claude-opus-4-6",
     "claude-opus-4-5",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
+    "claude-sonnet-4",
     "claude-haiku-4-5",
     "qwen3.8-flash",
     "qwen3.7-max",
@@ -608,7 +610,7 @@ mod tests {
 
     fn anthropic_response_with_content(content: &str) -> serde_json::Value {
         json!({
-            "model": "claude-sonnet-4-6",
+            "model": "claude-sonnet-5-5",
             "content": [{ "type": "text", "text": content }],
             "usage": { "input_tokens": 1, "output_tokens": 1 },
         })
@@ -778,7 +780,7 @@ mod tests {
 
         let provider = OpenCodeProvider::new_with_base_url(
             SecretString::from("sk-test"),
-            "claude-sonnet-5",
+            "claude-sonnet-5-5",
             format!("{}/zen/v1", server.uri()),
         )
         .unwrap();
@@ -792,7 +794,7 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(body["model"], "claude-sonnet-5");
+        assert_eq!(body["model"], "claude-sonnet-5-5");
         assert_eq!(header_value(&requests[0], "x-api-key"), Some("sk-test"));
         assert_eq!(
             header_value(&requests[0], "user-agent"),

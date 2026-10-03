@@ -92,7 +92,7 @@ allowance rather than per-token billing. Set
 catalogue and written plainly (`mimo-v2.5`, `glm-5.3-flash`), not in the
 `opencode-go/<model>` form OpenCode's own client config uses. The built-in
 default is `mimo-v2.6-flash`, served by Go. When selecting Zen, set
-`AI_MEMORY_LLM_MODEL` to a model from its catalogue, such as `claude-sonnet-5`.
+`AI_MEMORY_LLM_MODEL` to a model from its catalogue, such as `claude-sonnet-5-5`.
 The provider preserves the chosen catalogue and does not switch billing products
 automatically. Published Responses models, including `gpt-5.6-luna` and
 `gpt-6-luna`, use `/responses`; supported Claude and Qwen Messages models use
@@ -116,8 +116,8 @@ For Claude through Zen:
 ```bash
 export AI_MEMORY_LLM_PROVIDER=opencode
 export AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1
-export AI_MEMORY_LLM_MODEL=claude-sonnet-5
-ai-memory llm-test --provider opencode --model claude-sonnet-5 --prompt "Reply with OK"
+export AI_MEMORY_LLM_MODEL=claude-sonnet-5-5
+ai-memory llm-test --provider opencode --model claude-sonnet-5-5 --prompt "Reply with OK"
 ```
 
 <a id="openrouter"></a>
