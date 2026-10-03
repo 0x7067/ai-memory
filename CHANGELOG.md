@@ -367,6 +367,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Documented the observed attach-hook behavior, early-exit import boundary and
   fallback validation limits.
   (#1052)
+- Fixed `resume` and `workstreams` running `git status` on every linked checkout
+  before listing anything: listing now reads only the checkout's stable
+  fingerprints, so a large working tree or a slow filesystem-monitor hook no
+  longer blocks the picker before its first frame. (#1039)
 
 ### Security
 - Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
