@@ -7,7 +7,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-ai-memory-client = { path = "../ai-memory-client" }
+ai-memory-client = { version = "0.1.0", path = "../ai-memory-client" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Native roots, matching the workspace: the importer POSTs to the same server
