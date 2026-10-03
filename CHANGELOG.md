@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `backfill` works with a non-root key on a multi-user server. Its emptiness
   check used the root-only `/admin/sessions/by-agent` route, so every
   developer's own key got 403; on a 403 it now asks the grant-checked
-  `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` instead.
+  `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` instead. (#1086)
 - Fixed interrupted launchers blocking an immediate managed-workstream restart
   by adding explicit `ai-memory run --force-unlock` recovery. The server
   atomically expires and replaces only a lease attributed to the same
