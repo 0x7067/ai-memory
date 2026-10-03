@@ -207,9 +207,18 @@ pub(crate) fn mcp_config_path_with(
             }
             #[cfg(target_os = "windows")]
             {
-                let local_data_dir = dirs::data_local_dir()
+                // The variables come first, through `env`, so a relocated
+                // profile (`run --env`, a hermetic test) is honoured; the
+                // Known Folder API ignores them.
+                let known_dir = |name: &str, fallback: fn() -> Option<PathBuf>| {
+                    env(name)
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(fallback)
+                };
+                let local_data_dir = known_dir("LOCALAPPDATA", dirs::data_local_dir)
                     .context("could not locate %LOCALAPPDATA% for Claude Desktop config")?;
-                let roaming_config_dir = dirs::config_dir()
+                let roaming_config_dir = known_dir("APPDATA", dirs::config_dir)
                     .context("could not locate %APPDATA% for Claude Desktop config")?;
                 claude_desktop_config_path_in(&local_data_dir, &roaming_config_dir)?
             }
@@ -1758,6 +1767,26 @@ mod tests {
                 "{client:?} must follow {var}"
             );
         }
+    }
+
+    /// A relocated Windows profile (`run --env`, a hermetic backup test)
+    /// moves Claude Desktop's config with it; the Known Folder API alone
+    /// would keep pointing at the real profile.
+    #[cfg(windows)]
+    #[test]
+    fn claude_desktop_config_follows_the_supplied_appdata() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("Local");
+        let roaming = root.path().join("Roaming");
+        let env = |name: &str| match name {
+            "LOCALAPPDATA" => Some(local.clone().into_os_string()),
+            "APPDATA" => Some(roaming.clone().into_os_string()),
+            _ => None,
+        };
+        assert_eq!(
+            mcp_config_path_with(McpClient::ClaudeDesktop, &env).unwrap(),
+            roaming.join("Claude").join("claude_desktop_config.json")
+        );
     }
 
     /// OMP's MCP file lives in the same agent dir as its extensions: a named

@@ -16,6 +16,13 @@ a derived SQLite index for search. Everything is **scoped per project**
 LLM at all (capture + full-text search + rule-based summaries); adding a provider
 enables consolidation and auto-improvement.
 
+## Recipe: use ai-memory as your tool's memory
+
+Call the existing MCP tools to save pages, query knowledge and pass a handoff
+between executions. Native hooks are optional. The [programmatic memory guide](programmatic-memory.md)
+includes complete HTTP requests, scope rules and machine authentication.
+If your tool also hosts a harness, follow the [external lifecycle contract](external-lifecycle.md).
+
 ## Everyday tasks (through your agent, over MCP)
 
 You mostly just talk to your agent; it calls the right tool. Common ones:
@@ -144,6 +151,19 @@ ai-memory run --env CODEX_HOME="$HOME/.codex-work" codex   # the dir must exist
   (provider keys, an account's config dir) can write it to a file and pass
   `--env-file <path>`, one `KEY=VALUE` per line. Values are taken literally, so
   use absolute paths in the file.
+- To name an account once instead of repeating `--env`, add a profile to
+  `config.toml` and select it with `--profile` (before the harness name):
+
+  ```toml
+  [run.profiles.work.env]
+  CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+  ```
+
+  Then `ai-memory run --profile work claude`. Use absolute paths: profile
+  values are not expanded. `--env-file` and `--env` still override a profile
+  entry, and an unknown name fails before anything is wired or launched. A
+  `--profile` after the harness name belongs to the harness (OMP and Codex
+  have their own).
 - Auto-wire runs once per config home, so the second account gets its hooks +
   MCP on its own first launch. To wire one by hand, export the variable for the
   installers: `CLAUDE_CONFIG_DIR="$HOME/.claude-work" ai-memory install-hooks
@@ -233,6 +253,26 @@ ai-memory run --yolo claude
 See [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) for the
 full contract.
 
+## Recipe: capture only some repositories
+
+`install-hooks --agent claude-code --apply` wires the hooks user-wide
+(`~/.claude/settings.json`), so every Claude Code session is captured and you
+exclude paths with `[capture] ignore_paths` in `.ai-memory.toml`. To opt in
+per repository instead, run from inside the checkout:
+
+```bash
+ai-memory install-hooks --agent claude-code --scope project --apply
+```
+
+This writes the repository's gitignored `.claude/settings.local.json` where
+Claude Code reads it (the git root; the current directory on Windows or when
+the repository root is your home directory) and leaves the user-level file
+alone. Backups of an updated file go under the data dir, not the checkout.
+Pick one scope per machine: Claude Code merges project and user hooks. The
+installer warns when the file is not git-ignored, and `ai-memory uninstall
+--only hooks --apply` from inside the checkout removes the entries again.
+Claude Code only; other harnesses keep their user-level hook files.
+
 ## Recipe: send different repositories to different servers
 
 One machine, several organisations, each with its own ai-memory server.
@@ -289,6 +329,7 @@ ai-memory run <harness>              # launch a harness, hooks + MCP auto-wired
 ai-memory continue                   # resume the newest managed checkout
 ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
+ai-memory list-projects              # every workspace/project the server knows about
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
 ai-memory write-page …               # save a durable page
@@ -312,7 +353,13 @@ ai-memory serve                      # run the server
   every harness that has local sessions in this project and whether the server
   captured them — so a harness you rotated in without installing its hook (a
   silent gap: it keeps its own local history while capturing nothing) shows up
-  as a warning with the exact `install-hooks` command to fix it.
+  as a warning with the exact `install-hooks` command to fix it. For Claude
+  Code it also reports the detected default auto-memory directory and whether
+  the repository's capture exclusions cover it. A custom
+  `autoMemoryDirectory` is not discoverable from Claude's session transcripts
+  and is not reported. An `excluded` verdict applies only to native/generated
+  hooks; shell and PowerShell compatibility hooks do not enforce capture-policy
+  exclusions.
 - **I just installed hooks in a project I've worked in for a while**: the first
   time you open the project after installing, ai-memory imports your existing
   local session history once (bounded, sanitized on the server, only into an

@@ -32,6 +32,37 @@ accounts by alias, put a same-named script or shim earlier on `PATH` instead
 (or pass `--executable PATH`, which also resolves a bare name through
 `PATH`), so the resolved `claude` process actually is the one you meant.
 
+**Named launch profiles.** Persist repeated per-account environment overrides
+in the same `config.toml` the client loads:
+
+```toml
+[run.profiles.work.env]
+CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+```
+
+```bash
+ai-memory run --profile work claude --model opus
+```
+
+Profiles are env-only by design; executable paths, native arguments, `--yolo`,
+and auto-wire choices stay explicit on the command line. The child inherits
+the normal process environment, then profile values override it,
+`--env-file` overrides the profile, and repeated `--env` entries win last.
+The resolved values also drive native-session discovery and auto-wire, so all
+three use the same account/config home. An unknown or invalid profile fails
+before ai-memory takes a workstream lease or starts a harness. Profile names
+use up to 64 ASCII letters, digits, `.`, `_`, or `-`; each profile may contain
+up to 128 environment entries. Because values are literal and may include
+credentials, protect `config.toml` like any other local secret-bearing config.
+
+`--profile` is wrapper-owned only before the harness name. A later flag remains
+native argv, which keeps OMP's own profile selector unambiguous:
+
+```bash
+ai-memory run --profile work omp --profile omp-work
+```
+
 **Multiple Claude accounts (e.g. Corporate and Personal).** Any harness name
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
 and always selects the Claude harness — the exact spelling never changes
@@ -73,6 +104,19 @@ ai-memory run kiro --v3
 ai-memory run
 ```
 
+After an interactive managed session exits successfully, `ai-memory run` offers
+the installed harnesses, a way to run the current harness again, and quit.
+Choosing another harness keeps the same workstream selected, so its saved
+context remains available to the next run. The prompt defaults to quit. It
+appears only when stdin, stdout, and stderr are terminals, the managed launch
+was a session, and `--executable` was not used; utility commands, failed or
+interrupted exits, and non-interactive launches do not prompt. A switch or
+re-run does not replay the previous harness's native arguments, which may be
+specific to that CLI; wrapper settings such as `--workspace`, `--project`,
+`--yolo` / `--true-yolo`, ai-jail controls, `--no-autowire`, `--env`, and
+`--env-file` remain in effect. The initial `--fresh` choice applies only to the
+first launch.
+
 Everything after the harness name is native argv except the wrapper-owned exact
 flags `--yolo`, `--fresh`, and `--force-unlock`. No `--` separator is needed,
 and ai-memory does not maintain a second copy of each harness's option schema.
@@ -88,7 +132,7 @@ file, and the current checkout remain authoritative.
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
-              [--yolo] [--fresh] [--force-unlock]
+              [--yolo] [--fresh] [--force-unlock] [--profile NAME]
               [--env KEY=VALUE]... [--env-file PATH]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]

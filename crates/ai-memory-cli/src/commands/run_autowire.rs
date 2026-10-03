@@ -169,6 +169,9 @@ struct WireTargets {
     /// the installer's own check (which reads ai-memory's environment) would
     /// miss it.
     shared_extensions_dir: Option<PathBuf>,
+    /// A `--scope project` Claude Code install covering the launch directory;
+    /// hooks are not wired user-level on top of it.
+    project_hooks: Option<PathBuf>,
 }
 
 fn wire_targets(
@@ -176,8 +179,10 @@ fn wire_targets(
     harness: ManagedHarness,
     overrides: &WireOverrides,
     run_env: &[(String, String)],
+    launch_cwd: &Path,
 ) -> Option<WireTargets> {
     let agent = agent_choice_for_harness(harness)?;
+    let project_hooks = project_scoped_claude_hooks(agent, launch_cwd);
     let hook_env = LaunchEnv::new(run_env);
     let hook_target = install_hooks::hook_config_target_with(agent, &|name| hook_env.var_os(name));
     let mcp_client = install_hooks::mcp_client_for_agent(agent);
@@ -190,6 +195,9 @@ fn wire_targets(
         &[
             target_key(overrides.hooks_config_file.as_deref(), Some(&hook_target)),
             target_key(overrides.mcp_config_file.as_deref(), mcp_target.as_ref()),
+            project_hooks
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
         ],
     );
     let shared_extensions_dir = match (&overrides.hooks_config_file, &hook_target) {
@@ -216,6 +224,7 @@ fn wire_targets(
         mcp_target,
         mcp_relocated: mcp_env.from_run_env.get(),
         shared_extensions_dir,
+        project_hooks,
     })
 }
 
@@ -273,6 +282,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
         as_user: None,
         apply: true,
         config_file,
+        scope: crate::cli::HookInstallScope::Global,
         project_strategy: None,
         capture_assistant: false,
         capture_mode: None,
@@ -375,13 +385,18 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
 /// Production launches pass [`WireOverrides::default()`] (via
 /// [`run_from`](super::run::run_from)); the overrides exist only so the seam can
 /// be exercised without writing to the developer's real `$HOME`.
+///
+/// `launch_cwd` is the directory the harness is launched in — a `resume` may
+/// launch into a checkout other than the shell's — and is where a
+/// `--scope project` Claude Code install is looked for.
 pub(crate) fn ensure_wired_with(
     config: &Config,
     harness: ManagedHarness,
     overrides: &WireOverrides,
     run_env: &[(String, String)],
+    launch_cwd: &Path,
 ) {
-    let Some(targets) = wire_targets(config, harness, overrides, run_env) else {
+    let Some(targets) = wire_targets(config, harness, overrides, run_env, launch_cwd) else {
         return;
     };
     if targets.sentinel.exists() {
@@ -389,6 +404,7 @@ pub(crate) fn ensure_wired_with(
     }
     let agent = targets.agent;
     let sentinel = targets.sentinel.clone();
+    let project_hooks = targets.project_hooks.clone();
 
     eprintln!(
         "ai-memory: first managed launch of {} here — wiring its ai-memory hooks + MCP so \
@@ -396,7 +412,15 @@ pub(crate) fn ensure_wired_with(
         harness.as_str()
     );
 
-    let installs = wire_installs(config, targets, overrides);
+    let mut installs = wire_installs(config, targets, overrides);
+    if let Some(project_file) = project_hooks {
+        eprintln!(
+            "ai-memory: project-scoped ai-memory hooks found at {}; not wiring the user-level \
+             Claude Code settings on top of them.",
+            project_file.display()
+        );
+        installs.hooks.clear();
+    }
     let warn_hooks = |reason: &str| {
         eprintln!(
             "ai-memory: could not auto-install {} hooks ({reason}); continuing launch. \
@@ -464,6 +488,18 @@ pub(crate) fn ensure_wired_with(
     write_sentinel(&sentinel);
 }
 
+/// The `--scope project` Claude Code install covering `launch_cwd`, if any.
+/// The operator chose per-checkout capture there, so auto-wire must not add
+/// the same hooks to the user-level file on top of it. The path also keys the
+/// sentinel, so suppressing hooks for this checkout never gates another one.
+fn project_scoped_claude_hooks(agent: AgentChoice, launch_cwd: &Path) -> Option<PathBuf> {
+    if agent != AgentChoice::ClaudeCode {
+        return None;
+    }
+    let path = install_hooks::project_claude_settings_local(launch_cwd);
+    install_hooks::settings_file_carries_ai_memory_hooks(&path).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +527,126 @@ mod tests {
                 "{harness:?} must map to an AgentChoice for autowire"
             );
         }
+    }
+
+    /// A `--scope project` Claude install in the launch checkout must stop the
+    /// auto-wire from adding the same hooks to the user-level file.
+    #[test]
+    fn project_scoped_claude_hooks_suppress_the_user_level_wire() {
+        let project = tempfile::TempDir::new().unwrap();
+        let local = install_hooks::project_claude_settings_local(project.path());
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::ClaudeCode, project.path()),
+            None,
+            "no file, nothing to honor"
+        );
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::ClaudeCode, project.path()),
+            None,
+            "a third-party hook is not an ai-memory install"
+        );
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /h/.local/share/ai-memory/hooks/claude-code/stop.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::ClaudeCode, project.path()),
+            Some(local)
+        );
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::Codex, project.path()),
+            None,
+            "only Claude Code reads that file"
+        );
+    }
+
+    /// End to end: a launch from a checkout with a `--scope project` install
+    /// wires MCP but not hooks, and its sentinel is keyed on that checkout, so
+    /// a later launch from another checkout still wires hooks there.
+    #[test]
+    fn a_project_scoped_checkout_suppresses_hooks_without_gating_other_checkouts() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let local = install_hooks::project_claude_settings_local(project.path());
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /h/.local/share/ai-memory/hooks/claude-code/stop.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let mcp = data.path().join("claude.json");
+        std::fs::write(&mcp, "{}").unwrap();
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            project.path(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{}",
+            "hooks must not be wired user-level over a project-scoped install"
+        );
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("ai-memory"),
+            "MCP is still wired"
+        );
+        let project_sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            project.path(),
+        )
+        .unwrap()
+        .sentinel;
+        assert!(project_sentinel.exists(), "the attempt is still recorded");
+
+        // Another checkout has no project install: its own sentinel, so hooks wire.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other_sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            elsewhere.path(),
+        )
+        .unwrap()
+        .sentinel;
+        assert_ne!(
+            project_sentinel, other_sentinel,
+            "suppression for one checkout must not gate another"
+        );
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            elsewhere.path(),
+        );
+        assert!(
+            install_hooks::settings_file_carries_ai_memory_hooks(&settings),
+            "a checkout without a project install must still get user-level hooks"
+        );
     }
 
     #[test]
@@ -557,7 +713,7 @@ mod tests {
         run_env: &[(String, String)],
     ) -> WireInstalls {
         let overrides = WireOverrides::default();
-        let targets = wire_targets(config, harness, &overrides, run_env).unwrap();
+        let targets = wire_targets(config, harness, &overrides, run_env, &config.data_dir).unwrap();
         wire_installs(config, targets, &overrides)
     }
 
@@ -789,7 +945,7 @@ mod tests {
         let overrides = WireOverrides::default();
         for harness in [ManagedHarness::Pi, ManagedHarness::Omp] {
             let shared = |run_env: &[(String, String)]| {
-                wire_targets(&config, harness, &overrides, run_env)
+                wire_targets(&config, harness, &overrides, run_env, &config.data_dir)
                     .unwrap()
                     .shared_extensions_dir
             };
@@ -812,7 +968,8 @@ mod tests {
                 &config,
                 ManagedHarness::Claude,
                 &overrides,
-                &env_pair("PI_CODING_AGENT_DIR", &root)
+                &env_pair("PI_CODING_AGENT_DIR", &root),
+                &config.data_dir,
             )
             .unwrap()
             .shared_extensions_dir,
@@ -834,7 +991,8 @@ mod tests {
             ..WireOverrides::default()
         };
         let plan = |harness: ManagedHarness, run_env: &[(String, String)]| {
-            let targets = wire_targets(&config, harness, &overrides, run_env).unwrap();
+            let targets =
+                wire_targets(&config, harness, &overrides, run_env, &config.data_dir).unwrap();
             wire_installs(&config, targets, &overrides)
         };
         let blank = [("CLAUDE_CONFIG_DIR".to_string(), "  ".to_string())];
@@ -899,8 +1057,14 @@ mod tests {
         std::os::unix::fs::symlink(&inside, &looped).unwrap();
         let plan = |dir: &Path| {
             let run_env = env_pair("CLAUDE_CONFIG_DIR", dir);
-            let targets =
-                wire_targets(&config, ManagedHarness::Claude, &overrides, &run_env).unwrap();
+            let targets = wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &run_env,
+                &config.data_dir,
+            )
+            .unwrap();
             wire_installs(&config, targets, &overrides)
         };
         let detour = data.path().join("missing").join("..").join("linked");
@@ -971,9 +1135,15 @@ mod tests {
         let overrides = WireOverrides::default();
         let sentinel = |dir: &str| {
             let run_env = env_pair("CLAUDE_CONFIG_DIR", &data.path().join(dir));
-            wire_targets(&config, ManagedHarness::Claude, &overrides, &run_env)
-                .unwrap()
-                .sentinel
+            wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &run_env,
+                &config.data_dir,
+            )
+            .unwrap()
+            .sentinel
         };
         assert_eq!(sentinel("work"), sentinel("work"));
         assert_ne!(
@@ -1004,8 +1174,20 @@ mod tests {
         };
         let work = account("work");
         let personal = account("personal");
-        ensure_wired_with(&config, ManagedHarness::Claude, &work, &[]);
-        ensure_wired_with(&config, ManagedHarness::Claude, &personal, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &work,
+            &[],
+            &config.data_dir,
+        );
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &personal,
+            &[],
+            &config.data_dir,
+        );
         for overrides in [&work, &personal] {
             let settings = overrides.hooks_config_file.as_ref().unwrap();
             let mcp = overrides.mcp_config_file.as_ref().unwrap();
@@ -1176,7 +1358,13 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
 
         let hooks_json = std::fs::read_to_string(&settings).unwrap();
         assert!(
@@ -1197,17 +1385,29 @@ mod tests {
             "the ai-memory MCP server must be installed: {mcp_json}"
         );
         assert!(
-            wire_targets(&config, ManagedHarness::Claude, &overrides, &[])
-                .unwrap()
-                .sentinel
-                .exists(),
+            wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &[],
+                &config.data_dir
+            )
+            .unwrap()
+            .sentinel
+            .exists(),
             "the attempt must be recorded"
         );
 
         // Second launch: the sentinel gates it, so the files are byte-identical.
         let before_hooks = std::fs::read(&settings).unwrap();
         let before_mcp = std::fs::read(&mcp).unwrap();
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert_eq!(
             std::fs::read(&settings).unwrap(),
             before_hooks,
@@ -1241,7 +1441,13 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
 
         let mcp_json = std::fs::read_to_string(&mcp).unwrap();
         let entry: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
@@ -1260,10 +1466,16 @@ mod tests {
         // The hooks still install, and the attempt is still recorded, so a plain
         // re-launch stays gated.
         assert!(
-            wire_targets(&config, ManagedHarness::Claude, &overrides, &[])
-                .unwrap()
-                .sentinel
-                .exists(),
+            wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &[],
+                &config.data_dir
+            )
+            .unwrap()
+            .sentinel
+            .exists(),
             "the attempt must be recorded even when the MCP bridge is preserved"
         );
     }
@@ -1291,6 +1503,7 @@ mod tests {
             ManagedHarness::Claude,
             &overrides,
             &env_pair("CLAUDE_CONFIG_DIR", &root),
+            &config.data_dir,
         );
 
         let mcp_json = std::fs::read_to_string(&mcp).unwrap();
@@ -1319,6 +1532,7 @@ mod tests {
             ManagedHarness::Crush,
             &WireOverrides::default(),
             &[],
+            &config.data_dir,
         );
         assert!(
             !autowire_state_dir(data.path()).exists(),
@@ -1343,13 +1557,25 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        let sentinel = wire_targets(&config, ManagedHarness::Claude, &overrides, &[])
-            .unwrap()
-            .sentinel;
+        let sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        )
+        .unwrap()
+        .sentinel;
         std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
         std::fs::write(&sentinel, b"").unwrap();
 
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert_eq!(
             std::fs::read_to_string(&settings).unwrap(),
             r#"{"existingUserKey":1}"#,
@@ -1381,12 +1607,24 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
 
         // The wiring is removed by hand; the sentinel alone keeps it that way.
         std::fs::write(&settings, user_settings).unwrap();
         std::fs::write(&mcp, user_mcp).unwrap();
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert_eq!(std::fs::read_to_string(&mcp).unwrap(), user_mcp);
 
         // Moving the state aside is, for the gate, the same as clearing it.
@@ -1395,7 +1633,13 @@ mod tests {
             data.path().join("cleared-autowire-state"),
         )
         .unwrap();
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert!(
             std::fs::read_to_string(&settings)
                 .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory"))
