@@ -102,7 +102,7 @@ async fn workstream_provenance_is_bounded_scrubbed_and_idempotent_before_storage
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(batch.clone())
+            .finish_workstream_run(local_authority(), batch.clone())
             .await
             .unwrap()
             .imported_events,
@@ -111,7 +111,7 @@ async fn workstream_provenance_is_bounded_scrubbed_and_idempotent_before_storage
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(batch)
+            .finish_workstream_run(local_authority(), batch)
             .await
             .unwrap()
             .imported_events,
@@ -178,10 +178,10 @@ async fn workstream_provenance_legacy_reads_strip_secrets_and_unknown_metadata()
     let run = prepare(&store).await;
     store
         .writer
-        .finish_workstream_run(finish(
-            run.run_id,
-            vec![event("legacy", "record-1", json!({}))],
-        ))
+        .finish_workstream_run(
+            local_authority(),
+            finish(run.run_id, vec![event("legacy", "record-1", json!({}))]),
+        )
         .await
         .unwrap();
     // Simulate rows written before provenance was scrubbed at ingress.
@@ -237,7 +237,7 @@ async fn workstream_provenance_reused_event_id_retains_data_and_refuses_identity
     let first = event("stable-id", "record-1", json!({"tool_call_id": "call-1"}));
     store
         .writer
-        .finish_workstream_run(finish(run.run_id, vec![first.clone()]))
+        .finish_workstream_run(local_authority(), finish(run.run_id, vec![first.clone()]))
         .await
         .unwrap();
     let mut reused = first.clone();
@@ -249,7 +249,7 @@ async fn workstream_provenance_reused_event_id_retains_data_and_refuses_identity
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(finish(run.run_id, vec![reused.clone()]))
+            .finish_workstream_run(local_authority(), finish(run.run_id, vec![reused.clone()]))
             .await
             .unwrap()
             .imported_events,
@@ -259,10 +259,13 @@ async fn workstream_provenance_reused_event_id_retains_data_and_refuses_identity
     assert!(matches!(
         store
             .writer
-            .finish_workstream_run(finish(
-                run.run_id,
-                vec![event("new-before-collision", "record-3", json!({})), reused,]
-            ))
+            .finish_workstream_run(
+                local_authority(),
+                finish(
+                    run.run_id,
+                    vec![event("new-before-collision", "record-3", json!({})), reused,]
+                )
+            )
             .await,
         Err(ai_memory_store::StoreError::InvalidState(_))
     ));
@@ -289,7 +292,7 @@ async fn workstream_provenance_reused_event_id_retains_data_and_refuses_identity
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(finish(run.run_id, vec![first]))
+            .finish_workstream_run(local_authority(), finish(run.run_id, vec![first]))
             .await
             .unwrap()
             .imported_events,
@@ -308,7 +311,7 @@ async fn workstream_provenance_finished_run_ignores_late_events() {
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(batch.clone())
+            .finish_workstream_run(local_authority(), batch.clone())
             .await
             .unwrap()
             .imported_events,
@@ -317,7 +320,7 @@ async fn workstream_provenance_finished_run_ignores_late_events() {
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(batch.clone())
+            .finish_workstream_run(local_authority(), batch.clone())
             .await
             .unwrap()
             .imported_events,
@@ -327,7 +330,11 @@ async fn workstream_provenance_finished_run_ignores_late_events() {
     batch
         .events
         .push(event("late-new-event", "record-3", json!({})));
-    let result = store.writer.finish_workstream_run(batch).await.unwrap();
+    let result = store
+        .writer
+        .finish_workstream_run(local_authority(), batch)
+        .await
+        .unwrap();
     assert_eq!(result.imported_events, 0);
     assert_eq!(result.latest_sequence, 1);
     let hits = store
@@ -382,7 +389,7 @@ async fn workstream_provenance_replay_survives_sanitizer_changes() {
         assert_eq!(
             store
                 .writer
-                .finish_workstream_run(batch.clone())
+                .finish_workstream_run(local_authority(), batch.clone())
                 .await
                 .unwrap()
                 .imported_events,
@@ -402,7 +409,7 @@ async fn workstream_provenance_replay_survives_sanitizer_changes() {
         assert_eq!(
             store
                 .writer
-                .finish_workstream_run(batch.clone())
+                .finish_workstream_run(local_authority(), batch.clone())
                 .await
                 .unwrap()
                 .imported_events,
@@ -427,7 +434,10 @@ async fn workstream_provenance_replay_survives_sanitizer_changes() {
         assert!(!hits[0].metadata.to_string().contains(&source));
         batch.events[0].kind = WorkstreamEventKind::Message;
         assert!(matches!(
-            store.writer.finish_workstream_run(batch).await,
+            store
+                .writer
+                .finish_workstream_run(local_authority(), batch)
+                .await,
             Err(ai_memory_store::StoreError::InvalidState(_))
         ));
     }
@@ -446,7 +456,10 @@ async fn workstream_provenance_replay_preserves_legacy_rows_above_bounds() {
     original.content = "portable ".repeat(4096);
     store
         .writer
-        .finish_workstream_run(finish(run.run_id, vec![original.clone()]))
+        .finish_workstream_run(
+            local_authority(),
+            finish(run.run_id, vec![original.clone()]),
+        )
         .await
         .unwrap();
     let conn = Connection::open(store.db_path()).unwrap();
@@ -456,7 +469,10 @@ async fn workstream_provenance_replay_preserves_legacy_rows_above_bounds() {
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(finish(run.run_id, vec![original.clone()]))
+            .finish_workstream_run(
+                local_authority(),
+                finish(run.run_id, vec![original.clone()])
+            )
             .await
             .unwrap()
             .imported_events,
@@ -513,7 +529,7 @@ async fn workstream_provenance_retry_with_marker_matching_pattern_is_idempotent(
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(batch.clone())
+            .finish_workstream_run(local_authority(), batch.clone())
             .await
             .unwrap()
             .imported_events,
@@ -522,10 +538,22 @@ async fn workstream_provenance_retry_with_marker_matching_pattern_is_idempotent(
     assert_eq!(
         store
             .writer
-            .finish_workstream_run(batch)
+            .finish_workstream_run(local_authority(), batch)
             .await
             .unwrap()
             .imported_events,
         0
     );
+}
+
+/// A single-user (no database users) caller: the finish gate admits it, so
+/// these provenance tests exercise only the storage boundary.
+fn local_authority() -> ai_memory_store::ManagedRunAuthority {
+    ai_memory_store::ManagedRunAuthority::from_auth(
+        ai_memory_core::AuthLevel::Anonymous,
+        None,
+        None,
+        &ai_memory_core::ActorContext::anonymous(),
+        false,
+    )
 }

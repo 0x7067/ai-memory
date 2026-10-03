@@ -13652,26 +13652,35 @@ mod tests {
             .unwrap();
         state
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: first.run_id,
-                native_session_id: Some("native-1".into()),
-                source_cursor: Some("cursor-1".into()),
-                events: vec![NewWorkstreamEvent {
-                    event_id: "event-1".into(),
-                    agent: AgentKind::Codex,
-                    native_session_id: "native-1".into(),
-                    source_record_id: Some("record-1".into()),
-                    kind: WorkstreamEventKind::Message,
-                    role: Some("assistant".into()),
-                    content: "LEDGER-MARKER".into(),
-                    occurred_at: None,
-                    metadata: serde_json::json!({}),
-                }],
-                complete: true,
-                segment_path: Some("segment-1.jsonl".into()),
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ai_memory_store::ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: first.run_id,
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: Some("cursor-1".into()),
+                    events: vec![NewWorkstreamEvent {
+                        event_id: "event-1".into(),
+                        agent: AgentKind::Codex,
+                        native_session_id: "native-1".into(),
+                        source_record_id: Some("record-1".into()),
+                        kind: WorkstreamEventKind::Message,
+                        role: Some("assistant".into()),
+                        content: "LEDGER-MARKER".into(),
+                        occurred_at: None,
+                        metadata: serde_json::json!({}),
+                    }],
+                    complete: true,
+                    segment_path: Some("segment-1.jsonl".into()),
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
         // Second run: this is the SessionStart that has a ledger to deliver.
@@ -14061,26 +14070,35 @@ mod tests {
             .unwrap();
         state
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: first.run_id,
-                native_session_id: Some("claude-session".into()),
-                source_cursor: None,
-                events: vec![ai_memory_core::NewWorkstreamEvent {
-                    event_id: "managed-event-1".into(),
-                    agent: AgentKind::ClaudeCode,
-                    native_session_id: "claude-session".into(),
-                    source_record_id: Some("record-1".into()),
-                    kind: WorkstreamEventKind::Message,
-                    role: Some("user".into()),
-                    content: "portable managed delta sentinel".into(),
-                    occurred_at: None,
-                    metadata: serde_json::json!({}),
-                }],
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ai_memory_store::ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: first.run_id,
+                    native_session_id: Some("claude-session".into()),
+                    source_cursor: None,
+                    events: vec![ai_memory_core::NewWorkstreamEvent {
+                        event_id: "managed-event-1".into(),
+                        agent: AgentKind::ClaudeCode,
+                        native_session_id: "claude-session".into(),
+                        source_record_id: Some("record-1".into()),
+                        kind: WorkstreamEventKind::Message,
+                        role: Some("user".into()),
+                        content: "portable managed delta sentinel".into(),
+                        occurred_at: None,
+                        metadata: serde_json::json!({}),
+                    }],
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
 

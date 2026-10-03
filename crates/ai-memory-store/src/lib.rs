@@ -98,10 +98,10 @@ pub use users::{
 };
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunContext,
-    ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection,
-    WorkstreamSelector,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
+    ManagedRunContext, ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -5015,16 +5015,25 @@ mod tests {
         assert_eq!(status(first.run_id).await, (Some("native-1".into()), true));
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: first.run_id,
-                native_session_id: Some("native-1".into()),
-                source_cursor: None,
-                events: Vec::new(),
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: first.run_id,
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
 
@@ -5072,13 +5081,31 @@ mod tests {
         };
         store
             .writer
-            .finish_workstream_run(finish("native-1", false))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                finish("native-1", false),
+            )
             .await
             .unwrap();
         assert_eq!(status(second.run_id).await, (Some("native-1".into()), true));
         store
             .writer
-            .finish_workstream_run(finish("native-3", false))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                finish("native-3", false),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5095,7 +5122,16 @@ mod tests {
         assert_eq!(status(second.run_id).await, (Some("native-3".into()), true));
         store
             .writer
-            .finish_workstream_run(finish("native-4", true))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                finish("native-4", true),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5174,7 +5210,16 @@ mod tests {
         assert_eq!(
             store
                 .writer
-                .finish_workstream_run(partial.clone())
+                .finish_workstream_run(
+                    ManagedRunAuthority::from_auth(
+                        ai_memory_core::AuthLevel::Anonymous,
+                        None,
+                        None,
+                        &ai_memory_core::ActorContext::anonymous(),
+                        false
+                    ),
+                    partial.clone()
+                )
                 .await
                 .unwrap()
                 .imported_events,
@@ -5183,7 +5228,16 @@ mod tests {
         assert_eq!(
             store
                 .writer
-                .finish_workstream_run(partial)
+                .finish_workstream_run(
+                    ManagedRunAuthority::from_auth(
+                        ai_memory_core::AuthLevel::Anonymous,
+                        None,
+                        None,
+                        &ai_memory_core::ActorContext::anonymous(),
+                        false
+                    ),
+                    partial
+                )
                 .await
                 .unwrap()
                 .imported_events,
@@ -5202,16 +5256,25 @@ mod tests {
 
         let finished = store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: run.run_id,
-                native_session_id: Some("native-1".into()),
-                source_cursor: Some("cursor-1".into()),
-                events: vec![event],
-                complete: true,
-                segment_path: Some("segment-final.jsonl".into()),
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: run.run_id,
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: Some("cursor-1".into()),
+                    events: vec![event],
+                    complete: true,
+                    segment_path: Some("segment-final.jsonl".into()),
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(finished.imported_events, 0);
@@ -5269,16 +5332,25 @@ mod tests {
         );
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: next.run_id,
-                native_session_id: Some("native-2".into()),
-                source_cursor: Some("cursor-2".into()),
-                events: Vec::new(),
-                complete: true,
-                segment_path: Some("segment-native-2.jsonl".into()),
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: next.run_id,
+                    native_session_id: Some("native-2".into()),
+                    source_cursor: Some("cursor-2".into()),
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: Some("segment-native-2.jsonl".into()),
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
         let retry = store
@@ -5301,16 +5373,25 @@ mod tests {
         );
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: retry.run_id,
-                native_session_id: Some("native-3".into()),
-                source_cursor: Some("cursor-3".into()),
-                events: Vec::new(),
-                complete: true,
-                segment_path: Some("segment-native-3.jsonl".into()),
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: retry.run_id,
+                    native_session_id: Some("native-3".into()),
+                    source_cursor: Some("cursor-3".into()),
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: Some("segment-native-3.jsonl".into()),
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
         let undelivered = store.writer.prepare_workstream_run(prepare).await.unwrap();
@@ -5413,16 +5494,25 @@ mod tests {
         assert!(blank.may_adopt_existing_session);
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: blank.run_id,
-                native_session_id: None,
-                source_cursor: None,
-                events: Vec::new(),
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: blank.run_id,
+                    native_session_id: None,
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
 
@@ -5444,16 +5534,25 @@ mod tests {
         );
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: first.run_id,
-                native_session_id: Some("claude-native".into()),
-                source_cursor: None,
-                events: Vec::new(),
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: first.run_id,
+                    native_session_id: Some("claude-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
 
@@ -5502,16 +5601,25 @@ mod tests {
             .unwrap();
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: claude.run_id,
-                native_session_id: Some("claude-current".into()),
-                source_cursor: Some("cursor".into()),
-                events: Vec::new(),
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: claude.run_id,
+                    native_session_id: Some("claude-current".into()),
+                    source_cursor: Some("cursor".into()),
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
 
@@ -5567,26 +5675,35 @@ mod tests {
                 .unwrap();
             store
                 .writer
-                .finish_workstream_run(FinishWorkstreamRun {
-                    sanitizer: ai_memory_core::Sanitizer::default(),
-                    run_id: run.run_id,
-                    native_session_id: Some(format!("native-{workspace_name}")),
-                    source_cursor: Some("cursor".into()),
-                    events: vec![NewWorkstreamEvent {
-                        event_id: "same-native-event-id".into(),
-                        agent: AgentKind::Codex,
-                        native_session_id: format!("native-{workspace_name}"),
-                        source_record_id: None,
-                        kind: WorkstreamEventKind::Message,
-                        role: Some("assistant".into()),
-                        content: content.into(),
-                        occurred_at: None,
-                        metadata: serde_json::json!({}),
-                    }],
-                    complete: true,
-                    segment_path: None,
-                    exit_code: Some(0),
-                })
+                .finish_workstream_run(
+                    ManagedRunAuthority::from_auth(
+                        ai_memory_core::AuthLevel::Anonymous,
+                        None,
+                        None,
+                        &ai_memory_core::ActorContext::anonymous(),
+                        false,
+                    ),
+                    FinishWorkstreamRun {
+                        sanitizer: ai_memory_core::Sanitizer::default(),
+                        run_id: run.run_id,
+                        native_session_id: Some(format!("native-{workspace_name}")),
+                        source_cursor: Some("cursor".into()),
+                        events: vec![NewWorkstreamEvent {
+                            event_id: "same-native-event-id".into(),
+                            agent: AgentKind::Codex,
+                            native_session_id: format!("native-{workspace_name}"),
+                            source_record_id: None,
+                            kind: WorkstreamEventKind::Message,
+                            role: Some("assistant".into()),
+                            content: content.into(),
+                            occurred_at: None,
+                            metadata: serde_json::json!({}),
+                        }],
+                        complete: true,
+                        segment_path: None,
+                        exit_code: Some(0),
+                    },
+                )
                 .await
                 .unwrap();
             runs.push(run);
@@ -5755,7 +5872,16 @@ mod tests {
         // Neither do finished runs.
         store
             .writer
-            .finish_workstream_run(complete_finish(run.run_id, Vec::new()))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(run.run_id, Vec::new()),
+            )
             .await
             .unwrap();
         assert!(
@@ -5849,14 +5975,36 @@ mod tests {
         };
         let first = store
             .writer
-            .finish_workstream_run(finish.clone())
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                finish.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(first.imported_events, 2);
         assert_eq!(first.latest_sequence, 2);
 
         // Re-finishing a completed run imports nothing, even with new input.
-        let second = store.writer.finish_workstream_run(finish).await.unwrap();
+        let second = store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                finish,
+            )
+            .await
+            .unwrap();
         assert_eq!(second.imported_events, 0);
         assert_eq!(second.latest_sequence, 2);
         assert_eq!(
@@ -5900,7 +6048,16 @@ mod tests {
 
         let cancelled = store
             .writer
-            .finish_workstream_run(complete_finish(run.run_id, Vec::new()))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(run.run_id, Vec::new()),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -5910,7 +6067,16 @@ mod tests {
 
         let unknown = store
             .writer
-            .finish_workstream_run(complete_finish(ManagedRunId::new(), Vec::new()))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(ManagedRunId::new(), Vec::new()),
+            )
             .await
             .unwrap_err();
         assert!(matches!(unknown, StoreError::NotFound(_)));
@@ -5937,19 +6103,28 @@ mod tests {
         // A valid event followed by another agent's event must import nothing.
         let wrong_agent = store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: run.run_id,
-                native_session_id: Some("native-1".into()),
-                source_cursor: None,
-                events: vec![
-                    managed_event("ev-1", AgentKind::Codex, "native-1", "valid"),
-                    managed_event("ev-2", AgentKind::ClaudeCode, "native-1", "foreign agent"),
-                ],
-                complete: false,
-                segment_path: None,
-                exit_code: None,
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: run.run_id,
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events: vec![
+                        managed_event("ev-1", AgentKind::Codex, "native-1", "valid"),
+                        managed_event("ev-2", AgentKind::ClaudeCode, "native-1", "foreign agent"),
+                    ],
+                    complete: false,
+                    segment_path: None,
+                    exit_code: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -5984,21 +6159,30 @@ mod tests {
         // Events from a different native session are rejected the same way.
         let wrong_session = store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: run.run_id,
-                native_session_id: Some("native-1".into()),
-                source_cursor: None,
-                events: vec![managed_event(
-                    "ev-3",
-                    AgentKind::Codex,
-                    "native-2",
-                    "foreign session",
-                )],
-                complete: false,
-                segment_path: None,
-                exit_code: None,
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: run.run_id,
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events: vec![managed_event(
+                        "ev-3",
+                        AgentKind::Codex,
+                        "native-2",
+                        "foreign session",
+                    )],
+                    complete: false,
+                    segment_path: None,
+                    exit_code: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -6009,16 +6193,25 @@ mod tests {
         // The run is still usable after the rejected batches.
         let finished = store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: run.run_id,
-                native_session_id: Some("native-1".into()),
-                source_cursor: None,
-                events: vec![managed_event("ev-1", AgentKind::Codex, "native-1", "valid")],
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: run.run_id,
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events: vec![managed_event("ev-1", AgentKind::Codex, "native-1", "valid")],
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(finished.imported_events, 1);
@@ -6070,7 +6263,16 @@ mod tests {
 
         store
             .writer
-            .finish_workstream_run(complete_finish(run.run_id, Vec::new()))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(run.run_id, Vec::new()),
+            )
             .await
             .unwrap();
         assert!(
@@ -6275,14 +6477,23 @@ mod tests {
         // undelivered context window spanning the whole ledger.
         store
             .writer
-            .finish_workstream_run(complete_finish(
-                first.run_id,
-                vec![
-                    managed_event("ev-1", AgentKind::Codex, "native-x", "one"),
-                    managed_event("ev-2", AgentKind::Codex, "native-x", "two"),
-                    managed_event("ev-3", AgentKind::Codex, "native-x", "three"),
-                ],
-            ))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(
+                    first.run_id,
+                    vec![
+                        managed_event("ev-1", AgentKind::Codex, "native-x", "one"),
+                        managed_event("ev-2", AgentKind::Codex, "native-x", "two"),
+                        managed_event("ev-3", AgentKind::Codex, "native-x", "three"),
+                    ],
+                ),
+            )
             .await
             .unwrap();
 
@@ -6377,16 +6588,25 @@ mod tests {
             .unwrap();
         store
             .writer
-            .finish_workstream_run(complete_finish(
-                run.run_id,
-                vec![
-                    managed_event("ev-1", AgentKind::Codex, "native-x", "alpha one"),
-                    managed_event("ev-2", AgentKind::Codex, "native-x", "alpha two"),
-                    managed_event("ev-3", AgentKind::Codex, "native-x", "alpha zebra three"),
-                    managed_event("ev-4", AgentKind::Codex, "native-x", "alpha four"),
-                    managed_event("ev-5", AgentKind::Codex, "native-x", "alpha five"),
-                ],
-            ))
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(
+                    run.run_id,
+                    vec![
+                        managed_event("ev-1", AgentKind::Codex, "native-x", "alpha one"),
+                        managed_event("ev-2", AgentKind::Codex, "native-x", "alpha two"),
+                        managed_event("ev-3", AgentKind::Codex, "native-x", "alpha zebra three"),
+                        managed_event("ev-4", AgentKind::Codex, "native-x", "alpha four"),
+                        managed_event("ev-5", AgentKind::Codex, "native-x", "alpha five"),
+                    ],
+                ),
+            )
             .await
             .unwrap();
 
@@ -6621,16 +6841,25 @@ mod tests {
             .unwrap();
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: current.run_id,
-                native_session_id: Some("codex-native".into()),
-                source_cursor: None,
-                events: Vec::new(),
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: current.run_id,
+                    native_session_id: Some("codex-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
         let claude = store
@@ -6644,32 +6873,50 @@ mod tests {
             .unwrap();
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: claude.run_id,
-                native_session_id: Some("claude-native".into()),
-                source_cursor: None,
-                events: Vec::new(),
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: claude.run_id,
+                    native_session_id: Some("claude-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
         // A non-current workstream may finish later and therefore be more
         // recently active; the selected workstream must still lead the list.
         store
             .writer
-            .finish_workstream_run(FinishWorkstreamRun {
-                sanitizer: ai_memory_core::Sanitizer::default(),
-                run_id: older.run_id,
-                native_session_id: Some("open-code-native".into()),
-                source_cursor: None,
-                events: Vec::new(),
-                complete: true,
-                segment_path: None,
-                exit_code: Some(0),
-            })
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: older.run_id,
+                    native_session_id: Some("open-code-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
             .await
             .unwrap();
 

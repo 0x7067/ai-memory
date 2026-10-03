@@ -1896,6 +1896,24 @@ impl ReaderPool {
         .await
     }
 
+    /// Check a managed run's owner and current Write access in one read
+    /// snapshot, before any mutation of the run.
+    ///
+    /// # Errors
+    /// Refuses a foreign owner, insufficient access, absent run or invalid scope;
+    /// SQL failures propagate without degrading authorization to open.
+    pub async fn authorize_managed_run(
+        &self,
+        run_id: ManagedRunId,
+        authority: crate::ManagedRunAuthority,
+    ) -> StoreResult<()> {
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            crate::workstream::authorize_run_mutation(&tx, run_id, &authority)
+        })
+        .await
+    }
+
     /// Return the current state of one `ai-memory run` invocation.
     pub async fn managed_run_status(
         &self,

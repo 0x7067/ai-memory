@@ -748,6 +748,7 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
         reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
     },
@@ -3122,11 +3123,16 @@ impl WriterHandle {
     /// Index an immutable transcript segment and release the run lease.
     pub async fn finish_workstream_run(
         &self,
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
     ) -> StoreResult<FinishedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::FinishWorkstreamRun { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::FinishWorkstreamRun {
+            authority,
+            input,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -4372,8 +4378,12 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 })();
                 send_or_warn(reply, result, "accept_startup_context");
             }
-            WriteCmd::FinishWorkstreamRun { input, reply } => {
-                let result = crate::workstream::finish_run(&mut conn, &input);
+            WriteCmd::FinishWorkstreamRun {
+                authority,
+                input,
+                reply,
+            } => {
+                let result = crate::workstream::finish_run(&mut conn, &authority, &input);
                 send_or_warn(reply, result, "finish_workstream_run");
             }
             WriteCmd::RenameWorkstream { input, reply } => {
