@@ -122,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact original identity within 512 UTF-8 bytes and pass privacy validation
   before use or persistence. Invalid historical identities were projected as
   unknown (`native_session_id: ""`) in workstream search without rewriting
-  stored history; the CLI also protected reads from older servers. (#987)
+  stored history; the CLI also protected reads from older servers. (#1079)
 - Required managed-run finish imports and finished retries to pass an
   authenticated owner check and current project access checks, repeated in the
   writer transaction. Database users required current Write access; trusted
