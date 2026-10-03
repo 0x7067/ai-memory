@@ -144,7 +144,7 @@ pub enum Command {
     /// Resume the most recently launched managed checkout from anywhere,
     /// without `cd` and without picking from a list.
     Continue(ContinueArgs),
-    /// Interactively pick a recent managed workstream and launch harness.
+    /// Interactively pick a managed workstream in the current checkout and launch harness.
     Resume(ResumeArgs),
     /// List open cross-agent handoffs so a stale one can be cancelled by id.
     Handoffs(HandoffsArgs),
@@ -613,15 +613,23 @@ pub struct ContinueArgs {
 ///
 /// The picker deliberately accepts only wrapper-owned flags. Harness selection
 /// happens interactively, then it delegates to `run --workstream NAME` in the
-/// selected checkout.
+/// selected checkout (the current one unless `--all` is given).
 #[derive(Debug, Args)]
 pub struct ResumeArgs {
-    /// Only consider checkouts resolving to this workspace.
+    /// Require the current checkout to resolve to this workspace; with
+    /// `--all`, only consider checkouts resolving to it.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Maximum workstreams to show in the picker.
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
-    pub limit: u8,
+    /// List workstreams from every locally linked checkout instead of only
+    /// the current one.
+    #[arg(long)]
+    pub all: bool,
+    /// Maximum matching workstreams to show (defaults to all).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub limit: Option<u32>,
+    /// Initial case-insensitive workstream-name search; type to edit it.
+    #[arg(long)]
+    pub search: Option<String>,
     /// Disable native permission prompts using the resolved harness's
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
@@ -3417,6 +3425,22 @@ mod tests {
     /// native harness without accepting harness-native arguments.
     #[test]
     fn resume_takes_picker_and_wrapper_flags_only() {
+        let Command::Resume(defaults) = Cli::try_parse_from(["ai-memory", "resume"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected resume");
+        };
+        assert!(defaults.limit.is_none());
+        assert!(defaults.search.is_none());
+        assert!(!defaults.all);
+        let Command::Resume(wide) = Cli::try_parse_from(["ai-memory", "resume", "--limit", "500"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected resume");
+        };
+        assert_eq!(wide.limit, Some(500));
         let parsed = Cli::try_parse_from([
             "ai-memory",
             "resume",
@@ -3424,6 +3448,9 @@ mod tests {
             "work",
             "--limit",
             "50",
+            "--search",
+            "refactor",
+            "--all",
             "--yolo",
         ])
         .expect("resume parses picker flags");
@@ -3431,7 +3458,9 @@ mod tests {
             panic!("expected resume command");
         };
         assert_eq!(args.workspace.as_deref(), Some("work"));
-        assert_eq!(args.limit, 50);
+        assert_eq!(args.limit, Some(50));
+        assert_eq!(args.search.as_deref(), Some("refactor"));
+        assert!(args.all);
         assert!(args.yolo);
         assert!(!args.fresh);
 

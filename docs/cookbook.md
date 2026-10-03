@@ -332,6 +332,8 @@ Your agent runs most of these for you; `run` and `continue` are how you start it
 ```bash
 ai-memory run <harness>              # launch a harness, hooks + MCP auto-wired
 ai-memory continue                   # resume the newest managed checkout
+ai-memory resume --search auth       # pick a matching workstream in this checkout only
+ai-memory resume --all               # pick from every linked checkout on this machine
 ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
 ai-memory list-projects              # every workspace/project the server knows about

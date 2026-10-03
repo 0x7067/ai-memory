@@ -1086,8 +1086,10 @@ pub(crate) fn list_recent(
     repo_fingerprint: &str,
     worktree_fingerprint: &str,
     limit: usize,
+    offset: usize,
 ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
     let mut statement = conn.prepare(
         "WITH scoped AS ( \
              SELECT id, name, created_at, selected_at, updated_at \
@@ -1101,7 +1103,7 @@ pub(crate) fn list_recent(
                     EXISTS(SELECT 1 FROM current_workstream \
                            WHERE current_workstream.id = scoped.id) AS is_current \
              FROM scoped \
-              ORDER BY is_current DESC, scoped.updated_at DESC, scoped.id DESC LIMIT ?5 \
+              ORDER BY is_current DESC, scoped.updated_at DESC, scoped.id DESC LIMIT ?5 OFFSET ?6 \
          ) \
          SELECT recent.id, recent.name, recent.created_at, recent.updated_at, \
                 recent.is_current, native.agent_kind \
@@ -1118,6 +1120,7 @@ pub(crate) fn list_recent(
             repo_fingerprint,
             worktree_fingerprint,
             limit,
+            offset,
         ],
         |row| {
             Ok((

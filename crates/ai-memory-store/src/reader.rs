@@ -1947,6 +1947,28 @@ impl ReaderPool {
         worktree_fingerprint: String,
         limit: usize,
     ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        self.recent_workstreams_page(
+            workspace_id,
+            project_id,
+            repo_fingerprint,
+            worktree_fingerprint,
+            limit,
+            0,
+        )
+        .await
+    }
+
+    /// List one bounded page for an exact repository/worktree, preserving the
+    /// current-first order and every linked harness on each returned row.
+    pub async fn recent_workstreams_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
         self.with_conn(move |conn| {
             crate::workstream::list_recent(
                 conn,
@@ -1955,6 +1977,7 @@ impl ReaderPool {
                 &repo_fingerprint,
                 &worktree_fingerprint,
                 limit,
+                offset,
             )
         })
         .await

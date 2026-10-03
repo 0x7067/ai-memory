@@ -8,11 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Added shared capture privacy checks to the relay and the conversation importer,
-  run before an event is hashed, persisted, previewed or delivered: they refuse
-  credential-shaped native identities, scrub nested credentials while keeping
-  numeric token counts, and drop locally a relay item queued before them that
-  fails them, so it no longer holds its session. (#1072)
+- Added `ai-memory resume --search` with immediate type-to-filter name search,
+  and `resume --all`, which keeps the previous cross-checkout picker: every
+  linked checkout, the current one first, each listed with its own fully
+  paginated query. (#1039)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
@@ -60,13 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   harness, or a non-interactive launch silently consuming a baton meant for
   a specific session. Server-wide for now; a per-project override is left for
   a follow-up change. (#1030)
-- Added `[handoff].create_on_session_end` (default `true` - unchanged
-  behavior). When set to `false`, unmanaged session ends write the session
-  summary page and enqueue consolidation as usual, but skip creating an
-  automatic open handoff for the next session; OpenCode turn checkpoints
-  refresh the page without a baton too. Explicit handoffs created via
-  `memory_handoff_begin` and managed workstream runs remain unaffected.
-  Server-wide: applies to every operator on this server. (#1043)
 - Added a default-quit prompt after a successful interactive managed run so the
   operator can re-run the current harness or switch to another installed
   harness in the same workstream. Utility, failed, interrupted,
@@ -128,6 +120,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or distinct extensions, including backfill).
   Mixed-source counts preserve scope, session ownership and time-window filters;
   older servers leave unsupported fields unknown. (#1016)
+- Added shared capture privacy checks to the relay and the conversation importer,
+  run before an event is hashed, persisted, previewed or delivered: they refuse
+  credential-shaped native identities, scrub nested credentials while keeping
+  numeric token counts, and drop locally a relay item queued before them that
+  fails them, so it no longer holds its session. (#1072)
+- Added `[handoff].create_on_session_end` (default `true` - unchanged
+  behavior). When set to `false`, unmanaged session ends write the session
+  summary page and enqueue consolidation as usual, but skip creating an
+  automatic open handoff for the next session; OpenCode turn checkpoints
+  refresh the page without a baton too. Explicit handoffs created via
+  `memory_handoff_begin` and managed workstream runs remain unaffected.
+  Server-wide: applies to every operator on this server. (#1043)
 - Added bounded, sanitized native-record and adapter correlation provenance to
   managed-workstream search/tail results and the CLI's text/JSON output, with
   compatible optional fields and sanitization of legacy provenance on reads. (#1057)
@@ -182,6 +186,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued SessionEnd consolidation job completed. (#1038)
 
 ### Changed
+- Scoped `ai-memory resume` to the current checkout by default instead of every
+  linked project (`--all` restores the old view) and removed its default result
+  cutoff with bounded server pagination, preserving Left/Right harness
+  selection. Explicit limits now apply after the initial search; against an
+  older server that ignores paging, the picker warns and shows the first page.
+  `continue` retained its cross-directory behavior. (#1039)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
@@ -204,6 +214,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consolidated as before. (#1038)
 
 ### Fixed
+- Removed unnecessary working-tree scans from checkout-local workstream listing
+  and the resume picker; launching a selected workstream still captured its
+  full checkpoint. (#1039)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)

@@ -370,6 +370,9 @@ ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
 # after a dead launcher left its lease behind (same operator only)
 ai-memory run --force-unlock codex
+ai-memory resume             # pick from ALL workstreams in this checkout only
+ai-memory resume --search auth # find a workstream by name (case-insensitive)
+ai-memory resume --all       # pick across every linked checkout
 ```
 
 `--force-unlock` immediately expires the selected workstream's active lease;
@@ -377,6 +380,18 @@ use it only when you know the previous launcher is gone. It does not kill a
 native process, and it cannot evict another authenticated operator's run. See
 the [managed-workstream recovery notes](docs/managed-workstreams.md#lease-recovery)
 for the full safety contract.
+
+In `resume`, just type to search, use Up/Down to select a workstream, and Left/Right
+to choose its harness. Enter launches the selection; Escape clears a search,
+then cancels when the search is empty (Ctrl-C always cancels).
+The list scrolls and loads every checkout-local page;
+there is no default workstream cutoff. Use `--limit N` only when you want to
+cap the matching results. Workstreams from other repositories or worktrees
+are left out unless you pass `--all`, which lists every linked checkout (the
+current one first); `continue` still resumes the newest linked checkout from
+anywhere. Listing reads Git identity only; it does not scan the working tree
+with `git status` before showing the picker. Full checkpoints are still captured
+when launching the selected workstream.
 
 Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with
