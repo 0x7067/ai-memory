@@ -325,6 +325,59 @@ pub fn resolve_project_authz(
     })
 }
 
+/// Strict snapshot resolution used only by managed-run finish imports.
+/// The legacy resolver deliberately retains its degrade-to-open behavior.
+pub(crate) fn resolve_finish_project_authz(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    principal: &ProjectPrincipal,
+    authenticated_operators: bool,
+) -> StoreResult<ProjectAuthz> {
+    use crate::StoreError;
+    let (mode, creator) = conn.query_row(
+        "SELECT p.access_mode, p.created_by FROM projects p \
+         JOIN workspaces w ON w.id = p.workspace_id \
+         WHERE p.workspace_id = ?1 AND p.id = ?2",
+        params![workspace_id.as_bytes(), project_id.as_bytes()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+    )?;
+    let access_mode = match mode.as_str() {
+        "open" => AccessMode::Open,
+        "restricted" => AccessMode::Restricted,
+        _ => {
+            return Err(StoreError::MalformedRecord(
+                "unknown project access mode".into(),
+            ));
+        }
+    };
+    let creator = creator.map(|raw| UserId::from_slice(&raw)).transpose()?;
+    let users_exist = crate::users::users_exist(conn)?;
+    if let Some(user_id) = principal.user_id {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+            params![user_id.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Forbidden("authenticated user no longer exists"));
+        }
+    }
+    let grant = match principal.user_id {
+        Some(user_id) if access_mode == AccessMode::Restricted => {
+            read_grant(conn, workspace_id, project_id, user_id)?
+        }
+        _ => None,
+    };
+    Ok(ProjectAuthz {
+        distinguishes_operators: authenticated_operators || users_exist,
+        access_mode,
+        is_root: principal.is_root,
+        is_creator: creator.is_some() && creator == principal.user_id,
+        grant,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,6 +30,112 @@ pub enum WorkstreamSelection {
     New(String),
 }
 
+/// Authenticated authority shared by finish preflight and the writer transaction.
+///
+/// Construct only from middleware extensions, never transcript metadata. Owner
+/// filters are derived here so this boundary cannot request `OwnerFilter::Any`.
+#[derive(Debug, Clone)]
+pub struct WorkstreamFinishAuthority {
+    principal: crate::ProjectPrincipal,
+    owner: ai_memory_core::OwnerFilter,
+    distinguishes_operators: bool,
+    project_policy: FinishProjectPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FinishProjectPolicy {
+    Grants,
+    TrustedProxyLegacy,
+}
+
+impl WorkstreamFinishAuthority {
+    /// Reduce the actual HTTP auth extensions to one immutable finish authority.
+    /// A DB user's attribution id remains authoritative without a viewer marker.
+    #[must_use]
+    pub fn from_auth(
+        level: ai_memory_core::AuthLevel,
+        viewer: Option<ai_memory_core::AuthorizedViewer>,
+        user_id: Option<ai_memory_core::UserId>,
+        actor: &ai_memory_core::ActorContext,
+        trusted_proxy_identity: bool,
+    ) -> Self {
+        use ai_memory_core::AuthLevel;
+        let user = viewer
+            .map(ai_memory_core::AuthorizedViewer::user)
+            .or(user_id);
+        let principal = match level {
+            AuthLevel::Root => crate::ProjectPrincipal::root(),
+            AuthLevel::User => user.map_or_else(
+                crate::ProjectPrincipal::anonymous,
+                crate::ProjectPrincipal::user,
+            ),
+            AuthLevel::Anonymous => crate::ProjectPrincipal::anonymous(),
+        };
+        let owner = if level == AuthLevel::Anonymous {
+            ai_memory_core::OwnerFilter::Unattributed
+        } else {
+            ai_memory_core::OwnerFilter::for_actor_context(actor)
+        };
+        // The real proxy middleware has an identity and User capability, but
+        // no DB principal. Preserve its viewer-less project policy only when
+        // this server actually enables trusted proxy authentication.
+        let project_policy = match (level, user, actor.identity_key(), trusted_proxy_identity) {
+            (AuthLevel::User, None, Some(_), true) => FinishProjectPolicy::TrustedProxyLegacy,
+            _ => FinishProjectPolicy::Grants,
+        };
+        Self {
+            principal,
+            owner,
+            distinguishes_operators: trusted_proxy_identity || level == AuthLevel::User,
+            project_policy,
+        }
+    }
+}
+
+/// Resolve only the real run scope and owner, without creating a scope or
+/// changing the active-project pointer. Both callers supply a SQL snapshot.
+pub(crate) fn authorize_finish(
+    conn: &Connection,
+    run_id: ManagedRunId,
+    authority: &WorkstreamFinishAuthority,
+) -> StoreResult<()> {
+    let (owner, workspace, project) = conn
+        .query_row(
+            "SELECT r.owner_user, w.workspace_id, w.project_id FROM managed_runs r \
+             LEFT JOIN workstreams w ON w.id = r.workstream_id WHERE r.id = ?1",
+            params![run_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound("managed run not found".into()))?;
+    if !authority.owner.admits(owner.as_deref()) {
+        return Err(StoreError::Forbidden(
+            "managed run belongs to another operator",
+        ));
+    }
+    let workspace = WorkspaceId::from_slice(&workspace)?;
+    let project = ProjectId::from_slice(&project)?;
+    let project_authz = crate::project_authz::resolve_finish_project_authz(
+        conn,
+        workspace,
+        project,
+        &authority.principal,
+        authority.distinguishes_operators,
+    )?;
+    match authority.project_policy {
+        FinishProjectPolicy::TrustedProxyLegacy => Ok(()),
+        FinishProjectPolicy::Grants => project_authz
+            .authorize(crate::ProjectAccess::Write)
+            .map_err(|failure| StoreError::Forbidden(failure.message())),
+    }
+}
+
 /// Store-level input for opening a managed run.
 #[derive(Debug, Clone)]
 pub struct PrepareWorkstreamRun {
@@ -826,10 +932,12 @@ fn accept_context_in_transaction(
 /// Index one immutable source segment and close the run atomically.
 pub(crate) fn finish_run(
     conn: &mut Connection,
+    authority: &WorkstreamFinishAuthority,
     input: &FinishWorkstreamRun,
 ) -> StoreResult<FinishedWorkstreamRun> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    authorize_finish(&tx, input.run_id, authority)?;
     let run: Option<FinishRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, state, \

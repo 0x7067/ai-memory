@@ -163,6 +163,10 @@ pub enum StoreError {
     #[error("os error: {0}")]
     Os(String),
 
+    /// An authenticated finish authority failed an owner or project guard.
+    #[error("forbidden: {0}")]
+    Forbidden(&'static str),
+
     /// A persisted row contains malformed data.
     #[error("malformed record: {0}")]
     MalformedRecord(String),

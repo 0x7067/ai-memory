@@ -796,6 +796,38 @@ process launch is fatal; ai-memory does not silently start an unmanaged agent.
 
 ## Privacy and storage boundaries
 
+Finish imports, including retries of finished runs, use the identity resolved by
+HTTP authentication. A caller must own the run (or reach a shared NULL-owned
+run). Database users must hold current Write access to its actual
+workspace/project. Another writer in the same project cannot finish a run
+attributed to a different
+operator. Root without an actor reaches only shared runs; root authentication
+does not bypass ownership. Authenticated operators behind the configured trusted
+proxy retain their existing project access policy without requiring a database
+user. Actor headers without proxy authentication and transcript metadata cannot
+supply this authority. Disabling a user's human login does not revoke an active
+API key; the HTTP authentication checks the key, and finish checks that the
+database user still exists and has current project access.
+
+With authentication disabled but database users still present, anonymous finish
+requests to restricted projects are refused. Prepare retains its existing
+compatibility path and can still succeed. Completing the run requires
+authentication and a caller satisfying the ownership and Write checks above.
+
+The server checks access before reading run status or writing a raw segment,
+then checks again in the SQLite writer transaction before any import, cursor,
+link, or run update. The transaction reads current users, project mode, creator,
+and paired grants; SQL failures and malformed or missing scope fail closed.
+This stricter resolution applies only to finish imports. An active run can still
+finish after its lease timestamp has elapsed, and an authorized finished retry
+imports zero events. Cancelled or replaced runs remain expired and refused.
+
+Raw segments are written before the SQL transaction. A Write revocation after
+the preflight can leave a sanitized raw segment without an indexed event. The
+writer refusal leaves SQL unchanged; raw-file persistence and SQL are not an
+atomic operation.
+
+
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
 Kimi Code, Command Code, Kiro, OMP, Grok, or Antigravity private stores. The
 launched harness retains normal ownership of its own session writes. Adapters read only

@@ -118,6 +118,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- Required managed-run finish imports and finished retries to pass an
+  authenticated owner check and current project access checks, repeated in the
+  writer transaction. Database users required current Write access; trusted
+  proxy operators retained their existing project policy. Active API keys
+  remained valid after human login was disabled. Shared, unattributed runs and
+  late finishes of still-active runs retained their existing behavior.
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
