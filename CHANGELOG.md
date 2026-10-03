@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added bounded, sanitized native-record and adapter correlation provenance to
+  managed-workstream search/tail results and the CLI's text/JSON output, with
+  compatible optional fields and sanitization of legacy provenance on reads. (#1057)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
@@ -122,8 +125,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or distinct extensions, including backfill).
   Mixed-source counts preserve scope, session ownership and time-window filters;
   older servers leave unsupported fields unknown. (#1016)
+- Added Portuguese history phrases to the existing opt-in session-recall
+  router (`[retrieval] query_intent`), including accented and unaccented spellings of
+  "última sessão", "onde paramos ontem", and "decisão anterior". Word
+  boundaries and explicit history phrases keep technical session queries
+  unchanged; routing remains off by default. (#1056)
+- Added shared, typed and bounded `entities`, `abstract`, and `relations`
+  metadata to MCP `memory_write_page` and admin `/admin/write-page`, plus bounded
+  MCP `kind` while preserving the admin's legacy `kind` adapter. Kept existing
+  request shapes, entity normalization, authenticated attribution and the wiki
+  write pipeline. Documented whole-page replacement, raw-input metadata bounds
+  and trimmed relation scope components. (#1055)
+- Added structured results for the existing auto-improvement eval execution in
+  review reports, staged run metadata, and accepted proposal sidecars, with
+  server-generated eval IDs, evaluated request/body digests, checker invocation
+  identity, observed success/rejection/failure/timeout, and sanitized bounded
+  reasons. Report deserialization discarded supplied eval observations. (#1053)
+- Added `grizzybot` as a recognised agent (wire value `grizzybot`, alias
+  `grizzy-bot`), so GrizzyBot's lifecycle events are attributed to it instead
+  of `other` and its tool calls are captured as closed-schema tool families,
+  like other Claude Code-shaped agents. GrizzyBot posts to `/hook` and
+  `/mcp` itself, so there is nothing to install. Adds migration V72 to extend
+  the `sessions.agent_kind` CHECK constraint. (#1036)
 
 ### Changed
+- Restricted managed-workstream provenance to scrubbed source labels and an
+  explicit scalar metadata allowlist, with 512-byte string bounds. Client event
+  ids beginning with `managed-run:` are reserved for server checkpoints and
+  extraction-loss annotations. Active-run retries reject changes to an existing
+  event's agent, native session or kind, and retain its first indexed content
+  and provenance across sanitizer changes. (#1057)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
@@ -133,6 +164,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   labelled `nix` / `full-ci`. (#989)
 
 ### Fixed
+- Concurrent relay queue opens no longer report a locked queue as foreign:
+  journal setup now retries SQLite BUSY/LOCKED within one 10-second budget,
+  rechecking the queue's identity and schema version before each attempt.
+  (#1060)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
@@ -197,6 +232,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+- Fixed watcher reindexing racing with writes and batches to the same page by
+  sharing their per-page mutex from disk read through SQLite upsert. Both
+  mutation guards are released before embedding; external editors remain
+  outside this coordination. (#1059)
+- Fixed a managed Claude Code run losing its conversation after `/resume` on a
+  Claude Code background session. The run used to finish on the foreground
+  session it started with, which held none of the conversation, so the next
+  `ai-memory run claude` or `continue` resumed it and Claude opened an empty
+  session. A Claude run now finishes on the background session its own
+  session attached to in this checkout, found from that transcript's
+  `sessionKind: "bg"` records; another launch's background session is never
+  taken. (#1050)
+- Fixed `continue`, `resume` and bare `ai-memory run` losing sessions launched
+  under a custom native store, such as a second Claude Code config home set
+  with `CLAUDE_CONFIG_DIR`. Automatic harness selection now scans the store the
+  launch resolves (`--env`, then the process environment) instead of always the
+  default one. The client records the store of every session it links, at
+  launch or when the run finishes, in `client-projects.json`. A later launch
+  that cannot find that session and resolves a different store now stops with
+  an error naming both stores and keeps the workstream link, where it used to
+  start fresh and repoint the workstream. `--fresh` still starts a new session.
+  (#1047)
+- Fixed Claude Code sessions never seeing the "broaden when the current project
+  comes up empty" and "maintained pages are evidence, not authority" rules,
+  because Claude Code truncates MCP server instructions at 2,048 characters.
+  The instructions now open with a self-contained core under that cap, and a
+  regression test keeps it there. (#1035)
+- Fixed the macOS menu-bar app showing only a red status item when the bundled
+  server cannot start (for example a port already in use; #1044 reports OpenCode
+  v2's background service on `127.0.0.1:49374`). The menu extra now surfaces a
+  fatal `stderr.log` line written since the last start, and `docs/macos.md`
+  documents the port collision and how to move one side. (#1044)
+- Fixed hook-spool drains stalling behind an event that has no session id.
+  `/hook/batch` reported such an event (anything but a session start) as a
+  failed item, so the drain retried it up to its attempt budget while every
+  event queued behind it waited. The server now acknowledges and drops it,
+  counted as `dropped_invalid` in the ingest metrics, and keeps processing the
+  rest of the batch. (#1062)
+- Fixed `drop_subagent_captures` discarding entire top-level Claude Code
+  sessions launched with `--agent`. An `agent_type` alone no longer marks a
+  session as a subagent; `agent_id` and Grok's `subagentType` still do, so
+  actual subagent filtering remains enabled. Claude Code reports a Task
+  subagent under its parent's session id, so a subagent's events no longer
+  mark that session as a subagent: the parent's Stop, SessionEnd, summary and
+  handoff are kept. (#1041, #1048)
+
+### Docs
+- Corrected the Codex support matrix to describe managed-run recovery from a
+  stale shared-daemon run id; `--no-daemon` remains an optional diagnostic and
+  isolation switch. (#987)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added

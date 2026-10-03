@@ -1922,10 +1922,18 @@ impl ReaderPool {
         workstream_id: WorkstreamId,
         query: String,
         limit: usize,
+        sanitizer: ai_memory_core::Sanitizer,
     ) -> StoreResult<Vec<WorkstreamEvent>> {
         let stopwords = self.fts_stopwords.clone();
         self.with_conn(move |conn| {
-            crate::workstream::search_events(conn, workstream_id, &query, limit, &stopwords)
+            crate::workstream::search_events(
+                conn,
+                workstream_id,
+                &query,
+                limit,
+                &stopwords,
+                &sanitizer,
+            )
         })
         .await
     }
