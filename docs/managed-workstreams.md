@@ -489,6 +489,36 @@ including on retries of a finished run. This namespace belongs to the server's
 checkpoint and extraction-loss events, which it appends when completing an
 active run.
 
+## Native identity privacy
+
+New managed bindings accept the exact original native identity only when it is
+nonempty, at most 512 UTF-8 bytes, free of controls and unsafe invisible
+formatting, and unchanged by the privacy scrubber. IDs are never trimmed,
+normalized, truncated, or replaced with a redaction placeholder to make a
+binding succeed. Existing vendor IDs and generated fresh-session UUIDs remain
+supported. Each adapter retains its own path and selector restrictions.
+
+The launcher validates prepared and linked IDs from older servers before resume
+or native-store use, and validates finish identities before serialization.
+Configured privacy rules also apply to post-launch status and discovered IDs
+before transcript export and finish transport.
+HTTP ingress applies the configured privacy rules before segment writes; the
+writer also validates identities before link/import SQL, after the existing
+owner and current Write checks on finish. A refused hook auto-link still leaves
+regular sanitized shared observation capture and legacy UUID/v5 session routing
+intact. A run without a native ID keeps its existing unbound checkpoint behavior.
+
+`workstream-search --json` keeps its existing String field: an invalid historical
+`native_session_id` is returned as `""` (UNKNOWN), which cannot be used for a new
+managed binding. Valid identities retain their exact bytes. The stored value,
+event content, rows, source cursor, and shared history are not rewritten. The
+CLI repeats the privacy projection for older-server responses.
+
+This boundary establishes identity representation and privacy only. It does not
+prove a native file exists, authenticate a source ID, correlate a run with an
+event, or establish a tool outcome. SQL refusal remains transactional; this
+change does not add an atomic disk/SQL seal or change lease/retry policy.
+
 ## Native adapter behavior
 
 | Harness | Fresh native session | Returning native session | Read-only source |

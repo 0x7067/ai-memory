@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime};
 
 use ai_memory_core::{
     AgentKind, FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ManagedRunContextResponse, ManagedRunStatus, PrepareManagedRunRequest,
-    PrepareManagedRunResponse, SessionId,
+    ManagedRunContextResponse, ManagedRunStatus, NativeSessionIdentity, PrepareManagedRunRequest,
+    PrepareManagedRunResponse, Sanitizer, SessionId,
 };
 use ai_memory_workstream::{
     AmbiguousNativeSession, ExportedTranscript, FORWARDED_ENV_NAMES, JailChecklistItem,
@@ -480,6 +480,10 @@ async fn run_once_with_wiring(
             "managed run interrupted before the agent started"
         )));
     }
+    let privacy = acquired_try!(Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from));
+    if let Some(id) = prepared.native_session_id.as_deref() {
+        acquired_try!(NativeSessionIdentity::parse(id, &privacy).map_err(anyhow::Error::from));
+    }
     let resolved_harness = if automatic_harness {
         let resolved = prepared.resolved_agent.unwrap_or_else(|| {
             eprintln!(
@@ -683,6 +687,13 @@ async fn run_once_with_wiring(
     if yolo_modes.claude_true_yolo && harness == ManagedHarness::Claude {
         apply_claude_true_yolo(harness, &mut plan.args);
     }
+    let planned_native_identity = acquired_try!(
+        plan.expected_session_id
+            .as_deref()
+            .map(|id| NativeSessionIdentity::parse(id, &privacy))
+            .transpose()
+            .map_err(anyhow::Error::from)
+    );
     let remove_kiro_home = if harness == ManagedHarness::KiroV3
         && let Some(native_session_id) = plan.expected_session_id.as_deref()
     {
@@ -746,20 +757,26 @@ async fn run_once_with_wiring(
         },
     );
     if plan.mode == LaunchMode::Session
-        && let Some(native_session_id) = &plan.expected_session_id
+        && let Some(native_identity) = &planned_native_identity
     {
         acquired_try!(
             post_json_no_content(
                 &endpoint,
                 &format!("{run_path}/link"),
                 &LinkManagedRunRequest {
-                    native_session_id: native_session_id.clone(),
+                    native_session_id: native_identity.as_str().to_owned(),
                 },
             )
             .await
             .context("linking the managed native session; the agent was not started")
         );
-        remember_session_store(config, &endpoint, harness, native_session_id, &linked_store);
+        remember_session_store(
+            config,
+            &endpoint,
+            harness,
+            native_identity.as_str(),
+            &linked_store,
+        );
     }
     // Claude refuses `--resume` on a background session that is still running
     // and points at `claude attach`, so open it that way instead. The 2.1.288
@@ -929,6 +946,7 @@ async fn run_once_with_wiring(
         &home,
         &repository.cwd,
         server_status.as_ref(),
+        &privacy,
     ) {
         Ok(own) => own,
         Err(error) => {
@@ -958,6 +976,7 @@ async fn run_once_with_wiring(
             &repository.cwd,
             started_at,
             server_status.as_ref(),
+            &privacy,
         )
         .await
     );
@@ -990,6 +1009,7 @@ async fn run_once_with_wiring(
             transcript,
             checkpoint,
             Some(exit_code),
+            &privacy,
         )
         .await
     );
@@ -1654,12 +1674,15 @@ fn own_native_session(
     home: &Path,
     cwd: &Path,
     server_status: Option<&ManagedRunStatus>,
+    sanitizer: &Sanitizer,
 ) -> Result<Option<String>> {
     if plan.mode == LaunchMode::Passthrough {
         return Ok(None);
     }
     if let Some(native_session_id) = &plan.expected_session_id {
-        return Ok(Some(native_session_id.clone()));
+        return Ok(Some(
+            NativeSessionIdentity::parse(native_session_id, sanitizer)?.into_string(),
+        ));
     }
     let Some(linked) = server_status
         .filter(|status| status.native_session_linked)
@@ -1667,6 +1690,8 @@ fn own_native_session(
     else {
         return Ok(None);
     };
+    let linked = NativeSessionIdentity::parse(linked, sanitizer)?;
+    let linked = linked.as_str();
     let in_checkout =
         native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
             .with_context(|| format!("reading native session {linked}"))?;
@@ -1714,6 +1739,7 @@ fn follow_claude_background_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_native_session_after_run(
     plan: &LaunchPlan,
     harness: ManagedHarness,
@@ -1721,11 +1747,15 @@ async fn resolve_native_session_after_run(
     cwd: &Path,
     started_at: SystemTime,
     server_status: Option<&ManagedRunStatus>,
+    sanitizer: &Sanitizer,
 ) -> Result<Option<String>> {
     if plan.mode == LaunchMode::Passthrough {
         return Ok(None);
     }
-    if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status) {
+    if let Some(id) = server_status.and_then(|status| status.native_session_id.as_deref()) {
+        NativeSessionIdentity::parse(id, sanitizer)?;
+    }
+    if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status, sanitizer) {
         return Ok(Some(follow_claude_background_session(
             plan, harness, home, cwd, own, started_at,
         )));
@@ -1757,11 +1787,17 @@ async fn resolve_native_session_after_run(
     };
     // A linked session `own_native_session` rejected (not in this checkout,
     // or its native store could not be read) is no fallback either.
-    Ok(discovered.or_else(|| {
+    let resolved = discovered.or_else(|| {
         server_status
             .and_then(|status| status.native_session_id.clone())
             .filter(|reported| Some(reported.as_str()) != linked)
-    }))
+    });
+    Ok(resolved
+        .as_deref()
+        .map(|id| {
+            NativeSessionIdentity::parse(id, sanitizer).map(NativeSessionIdentity::into_string)
+        })
+        .transpose()?)
 }
 
 async fn list_auto_sessions(
@@ -2123,6 +2159,9 @@ fn build_preflighted_launch_plan(
     cwd: &Path,
     env_overrides: &[(String, String)],
 ) -> Result<(LaunchPlan, Option<String>)> {
+    if let Some(id) = linked_session_id {
+        NativeSessionIdentity::parse(id, &Sanitizer::builtin())?;
+    }
     let explicit_selector = has_native_session_selector(harness, &native_args);
     if force_fresh && explicit_selector {
         return Err(anyhow!(
@@ -2746,13 +2785,20 @@ async fn import_batches(
     transcript: ExportedTranscript,
     checkpoint: ai_memory_core::WorkstreamCheckpoint,
     exit_code: Option<i32>,
+    sanitizer: &Sanitizer,
 ) -> Result<usize> {
+    let native_identity = nonempty_session(&transcript.native_session_id)
+        .map(|id| NativeSessionIdentity::parse(&id, sanitizer))
+        .transpose()?;
+    for event in &transcript.events {
+        NativeSessionIdentity::parse(&event.native_session_id, sanitizer)?;
+    }
     let mut imported = 0;
     let mut batches = event_batches(transcript.events).into_iter().peekable();
     while let Some(batch) = batches.next() {
         let complete = batches.peek().is_none();
         let request = FinishManagedRunRequest {
-            native_session_id: nonempty_session(&transcript.native_session_id),
+            native_session_id: native_identity.as_ref().map(|id| id.as_str().to_owned()),
             source_cursor: complete.then(|| transcript.source_cursor.clone()).flatten(),
             events: batch,
             complete,
@@ -5501,6 +5547,7 @@ mod tests {
                     &cwd,
                     started_at,
                     None,
+                    &Sanitizer::builtin(),
                 )
                 .await
                 .unwrap()
@@ -5570,7 +5617,8 @@ mod tests {
                     ManagedHarness::Codex,
                     temp.path(),
                     &cwd,
-                    Some(&status)
+                    Some(&status),
+                    &Sanitizer::builtin(),
                 )
                 .unwrap()
                 .as_deref(),
@@ -5585,6 +5633,7 @@ mod tests {
                     &cwd,
                     started_at,
                     Some(&status),
+                    &Sanitizer::builtin(),
                 )
                 .await
                 .unwrap()
@@ -5607,6 +5656,7 @@ mod tests {
                     &empty,
                     started_at,
                     Some(&status),
+                    &Sanitizer::builtin(),
                 )
                 .await
                 .unwrap()
@@ -5658,6 +5708,7 @@ mod tests {
                 &cwd,
                 started_at,
                 None,
+                &Sanitizer::builtin(),
             )
             .await
             .unwrap()
@@ -5674,6 +5725,7 @@ mod tests {
                 &cwd,
                 started_at,
                 None,
+                &Sanitizer::builtin(),
             )
             .await
             .unwrap()
@@ -5740,6 +5792,7 @@ mod tests {
                 &cwd,
                 started_at,
                 Some(&status),
+                &Sanitizer::builtin(),
             )
             .await
             .unwrap()
@@ -6843,5 +6896,434 @@ mod tests {
         );
         drop(seen);
         server.abort();
+    }
+
+    #[test]
+    fn native_identity_run_preflight_refuses_before_resume_or_private_path() {
+        let home = tempfile::tempdir().unwrap();
+        for id in [
+            "sk-abcdefghijklmnopqrstuvwx",
+            "native\u{202e}tail",
+            "native\u{200b}tail",
+        ] {
+            let result = build_preflighted_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                Vec::new(),
+                Some(id),
+                false,
+                home.path(),
+                home.path(),
+                &[],
+            );
+            assert!(
+                result.is_err(),
+                "dirty server identity must be refused before resume"
+            );
+            assert!(!format!("{:#}", result.unwrap_err()).contains(id));
+        }
+        assert!(
+            build_preflighted_launch_plan(
+                ManagedHarness::Claude,
+                None,
+                Vec::new(),
+                Some("sk-abcdefghijklmnopqrstuvwx"),
+                true,
+                home.path(),
+                home.path(),
+                &[]
+            )
+            .is_err(),
+            "fresh mode must validate the original prepared identity before discarding it"
+        );
+        let (plan, _) = build_preflighted_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            Vec::new(),
+            None,
+            false,
+            home.path(),
+            home.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(uuid::Uuid::parse_str(plan.expected_session_id.as_deref().unwrap()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_run_old_server_refusal_prevents_child_and_transport() {
+        let (address, server) = mock_workstream_server(Some("private-vendor")).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "AI_MEMORY_MANAGED_RUN");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+        config.sanitize.extra_patterns.push("private-vendor".into());
+        let result = run_from(
+            &config,
+            run_args(RunHarnessChoice::Claude, script, Vec::new(), &[]),
+            repo.path(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "old server dirty identity must refuse the actual launch"
+        );
+        assert!(!captured.exists(), "child must not start");
+        assert!(!format!("{:#}", result.unwrap_err()).contains("private-vendor"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn native_identity_finish_transport_refuses_before_request_and_preserves_exact_control() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events: 1,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-vendor".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let transcript = |id: &str| ExportedTranscript {
+            native_session_id: id.into(),
+            source_cursor: Some("cursor".into()),
+            events: Vec::new(),
+            losses: Vec::new(),
+        };
+        for bad in ["sk-abcdefghijklmnopqrstuvwx", "private-vendor"] {
+            assert!(
+                import_batches(
+                    &endpoint,
+                    "/workstream/runs/test",
+                    transcript(bad),
+                    Default::default(),
+                    Some(0),
+                    &sanitizer,
+                )
+                .await
+                .is_err(),
+                "dirty finish identity must not reach transport"
+            );
+            assert!(requests.lock().unwrap().is_empty());
+            let mut with_event = transcript("vendor-界-01");
+            with_event.events.push(ai_memory_core::NewWorkstreamEvent {
+                event_id: "e".into(),
+                agent: AgentKind::Codex,
+                native_session_id: bad.into(),
+                source_record_id: None,
+                kind: ai_memory_core::WorkstreamEventKind::Message,
+                role: None,
+                content: "shared history".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            });
+            assert!(
+                import_batches(
+                    &endpoint,
+                    "/workstream/runs/test",
+                    with_event,
+                    Default::default(),
+                    Some(0),
+                    &sanitizer,
+                )
+                .await
+                .is_err(),
+                "dirty event identity must not reach transport"
+            );
+            assert!(requests.lock().unwrap().is_empty());
+        }
+        assert_eq!(
+            import_batches(
+                &endpoint,
+                "/workstream/runs/test",
+                transcript("vendor-界-01"),
+                Default::default(),
+                Some(0),
+                &sanitizer,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            requests.lock().unwrap()[0].native_session_id.as_deref(),
+            Some("vendor-界-01")
+        );
+        assert_eq!(
+            requests.lock().unwrap()[0].source_cursor.as_deref(),
+            Some("cursor")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_identity_run_status_and_expected_refuse_before_discovery() {
+        let home = tempfile::tempdir().unwrap();
+        let mut plan = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        plan.session_dir = None;
+        let sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-vendor".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        for bad in ["sk-abcdefghijklmnopqrstuvwx", "private-vendor"] {
+            plan.expected_session_id = Some(bad.into());
+            assert!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    None,
+                    &sanitizer
+                )
+                .is_err(),
+                "expected identity must refuse before use"
+            );
+            plan.expected_session_id = None;
+            let status = ManagedRunStatus {
+                run_id: ManagedRunId::new(),
+                workstream_id: WorkstreamId::new(),
+                agent: AgentKind::Codex,
+                native_session_id: Some(bad.into()),
+                native_session_linked: true,
+                context_delivered: false,
+                state: "active".into(),
+            };
+            assert!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    Some(&status),
+                    &sanitizer,
+                )
+                .is_err(),
+                "linked status must refuse before native IO"
+            );
+            assert!(
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    SystemTime::now(),
+                    Some(&status),
+                    &sanitizer,
+                )
+                .await
+                .is_err(),
+                "dirty old-server status must not fall back to discovery"
+            );
+            plan.expected_session_id = Some("vendor-界-01".into());
+            assert_eq!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    None,
+                    &sanitizer
+                )
+                .unwrap()
+                .as_deref(),
+                Some("vendor-界-01")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_run_configured_selector_refuses_before_link_or_child() {
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "AI_MEMORY_MANAGED_RUN");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+        config.sanitize.extra_patterns.push("private-vendor".into());
+        let result = run_from(
+            &config,
+            run_args(
+                RunHarnessChoice::Claude,
+                script,
+                Vec::new(),
+                &["--session-id", "private-vendor"],
+            ),
+            repo.path(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "configured selector must refuse before link and spawn"
+        );
+        assert!(!captured.exists());
+        assert!(!format!("{:#}", result.unwrap_err()).contains("private-vendor"));
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_run_configured_old_status_refuses_before_native_io_and_finish() {
+        for id in ["private-vendor", "vendor-界-01"] {
+            let finishes = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+            let captured_finishes = finishes.clone();
+            let app = Router::new()
+                .route(
+                    "/workstream/runs",
+                    post(|| async {
+                        axum::Json(PrepareManagedRunResponse {
+                            workstream_id: WorkstreamId::new(),
+                            workstream_name: "default".into(),
+                            run_id: ManagedRunId::new(),
+                            resolved_agent: None,
+                            native_session_id: None,
+                            source_cursor: None,
+                            sync_after: 0,
+                            sync_through: 0,
+                            may_adopt_existing_session: false,
+                        })
+                    }),
+                )
+                .route(
+                    "/workstream/runs/{id}",
+                    axum::routing::get(move || async move {
+                        axum::Json(ManagedRunStatus {
+                            run_id: ManagedRunId::new(),
+                            workstream_id: WorkstreamId::new(),
+                            agent: AgentKind::Codex,
+                            native_session_id: Some(id.into()),
+                            native_session_linked: false,
+                            context_delivered: false,
+                            state: "active".into(),
+                        })
+                    }),
+                )
+                .route(
+                    "/workstream/runs/{id}/finish",
+                    post(
+                        move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                            let captured_finishes = captured_finishes.clone();
+                            async move {
+                                captured_finishes.lock().unwrap().push(request);
+                                axum::Json(FinishManagedRunResponse {
+                                    imported_events: 0,
+                                    latest_sequence: 0,
+                                })
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/workstream/runs/{id}/cancel",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let home = tempfile::tempdir().unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            let (script, child_capture) = capture_env_script(repo.path(), "AI_MEMORY_MANAGED_RUN");
+            let mut config = launch_config(home.path(), home.path(), address);
+            config.run_autowire = false;
+            config.sanitize.extra_patterns.push("private-vendor".into());
+            let result = run_from(
+                &config,
+                run_args(RunHarnessChoice::Codex, script, Vec::new(), &[]),
+                repo.path(),
+            )
+            .await;
+            assert!(
+                child_capture.exists(),
+                "the status is returned after the child exits"
+            );
+            if id == "private-vendor" {
+                assert!(
+                    result.is_err(),
+                    "configured old status must refuse before native IO and finish"
+                );
+                assert!(!format!("{:#}", result.unwrap_err()).contains(id));
+                assert!(finishes.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(result.unwrap(), 0);
+                assert_eq!(
+                    finishes.lock().unwrap()[0].native_session_id.as_deref(),
+                    Some(id)
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_identity_run_configured_discovery_refuses_before_export() {
+        let sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-vendor".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        for id in ["private-vendor", "vendor-界-01"] {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = home.path().join("repo");
+            let root = home.path().join(".codex/sessions/2026/01/01");
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let started_at = SystemTime::now();
+            std::fs::write(
+                root.join("rollout-current.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "session_meta", "payload": {"id": id, "cwd": cwd}
+                    })
+                ),
+            )
+            .unwrap();
+            let mut plan =
+                build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+            plan.session_dir = None;
+            let result = resolve_native_session_after_run(
+                &plan,
+                ManagedHarness::Codex,
+                home.path(),
+                &cwd,
+                started_at,
+                None,
+                &sanitizer,
+            )
+            .await;
+            if id == "private-vendor" {
+                assert!(
+                    result.is_err(),
+                    "configured discovered identity must refuse before export"
+                );
+                assert!(!format!("{:#}", result.unwrap_err()).contains(id));
+            } else {
+                assert_eq!(result.unwrap().as_deref(), Some(id));
+            }
+        }
     }
 }

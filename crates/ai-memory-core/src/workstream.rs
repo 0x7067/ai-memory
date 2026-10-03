@@ -72,6 +72,57 @@ impl std::str::FromStr for WorkstreamEventKind {
     }
 }
 
+/// Exact original native identity accepted for a managed binding.
+///
+/// This validates privacy and representation only, not native authenticity,
+/// transcript existence, or association with a particular run.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NativeSessionIdentity(String);
+
+impl NativeSessionIdentity {
+    /// Validate the original UTF-8 bytes without rewriting them.
+    ///
+    /// # Errors
+    /// Refuses empty/oversized identities, controls, invisible formatting,
+    /// redaction placeholders, and any change made by the privacy scrubber.
+    pub fn parse(original: &str, sanitizer: &crate::Sanitizer) -> Result<Self, crate::MemoryError> {
+        if original.trim().is_empty()
+            || original.len() > 512
+            || original.chars().any(|c| {
+                c.is_control()
+                    || matches!(c,
+                '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}' | '\u{feff}')
+            })
+            || original.contains("[REDACTED:")
+            || sanitizer.scrub(original) != original
+        {
+            return Err(crate::MemoryError::MalformedRecord(
+                "native session identity is UNKNOWN; refusing managed binding".into(),
+            ));
+        }
+        Ok(Self(original.to_owned()))
+    }
+
+    /// Borrow exactly the accepted original bytes.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Carry exactly the accepted original bytes into existing wire/storage fields.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// Compatible privacy projection for history: invalid identities are UNKNOWN.
+    #[must_use]
+    pub fn project(original: &str, sanitizer: &crate::Sanitizer) -> String {
+        Self::parse(original, sanitizer).map_or_else(|_| String::new(), Self::into_string)
+    }
+}
+
 /// One normalized event uploaded from a native harness transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewWorkstreamEvent {
@@ -517,6 +568,82 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).unwrap()["force_unlock"],
             serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn native_identity_original_bytes_limits_privacy_and_collisions() {
+        let sanitizer = crate::Sanitizer::builtin();
+        for id in [
+            "vendor-session_01".into(),
+            "x".repeat(501),
+            "x".repeat(512),
+            "界".repeat(170) + "ab",
+            "café".into(),
+            "cafe\u{301}".into(),
+            " vendor ".into(),
+        ] {
+            assert_eq!(
+                NativeSessionIdentity::parse(&id, &sanitizer)
+                    .unwrap()
+                    .as_str(),
+                id
+            );
+            assert_eq!(NativeSessionIdentity::project(&id, &sanitizer), id);
+        }
+        let unsafe_ids = [
+            "".into(),
+            " ".into(),
+            "x".repeat(513),
+            "界".repeat(171),
+            "x\0y".into(),
+            "x\u{1b}[31my".into(),
+            "x\ny".into(),
+            "x\ty".into(),
+            "x\u{85}y".into(),
+            "x\u{202e}y".into(),
+            "x\u{200b}y".into(),
+            "x\u{feff}y".into(),
+            "[REDACTED:api_key]".into(),
+            "sk-abcdefghijklmnopqrstuvwx".into(),
+        ];
+        for id in unsafe_ids {
+            assert!(
+                NativeSessionIdentity::parse(&id, &sanitizer).is_err(),
+                "dirty native identity must be refused"
+            );
+            assert_eq!(NativeSessionIdentity::project(&id, &sanitizer), "");
+            assert!(
+                !NativeSessionIdentity::parse(&id, &sanitizer)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains(&id)
+                    || id.is_empty()
+                    || id == " "
+            );
+        }
+        let a = "sk-abcdefghijklmnopqrstuvwx";
+        let b = "sk-zyxwvutsrqponmlkjihgfedcba";
+        assert_eq!(sanitizer.scrub(a), sanitizer.scrub(b));
+        assert!(NativeSessionIdentity::parse(a, &sanitizer).is_err());
+        assert!(NativeSessionIdentity::parse(b, &sanitizer).is_err());
+        let a = "x".repeat(512) + "a";
+        let b = "x".repeat(512) + "b";
+        assert_eq!(&a[..512], &b[..512]);
+        assert!(NativeSessionIdentity::parse(&a, &sanitizer).is_err());
+        assert!(NativeSessionIdentity::parse(&b, &sanitizer).is_err());
+        let cfg = crate::SanitizeConfig {
+            extra_patterns: vec!["vendor-private".into()],
+            ..Default::default()
+        };
+        assert!(
+            NativeSessionIdentity::parse("vendor-private", &crate::Sanitizer::new(&cfg).unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            crate::SessionId::from_native("vendor-id"),
+            crate::SessionId::from_native("vendor-id")
         );
     }
 }

@@ -32,3 +32,5 @@ mod shutdown_signals;
 mod upgrade_e2e;
 mod workstream_provenance;
 mod yolo_ai_jail;
+
+mod workstream_identity;

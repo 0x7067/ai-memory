@@ -220,6 +220,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxy operators retained their existing project policy. Active API keys
   remained valid after human login was disabled. Shared, unattributed runs and
   late finishes of still-active runs retained their existing behavior. (#1075)
+- Required new managed native-session bindings and imports to preserve the
+  exact original identity within 512 UTF-8 bytes and pass privacy validation
+  before use or persistence. Invalid historical identities were projected as
+  unknown (`native_session_id: ""`) in workstream search without rewriting
+  stored history; the CLI also protected reads from older servers. (#1079)
 
 ### Fixed
 - Removed unnecessary working-tree scans from checkout-local workstream listing

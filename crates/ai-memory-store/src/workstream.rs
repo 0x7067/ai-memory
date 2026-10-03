@@ -3,8 +3,8 @@
 use std::str::FromStr as _;
 
 use ai_memory_core::{
-    AgentKind, ManagedRunId, NewWorkstreamEvent, ProjectId, Sanitizer, WorkspaceId,
-    WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
+    AgentKind, ManagedRunId, NativeSessionIdentity, NewWorkstreamEvent, ProjectId, Sanitizer,
+    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -680,12 +680,14 @@ pub(crate) fn link_native_session(
     agent: AgentKind,
     native_session_id: &str,
 ) -> StoreResult<bool> {
-    if native_session_id.trim().is_empty() {
-        return Ok(false);
-    }
+    let native_identity =
+        match NativeSessionIdentity::parse(native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(false),
+        };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let linked = link_native_session_in_transaction(&tx, run_id, agent, native_session_id, now)?;
+    let linked = link_native_session_in_transaction(&tx, run_id, agent, &native_identity, now)?;
     tx.commit()?;
     Ok(linked)
 }
@@ -694,9 +696,10 @@ fn link_native_session_in_transaction(
     tx: &Transaction<'_>,
     run_id: ManagedRunId,
     agent: AgentKind,
-    native_session_id: &str,
+    native_session_id: &NativeSessionIdentity,
     now: i64,
 ) -> StoreResult<bool> {
+    let native_session_id = native_session_id.as_str();
     let run: Option<LinkRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, \
@@ -791,6 +794,11 @@ pub(crate) fn link_or_adopt_native_session(
         return Ok(ManagedRunSessionLink::Refused);
     }
 
+    let native_identity =
+        match NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(ManagedRunSessionLink::Refused),
+        };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     let supplied: Option<ManagedRunBoundaryRow> = tx
@@ -866,13 +874,7 @@ pub(crate) fn link_or_adopt_native_session(
         }
     };
 
-    if !link_native_session_in_transaction(
-        &tx,
-        selected.0,
-        input.agent,
-        &input.native_session_id,
-        now,
-    )? {
+    if !link_native_session_in_transaction(&tx, selected.0, input.agent, &native_identity, now)? {
         tx.commit()?;
         return Ok(ManagedRunSessionLink::Refused);
     }
@@ -999,9 +1001,24 @@ pub(crate) fn finish_run(
         .as_deref()
         .or(linked_session.as_deref());
 
+    let sanitizer = Sanitizer::builtin();
+    let validate = |id: &str| {
+        NativeSessionIdentity::parse(id, &sanitizer).map_err(|_| {
+            StoreError::InvalidState(
+                "native session identity is UNKNOWN; refusing managed binding".into(),
+            )
+        })
+    };
+    let native_identity = native_session.map(validate).transpose()?;
+    let native_session = native_identity.as_ref().map(NativeSessionIdentity::as_str);
+    let event_identities = input
+        .events
+        .iter()
+        .map(|event| validate(&event.native_session_id))
+        .collect::<StoreResult<Vec<_>>>()?;
     let mut latest = latest_before;
     let mut imported = 0_usize;
-    for event in &input.events {
+    for (event, event_identity) in input.events.iter().zip(event_identities) {
         if event.agent != agent {
             return Err(StoreError::InvalidState(format!(
                 "event {} belongs to {}, managed run expects {}",
@@ -1063,7 +1080,7 @@ pub(crate) fn finish_run(
                 latest,
                 event.event_id,
                 event.agent.as_str(),
-                event.native_session_id,
+                event_identity.as_str(),
                 source_record_id,
                 event.kind.as_str(),
                 event.role,
@@ -1556,7 +1573,7 @@ fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamE
         sequence,
         event_id,
         agent: AgentKind::from_wire(&agent),
-        native_session_id,
+        native_session_id: NativeSessionIdentity::project(&native_session_id, sanitizer),
         source_record_id,
         metadata,
         kind: WorkstreamEventKind::from_str(&kind)?,

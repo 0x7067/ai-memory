@@ -1,6 +1,6 @@
 //! Explicit retrieval for history older than a managed startup packet.
 
-use ai_memory_core::WorkstreamEvent;
+use ai_memory_core::{NativeSessionIdentity, Sanitizer, WorkstreamEvent};
 use anyhow::Result;
 
 use crate::cli::WorkstreamSearchArgs;
@@ -12,12 +12,17 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let path = format!("/workstream/{}/events", args.workstream_id);
     let limit = args.limit.to_string();
-    let events: Vec<WorkstreamEvent> = get_json(
+    let mut events: Vec<WorkstreamEvent> = get_json(
         &endpoint,
         &path,
         &[("q", args.query.as_str()), ("limit", limit.as_str())],
     )
     .await?;
+    let sanitizer = Sanitizer::new(&config.sanitize)?;
+    for event in &mut events {
+        event.native_session_id =
+            NativeSessionIdentity::project(&event.native_session_id, &sanitizer);
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&events)?);
         return Ok(());

@@ -9,9 +9,9 @@ use std::str::FromStr as _;
 use ai_memory_core::{
     AgentKind, AuthLevel, Capability, FinishManagedRunRequest, FinishManagedRunResponse,
     LinkManagedRunRequest, ListManagedWorkstreamsRequest, ManagedRunContextResponse, ManagedRunId,
-    ManagedRunStatus, ManagedWorkstreamSummary, NewWorkstreamEvent, PrepareManagedRunRequest,
-    PrepareManagedRunResponse, RenameManagedWorkstreamRequest, RenamedManagedWorkstream, Sanitizer,
-    WorkstreamEventKind, WorkstreamId,
+    ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity, NewWorkstreamEvent,
+    PrepareManagedRunRequest, PrepareManagedRunResponse, RenameManagedWorkstreamRequest,
+    RenamedManagedWorkstream, Sanitizer, WorkstreamEventKind, WorkstreamId,
 };
 use ai_memory_store::{
     FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
@@ -31,7 +31,6 @@ use tracing::warn;
 const MAX_EVENTS_PER_FINISH: usize = 4_096;
 const MAX_EVENT_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_ID_BYTES: usize = 512;
-const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_CWD_BYTES: usize = 16 * 1024;
 
@@ -773,7 +772,13 @@ async fn search_events(
         )
         .await
     {
-        Ok(events) => Json(events).into_response(),
+        Ok(mut events) => {
+            for event in &mut events {
+                event.native_session_id =
+                    NativeSessionIdentity::project(&event.native_session_id, &state.sanitizer);
+            }
+            Json(events).into_response()
+        }
         Err(failure) => error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
     }
 }
@@ -798,11 +803,16 @@ async fn link_run(
     {
         return response;
     }
-    if request.native_session_id.trim().is_empty()
-        || request.native_session_id.len() > MAX_NATIVE_SESSION_ID_BYTES
-    {
-        return error(StatusCode::BAD_REQUEST, "invalid native session id");
-    }
+    let native_identity =
+        match NativeSessionIdentity::parse(&request.native_session_id, &state.sanitizer) {
+            Ok(id) => id,
+            Err(_) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "native session identity is UNKNOWN; refusing managed binding",
+                );
+            }
+        };
     let status = match state.reader.managed_run_status(run_id).await {
         Ok(Some(status)) => status,
         Ok(None) => return error(StatusCode::NOT_FOUND, "managed run not found"),
@@ -813,7 +823,7 @@ async fn link_run(
     }
     match state
         .writer
-        .link_managed_run_session(run_id, status.agent, request.native_session_id)
+        .link_managed_run_session(run_id, status.agent, native_identity.into_string())
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -860,12 +870,18 @@ async fn finish_run(
     {
         return error(StatusCode::BAD_REQUEST, "reserved workstream event id");
     }
-    if request
-        .native_session_id
-        .as_deref()
-        .is_some_and(|id| id.trim().is_empty() || id.len() > MAX_NATIVE_SESSION_ID_BYTES)
-    {
-        return error(StatusCode::BAD_REQUEST, "invalid native session id");
+    for id in request.native_session_id.as_deref().into_iter().chain(
+        request
+            .events
+            .iter()
+            .map(|event| event.native_session_id.as_str()),
+    ) {
+        if NativeSessionIdentity::parse(id, &state.sanitizer).is_err() {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "native session identity is UNKNOWN; refusing managed binding",
+            );
+        }
     }
     let status = match state.reader.managed_run_status(run_id).await {
         Ok(Some(status)) => status,
@@ -901,10 +917,24 @@ async fn finish_run(
     if status.state != "active" {
         return error(StatusCode::CONFLICT, "managed run is not active");
     }
-    let native_session_id = request
+    let native_identity = match request
         .native_session_id
-        .clone()
-        .or(status.native_session_id.clone())
+        .as_deref()
+        .or(status.native_session_id.as_deref())
+        .map(|id| NativeSessionIdentity::parse(id, &state.sanitizer))
+        .transpose()
+    {
+        Ok(id) => id,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "native session identity is UNKNOWN; refusing managed binding",
+            );
+        }
+    };
+    let native_session_id = native_identity
+        .as_ref()
+        .map(|id| id.as_str().to_owned())
         .unwrap_or_else(|| format!("unresolved:{run_id}"));
     if let Err(message) = sanitize_events(
         &state.sanitizer,
@@ -938,7 +968,7 @@ async fn finish_run(
     let input = FinishWorkstreamRun {
         sanitizer: state.sanitizer.clone(),
         run_id,
-        native_session_id: request.native_session_id.or(status.native_session_id),
+        native_session_id: native_identity.map(NativeSessionIdentity::into_string),
         source_cursor: request.source_cursor,
         events: request.events,
         complete: request.complete,
@@ -3266,5 +3296,298 @@ mod tests {
                 "restored Write legitimately finishes or retries the same run"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn native_identity_http_link_refuses_before_status_or_sql() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        let mut privacy = ai_memory_core::SanitizeConfig::default();
+        privacy.extra_patterns.push("private-vendor".into());
+        state.sanitizer = Sanitizer::new(&privacy).unwrap();
+        let (ws, project) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(ws, project, AgentKind::Codex, "launcher"))
+            .await
+            .unwrap();
+        for id in [
+            "private-vendor".to_owned(),
+            "native\0tail".into(),
+            "native\u{202e}tail".into(),
+            "x".repeat(513),
+        ] {
+            let before = finish_sql_snapshot(&store).await;
+            let response = link_run(
+                State(state.clone()),
+                None,
+                None,
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(LinkManagedRunRequest {
+                    native_session_id: id,
+                }),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "HTTP must refuse dirty original native identity"
+            );
+            assert_eq!(finish_sql_snapshot(&store).await, before);
+            assert!(!temp.path().join("raw/workstreams").exists());
+        }
+        let response = link_run(
+            State(state),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(LinkManagedRunRequest {
+                native_session_id: "vendor-界-01".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("vendor-界-01")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_identity_http_finish_refuses_before_segment_or_sql() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (ws, project) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(ws, project, AgentKind::Codex, "launcher"))
+            .await
+            .unwrap();
+        let request = |id: &str| FinishManagedRunRequest {
+            native_session_id: Some(id.into()),
+            source_cursor: Some("cursor-attack".into()),
+            events: vec![NewWorkstreamEvent {
+                event_id: "event-attack".into(),
+                agent: AgentKind::Codex,
+                native_session_id: id.into(),
+                source_record_id: None,
+                kind: WorkstreamEventKind::Message,
+                role: None,
+                content: "legitimate content".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            }],
+            complete: true,
+            checkpoint: Default::default(),
+            losses: Vec::new(),
+            exit_code: Some(0),
+        };
+        for id in [
+            "sk-abcdefghijklmnopqrstuvwx",
+            "native\u{202e}tail",
+            "native\u{200b}tail",
+        ] {
+            let before = finish_sql_snapshot(&store).await;
+            let response = finish_run(
+                State(state.clone()),
+                None,
+                None,
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(request(id)),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "finish must refuse before raw segment"
+            );
+            let body = to_bytes(response.into_body(), 65536).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains(id));
+            assert!(!temp.path().join("raw/workstreams").exists());
+            assert_eq!(finish_sql_snapshot(&store).await, before);
+        }
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(request("vendor-界-01")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = store
+            .reader
+            .search_workstream_events(run.workstream_id, "".into(), 10, Sanitizer::default())
+            .await
+            .unwrap();
+        assert!(events.iter().all(|e| e.native_session_id == "vendor-界-01"));
+    }
+    #[tokio::test]
+    async fn native_identity_http_event_guard_and_configured_history_projection() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        let (ws, project) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(ws, project, AgentKind::Codex, "launcher"))
+            .await
+            .unwrap();
+        let request = |event_native: &str| FinishManagedRunRequest {
+            native_session_id: Some("vendor-valid".into()),
+            source_cursor: Some("cursor".into()),
+            events: vec![NewWorkstreamEvent {
+                event_id: "event".into(),
+                agent: AgentKind::Codex,
+                native_session_id: event_native.into(),
+                source_record_id: None,
+                kind: WorkstreamEventKind::Message,
+                role: None,
+                content: "shared history".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            }],
+            complete: true,
+            checkpoint: Default::default(),
+            losses: Vec::new(),
+            exit_code: Some(0),
+        };
+        let before = finish_sql_snapshot(&store).await;
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(request("sk-abcdefghijklmnopqrstuvwx")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("native session identity is UNKNOWN"),
+            "event identity must be checked before mismatch/segment handling"
+        );
+        assert_eq!(finish_sql_snapshot(&store).await, before);
+        assert!(!temp.path().join("raw/workstreams").exists());
+        assert_eq!(
+            finish_run(
+                State(state.clone()),
+                None,
+                None,
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(request("vendor-valid"))
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let privacy = ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["vendor-valid".into()],
+            ..Default::default()
+        };
+        state.sanitizer = Sanitizer::new(&privacy).unwrap();
+        let before = finish_sql_snapshot(&store).await;
+        let response = search_events(
+            State(state),
+            None,
+            None,
+            AxumPath(run.workstream_id.to_string()),
+            Query(EventQuery::default()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let events: Vec<ai_memory_core::WorkstreamEvent> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            events.iter().all(|e| e.native_session_id.is_empty()),
+            "HTTP configured privacy must project UNKNOWN"
+        );
+        assert_eq!(finish_sql_snapshot(&store).await, before);
+    }
+
+    #[tokio::test]
+    async fn native_identity_http_stored_identity_refuses_before_raw_segment() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        let (ws, project) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(ws, project, AgentKind::Codex, "launcher"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .link_managed_run_session(run.run_id, AgentKind::Codex, "private-existing")
+            .await
+            .unwrap();
+        state.sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-existing".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let request = || FinishManagedRunRequest {
+            native_session_id: None,
+            source_cursor: Some("must-not-advance".into()),
+            events: Vec::new(),
+            complete: true,
+            checkpoint: Default::default(),
+            losses: Vec::new(),
+            exit_code: Some(0),
+        };
+        let before = finish_sql_snapshot(&store).await;
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "stored identity must be validated before segment"
+        );
+        assert!(!temp.path().join("raw/workstreams").exists());
+        assert_eq!(finish_sql_snapshot(&store).await, before);
+        state.sanitizer = Sanitizer::builtin();
+        assert_eq!(
+            finish_run(
+                State(state),
+                None,
+                None,
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(request())
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
     }
 }
