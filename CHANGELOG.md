@@ -166,6 +166,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `install-mcp --client copilot` alias keeps meaning VS Code Copilot;
   `install-mcp --client copilot-cli` and `ai-memory run copilot` follow
   separately. (#1040)
+- Added GitHub Copilot CLI as a hooked agent: `install-hooks --agent
+  copilot-cli` writes `$COPILOT_HOME/hooks/ai-memory.json` (default
+  `~/.copilot/hooks/ai-memory.json`) with Copilot's flat, matcher-less entries
+  and PascalCase event names, so Copilot sends its VS Code/Claude-compatible
+  payload. Ten events — Claude Code's nine plus `PostToolUseFailure` — with
+  native commands enforcing capture exclusions; tool output is read from
+  `tool_result.text_result_for_llm` and the outcome from
+  `tool_result.result_type`. The `SessionStart` hook delivers the prior
+  session's handoff through Copilot's top-level `additionalContext` (ported
+  from #1069). There is deliberately no `--scope project`. The bare
+  `install-mcp --client copilot` alias keeps meaning VS Code Copilot;
+  `ai-memory run copilot` follows separately. (#1040)
+- Added `install-mcp --client copilot-cli`, which merges ai-memory's remote
+  entry (`type: "http"`, `url`, bearer `headers`, `tools: ["*"]`) into the root
+  `mcpServers` map of `$COPILOT_HOME/mcp-config.json` (default
+  `~/.copilot/mcp-config.json`), preserving other servers. `install-hooks
+  --agent copilot-cli` without `--server-url` now reads the server URL and
+  bearer back from that entry, and `uninstall` removes it. (#1040)
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`

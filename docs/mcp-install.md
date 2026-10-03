@@ -225,6 +225,62 @@ native HTTP or generated bridge paths.
 
 ---
 
+## GitHub Copilot CLI
+
+**Status:** MCP and lifecycle hooks are supported. Handoffs are not injected
+at `SessionStart` yet (see below), and there is no managed workstream
+(`ai-memory run copilot`).
+
+**Config files:** `$COPILOT_HOME/mcp-config.json` for MCP and
+`$COPILOT_HOME/hooks/ai-memory.json` for lifecycle hooks (`COPILOT_HOME`
+defaults to `~/.copilot`). Not to be confused with `--client vscode-copilot`
+(alias `copilot`), the VS Code agent-mode client below.
+
+```bash
+ai-memory install-mcp --client copilot-cli --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent copilot-cli --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer merges the documented remote entry into the root
+`mcpServers` map, preserving other servers (including your own `github`
+entry):
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+The equivalent interactive registration is `copilot mcp add --transport http
+ai-memory http://homelab:49374/mcp` (add `--header "Authorization: Bearer
+<token>"` when bearer auth is on). Copilot also reads project-level
+`.mcp.json` and `.github/mcp.json` files; pass that path via `--config-file` to
+write one, keeping in mind that `.github/mcp.json` is meant to be committed,
+so it should not carry a bearer token. `install-hooks --agent copilot-cli`
+run without `--server-url` reads the URL and token back from this entry.
+
+The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
+with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
+payload; native installs spool events locally and enforce capture exclusions.
+Copilot reads a top-level `additionalContext` from `SessionStart` stdout, not
+the `hookSpecificOutput` envelope ai-memory prints, so the prior session's
+handoff is recovered with `memory_handoff_list` and `memory_handoff_accept`.
+
+- Sources: <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers>,
+  <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>,
+  <https://docs.github.com/en/copilot/reference/hooks-reference>
+
+---
+
 ## VS Code GitHub Copilot
 
 **Status:** ✅ MCP supported (workspace-default). ❌ No lifecycle hooks
