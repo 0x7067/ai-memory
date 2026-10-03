@@ -95,8 +95,20 @@ default is `mimo-v2.6-flash`, served by Go. When selecting Zen, set
 `AI_MEMORY_LLM_MODEL` to a model from its catalogue, such as `claude-sonnet-5-5`.
 The provider preserves the chosen catalogue and does not switch billing products
 automatically. Published Responses models, including `gpt-5.6-luna` and
-`gpt-6-luna`, use `/responses`; supported Claude and Qwen Messages models use
-`/messages`; other models retain Chat Completions. The provider sends the
+`gpt-6-luna`, use `/responses`. The wire API follows the selected catalogue:
+`minimax-m3`, `minimax-m2.7`, and `qwen3.8-max` use `/messages` on Go and
+Chat Completions on Zen. Go's `muse-spark-1.3-contributor` and
+`muse-spark-1.2-contributor` use `/responses`. Supported Claude and the other
+mapped Qwen models use `/messages`; remaining models retain Chat Completions.
+Changing the base URL reselects the transport and preserves timeout, reasoning
+effort, and operator headers. Go is identified by a URL path ending in
+`/zen/go` or `/zen/go/v1`, optionally including a complete endpoint;
+custom proxy URLs with other paths use the Zen mapping.
+See the official [Go endpoints](https://opencode.ai/docs/go/#endpoints) and
+[Zen endpoints](https://opencode.ai/docs/zen/#endpoints), whose source tables
+are [go.mdx](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/go.mdx)
+and [zen.mdx](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/zen.mdx).
+The provider sends the
 `x-opencode-session` correlation header OpenCode asks for, one id per logical
 operation, and its own `User-Agent`; `AI_MEMORY_LLM_HEADERS` overrides
 either. `AI_MEMORY_LLM_REASONING_EFFORT` and `AI_MEMORY_LLM_TIMEOUT_SECS`
