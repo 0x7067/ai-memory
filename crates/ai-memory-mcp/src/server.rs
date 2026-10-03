@@ -12489,6 +12489,7 @@ mod tests {
             scope: None,
             expires_at: None,
             session_id: Some(session_id.to_string()),
+            metadata: Default::default(),
         }
     }
 
@@ -13262,6 +13263,7 @@ mod tests {
             workspace: workspace.map(str::to_owned),
             scope: scope.map(str::to_owned),
             expires_at: None,
+            session_id: None,
             metadata: Default::default(),
         }
     }
