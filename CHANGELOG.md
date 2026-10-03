@@ -132,6 +132,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AutoScopeSettings`, the `ActiveProjectMode` module docs, `serve`) and the
   README docs index: they still named `single` as the default or called
   `per_actor` opt-in, but the default has been `per_actor` since v1.39. (#1065)
+- Fixed `gemini-3.8-flash` consolidation and lint spending hidden thinking
+  tokens on strict-JSON calls. The Gemini provider now sends
+  `thinkingBudget = 0` to 3.8 Flash as it already did for 2.5 and 3.5 Flash
+  (verified live: 0 thought tokens, about half the latency); 3.8 Flash-Lite
+  keeps the field omitted until verified. (#1077)
+- Fixed the secret scrubber missing Gemini authorization keys. AI Studio has
+  issued `AQ.Ab…` keys instead of `AIza…` since 2026-05-28, so a bare new key
+  reached capture unredacted; it is now redacted as `google_api_key`. (#1077)
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a
