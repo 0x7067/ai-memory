@@ -290,6 +290,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     let mut outcomes = ack::outcome_counts();
     let mut batches = 0usize;
     let mut blocked_sessions = 0usize;
+    let mut dropped_unsafe = 0usize;
     let mut failure: Option<String> = None;
     let mut backed_off = false;
 
@@ -311,6 +312,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
             break;
         }
         let mut items = Vec::new();
+        let mut unsafe_keys: Vec<(String, &str)> = Vec::new();
         for item in &batch.items {
             let wire = serde_json::from_str(&item.body_json).ok().and_then(|body| {
                 ai_memory_client::reject_sensitive(&serde_json::json!([
@@ -328,16 +330,19 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
             if let Some(wire) = wire {
                 items.push(wire);
             } else {
-                queue.record_failure(&item.ingest_key, "privacy/validation")?;
-                deferred.insert(item.session());
-                failure.get_or_insert_with(|| {
-                    "privacy/validation: unsafe stored body retained; its session deferred".into()
-                });
+                // Only an item queued before local sanitation can fail here. It
+                // is never sent, and retaining it would hold its session's later
+                // events on every flush, so it leaves the queue as a local
+                // policy drop; the receipt keeps its key replay-protected.
+                unsafe_keys.push((item.ingest_key.clone(), "dropped_policy"));
             }
         }
-        batch
-            .items
-            .retain(|item| !deferred.contains(&item.session()));
+        if !unsafe_keys.is_empty() {
+            dropped_unsafe += queue.confirm(&unsafe_keys, now)?;
+            batch
+                .items
+                .retain(|item| !unsafe_keys.iter().any(|(key, _)| *key == item.ingest_key));
+        }
         if items.is_empty() {
             continue;
         }
@@ -496,9 +501,15 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
                 .to_owned(),
         );
     }
+    if dropped_unsafe > 0 {
+        summary.push(format!(
+            "{dropped_unsafe} event(s) queued before local sanitation failed privacy/validation \
+             and were dropped locally, never sent; their sessions continued"
+        ));
+    }
     if !deferred.is_empty() {
         summary.push(format!(
-            "{} session(s) deferred to a later flush (an unsafe, failed or rate-limited head); \
+            "{} session(s) deferred to a later flush (a failed or rate-limited head); \
              their later events were never sent ahead of it",
             deferred.len()
         ));

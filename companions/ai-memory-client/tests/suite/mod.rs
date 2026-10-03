@@ -145,6 +145,24 @@ fn sensitive_key_forms_redact_opaque_values_and_preserve_numeric_metrics() {
 }
 
 #[test]
+fn unlisted_numeric_token_counts_survive_while_their_string_form_redacts() {
+    let counts = json!({"cached_tokens": 7, "thinking_tokens": 1024, "cacheTokens": 3});
+    let mut safe = counts.clone();
+    sanitize_external_value(&mut safe).unwrap();
+    assert_eq!(
+        safe, counts,
+        "numeric usage counts keep their value and type"
+    );
+    reject_sensitive(&safe).unwrap();
+
+    let mut strings = json!({"cached_tokens": "fixture-value", "thinking_tokens": "fixture-value"});
+    assert!(reject_sensitive(&strings).is_err());
+    sanitize_external_value(&mut strings).unwrap();
+    assert_eq!(strings["cached_tokens"], "[REDACTED]");
+    assert_eq!(strings["thinking_tokens"], "[REDACTED]");
+}
+
+#[test]
 fn numeric_token_metrics_preserve_representation_without_credential_bypass() {
     let metrics = json!({"max_tokens":12,"input_tokens":34,"token_count":0,"token_usage":1.25,"output_tokens":9007199254740993_u64,"total_tokens":89,"totalTokens":89,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"prompt_tokens":5,"completion_tokens":7,"reasoning_tokens":11});
     let raw = json!({"usage":metrics,"nested":[metrics.clone()]});

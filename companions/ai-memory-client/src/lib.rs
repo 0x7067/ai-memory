@@ -83,11 +83,24 @@ fn sensitive_key(key: &str, value: &Value) -> bool {
         "output_tokens total_tokens cache_read_input_tokens cache_creation_input_tokens ",
         "prompt_tokens completion_tokens reasoning_tokens"
     );
-    let is_metric = metrics.split(' ').any(|metric| metric == name);
+    let parts: Vec<_> = name.split('_').filter(|part| !part.is_empty()).collect();
+    // Beyond the exact list, a `*_tokens` number is a usage count
+    // (`cached_tokens`, `thinking_tokens`) unless a credential qualifier names
+    // it (`access_tokens`, `refresh_tokens`); string values still redact.
+    let usage_count = parts.len() > 1
+        && parts.last() == Some(&"tokens")
+        && !parts[..parts.len() - 1].iter().any(|part| {
+            concat!(
+                "access refresh id auth authorization bearer session api private ",
+                "client oauth secret password credential cookie"
+            )
+            .split(' ')
+            .any(|qualifier| qualifier == *part)
+        });
+    let is_metric = metrics.split(' ').any(|metric| metric == name) || usage_count;
     if value.is_number() && is_metric {
         return false;
     }
-    let parts: Vec<_> = name.split('_').filter(|part| !part.is_empty()).collect();
     let sensitive = concat!(
         "authorization auth jwt pwd bearer password passwd secret token cookie ",
         "credential apikey privatekey accesskey signature"

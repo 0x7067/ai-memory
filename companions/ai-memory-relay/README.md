@@ -155,10 +155,12 @@ print event bodies. Receipts count acknowledgements, including policy drops.
 
 New queue bodies receive local credential sanitation before persistence, then
 cross the normal server sanitizer on delivery. Legacy pending bytes, digest,
-native identity, ingest key and attempt state remain exact. An unsafe stored
-head is retained with a payload-free `privacy/validation` diagnostic; only its
-session is deferred while clean sessions continue. No attempt or receipt is
-recorded for the refused item. See the [shared privacy helpers](../ai-memory-client).
+native identity, ingest key and attempt state remain exact. A stored item that
+fails the privacy check (only possible for one queued before local sanitation)
+is never sent: the flush drops it locally as `dropped_policy`, keeps a receipt
+so its key stays replay-protected, and reports the count without payload. Its
+session's later events continue instead of waiting behind it. See the [shared
+privacy helpers](../ai-memory-client).
 
 The producer must apply its capture exclusions before enqueueing. The relay
 does not load the project's `[capture] ignore_paths` settings or inspect tool

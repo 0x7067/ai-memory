@@ -2353,7 +2353,7 @@ fn new_native_bodies_are_sanitized_before_hash_enqueue_and_exact_retry() {
 }
 
 #[test]
-fn unsafe_legacy_pending_is_retained_exactly_and_never_sent() {
+fn unsafe_legacy_pending_is_dropped_locally_and_never_blocks_its_session() {
     let root = fixture("unsafe-legacy-pending");
     let server = stub(vec![Reply::AcceptAll, Reply::AcceptAll]);
     let dir = bind(&root, &server.url());
@@ -2363,88 +2363,55 @@ fn unsafe_legacy_pending_is_retained_exactly_and_never_sent() {
     queue
         .enqueue(&[legacy.clone()], ai_memory_relay::now_ms())
         .unwrap();
-    let first_attempt = ai_memory_relay::now_ms() - 1000;
-    queue
-        .stamp_attempt(&[legacy.ingest_key.clone()], first_attempt)
-        .unwrap();
-    queue
-        .stamp_attempt(&[legacy.ingest_key.clone()], first_attempt)
-        .unwrap();
+    let later = valid("later-clean", "codex", "session-end", "native-session");
     let clean = valid("clean-event", "codex", "session-start", "clean-session");
     queue
-        .enqueue(
-            &[
-                valid("later-dirty", "codex", "session-end", "native-session"),
-                clean.clone(),
-            ],
-            ai_memory_relay::now_ms(),
-        )
+        .enqueue(&[later.clone(), clean.clone()], ai_memory_relay::now_ms())
         .unwrap();
     drop(queue);
-    for _ in 0..2 {
-        let report = relay::flush(&dir, &FlushOptions::default()).unwrap();
-        assert!(
-            report
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.contains("privacy/validation"))
-        );
-        assert!(!format!("{report:?}").contains("abcdefghijklmnop"));
-        assert!(report.pending);
-        assert_eq!(pending_count(&dir), 2);
-    }
-    let sent = server.bodies();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(
-        sent[0][0]["body"],
-        serde_json::from_str::<serde_json::Value>(&clean.body_json).unwrap()
+
+    let report = relay::flush(&dir, &FlushOptions::default()).unwrap();
+    assert!(report.failure.is_none(), "{report:?}");
+    assert!(!format!("{report:?}").contains("abcdefghijklmnop"));
+    assert!(
+        report
+            .summary
+            .iter()
+            .any(|line| line.starts_with("1 event(s) queued before local sanitation")),
+        "{report:?}"
     );
-    assert_eq!(
-        Queue::open(&dir)
+    assert!(!report.pending);
+    assert_eq!(pending_count(&dir), 0);
+
+    // The unsafe head never reached the wire; the clean session and the unsafe
+    // session's later event both did.
+    let sent: Vec<serde_json::Value> = server
+        .bodies()
+        .iter()
+        .flat_map(|batch| batch.as_array().unwrap().clone())
+        .collect();
+    assert!(
+        !serde_json::to_string(&sent)
             .unwrap()
-            .stats(ai_memory_relay::now_ms())
-            .unwrap()
-            .receipts,
-        1
+            .contains("abcdefghijklmnop")
     );
+    let ids: Vec<&str> = sent
+        .iter()
+        .map(|item| item["body"]["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"clean-session"));
+    assert!(ids.contains(&"native-session"));
+
     let conn = rusqlite::Connection::open(dir.join(ai_memory_relay::fsguard::DB_FILE)).unwrap();
-    let preserved: (String, String, String, String, Option<i64>, i64) = conn
+    let outcome: Option<String> = conn
         .query_row(
-            "SELECT ingest_key,session_id,body_json,body_sha256,first_attempt_ms,attempts FROM pending WHERE event_id=?1",
-            [&legacy.event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            "SELECT outcome FROM receipt WHERE ingest_key = ?1",
+            [&legacy.ingest_key],
+            |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        preserved
-            == (
-                legacy.ingest_key,
-                legacy.session_id,
-                legacy.body_json,
-                legacy.body_sha256,
-                Some(first_attempt),
-                2
-            ),
-        "unsafe legacy identity, bytes, digest and attempt state must remain unchanged"
-    );
-    let errors: Vec<(String, Option<String>, Option<i64>)> = conn
-        .prepare("SELECT event_id,last_error,first_attempt_ms FROM pending ORDER BY seq")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(
-        errors,
-        [
-            (
-                "native-event".into(),
-                Some("privacy/validation".into()),
-                Some(first_attempt)
-            ),
-            ("later-dirty".into(), None, None)
-        ]
-    );
+    assert_eq!(outcome.as_deref(), Some("dropped_policy"));
 }
 
 #[test]
@@ -2593,7 +2560,7 @@ fn sensitive_binding_is_refused_before_queue_creation() {
 }
 
 #[test]
-fn unsafe_legacy_native_identity_defers_only_its_session() {
+fn unsafe_legacy_native_identity_is_dropped_and_its_session_continues() {
     let root = fixture("privacy-legacy-native-id");
     let server = stub(vec![Reply::AcceptAll, Reply::AcceptAll]);
     let dir = bind(&root, &server.url());
@@ -2606,42 +2573,35 @@ fn unsafe_legacy_native_identity_defers_only_its_session() {
         .unwrap();
     drop(queue);
     let report = flush(&dir);
-    assert!(
-        report
-            .failure
-            .is_some_and(|failure| failure.contains("privacy/validation")),
-        "unsafe legacy native identity must be refused"
-    );
-    assert_eq!(pending_count(&dir), 1);
+    assert!(report.failure.is_none(), "{report:?}");
+    assert!(!format!("{report:?}").contains("abcdefghijklmnop"));
+    assert_eq!(pending_count(&dir), 0);
+
     enqueue(
         &dir,
         &root,
         "after.json",
-        serde_json::json!([event("after", "codex", "session-start", "clean-after")]),
+        serde_json::json!([event("after", "codex", "session-end", "old-session")]),
     )
     .unwrap();
     let report = flush(&dir);
-    assert!(report.failure.is_some());
-    assert_eq!(pending_count(&dir), 1);
+    assert!(report.failure.is_none(), "{report:?}");
+    assert_eq!(pending_count(&dir), 0);
+
     let sent = server.bodies();
     assert_eq!(sent.len(), 2);
     assert_eq!(
         sent[0][0]["body"],
         serde_json::from_str::<serde_json::Value>(&before.body_json).unwrap()
     );
-    assert_eq!(sent[1][0]["body"]["session_id"], "clean-after");
-    let conn = rusqlite::Connection::open(dir.join(ai_memory_relay::fsguard::DB_FILE)).unwrap();
-    let stored: (String,String,String,String,String,Option<i64>,i64) = conn.query_row("SELECT event_id,session_id,ingest_key,body_json,body_sha256,first_attempt_ms,attempts FROM pending", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
-    assert_eq!(
-        stored,
-        (
-            legacy.event_id,
-            legacy.session_id,
-            legacy.ingest_key,
-            legacy.body_json,
-            legacy.body_sha256,
-            None,
-            0
-        )
+    assert_eq!(sent[1][0]["body"]["session_id"], "old-session");
+    assert!(
+        server
+            .heads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|head| !head.contains("abcdefghijklmnop")),
+        "the unsafe native identity must never reach a request line"
     );
 }
