@@ -11,15 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 
-### Security
-- Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
-  write grant on the reserved global preferences scope (`default/_global`)
-  could write it, and its pages are unioned into every user's queries,
-  including restricted projects. Writing it now needs root or an explicit
-  `write` grant on `_global`, whichever way the scope is named; creating it
-  grants nothing, reads stay open, and installs without database users are
-  unchanged. Reported by @Josehbr.
-
 ### Fixed
 - Fixed the generated OpenCode 2 plugin ending every tracked session when
   OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
@@ -168,6 +159,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[[workspace/project:path]]` are unchanged. Legacy rows that stored the
   project-only form with a NULL workspace resolve when the reserved page
   is next written. (#1042)
+- Fixed `ai-memory run claude` / `continue` exiting with Claude's "That session
+  is running in the background" error when the linked session is a Claude Code
+  background session that is still running and the launch carries any native
+  flag. The launcher now confirms the session is live in this checkout with
+  `claude agents --json` (only for a transcript recorded in the background) and
+  opens it with `claude attach <id>`; any failure keeps the native resume.
+  Documented the observed attach-hook behavior, early-exit import boundary and
+  fallback validation limits.
+  (#1052)
+
+### Security
+- Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
+  write grant on the reserved global preferences scope (`default/_global`)
+  could write it, and its pages are unioned into every user's queries,
+  including restricted projects. Writing it now needs root or an explicit
+  `write` grant on `_global`, whichever way the scope is named; creating it
+  grants nothing, reads stay open, and installs without database users are
+  unchanged. Reported by @Josehbr.
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a
