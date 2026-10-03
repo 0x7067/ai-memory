@@ -16,7 +16,7 @@
 //! Built-in patterns cover bearer tokens, vendor-prefixed API keys
 //! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_/rk_live_…,
 //! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
-//! github_pat_…, Google AIza… plus OAuth refresh tokens 1//…, Meta /
+//! github_pat_…, Google AIza… and AQ.Ab… plus OAuth refresh tokens 1//…, Meta /
 //! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
 //! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
 //! keys, URL-embedded credentials (`postgres://user:pass@host`), and

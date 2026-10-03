@@ -140,8 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the secret scrubber missing Gemini authorization keys. AI Studio has
   issued `AQ.Ab…` keys instead of `AIza…` since 2026-05-28, so a bare new key
   reached capture unredacted; it is now redacted as `google_api_key`. (#1077)
-- The OpenCode provider now selects the published wire API for supported Go/Zen
-  models: Responses, Anthropic Messages, or OpenAI-compatible Chat Completions.
+- Fixed the OpenCode provider sending every Go/Zen model through Chat
+  Completions. It now selects the published wire API per supported model:
+  Responses, Anthropic Messages, or OpenAI-compatible Chat Completions.
   Claude Sonnet 5.5 and the legacy Sonnet 4 ID also use Messages.
   Its default model is now `mimo-v2.6-flash`, matching the default Go catalogue;
   Claude models require an explicit Zen base URL. Configured base URLs remain
