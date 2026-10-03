@@ -1738,6 +1738,16 @@ async fn fetch_managed_context(
         warn!(managed_run = %run_id, "managed SessionStart has no native session id");
         return Ok(None);
     };
+    let native_identity = match ai_memory_core::NativeSessionIdentity::parse(
+        native_session_id,
+        &state.sanitizer,
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            warn!(managed_run = %run_id, "managed SessionStart native identity is UNKNOWN; binding refused");
+            return Ok(None);
+        }
+    };
     let Some(cwd) = query
         .cwd
         .as_deref()
@@ -1760,7 +1770,7 @@ async fn fetch_managed_context(
             project_id,
             cwd: cwd.to_owned(),
             agent,
-            native_session_id: native_session_id.to_owned(),
+            native_session_id: native_identity.into_string(),
             owner_user,
         })
         .await?;
@@ -3290,14 +3300,13 @@ async fn process_authorized(
     ws = admitted.workspace_id();
     proj = admitted.project_id();
     if let Some(run_id) = managed_run
-        && let Some(native_session_id) = env
-            .session_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
+        && let Some(native_session_id) = env.session_id.as_deref().and_then(|value| {
+            ai_memory_core::NativeSessionIdentity::parse(value, &state.sanitizer).ok()
+        })
     {
         let _ = state
             .writer
-            .link_managed_run_session(run_id, env.agent, native_session_id)
+            .link_managed_run_session(run_id, env.agent, native_session_id.into_string())
             .await?;
     }
     if publishable_scope {
@@ -16282,5 +16291,102 @@ mod tests {
             prompt_obs.created_at, expected_prompt_at,
             "created_at must come from the observation's own occurred_at"
         );
+    }
+
+    #[tokio::test]
+    async fn native_identity_managed_start_refuses_but_keeps_shared_legacy_capture() {
+        println!(
+            "NATIVE_TEST_PID {} {:?}",
+            std::process::id(),
+            std::env::current_exe().unwrap()
+        );
+        for start_path in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let mut state = make_state(&tmp).await;
+            let privacy = ai_memory_core::SanitizeConfig {
+                extra_patterns: vec!["private-vendor".into()],
+                ..Default::default()
+            };
+            state.sanitizer = Sanitizer::new(&privacy).unwrap();
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let run = state
+                .writer
+                .prepare_workstream_run(ai_memory_store::PrepareWorkstreamRun {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    repo_fingerprint: "repo".into(),
+                    worktree_fingerprint: "worktree".into(),
+                    cwd: cwd.clone(),
+                    agent: AgentKind::ClaudeCode,
+                    automatic_harness: false,
+                    available_agents: Vec::new(),
+                    selection: ai_memory_store::WorkstreamSelection::Current,
+                    lease_owner: "launcher".into(),
+                })
+                .await
+                .unwrap();
+            if start_path {
+                let query = HandoffQuery {
+                    managed_run: Some(run.run_id.to_string()),
+                    session_id: Some("private-vendor".into()),
+                    cwd: Some(cwd.clone()),
+                    ..Default::default()
+                };
+                assert!(
+                    fetch_managed_context(
+                        &state,
+                        &query,
+                        AgentKind::ClaudeCode,
+                        state.workspace_id,
+                        state.project_id,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                    "dirty original must not bind SessionStart"
+                );
+            } else {
+                let mut env = session_envelope("user-prompt", "private-vendor", &cwd);
+                env.managed_run = Some(run.run_id.to_string());
+                env.body_excerpt = Some("shared privacy-safe prompt".into());
+                let sid = resolve_session_id(&env).unwrap();
+                assert_eq!(sid, SessionId::from_native("private-vendor"));
+                process(&state, env, None, Vec::new()).await.unwrap();
+                let observations = state.reader.observations_for_session(sid).await.unwrap();
+                assert_eq!(
+                    observations.len(),
+                    1,
+                    "binding refusal must keep regular observation capture"
+                );
+                assert_eq!(observations[0].body, "shared privacy-safe prompt");
+            }
+            let status = state
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                status.native_session_id.is_none(),
+                "dirty original must not reach auto-link SQL"
+            );
+            assert!(!status.context_delivered);
+            let mut env = session_envelope("user-prompt", "vendor-界-01", &cwd);
+            env.managed_run = Some(run.run_id.to_string());
+            env.body_excerpt = Some("valid control".into());
+            process(&state, env, None, Vec::new()).await.unwrap();
+            assert_eq!(
+                state
+                    .reader
+                    .managed_run_status(run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .native_session_id
+                    .as_deref(),
+                Some("vendor-界-01")
+            );
+        }
     }
 }

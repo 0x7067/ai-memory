@@ -118,6 +118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- Required new managed native-session bindings and imports to preserve the
+  exact original identity within 512 UTF-8 bytes and pass privacy validation
+  before use or persistence. Invalid historical identities were projected as
+  unknown (`native_session_id: ""`) in workstream search without rewriting
+  stored history; the CLI also protected reads from older servers. (#987)
 - Required managed-run finish imports and finished retries to pass an
   authenticated owner check and current project access checks, repeated in the
   writer transaction. Database users required current Write access; trusted

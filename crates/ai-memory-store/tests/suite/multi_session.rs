@@ -2057,3 +2057,205 @@ async fn owner_finish_store_keeps_qualified_identity_namespaces() {
         1
     );
 }
+
+#[tokio::test]
+async fn native_identity_store_link_refuses_original_dirty_bytes() {
+    println!(
+        "NATIVE_TEST_PID {} {:?}",
+        std::process::id(),
+        std::env::current_exe().unwrap()
+    );
+    let f = FinishFixture::new().await;
+    let run = f.run("identity-link", Some(operator("alice"))).await;
+    for id in [
+        "native\0tail".to_owned(),
+        "native\u{202e}tail".into(),
+        "sk-abcdefghijklmnopqrstuvwx".into(),
+        "x".repeat(513),
+    ] {
+        let before = finish_snapshot(&f.store).await;
+        let result = f
+            .store
+            .writer
+            .link_managed_run_session(run.run_id, AgentKind::Codex, id)
+            .await;
+        assert!(
+            matches!(result, Err(_) | Ok(false)),
+            "dirty native identity must not link"
+        );
+        assert_eq!(finish_snapshot(&f.store).await, before);
+    }
+    let exact = "界".repeat(170) + "ab";
+    assert_eq!(exact.len(), 512);
+    assert!(
+        f.store
+            .writer
+            .link_managed_run_session(run.run_id, AgentKind::Codex, exact.clone())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        f.store
+            .reader
+            .managed_run_status(run.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_session_id,
+        Some(exact)
+    );
+}
+
+#[tokio::test]
+async fn native_identity_store_adoption_refuses_before_link() {
+    println!(
+        "NATIVE_TEST_PID {} {:?}",
+        std::process::id(),
+        std::env::current_exe().unwrap()
+    );
+    let f = FinishFixture::new().await;
+    let run = f.run("identity-adopt", Some(operator("alice"))).await;
+    let input = |id: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run.run_id,
+        workspace_id: f.ws,
+        project_id: f.project,
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        native_session_id: id.into(),
+        owner_user: Some(operator("alice")),
+    };
+    let before = finish_snapshot(&f.store).await;
+    let result = f
+        .store
+        .writer
+        .link_or_adopt_managed_run_session(input("sk-abcdefghijklmnopqrstuvwx"))
+        .await;
+    assert!(
+        matches!(result, Ok(ManagedRunSessionLink::Refused) | Err(_)),
+        "dirty native identity must not adopt"
+    );
+    assert_eq!(finish_snapshot(&f.store).await, before);
+    assert_eq!(
+        f.store
+            .writer
+            .link_or_adopt_managed_run_session(input("vendor-session_01"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+}
+
+#[tokio::test]
+async fn native_identity_store_finish_refuses_without_sql_or_index_mutation() {
+    println!(
+        "NATIVE_TEST_PID {} {:?}",
+        std::process::id(),
+        std::env::current_exe().unwrap()
+    );
+    let f = FinishFixture::new().await;
+    let run = f.run("identity-finish", Some(operator("alice"))).await;
+    for (run_id, event_id) in [
+        (
+            Some("sk-abcdefghijklmnopqrstuvwx"),
+            "sk-abcdefghijklmnopqrstuvwx",
+        ),
+        (None, "native\u{200b}tail"),
+    ] {
+        let mut input = finish_input(run.run_id);
+        input.native_session_id = run_id.map(str::to_owned);
+        input.events[0].native_session_id = event_id.into();
+        if run_id.is_some() {
+            input.events.clear();
+        }
+        let before = finish_snapshot(&f.store).await;
+        assert!(
+            matches!(
+                f.store
+                    .writer
+                    .finish_workstream_run(f.alice(), input.clone())
+                    .await,
+                Err(StoreError::InvalidState(_))
+            ),
+            "dirty finish identity must be refused"
+        );
+        assert_eq!(finish_snapshot(&f.store).await, before);
+        let bob = finish_authority(ai_memory_core::AuthLevel::User, Some(f.bob), Some("bob"));
+        assert!(
+            matches!(
+                f.store.writer.finish_workstream_run(bob, input).await,
+                Err(StoreError::Forbidden(_))
+            ),
+            "ownership must precede identity validation"
+        );
+        assert_eq!(finish_snapshot(&f.store).await, before);
+    }
+    assert_eq!(
+        f.store
+            .writer
+            .finish_workstream_run(f.alice(), finish_input(run.run_id))
+            .await
+            .unwrap()
+            .imported_events,
+        1
+    );
+}
+
+#[tokio::test]
+async fn native_identity_store_history_projects_unknown_without_rewriting() {
+    println!(
+        "NATIVE_TEST_PID {} {:?}",
+        std::process::id(),
+        std::env::current_exe().unwrap()
+    );
+    let f = FinishFixture::new().await;
+    let run = f.run("identity-history", Some(operator("alice"))).await;
+    f.store
+        .writer
+        .finish_workstream_run(f.alice(), finish_input(run.run_id))
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(f.store.db_path()).unwrap();
+    let dirty = "sk-abcdefghijklmnopqrstuvwx";
+    conn.execute(
+        "UPDATE workstream_events SET native_session_id = ?1",
+        [dirty],
+    )
+    .unwrap();
+    let before = finish_snapshot(&f.store).await;
+    for query in ["", "snapshot"] {
+        let events = f
+            .store
+            .reader
+            .search_workstream_events(run.workstream_id, query.to_owned(), 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].native_session_id, "",
+            "legacy dirty identity must project UNKNOWN"
+        );
+        assert_eq!(events[0].content, "finish snapshot evidence");
+        assert_eq!(events[0].sequence, 1);
+    }
+    assert_eq!(finish_snapshot(&f.store).await, before);
+    let stored: String = conn
+        .query_row("SELECT native_session_id FROM workstream_events", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, dirty);
+    conn.execute(
+        "UPDATE workstream_events SET native_session_id = ?1",
+        ["vendor-界-01"],
+    )
+    .unwrap();
+    assert_eq!(
+        f.store
+            .reader
+            .search_workstream_events(run.workstream_id, "".into(), 10)
+            .await
+            .unwrap()[0]
+            .native_session_id,
+        "vendor-界-01"
+    );
+}

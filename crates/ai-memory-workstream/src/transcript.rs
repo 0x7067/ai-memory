@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ai_memory_core::{
-    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NewWorkstreamEvent, WorkstreamEventKind,
+    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NativeSessionIdentity, NewWorkstreamEvent,
+    Sanitizer, WorkstreamEventKind,
 };
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, params};
@@ -20,7 +21,6 @@ use crate::{ManagedHarness, clean_path};
 
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
-const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
 const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
@@ -3595,13 +3595,11 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 fn valid_native_session_id(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= MAX_NATIVE_SESSION_ID_BYTES
+    NativeSessionIdentity::parse(value, &Sanitizer::builtin()).is_ok()
         && !value.starts_with('-')
         && value != "."
         && value != ".."
         && !value.contains(['/', '\\'])
-        && !value.chars().any(char::is_control)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -6076,5 +6074,31 @@ mod tests {
             native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
             None
         );
+    }
+
+    #[test]
+    fn native_identity_adapter_preserves_exact_and_rejects_privacy_changes() {
+        println!(
+            "NATIVE_TEST_PID {} {:?}",
+            std::process::id(),
+            std::env::current_exe().unwrap()
+        );
+        for id in [
+            "sk-abcdefghijklmnopqrstuvwx",
+            "native\u{202e}tail",
+            "native\u{200b}tail",
+            "native\u{feff}tail",
+        ] {
+            assert!(
+                !valid_native_session_id(id),
+                "adapter must reject dirty identity"
+            );
+        }
+        for id in ["session_vendor-01", "native-界-01"] {
+            assert!(valid_native_session_id(id));
+        }
+        for id in ["../session", "-selector", "a/b", "a\\b", ".", ".."] {
+            assert!(!valid_native_session_id(id));
+        }
     }
 }
