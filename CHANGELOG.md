@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed `resume` and `workstreams` running `git status` on every linked checkout
+  before listing anything: listing now reads only the checkout's stable
+  fingerprints, so a large working tree or a slow filesystem-monitor hook no
+  longer blocks the picker before its first frame. (#1039)
 - Fixed the generated OpenCode 2 plugin ending every tracked session when
   OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
   host and its sessions stay alive, so each eviction froze a live session
