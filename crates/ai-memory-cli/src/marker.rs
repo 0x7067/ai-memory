@@ -198,12 +198,13 @@ fn find_marker_matching<T>(
 /// the file. That is conservative on purpose: it can only turn a marker INTO
 /// a boundary, never wrongly make one transparent.
 fn declares_more_than_capture(text: &str) -> bool {
-    const QUOTED_KEYS: [&str; 5] = [
+    const QUOTED_KEYS: [&str; 6] = [
         "workspace",
         "project",
         "project_strategy",
         "drop_subagent_captures",
         "identity",
+        "identity_style",
     ];
     const FLAG_KEYS: [&str; 3] = ["default_global", "inject_on_session_start", "max_chars"];
     QUOTED_KEYS

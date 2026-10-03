@@ -230,19 +230,26 @@ that name, so a static client that passes a worktree folder misses the merged
 project. #1033 makes a remote-derived key the default name, landing in steps on
 `release/2.6`:
 
-1. **Normaliser and style (landed first).** `repository_identity::styled_key`
-   turns an identity into a key under `IdentityStyle`: `path` drops a git
+1. **Normaliser and opt-in naming (landed first).** `repository_identity::
+   styled_key` spells an identity under `IdentityStyle`: `path` drops a git
    remote's host (`github.com/acme/api` → `acme/api`); `host_path` is the #708
-   identity unchanged and stays the default. Declared and folder keys never
-   change. Checked against the `styled_key` section of
-   `fixtures/remote_identity_cases.json`. Nothing routes or names by it yet.
+   identity unchanged and stays the default. A marker's
+   `identity_style = "path"` is forwarded by all four capture clients
+   alongside a remote identity, and `resolve_project_by_identity` then names a
+   project it **creates** `path_style_name(identity)` (`acme-api`: `/` written
+   as `-`, today's split-name character rule). Captures keep routing by the
+   full identity. **Cross-forge collisions are detected, never merged:** the
+   path name is used only while no project in the workspace holds it, checked
+   in the same transaction as the identity match, so `gitlab.com/acme/api`
+   after `github.com/acme/api` falls back to the name it would otherwise get.
+   Existing projects — matched, claimed or unclaimed — are never renamed.
+   Checked against the `styled_key` and `identity_style` sections of
+   `fixtures/remote_identity_cases.json` (core plus shell, PowerShell and
+   TypeScript parity), store adversarial tests, and a two-operator
+   `multi_session.rs` case. Reporting the fallback in `doctor` is a follow-up.
 2. **Default naming chain** (`upstream` → `origin` → folder) for **new**
-   projects, with marker `project`/`identity` still outranking remotes.
-   **Cross-forge collisions are detected, never merged:** when a newcomer's
-   `path` key is already held by a project under a different host
-   (`github.com/acme/api` vs `gitlab.com/acme/api`), the newcomer takes its
-   `host_path` key instead and `doctor` reports it. Needs an adversarial
-   isolation test and a security-boundaries row.
+   projects without opting in, with marker `project`/`identity` still
+   outranking remotes and the same collision fallback.
 3. **Dual-key resolve and in-place rename** (UUID foreign keys kept, no alias
    table) until v3, so existing basename projects are renamed toward their
    canonical key rather than split. Two operators on different clones of one

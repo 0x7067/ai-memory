@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added the opt-in `identity_style = "path"` marker key: a new project created
+  from a git remote is named from its repository path without the host
+  (`github.com/acme/api` → `acme-api`), so worktrees and clones in differently
+  named folders share one project. Captures still route by the full repository
+  identity, existing projects are never renamed, and when another repository
+  (such as the same path on another forge) already holds the name the newcomer
+  keeps the name it would otherwise get. The default stays `host_path`. (#1033)
 - Added shared capture privacy checks to the relay and the conversation importer,
   run before an event is hashed, persisted, previewed or delivered: they refuse
   credential-shaped native identities, scrub nested credentials while keeping

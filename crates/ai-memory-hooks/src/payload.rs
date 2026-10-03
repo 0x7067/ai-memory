@@ -97,6 +97,10 @@ pub struct HookQuery {
     /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
     /// else, or a malformed identity, is ignored and the event routes by name.
     pub identity_src: Option<String>,
+    /// The marker's `identity_style` (#1033). `path` names a new remote-backed
+    /// project from its repository path without the host; anything else keeps
+    /// the default. Never changes routing, only what a creation is called.
+    pub identity_style: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -129,6 +133,9 @@ pub struct HookEnvelope {
     /// [`ai_memory_core::repository_identity::accept_wire_identity`]. `None`
     /// routes by project name, as every event did before identities existed.
     pub identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+    /// How a project this event creates is named; see
+    /// [`ai_memory_core::repository_identity::IdentityStyle`].
+    pub identity_style: ai_memory_core::repository_identity::IdentityStyle,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -539,6 +546,11 @@ impl HookEnvelope {
             }
             _ => None,
         };
+        let identity_style = query
+            .identity_style
+            .as_deref()
+            .and_then(ai_memory_core::repository_identity::IdentityStyle::from_str_opt)
+            .unwrap_or_default();
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
@@ -623,6 +635,7 @@ impl HookEnvelope {
             project_strategy,
             project_source,
             identity,
+            identity_style,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,

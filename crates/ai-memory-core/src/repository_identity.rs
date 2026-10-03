@@ -273,8 +273,29 @@ pub fn split_name_base(identity: &str) -> String {
     } else {
         segments.join("-")
     };
-    let mut out = String::with_capacity(tail.len());
-    for c in tail.chars() {
+    project_name_from(&tail)
+}
+
+/// The project name a `path`-style repository takes (#1033): the git remote's
+/// whole repository path without its host, spelled the way
+/// [`split_name_base`] spells names (`github.com/acme/group/api` →
+/// `acme-group-api`). `None` for any identity that is not a git remote — a
+/// declared identity or name keeps the name it already has.
+#[must_use]
+pub fn path_style_name(identity: &RepositoryIdentity) -> Option<String> {
+    if identity.source != IdentitySource::GitRemote {
+        return None;
+    }
+    let key = styled_key(identity, IdentityStyle::Path);
+    let joined: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+    Some(project_name_from(&joined.join("-")))
+}
+
+/// Characters a project name cannot carry become `-`, runs collapse, and the
+/// ends are trimmed; an empty result is `repository`.
+fn project_name_from(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
         let keep = c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
         let c = if keep { c } else { '-' };
         if !(c == '-' && out.ends_with('-')) {
@@ -291,13 +312,15 @@ pub fn split_name_base(identity: &str) -> String {
 
 /// How a remote-derived key spells a repository (#1033).
 ///
-/// `HostPath` is the #708 identity exactly as it is stored and routed today,
-/// and stays the default: nothing changes until a later step adopts `Path` as
-/// a project's name. `Path` drops the host, so worktrees and clones of one
-/// repository share a short `owner/repo` key; two forges hosting the same path
-/// must still never share a project, which is why adoption has to detect that
-/// collision rather than trust the key alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Chosen by `identity_style` in `.ai-memory.toml`. Either way captures route
+/// by the full #708 identity; the style only decides the name a **new**
+/// remote-backed project is created under. `HostPath` is the default and keeps
+/// today's naming. `Path` names it from the repository path without the host
+/// ([`path_style_name`]), so worktrees and clones agree on a short name. Two
+/// forges hosting the same path must never share a project, so the store
+/// falls back to today's name when the path name is already taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityStyle {
     /// `acme/api` — the repository path without its host.
     Path,
@@ -809,6 +832,28 @@ mod tests {
                     identity.identity
                 );
             }
+            assert_eq!(
+                path_style_name(&identity).as_deref(),
+                case["path_name"].as_str(),
+                "{} path name",
+                identity.identity
+            );
+        }
+    }
+
+    /// The marker spellings every client forwards: only `path` asks for
+    /// anything, so a client sends `identity_style=path` exactly when the
+    /// fixture's `style` is `path`.
+    #[test]
+    fn identity_style_values_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in cases["identity_style"].as_array().unwrap() {
+            let value = case["value"].as_str().unwrap();
+            assert_eq!(
+                IdentityStyle::from_str_opt(value).map(IdentityStyle::as_str),
+                case["style"].as_str(),
+                "{value:?}"
+            );
         }
     }
 

@@ -8,7 +8,7 @@
 //! existing project is claimed in place rather than split away, and somebody
 //! who may not write to it cannot take its identity.
 
-use ai_memory_core::repository_identity::{IdentitySource, RepositoryIdentity};
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{NewUser, ProjectId, UserId, WorkspaceId};
 use ai_memory_store::{
     AccessMode, GrantLevel, IdentityResolution, ProjectAccess, ProjectPrincipal, Store,
@@ -62,11 +62,23 @@ async fn resolve(
     name: &str,
     creator: Option<UserId>,
 ) -> (ProjectId, IdentityResolution) {
+    resolve_styled(store, ws, identity, IdentityStyle::HostPath, name, creator).await
+}
+
+async fn resolve_styled(
+    store: &Store,
+    ws: WorkspaceId,
+    identity: &RepositoryIdentity,
+    style: IdentityStyle,
+    name: &str,
+    creator: Option<UserId>,
+) -> (ProjectId, IdentityResolution) {
     store
         .writer
         .resolve_project_by_identity(
             ws,
             identity.clone(),
+            style,
             name,
             Some("/work/api".to_owned()),
             None,
@@ -296,6 +308,7 @@ async fn the_prefix_parent_is_the_candidate_when_given() {
         .resolve_project_by_identity(
             ws,
             remote("github.com/acme/monorepo"),
+            IdentityStyle::HostPath,
             "src",
             None,
             Some(parent),
@@ -314,4 +327,223 @@ async fn the_prefix_parent_is_the_candidate_when_given() {
             .is_none(),
         "no fragment project for the subdirectory"
     );
+}
+
+fn explicit(identity: &str) -> RepositoryIdentity {
+    RepositoryIdentity {
+        identity: identity.to_owned(),
+        source: IdentitySource::Explicit,
+    }
+}
+
+/// #1033: under the `path` style a new repository is named from its path
+/// without the host, so every worktree and clone — whatever its folder is
+/// called — lands in that one project.
+#[tokio::test]
+async fn the_path_style_names_a_new_project_from_the_host_less_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repo = remote("gitlab.com/acme/group/api");
+
+    let (id, how) = resolve_styled(&store, ws, &repo, IdentityStyle::Path, "main", None).await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_eq!(row(&store, id).0, "acme-group-api");
+    assert_eq!(row(&store, id).1, "gitlab.com/acme/group/api");
+
+    for folder in ["fix-1025", "main"] {
+        let (again, how) =
+            resolve_styled(&store, ws, &repo, IdentityStyle::Path, folder, None).await;
+        assert_eq!((again, how), (id, IdentityResolution::Matched), "{folder}");
+    }
+    assert!(
+        store
+            .reader
+            .find_project(ws, "main".into())
+            .await
+            .unwrap()
+            .is_none(),
+        "no folder-named project was created alongside it"
+    );
+}
+
+/// The collision the path style must never merge: the same path on another
+/// forge is a different repository. Whichever arrives second keeps the name it
+/// would have had without the style — the folder name, or the split name when
+/// that is taken too — and the first project is left untouched.
+#[tokio::test]
+async fn the_same_path_on_another_forge_falls_back_instead_of_merging() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let github = remote("github.com/acme/api");
+
+    let (first, _) = resolve_styled(&store, ws, &github, IdentityStyle::Path, "api", None).await;
+    assert_eq!(row(&store, first).0, "acme-api");
+
+    let (gitlab, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_ne!(gitlab, first, "another forge's repository is never adopted");
+    assert_eq!(row(&store, gitlab).0, "api");
+    assert_eq!(row(&store, gitlab).1, "gitlab.com/acme/api");
+
+    // Its folder is called `acme-api` too: that name belongs to the GitHub
+    // project, so it splits, and the split name is taken as well.
+    let (bitbucket, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("bitbucket.org/acme/api"),
+        IdentityStyle::Path,
+        "acme-api",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Split);
+    assert_eq!(row(&store, bitbucket).0, "acme-api-2");
+
+    assert_eq!(
+        row(&store, first),
+        (
+            "acme-api".into(),
+            "github.com/acme/api".into(),
+            "git_remote".into(),
+            Some("/work/api".into())
+        ),
+        "the first project kept its name, identity and path"
+    );
+}
+
+/// A project already holding the path name without any identity is some other
+/// checkout's folder project. Taking it would merge two repositories, so the
+/// newcomer falls back and the holder stays unclaimed.
+#[tokio::test]
+async fn an_unclaimed_project_holding_the_path_name_is_not_taken() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let holder = store
+        .writer
+        .get_or_create_project(ws, "acme-api", None)
+        .await
+        .unwrap();
+
+    let (id, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_ne!(id, holder);
+    assert_eq!(row(&store, id).0, "api");
+    assert_eq!(row(&store, holder).1, "", "the holder was not claimed");
+}
+
+/// Opting an install in renames nothing: a repository that already has a
+/// project — claimed by identity, or still unclaimed under its folder name —
+/// resolves exactly as it would without the style.
+#[tokio::test]
+async fn opting_in_leaves_existing_projects_where_they_are() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+
+    let claimed_repo = remote("github.com/acme/api");
+    let (claimed, _) = resolve(&store, ws, &claimed_repo, "api", None).await;
+    let (again, how) =
+        resolve_styled(&store, ws, &claimed_repo, IdentityStyle::Path, "api", None).await;
+    assert_eq!((again, how), (claimed, IdentityResolution::Matched));
+    assert_eq!(row(&store, claimed).0, "api", "not renamed to acme-api");
+
+    let legacy = store
+        .writer
+        .get_or_create_project(ws, "web", None)
+        .await
+        .unwrap();
+    let (id, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("github.com/acme/web"),
+        IdentityStyle::Path,
+        "web",
+        None,
+    )
+    .await;
+    assert_eq!((id, how), (legacy, IdentityResolution::Claimed));
+    assert_eq!(row(&store, legacy).0, "web");
+    assert!(
+        store
+            .reader
+            .find_project(ws, "acme-web".into())
+            .await
+            .unwrap()
+            .is_none(),
+        "no path-named twin split off the legacy project"
+    );
+}
+
+/// The style only renames what has a host to drop: a declared identity keeps
+/// the name the client sent.
+#[tokio::test]
+async fn the_path_style_leaves_a_declared_identity_named_as_sent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let (id, how) = resolve_styled(
+        &store,
+        ws,
+        &explicit("acme/platform"),
+        IdentityStyle::Path,
+        "platform",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_eq!(row(&store, id).0, "platform");
+}
+
+/// Naming a project differently changes nothing about reads: a lookup is
+/// still no-create, and the folder name a static client might guess resolves
+/// to nothing rather than to a fresh project.
+#[tokio::test]
+async fn reads_of_a_path_named_project_stay_no_create() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let (id, _) = resolve_styled(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        store
+            .reader
+            .find_project(ws, "acme-api".into())
+            .await
+            .unwrap(),
+        Some(id)
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            store.reader.find_project(ws, "api".into()).await.unwrap(),
+            None,
+            "a lookup of the folder name finds nothing and creates nothing"
+        );
+    }
 }
