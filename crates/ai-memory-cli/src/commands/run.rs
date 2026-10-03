@@ -550,9 +550,9 @@ pub(super) async fn run_from_with_wiring(
         remember_session_store(config, &endpoint, harness, native_session_id, &linked_store);
     }
     // Claude refuses `--resume` on a background session that is still running
-    // and points at `claude attach`, so open it that way instead. An attached
-    // terminal starts no native session of its own: SessionStart never fires
-    // in it, and native flags have nothing to apply to.
+    // and points at `claude attach`, so open it that way instead. The 2.1.288
+    // lifecycle check observed no new SessionStart from the attach client;
+    // native flags are omitted because it connects to the existing session.
     let attached_background = if harness == ManagedHarness::Claude
         && plan.mode == LaunchMode::Session
         && resumes_linked_session

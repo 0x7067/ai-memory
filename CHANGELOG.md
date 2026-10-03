@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag. The launcher now confirms the session is live in this checkout with
   `claude agents --json` (only for a transcript recorded in the background) and
   opens it with `claude attach <id>`; any failure keeps the native resume.
+  Documented the observed attach-hook behavior, early-exit import boundary and
+  fallback validation limits.
   (#1052)
 - Fixed watcher reindexing racing with writes and batches to the same page by
   sharing their per-page mutex from disk read through SQLite upsert. Both
