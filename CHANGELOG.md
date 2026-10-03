@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed `memory_delete_page` bypassing per-user slot namespace routing and
+  access checks when `[slots] per_user` is active. Non-admin callers deleting a
+  generic slot path (`_slots/current-focus.md`) are now redirected to their
+  personal slot namespace instead of removing the shared project-wide slot, and
+  deleting directly inside another operator's slot namespace is rejected with an
+  invalid request error.
 - Fixed the generated OpenCode 2 plugin ending every tracked session when
   OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
   host and its sessions stay alive, so each eviction froze a live session
