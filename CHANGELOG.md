@@ -128,6 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subagent under its parent's session id, so a subagent's events no longer
   mark that session as a subagent: the parent's Stop, SessionEnd, summary and
   handoff are kept. (#1041, #1048)
+- Corrected the `[auto_scope]` default in doc comments (`Config`,
+  `AutoScopeSettings`, the `ActiveProjectMode` module docs, `serve`) and the
+  README docs index: they still named `single` as the default or called
+  `per_actor` opt-in, but the default has been `per_actor` since v1.39. (#1065)
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a
