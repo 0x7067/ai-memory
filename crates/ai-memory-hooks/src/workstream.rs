@@ -156,6 +156,36 @@ async fn authorize_run(
         .map_err(scope_refusal)
 }
 
+/// Admit a mutation of `run_id` only for its owner with current Write access
+/// on the run's project — the rule finish applies, shared by every route that
+/// releases, renews or rebinds a run so none of them is a side door around it.
+/// The authority comes from authenticated middleware extensions only.
+async fn authorize_run_owner(
+    state: &WorkstreamState,
+    run_id: ManagedRunId,
+    level: Option<Extension<AuthLevel>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+) -> Result<ai_memory_store::ManagedRunAuthority, Response> {
+    let authority = ai_memory_store::ManagedRunAuthority::from_auth(
+        level.map_or(AuthLevel::Anonymous, |Extension(level)| level),
+        viewer.map(|Extension(viewer)| viewer),
+        user_id.map(|Extension(user_id)| user_id),
+        &actor.map_or_else(
+            ai_memory_core::ActorContext::anonymous,
+            |Extension(actor)| actor,
+        ),
+        state.trusted_proxy_identity,
+    );
+    state
+        .reader
+        .authorize_managed_run(run_id, authority.clone())
+        .await
+        .map_err(store_error_response)?;
+    Ok(authority)
+}
+
 /// A refusal as a response: 403 for an access problem, 500 otherwise.
 fn scope_refusal(failure: ScopeResolutionError) -> Response {
     if failure.is_forbidden() {
@@ -368,7 +398,9 @@ async fn run_status(
 async fn heartbeat_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -378,13 +410,7 @@ async fn heartbeat_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -398,7 +424,9 @@ async fn heartbeat_run(
 async fn cancel_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -408,13 +436,7 @@ async fn cancel_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -473,7 +495,9 @@ async fn run_context(
 async fn accept_run_context(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -483,13 +507,7 @@ async fn accept_run_context(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -762,7 +780,9 @@ async fn search_events(
 async fn link_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
     Json(request): Json<LinkManagedRunRequest>,
 ) -> Response {
@@ -773,13 +793,7 @@ async fn link_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -823,23 +837,10 @@ async fn finish_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    let authority = ai_memory_store::WorkstreamFinishAuthority::from_auth(
-        level.map_or(AuthLevel::Anonymous, |Extension(level)| level),
-        viewer.map(|Extension(viewer)| viewer),
-        user_id.map(|Extension(user_id)| user_id),
-        &actor.map_or_else(
-            ai_memory_core::ActorContext::anonymous,
-            |Extension(actor)| actor,
-        ),
-        state.trusted_proxy_identity,
-    );
-    if let Err(failure) = state
-        .reader
-        .authorize_workstream_finish(run_id, authority.clone())
-        .await
-    {
-        return store_error_response(failure);
-    }
+    let authority = match authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     #[cfg(test)]
     if let Some(barrier) = &state.finish_barrier {
         barrier.0.notify_one();
@@ -1618,7 +1619,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1721,7 +1722,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1809,7 +1810,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1946,6 +1947,154 @@ mod tests {
         );
     }
 
+    /// #1075: every route that renews, rebinds, accepts for or releases a run
+    /// applies finish's owner rule, so none is a side door around it. Another
+    /// operator — even one who may write the project, and root acting under a
+    /// different identity — is refused on all four, and the run stays intact;
+    /// the owner is admitted (legitimate control).
+    #[tokio::test]
+    async fn run_mutation_routes_refuse_another_operator() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        for name in ["alice", "bob"] {
+            store
+                .writer
+                .create_human_user(
+                    ai_memory_core::NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    ai_memory_core::UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let actor = |name: &str| {
+            Some(Extension(ai_memory_core::ActorContext {
+                user: Some(name.into()),
+                ..ai_memory_core::ActorContext::default()
+            }))
+        };
+        let user = || Some(Extension(AuthLevel::User));
+        let prepared = prepare_run(
+            State(state.clone()),
+            None,
+            actor("alice"),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed-owner-routes".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Grok,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                force_unlock: false,
+                lease_owner: "alice:1".into(),
+            }),
+        )
+        .await;
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let body = to_bytes(prepared.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        let run = || AxumPath(prepared.run_id.to_string());
+        let link = || {
+            Json(LinkManagedRunRequest {
+                native_session_id: "native-link".into(),
+            })
+        };
+
+        for (who, level) in [("bob", user()), ("admin", Some(Extension(AuthLevel::Root)))] {
+            let statuses = [
+                heartbeat_run(State(state.clone()), level, None, actor(who), None, run())
+                    .await
+                    .status(),
+                link_run(
+                    State(state.clone()),
+                    level,
+                    None,
+                    actor(who),
+                    None,
+                    run(),
+                    link(),
+                )
+                .await
+                .status(),
+                accept_run_context(State(state.clone()), level, None, actor(who), None, run())
+                    .await
+                    .status(),
+                cancel_run(State(state.clone()), level, None, actor(who), None, run())
+                    .await
+                    .status(),
+            ];
+            assert_eq!(statuses, [StatusCode::FORBIDDEN; 4], "{who}");
+        }
+        let status = store
+            .reader
+            .managed_run_status(prepared.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status.state, "active",
+            "refused callers must not end the run"
+        );
+        assert!(!status.context_delivered);
+        assert_eq!(status.native_session_id, None);
+
+        let statuses = [
+            heartbeat_run(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+            )
+            .await
+            .status(),
+            link_run(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+                link(),
+            )
+            .await
+            .status(),
+            accept_run_context(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+            )
+            .await
+            .status(),
+            cancel_run(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+            )
+            .await
+            .status(),
+        ];
+        assert_eq!(statuses, [StatusCode::NO_CONTENT; 4]);
+    }
+
     #[tokio::test]
     async fn force_unlock_cannot_evict_another_operator() {
         let temp = TempDir::new().unwrap();
@@ -2080,7 +2229,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2159,7 +2308,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2238,7 +2387,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2320,7 +2469,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2387,6 +2536,8 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
+            None,
             AxumPath(prepared.run_id.to_string()),
         )
         .await;
@@ -2425,6 +2576,8 @@ mod tests {
                 State(state.clone()),
                 None,
                 None,
+                None,
+                None,
                 AxumPath(prepared.run_id.to_string()),
             )
             .await;
@@ -2452,7 +2605,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2525,6 +2678,8 @@ mod tests {
 
         let accepted = accept_run_context(
             State(state.clone()),
+            None,
+            None,
             None,
             None,
             AxumPath(crush.run_id.to_string()),
@@ -2652,7 +2807,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2716,6 +2871,7 @@ mod tests {
             .await
             .unwrap();
         let as_viewer = |user| Some(Extension(AuthorizedViewer(user)));
+        let as_user = || Some(Extension(AuthLevel::User));
         let run = || AxumPath(prepared.run_id.to_string());
 
         // Status is a read: bob (nothing) is refused, carol (reader) is not.
@@ -2737,24 +2893,45 @@ mod tests {
         // Acting on the run needs write: carol's read is not enough.
         for viewer in [bob, carol] {
             assert_eq!(
-                heartbeat_run(State(state.clone()), None, as_viewer(viewer), run())
-                    .await
-                    .status(),
+                heartbeat_run(
+                    State(state.clone()),
+                    as_user(),
+                    as_viewer(viewer),
+                    None,
+                    None,
+                    run()
+                )
+                .await
+                .status(),
                 StatusCode::FORBIDDEN,
                 "heartbeat"
             );
             assert_eq!(
-                cancel_run(State(state.clone()), None, as_viewer(viewer), run())
-                    .await
-                    .status(),
+                cancel_run(
+                    State(state.clone()),
+                    as_user(),
+                    as_viewer(viewer),
+                    None,
+                    None,
+                    run()
+                )
+                .await
+                .status(),
                 StatusCode::FORBIDDEN,
                 "cancel"
             );
         }
         assert_eq!(
-            heartbeat_run(State(state.clone()), None, as_viewer(alice), run())
-                .await
-                .status(),
+            heartbeat_run(
+                State(state.clone()),
+                as_user(),
+                as_viewer(alice),
+                None,
+                None,
+                run()
+            )
+            .await
+            .status(),
             StatusCode::NO_CONTENT,
             "alice's own run keeps working"
         );
@@ -2883,7 +3060,7 @@ mod tests {
                 store
                     .writer
                     .finish_workstream_run(
-                        ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                        ai_memory_store::ManagedRunAuthority::from_auth(
                             AuthLevel::User,
                             Some(ai_memory_core::AuthorizedViewer(alice)),
                             Some(alice),

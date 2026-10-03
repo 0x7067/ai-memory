@@ -98,9 +98,9 @@ pub use users::{
 };
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunContext,
-    ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamFinishAuthority,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
+    ManagedRunContext, ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
     WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
@@ -5016,7 +5016,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5082,7 +5082,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5097,7 +5097,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5123,7 +5123,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5211,7 +5211,7 @@ mod tests {
             store
                 .writer
                 .finish_workstream_run(
-                    WorkstreamFinishAuthority::from_auth(
+                    ManagedRunAuthority::from_auth(
                         ai_memory_core::AuthLevel::Anonymous,
                         None,
                         None,
@@ -5229,7 +5229,7 @@ mod tests {
             store
                 .writer
                 .finish_workstream_run(
-                    WorkstreamFinishAuthority::from_auth(
+                    ManagedRunAuthority::from_auth(
                         ai_memory_core::AuthLevel::Anonymous,
                         None,
                         None,
@@ -5257,7 +5257,7 @@ mod tests {
         let finished = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5333,7 +5333,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5374,7 +5374,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5495,7 +5495,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5535,7 +5535,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5602,7 +5602,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5676,7 +5676,7 @@ mod tests {
             store
                 .writer
                 .finish_workstream_run(
-                    WorkstreamFinishAuthority::from_auth(
+                    ManagedRunAuthority::from_auth(
                         ai_memory_core::AuthLevel::Anonymous,
                         None,
                         None,
@@ -5873,7 +5873,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5976,7 +5976,7 @@ mod tests {
         let first = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5994,7 +5994,7 @@ mod tests {
         let second = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6049,7 +6049,7 @@ mod tests {
         let cancelled = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6068,7 +6068,7 @@ mod tests {
         let unknown = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6104,7 +6104,7 @@ mod tests {
         let wrong_agent = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6160,7 +6160,7 @@ mod tests {
         let wrong_session = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6194,7 +6194,7 @@ mod tests {
         let finished = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6264,7 +6264,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6478,7 +6478,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6589,7 +6589,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6842,7 +6842,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6874,7 +6874,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6899,7 +6899,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,

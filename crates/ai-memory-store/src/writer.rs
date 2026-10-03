@@ -748,7 +748,7 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
-        authority: crate::WorkstreamFinishAuthority,
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
         reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
     },
@@ -3123,7 +3123,7 @@ impl WriterHandle {
     /// Index an immutable transcript segment and release the run lease.
     pub async fn finish_workstream_run(
         &self,
-        authority: crate::WorkstreamFinishAuthority,
+        authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
     ) -> StoreResult<FinishedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();

@@ -516,6 +516,58 @@ mod tests {
         }
     }
 
+    /// The strict resolution managed-run mutations use is the canonical
+    /// decision, not a parallel one: the reserved global scope's write gate
+    /// holds there too, and only a resolution gap is treated differently (an
+    /// unknown project fails instead of degrading to open).
+    #[tokio::test]
+    async fn strict_resolution_shares_the_global_gate_and_fails_closed_on_a_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(tmp.path()).unwrap();
+        let global = crate::create_global_scope(&store.writer).await.unwrap();
+        let user = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let principal = ProjectPrincipal::user(user);
+
+        let strict = resolve_project_authz_strict(
+            &conn,
+            global.workspace_id,
+            global.project_id,
+            &principal,
+            false,
+        )
+        .unwrap();
+        assert!(strict.reserved_global);
+        assert!(
+            strict.distinguishes_operators,
+            "a server with database users distinguishes operators"
+        );
+        assert!(strict.authorize(ProjectAccess::Write).is_err());
+        assert!(strict.authorize(ProjectAccess::Read).is_ok());
+
+        let unknown = ProjectId::new();
+        assert!(
+            resolve_project_authz_strict(&conn, global.workspace_id, unknown, &principal, true)
+                .is_err()
+        );
+        let lenient =
+            resolve_project_authz(&conn, global.workspace_id, unknown, &principal, true).unwrap();
+        assert_eq!(lenient.access_mode, AccessMode::Open);
+    }
+
     /// GHSA-7qj3-7wqw-m5w6: writing the reserved global scope needs root or a
     /// write grant in either mode; its creator and an open mode admit nothing
     /// extra, reads stay open, and an install without operators is unchanged.

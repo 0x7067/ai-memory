@@ -30,25 +30,27 @@ pub enum WorkstreamSelection {
     New(String),
 }
 
-/// Authenticated authority shared by finish preflight and the writer transaction.
+/// Authenticated authority for a managed-run mutation: finish (its preflight
+/// and its import transaction), cancel, heartbeat, native-session link and
+/// context acceptance.
 ///
 /// Construct only from middleware extensions, never transcript metadata. Owner
 /// filters are derived here so this boundary cannot request `OwnerFilter::Any`.
 #[derive(Debug, Clone)]
-pub struct WorkstreamFinishAuthority {
+pub struct ManagedRunAuthority {
     principal: crate::ProjectPrincipal,
     owner: ai_memory_core::OwnerFilter,
     distinguishes_operators: bool,
-    project_policy: FinishProjectPolicy,
+    project_policy: RunProjectPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum FinishProjectPolicy {
+enum RunProjectPolicy {
     Grants,
     TrustedProxyLegacy,
 }
 
-impl WorkstreamFinishAuthority {
+impl ManagedRunAuthority {
     /// Reduce the actual HTTP auth extensions to one immutable finish authority.
     /// A DB user's attribution id remains authoritative without a viewer marker.
     #[must_use]
@@ -80,8 +82,8 @@ impl WorkstreamFinishAuthority {
         // no DB principal. Preserve its viewer-less project policy only when
         // this server actually enables trusted proxy authentication.
         let project_policy = match (level, user, actor.identity_key(), trusted_proxy_identity) {
-            (AuthLevel::User, None, Some(_), true) => FinishProjectPolicy::TrustedProxyLegacy,
-            _ => FinishProjectPolicy::Grants,
+            (AuthLevel::User, None, Some(_), true) => RunProjectPolicy::TrustedProxyLegacy,
+            _ => RunProjectPolicy::Grants,
         };
         Self {
             principal,
@@ -94,10 +96,10 @@ impl WorkstreamFinishAuthority {
 
 /// Resolve only the real run scope and owner, without creating a scope or
 /// changing the active-project pointer. Both callers supply a SQL snapshot.
-pub(crate) fn authorize_finish(
+pub(crate) fn authorize_run_mutation(
     conn: &Connection,
     run_id: ManagedRunId,
-    authority: &WorkstreamFinishAuthority,
+    authority: &ManagedRunAuthority,
 ) -> StoreResult<()> {
     let (owner, workspace, project) = conn
         .query_row(
@@ -129,8 +131,8 @@ pub(crate) fn authorize_finish(
         authority.distinguishes_operators,
     )?;
     match authority.project_policy {
-        FinishProjectPolicy::TrustedProxyLegacy => Ok(()),
-        FinishProjectPolicy::Grants => project_authz
+        RunProjectPolicy::TrustedProxyLegacy => Ok(()),
+        RunProjectPolicy::Grants => project_authz
             .authorize(crate::ProjectAccess::Write)
             .map_err(|failure| StoreError::Forbidden(failure.message())),
     }
@@ -934,12 +936,12 @@ fn accept_context_in_transaction(
 /// Index one immutable source segment and close the run atomically.
 pub(crate) fn finish_run(
     conn: &mut Connection,
-    authority: &WorkstreamFinishAuthority,
+    authority: &ManagedRunAuthority,
     input: &FinishWorkstreamRun,
 ) -> StoreResult<FinishedWorkstreamRun> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    authorize_finish(&tx, input.run_id, authority)?;
+    authorize_run_mutation(&tx, input.run_id, authority)?;
     let run: Option<FinishRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, state, \

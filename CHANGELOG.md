@@ -182,9 +182,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued SessionEnd consolidation job completed. (#1038)
 
 ### Changed
-- Required managed-run finish imports and finished retries to pass an
-  authenticated owner check and current project access checks, repeated in the
-  writer transaction. Database users required current Write access; trusted
+- Required managed-run finish imports and finished retries, and the cancel,
+  heartbeat, native-session link and context-acceptance routes, to pass an
+  authenticated owner check and current project access checks (repeated in
+  finish's writer transaction), so another operator cannot release or rebind a
+  run. Database users required current Write access; trusted
   proxy operators retained their existing project policy. Active API keys
   remained valid after human login was disabled. Shared, unattributed runs and
   late finishes of still-active runs retained their existing behavior. (#1075)

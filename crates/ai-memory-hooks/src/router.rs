@@ -13653,7 +13653,7 @@ mod tests {
         state
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -14071,7 +14071,7 @@ mod tests {
         state
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,

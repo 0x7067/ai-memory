@@ -548,8 +548,8 @@ async fn workstream_provenance_retry_with_marker_matching_pattern_is_idempotent(
 
 /// A single-user (no database users) caller: the finish gate admits it, so
 /// these provenance tests exercise only the storage boundary.
-fn local_authority() -> ai_memory_store::WorkstreamFinishAuthority {
-    ai_memory_store::WorkstreamFinishAuthority::from_auth(
+fn local_authority() -> ai_memory_store::ManagedRunAuthority {
+    ai_memory_store::ManagedRunAuthority::from_auth(
         ai_memory_core::AuthLevel::Anonymous,
         None,
         None,
