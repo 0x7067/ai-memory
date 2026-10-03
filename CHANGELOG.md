@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   harness, or a non-interactive launch silently consuming a baton meant for
   a specific session. Server-wide for now; a per-project override is left for
   a follow-up change. (#1030)
+- Added `[handoff].create_on_session_end` (default `true` - unchanged
+  behavior). When set to `false`, unmanaged session ends write the session
+  summary page and enqueue consolidation as usual, but skip creating an
+  automatic open handoff for the next session; OpenCode turn checkpoints
+  refresh the page without a baton too. Explicit handoffs created via
+  `memory_handoff_begin` and managed workstream runs remain unaffected.
+  Server-wide: applies to every operator on this server. (#1043)
 - Added a default-quit prompt after a successful interactive managed run so the
   operator can re-run the current harness or switch to another installed
   harness in the same workstream. Utility, failed, interrupted,
