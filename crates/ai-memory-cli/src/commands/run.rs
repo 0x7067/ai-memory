@@ -6175,7 +6175,6 @@ mod tests {
         (script, captured)
     }
 
-    #[cfg(unix)]
     fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
         let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
         config.data_dir = data.to_path_buf();
