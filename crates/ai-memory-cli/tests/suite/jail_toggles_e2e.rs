@@ -794,6 +794,103 @@ async fn bare_nonterminal_command_help_version_and_typos_do_not_launch_a_picker(
     handle.abort();
 }
 
+/// Run an installed ai-jail's actual PTY proxy without nesting a kernel sandbox.
+/// The backend stub only executes the command after bwrap's separator.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set AI_MEMORY_TEST_REAL_AI_JAIL to an ai-jail binary accepting a fixture BWRAP_BIN"]
+async fn installed_ai_jail_proxy_displays_resume_yolo() {
+    let jail = std::env::var_os("AI_MEMORY_TEST_REAL_AI_JAIL")
+        .expect("AI_MEMORY_TEST_REAL_AI_JAIL points to the binary being tested");
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    std::os::unix::fs::symlink(BIN, fixture.bin.join("ai-memory")).unwrap();
+    write_script(
+        &fixture.bin.join("bwrap"),
+        "if [ \"$1\" = --version ]; then echo 'bubblewrap 0.11.0'; exit 0; fi\nwhile [ $# -gt 0 ]; do\nif [ \"$1\" = -- ]; then shift; exec \"$@\"; fi\nshift\ndone\nexit 1\n",
+    );
+    let (server, requests, handle) = mock_server().await;
+    let launch = inside_ai_jail_here();
+    let output = terminal_run_program(
+        &fixture,
+        &server,
+        Path::new(&jail),
+        "--no-landlock --no-seccomp --no-rlimits --no-mise --no-save-config --no-gpu --no-docker --no-display ai-memory resume --yolo",
+        if launch { "\x1b[C\r" } else { "\x1b" },
+        Some("Resume workstream"),
+    )
+    .await;
+    assert!(output.contains("Resume workstream"), "{output}");
+    if launch {
+        let native_args = fs::read_to_string(&fixture.claude_ran).unwrap();
+        assert!(
+            native_args.contains("--dangerously-skip-permissions"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("Re-run this session inside it?"),
+            "{output}"
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/finish"))
+        );
+    } else {
+        assert_eq!(requests.lock().unwrap().as_slice(), ["/workstream/recent"]);
+        assert!(!fixture.claude_ran.exists());
+    }
+    handle.abort();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_yolo_displays_picker_without_scanning_git_status() {
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    std::os::unix::fs::symlink(BIN, fixture.bin.join("ai-memory")).unwrap();
+    write_script(
+        &fixture.bin.join("ai-jail"),
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}'\nexec \"$@\"\n",
+            fixture.jail_argv.display(),
+        ),
+    );
+    let git_binary = host_tool("git");
+    let status_called = fixture.home.join("git-status-called");
+    fs::remove_file(fixture.bin.join("git")).unwrap();
+    write_script(
+        &fixture.bin.join("git"),
+        &format!(
+            "for arg in \"$@\"; do\nif [ \"$arg\" = status ]; then\nprintf scanned > '{}'\nfi\ndone\nexec '{}' \"$@\"\n",
+            status_called.display(),
+            git_binary.display(),
+        ),
+    );
+    let (server, requests, handle) = mock_server().await;
+    let output = terminal_run_program(
+        &fixture,
+        &server,
+        &fixture.bin.join("ai-jail"),
+        "ai-memory resume --yolo",
+        "\x1b",
+        Some("Resume workstream"),
+    )
+    .await;
+    assert!(output.contains("Resume workstream"), "{output}");
+    assert!(
+        !status_called.exists(),
+        "listing must not scan the working tree before drawing the picker"
+    );
+    assert_eq!(requests.lock().unwrap().as_slice(), ["/workstream/recent"]);
+    assert_eq!(
+        fixture.jail_argv().unwrap(),
+        ["ai-memory", "resume", "--yolo"]
+    );
+    assert!(!fixture.claude_ran.exists());
+    handle.abort();
+}
+
 /// Run `ai-memory <args>` under `script` so stdin and stderr are a real
 /// terminal, feed `input`, and return everything the terminal showed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -839,6 +936,7 @@ async fn terminal_run_program(
         .env("JAIL_E2E_BINARY", program)
         .env("AI_MEMORY_NATIVE_BIN", BIN)
         .env("AI_MEMORY_RUN_AUTOWIRE", "false")
+        .env("BWRAP_BIN", fixture.bin.join("bwrap"))
         .current_dir(&fixture.repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

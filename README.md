@@ -372,6 +372,7 @@ ai-memory resume             # pick from ALL workstreams in this checkout only
 ai-memory resume --search auth # find a workstream by name (case-insensitive)
 ai-memory                     # same picker, when run in a terminal
 ai-jail ai-memory             # picker + selected harness inside ai-jail
+ai-jail ai-memory resume --yolo # explicit picker + harness's dangerous mode
 ai-jail --ssh ai-memory       # also share SSH access
 ```
 
@@ -394,6 +395,22 @@ Running `ai-memory` without a subcommand in a terminal opens the same picker.
 ai-jail; add ai-jail options before `ai-memory`, such as `--ssh` above.
 This works with native installs and the Linux/macOS shell wrapper. Scripts
 still require an explicit CLI subcommand, and `ai-memory --help` shows help.
+Workstream discovery reads Git identity only; it does not scan the working tree
+with `git status` before showing the picker. Full checkpoints are still captured
+when launching the selected workstream.
+
+For an unreleased source build, install the native binary on your host `PATH`
+before entering ai-jail. A temporary `/tmp` build is not a reliable executable
+location inside the sandbox:
+
+```bash
+cargo build -p ai-memory-cli --bin ai-memory
+mkdir -p "$HOME/.local/bin"
+install -m755 target/debug/ai-memory "$HOME/.local/bin/ai-memory"
+export PATH="$HOME/.local/bin:$PATH"
+# Run from the checkout you want to resume:
+ai-jail ai-memory resume --yolo
+```
 
 Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with

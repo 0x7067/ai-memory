@@ -20,7 +20,9 @@ pub use jail::{
     inside_ai_jail_here, jail_checklist, jail_toggle, marked_choices, parse_jail_toggles,
     usable_ai_jail, usable_ai_jail_here,
 };
-pub use repository::{RepositoryIdentity, inspect_repository};
+pub use repository::{
+    RepositoryFingerprints, RepositoryIdentity, inspect_repository, inspect_repository_fingerprints,
+};
 pub use transcript::{
     AmbiguousNativeSession, ExportedTranscript, NativeSessionCandidate, discover_native_session,
     export_transcript, kiro_harness_from_source_cursor, kiro_v3_resume_uses_default_store,

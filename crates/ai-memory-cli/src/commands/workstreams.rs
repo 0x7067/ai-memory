@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use ai_memory_core::{ListManagedWorkstreamsRequest, ManagedWorkstreamSummary};
-use ai_memory_workstream::inspect_repository;
+use ai_memory_workstream::inspect_repository_fingerprints;
 use anyhow::{Context as _, Result};
 
 use crate::cli::WorkstreamsArgs;
@@ -46,8 +46,8 @@ pub(super) async fn list_for_checkout(
     checkout: &Path,
     limit: usize,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
-    let repository =
-        inspect_repository(checkout).context("inspecting managed workstream checkout")?;
+    let repository = inspect_repository_fingerprints(checkout)
+        .context("inspecting managed workstream checkout")?;
     post_json(
         endpoint,
         "/workstream/recent",
@@ -70,8 +70,8 @@ pub(super) async fn list_all_for_checkout(
     project: &str,
     checkout: &Path,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
-    let repository =
-        inspect_repository(checkout).context("inspecting managed workstream checkout")?;
+    let repository = inspect_repository_fingerprints(checkout)
+        .context("inspecting managed workstream checkout")?;
     let mut request = ListManagedWorkstreamsRequest {
         workspace: workspace.to_owned(),
         project: project.to_owned(),

@@ -274,6 +274,7 @@ ai-memory resume --search auth
 ai-memory resume --workspace work --limit 50
 ai-memory                     # no subcommand needed in a terminal
 ai-jail ai-memory             # picker and harness inside the jail
+ai-jail ai-memory resume --yolo # explicit picker with dangerous-mode launch
 ai-jail --ssh ai-memory       # optional SSH access
 ```
 
@@ -282,6 +283,9 @@ directly with `ai-jail ai-memory` to keep the selected harness in that jail.
 There is no extra ai-memory jail flag or nested sandbox. The Linux/macOS shell
 wrapper routes this interactive launch to its native host client. Non-terminal
 CLI calls still require a subcommand, and explicit help/version remain available.
+Listing reads the stable repository/worktree fingerprints without running
+`git status`, so a working-tree scan or filesystem-monitor hook cannot hold up
+the picker. The selected launch still captures its normal Git checkpoint.
 
 Use Up/Down to move between workstreams and Left/Right to cycle the
 launch harness for the highlighted row. Each row remembers its choice while you

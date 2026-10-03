@@ -136,6 +136,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   labelled `nix` / `full-ci`. (#989)
 
 ### Fixed
+- Removed unnecessary working-tree scans from checkout-local workstream listing
+  and the resume picker, including `ai-jail ai-memory resume --yolo`; launching
+  a selected workstream still captured its full checkpoint. (#1039)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
