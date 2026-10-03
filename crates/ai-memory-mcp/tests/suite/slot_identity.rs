@@ -501,9 +501,7 @@ async fn oidc_operator_can_delete_their_own_personal_slot_explicitly() {
         .expect("write");
     assert!(brief_slots(&h.http, &alice).await.contains(&own));
 
-    let deleted = delete_slot(&h.http, &own, &alice)
-        .await
-        .expect("delete");
+    let deleted = delete_slot(&h.http, &own, &alice).await.expect("delete");
     assert_eq!(deleted, own);
     assert!(!brief_slots(&h.http, &alice).await.contains(&own));
 }
