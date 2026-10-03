@@ -64,7 +64,8 @@ pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
     DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
     DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
-    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request,
+    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request, disambiguate_colliding_session_title,
+    existing_session_page_titles,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,

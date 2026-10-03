@@ -184,6 +184,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.copilot/mcp-config.json`), preserving other servers. `install-hooks
   --agent copilot-cli` without `--server-url` now reads the server URL and
   bearer back from that entry, and `uninstall` removes it. (#1040)
+- Added an optional `session_id` to `memory_write_page`, so an agent can
+  write a session's page with its own model and keep it traceable to the
+  session. The session must belong to the project the page is written to, and
+  the page records it as session evidence. A page that cites a session does
+  not overwrite a pinned page. Writing `sessions/<id>.md` also stamps the
+  frontmatter `memory_consolidate` writes there (`session_id`, `agent`,
+  `consolidated`, plus `consolidated_by: agent`), defaults the tier to
+  `episodic`, applies the same duplicate-title suffix, and marks the session's
+  queued SessionEnd consolidation job completed. (#1038)
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
@@ -199,6 +208,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extraction-loss annotations. Active-run retries reject changes to an existing
   event's agent, native session or kind, and retain its first indexed content
   and provenance across sanitizer changes. (#1057)
+- The SessionEnd consolidation worker leaves a session page alone when the
+  agent wrote it through `memory_write_page` and no observation arrived after
+  it: the page records the session's observation count as
+  `observation_generation`, and the worker completes a job whose generation
+  that count reaches instead of replacing the page with the server's
+  provider. A page written before the session's last observation is
+  consolidated as before. (#1038)
 
 ### Fixed
 - Fixed completed retries and no-op session endings advancing

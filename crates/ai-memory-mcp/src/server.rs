@@ -1620,6 +1620,15 @@ struct WritePageArgs {
     /// by the next forget sweep. Omit for pages that never expire.
     #[serde(default)]
     expires_at: Option<String>,
+    /// Optional session this page was written from. The session must belong
+    /// to the project the page is written to. The page records it as
+    /// evidence, as `memory_consolidate` does, and refuses to overwrite a
+    /// pinned page. Writing `sessions/<session_id>.md` also stamps the
+    /// session-page frontmatter and marks the session's pending
+    /// consolidation job completed, so the agent can write the session page
+    /// with its own model. Not combinable with `scope: "global"`.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[tool_router]
@@ -3544,8 +3553,9 @@ impl AiMemoryServer {
     }
 
     /// Reconcile the durable SessionEnd job row after a successful manual
-    /// `memory_consolidate` so the operator does not see a `failed` job for a
-    /// session that is now consolidated. The automatic worker owns the job's
+    /// `memory_consolidate`, or a `memory_write_page` of the session page, so
+    /// the operator does not see a `failed` job for a session that is now
+    /// consolidated. The automatic worker owns the job's
     /// lease, so the reconcile never touches a `running` row; a best-effort
     /// failure here must not fail the consolidate that already wrote the page.
     async fn reconcile_consolidation_job(&self, session_id: SessionId) {
@@ -3557,9 +3567,127 @@ impl AiMemoryServer {
             tracing::warn!(
                 %session_id,
                 %error,
-                "failed to reconcile session consolidation job after manual consolidate"
+                "failed to reconcile session consolidation job after a manual session-page write"
             );
         }
+    }
+
+    /// A session id names a repository without passing through scope
+    /// resolution (#708), so a page may cite one only when the session lives
+    /// in the project the page is written to, the one the write grant was
+    /// checked against. The project comes from where the session's
+    /// observations landed, as for `memory_consolidate`. Unknown and foreign
+    /// sessions get the same refusal, so the error does not reveal whether a
+    /// foreign id exists.
+    async fn require_session_in_scope(
+        &self,
+        session_id: SessionId,
+        workspace_id: ai_memory_core::WorkspaceId,
+        project_id: ai_memory_core::ProjectId,
+    ) -> Result<(), McpError> {
+        let from_observations = self
+            .reader
+            .session_scope_from_observations(session_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let scope = match from_observations {
+            Some(scope) => Some(scope),
+            None => self
+                .reader
+                .session_project_ids(session_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        };
+        if scope == Some((workspace_id, project_id)) {
+            Ok(())
+        } else {
+            Err(McpError::invalid_params(
+                format!(
+                    "session {session_id} is not a session of the project this page is written to"
+                ),
+                None,
+            ))
+        }
+    }
+
+    /// Pinned pages are immutable to automation, and a write that cites a
+    /// session is a consolidation by another route. `Wiki::write_page` takes
+    /// the pin from the request alone, so without this check the write would
+    /// replace the body and drop the pin. `_slots/` keep their own regime,
+    /// as in the consolidator's batch path.
+    fn refuse_pinned_page_overwrite(
+        wiki: &Wiki,
+        workspace_id: ai_memory_core::WorkspaceId,
+        project_id: ai_memory_core::ProjectId,
+        path: &PagePath,
+    ) -> Result<(), McpError> {
+        if ai_memory_core::is_slot_path(path.as_str()) {
+            return Ok(());
+        }
+        let pinned = match wiki.read_page(workspace_id, project_id, path) {
+            Ok(md) => {
+                md.frontmatter
+                    .get("pinned")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            }
+            Err(WikiError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        };
+        if pinned {
+            return Err(McpError::invalid_request(
+                format!(
+                    "page '{}' is pinned; a write that cites a session does not overwrite a pinned page",
+                    path.as_str()
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The origin keys consolidation stamps on a session page, so a reader
+    /// cannot tell the two writers apart by shape. `consolidated_by` is the
+    /// one difference: the server cannot verify which model the agent ran, so
+    /// it records the route and no model name. `observation_generation` is
+    /// the session's observation count at write time, which the SessionEnd
+    /// worker compares to its job's generation before overwriting the page.
+    async fn stamp_session_page(
+        &self,
+        fm: &mut serde_json::Map<String, serde_json::Value>,
+        session_id: SessionId,
+    ) -> Result<(), McpError> {
+        let agent = self
+            .reader
+            .session_agent_kind(session_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("session {session_id} has no session row"), None)
+            })?;
+        fm.insert(
+            "session_id".into(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+        fm.insert(
+            "agent".into(),
+            serde_json::Value::String(agent.as_str().into()),
+        );
+        fm.insert("consolidated".into(), serde_json::Value::Bool(true));
+        fm.insert(
+            "consolidated_by".into(),
+            serde_json::Value::String("agent".into()),
+        );
+        let generation = self
+            .reader
+            .session_observation_count(session_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        fm.insert(
+            "observation_generation".into(),
+            serde_json::Value::from(generation),
+        );
+        Ok(())
     }
 
     /// Stage durable wiki edit proposals for a completed session.
@@ -3875,7 +4003,15 @@ impl AiMemoryServer {
         pass the `title` argument; passing it forces correct JSON-escaping \
         of the string and is a known source of `JSON parsing` errors when \
         the title contains quotes or punctuation (issue #67). Use `title` \
-        only when there's no usable H1 in the body."
+        only when there's no usable H1 in the body. \
+        \
+        **Session evidence:** pass `session_id` when the page is compiled \
+        from that session's captured observations. Write the session page \
+        itself at `sessions/<session_id>.md` (tier defaults to `episodic` \
+        there) to replace the server-model consolidation with your own; \
+        `memory_read_session_observations` returns the evidence to write \
+        from. The write goes through the `write_page` admission op, not \
+        `consolidate`."
     )]
     async fn memory_write_page(
         &self,
@@ -3893,15 +4029,38 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let tier_name = args.tier.as_deref().unwrap_or("semantic");
-        let tier: Tier = tier_name
-            .parse()
-            .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+        // Same blank-means-omitted reading as `memory_consolidate`; anything
+        // else that is not a UUID is caller input.
+        let session_id = args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(SessionId::from_str)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         path.ensure_portable()
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
+        let session_page =
+            session_id.is_some_and(|id| path.as_str() == format!("sessions/{id}.md"));
+        // Consolidation writes the session page as episodic; keep that
+        // default so both writers of the page agree.
+        let tier_name =
+            args.tier
+                .as_deref()
+                .unwrap_or(if session_page { "episodic" } else { "semantic" });
+        let tier: Tier = tier_name
+            .parse()
+            .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+        if session_id.is_some() && args.scope.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            return Err(McpError::invalid_params(
+                "session_id cannot be combined with scope: \"global\"; a session belongs to one project",
+                None,
+            ));
+        }
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
                 self.write_target_ids_with_actor(
@@ -3944,6 +4103,10 @@ impl AiMemoryServer {
                 ));
             }
         };
+        if let Some(session_id) = session_id {
+            self.require_session_in_scope(session_id, ws, proj).await?;
+            Self::refuse_pinned_page_overwrite(wiki, ws, proj, &path)?;
+        }
 
         let mut fm = metadata;
         if let Some(title) = &args.title {
@@ -3977,16 +4140,40 @@ impl AiMemoryServer {
                 serde_json::Value::String(expires_at.to_string()),
             );
         }
+        // rmcp exposes the original HTTP `Parts`; trust the auth middleware's
+        // extension, not raw client-controlled actor headers.
+        let actor = crate::actor::actor_from_parts(&parts);
+        let author_id = crate::actor::author_id_from_parts(&parts);
+        let mut body = args.body;
+        let mut title = args.title;
+        if let Some(session_id) = session_id.filter(|_| session_page) {
+            self.stamp_session_page(&mut fm, session_id).await?;
+            let current =
+                ai_memory_wiki::derive_title(&serde_json::Value::Object(fm.clone()), &body, &path);
+            let existing = ai_memory_consolidate::existing_session_page_titles(
+                &self.reader,
+                ws,
+                proj,
+                &actor,
+                session_id,
+            )
+            .await;
+            if let Some((new_title, new_body)) =
+                ai_memory_consolidate::disambiguate_colliding_session_title(
+                    &current, &body, &existing, session_id,
+                )
+            {
+                fm.insert("title".into(), serde_json::Value::String(new_title.clone()));
+                title = Some(new_title);
+                body = new_body;
+            }
+        }
         let frontmatter = if fm.is_empty() {
             serde_json::Value::Null
         } else {
             serde_json::Value::Object(fm)
         };
 
-        // rmcp exposes the original HTTP `Parts`; trust the auth middleware's
-        // extension, not raw client-controlled actor headers.
-        let actor = crate::actor::actor_from_parts(&parts);
-        let author_id = crate::actor::author_id_from_parts(&parts);
         // Loop prevention: a webhook that writes back into the engine sets
         // `X-Memory-Skip-Admission-Chain` so the chain doesn't re-invoke it
         // on the recursive write. Only trusted/root re-entry can honor it.
@@ -4009,18 +4196,29 @@ impl AiMemoryServer {
                 project_id: proj,
                 path: path.clone(),
                 frontmatter,
-                body: args.body,
+                body,
                 tier,
                 pinned: args.pinned,
-                title: args.title,
+                title,
                 admission_ctx,
                 author_id,
                 actor,
-                evidence: Vec::new(),
+                evidence: session_id
+                    .map(|id| ai_memory_core::PageEvidence {
+                        kind: ai_memory_core::PageEvidenceKind::Session,
+                        source_id: id.to_string(),
+                    })
+                    .into_iter()
+                    .collect(),
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_write_page: {}", path.as_str()));
+        // Only the session page settles the job: evidence on another page
+        // must not close it while `sessions/<id>.md` is still missing.
+        if let Some(session_id) = session_id.filter(|_| session_page) {
+            self.reconcile_consolidation_job(session_id).await;
+        }
 
         ok_json(&serde_json::json!({
             "page_id": page_id.to_string(),
@@ -8803,6 +9001,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts),
             )
@@ -9484,6 +9683,7 @@ mod tests {
             workspace: None,
             scope: scope.map(str::to_string),
             expires_at: None,
+            session_id: None,
         };
 
         server
@@ -12197,6 +12397,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts),
             )
@@ -12231,6 +12432,310 @@ mod tests {
             recent_text.contains("notes/santander-2025.md"),
             "got {recent_text}"
         );
+    }
+
+    /// Two projects in one workspace, each with one ended session whose
+    /// SessionEnd consolidation job is queued, and a server on the first.
+    async fn session_evidence_fixture() -> (
+        TempDir,
+        Store,
+        AiMemoryServer,
+        WorkspaceId,
+        [(ProjectId, SessionId); 2],
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let mut pairs = Vec::new();
+        for name in ["here", "elsewhere"] {
+            let proj = store
+                .writer
+                .get_or_create_project(ws, name, None)
+                .await
+                .unwrap();
+            let session = seed_short_completed_session(&store, ws, proj).await;
+            assert!(
+                store
+                    .writer
+                    .enqueue_session_consolidation(ws, proj, session)
+                    .await
+                    .unwrap()
+            );
+            pairs.push((proj, session));
+        }
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let server =
+            AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, pairs[0].0)
+                .with_wiki(wiki);
+        (tmp, store, server, ws, [pairs[0], pairs[1]])
+    }
+
+    fn session_write_args(path: String, body: &str, session_id: SessionId) -> WritePageArgs {
+        WritePageArgs {
+            path,
+            body: body.into(),
+            title: None,
+            tier: None,
+            tags: Vec::new(),
+            pinned: false,
+            project: Some("here".into()),
+            workspace: Some("default".into()),
+            scope: None,
+            expires_at: None,
+            session_id: Some(session_id.to_string()),
+        }
+    }
+
+    /// Session ids whose SessionEnd job is still claimable, in claim order.
+    async fn claimable_sessions(store: &Store) -> Vec<SessionId> {
+        let now = jiff::Timestamp::now().as_microsecond();
+        let mut out = Vec::new();
+        while let Some(job) = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+        {
+            out.push(job.session_id());
+        }
+        out
+    }
+
+    fn session_evidence_rows(store: &Store, session_id: SessionId) -> i64 {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM page_evidence WHERE source_kind = 'session' AND source_id = ?1",
+            rusqlite::params![session_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A session id names a repository without passing through scope
+    /// resolution (#708). Citing a session from another project, or one that
+    /// does not exist, is refused before anything is written, and the other
+    /// project's job stays queued. Control: the project's own session is
+    /// accepted.
+    #[tokio::test]
+    async fn write_page_refuses_a_session_from_another_project() {
+        let (_tmp, store, server, _ws, [(_, own), (_, foreign)]) = session_evidence_fixture().await;
+
+        for session in [foreign, SessionId::new()] {
+            let err = server
+                .memory_write_page(
+                    Parameters(session_write_args(
+                        format!("sessions/{session}.md"),
+                        "# Borrowed session\n\nWritten from another project.",
+                        session,
+                    )),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+            assert!(
+                err.message
+                    .contains("is not a session of the project this page is written to"),
+                "{err:?}"
+            );
+        }
+        assert_eq!(session_evidence_rows(&store, foreign), 0);
+
+        server
+            .memory_write_page(
+                Parameters(session_write_args(
+                    format!("sessions/{own}.md"),
+                    "# Own session\n\nWritten from this project.",
+                    own,
+                )),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimable_sessions(&store).await, vec![foreign]);
+    }
+
+    /// Writing the session page settles what `memory_consolidate` would have
+    /// settled: session evidence, the origin frontmatter, the episodic tier,
+    /// and the queued job.
+    #[tokio::test]
+    async fn write_page_of_the_session_page_stamps_cites_and_reconciles() {
+        let (tmp, store, server, ws, [(proj, own), (_, foreign)]) =
+            session_evidence_fixture().await;
+
+        server
+            .memory_write_page(
+                Parameters(session_write_args(
+                    format!("sessions/{own}.md"),
+                    "# Retry policy settled\n\nThe agent compiled this page.",
+                    own,
+                )),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let page = wiki
+            .read_page(
+                ws,
+                proj,
+                &PagePath::new(format!("sessions/{own}.md")).unwrap(),
+            )
+            .unwrap();
+        let fm = &page.frontmatter;
+        assert_eq!(fm["session_id"], serde_json::json!(own.to_string()));
+        assert_eq!(fm["agent"], serde_json::json!(AgentKind::Other.as_str()));
+        assert_eq!(fm["consolidated"], serde_json::json!(true));
+        assert_eq!(fm["consolidated_by"], serde_json::json!("agent"));
+        assert_eq!(fm["tier"], serde_json::json!("episodic"));
+        assert_eq!(session_evidence_rows(&store, own), 1);
+        assert_eq!(claimable_sessions(&store).await, vec![foreign]);
+    }
+
+    /// Evidence may sit on any page, but only the session page closes the
+    /// job: closing it from another path would leave `sessions/<id>.md`
+    /// missing with nothing left to write it.
+    #[tokio::test]
+    async fn session_evidence_on_another_path_leaves_the_job_queued() {
+        let (_tmp, store, server, _ws, [(_, own), (_, foreign)]) = session_evidence_fixture().await;
+
+        server
+            .memory_write_page(
+                Parameters(session_write_args(
+                    "decisions/retry-policy.md".into(),
+                    "# Retry policy\n\nKeep the event id on retry.",
+                    own,
+                )),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(session_evidence_rows(&store, own), 1);
+        let queued = claimable_sessions(&store).await;
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(
+            queued.contains(&own) && queued.contains(&foreign),
+            "{queued:?}"
+        );
+    }
+
+    /// `Wiki::write_page` takes the pin from the request alone, so a write
+    /// that cites a session would otherwise replace a pinned page and drop
+    /// its pin. Control: the same write without `session_id` is an ordinary
+    /// operator edit and still goes through.
+    #[tokio::test]
+    async fn session_evidence_write_leaves_a_pinned_page_alone() {
+        let (tmp, store, server, ws, [(proj, own), _]) = session_evidence_fixture().await;
+        let path = "notes/curated.md";
+        let mut pinned = session_write_args(path.into(), "# Curated\n\nHand-written.", own);
+        pinned.session_id = None;
+        pinned.pinned = true;
+        server
+            .memory_write_page(Parameters(pinned), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+
+        let err = server
+            .memory_write_page(
+                Parameters(session_write_args(
+                    path.into(),
+                    "# Curated\n\nGenerated over it.",
+                    own,
+                )),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let page = wiki
+            .read_page(ws, proj, &PagePath::new(path).unwrap())
+            .unwrap();
+        assert!(page.body.contains("Hand-written."), "{}", page.body);
+        assert_eq!(page.frontmatter["pinned"], serde_json::json!(true));
+        assert_eq!(session_evidence_rows(&store, own), 0);
+
+        let mut edit = session_write_args(path.into(), "# Curated\n\nEdited by hand.", own);
+        edit.session_id = None;
+        edit.pinned = true;
+        server
+            .memory_write_page(Parameters(edit), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+    }
+
+    /// The session page gets the same title backstop as consolidation: a
+    /// title another page already carries is suffixed with the session's
+    /// short id, heading included.
+    #[tokio::test]
+    async fn session_page_write_disambiguates_a_taken_title() {
+        let (tmp, store, server, ws, [(proj, own), _]) = session_evidence_fixture().await;
+        let mut other = session_write_args(
+            "notes/release-checklist.md".into(),
+            "# Release checklist\n\nAn earlier page.",
+            own,
+        );
+        other.session_id = None;
+        server
+            .memory_write_page(Parameters(other), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+
+        server
+            .memory_write_page(
+                Parameters(session_write_args(
+                    format!("sessions/{own}.md"),
+                    "# Release checklist\n\nThis session's run.",
+                    own,
+                )),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let page = wiki
+            .read_page(
+                ws,
+                proj,
+                &PagePath::new(format!("sessions/{own}.md")).unwrap(),
+            )
+            .unwrap();
+        let title = page.frontmatter["title"].as_str().unwrap().to_string();
+        assert!(title.starts_with("Release checklist (session "), "{title}");
+        assert!(
+            page.body.starts_with(&format!("# {title}")),
+            "{}",
+            page.body
+        );
+    }
+
+    /// Malformed ids are caller input, and a session never belongs to the
+    /// reserved global scope.
+    #[tokio::test]
+    async fn write_page_rejects_a_malformed_or_global_session_id() {
+        let (_tmp, _store, server, _ws, [(_, own), _]) = session_evidence_fixture().await;
+        let mut malformed = session_write_args("notes/x.md".into(), "# X", own);
+        malformed.session_id = Some("not-a-uuid".into());
+        let mut global = session_write_args("notes/x.md".into(), "# X", own);
+        global.project = None;
+        global.workspace = None;
+        global.scope = Some("global".into());
+        for args in [malformed, global] {
+            let err = server
+                .memory_write_page(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        }
     }
 
     #[tokio::test]
@@ -12278,6 +12783,7 @@ mod tests {
                         workspace: None,
                         scope: None,
                         expires_at: None,
+                        session_id: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -12322,6 +12828,7 @@ mod tests {
                     workspace: Some("default".into()),
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -12389,6 +12896,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts),
             )
@@ -12497,6 +13005,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -12655,6 +13164,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -12977,6 +13487,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(alice_parts),
             )
@@ -13379,6 +13890,7 @@ mod tests {
                             workspace: None,
                             scope: None,
                             expires_at: None,
+                            session_id: None,
                         }),
                         OptionalParts(parts),
                     )
@@ -13474,6 +13986,7 @@ mod tests {
                             workspace: None,
                             scope: None,
                             expires_at: None,
+                            session_id: None,
                         }),
                         OptionalParts(parts),
                     )
@@ -13577,6 +14090,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13644,6 +14158,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -13736,6 +14251,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13832,6 +14348,7 @@ mod tests {
                     workspace: Some("alpha".into()),
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -13851,6 +14368,7 @@ mod tests {
                     workspace: Some("beta".into()),
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -13955,6 +14473,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -15898,6 +16417,7 @@ mod tests {
                     workspace: None,
                     scope: None,
                     expires_at: None,
+                    session_id: None,
                 }),
                 OptionalParts(parts()),
             )
