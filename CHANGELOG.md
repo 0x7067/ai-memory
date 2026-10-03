@@ -118,6 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subagent under its parent's session id, so a subagent's events no longer
   mark that session as a subagent: the parent's Stop, SessionEnd, summary and
   handoff are kept. (#1041, #1048)
+- The OpenCode provider now selects the published Zen endpoint for supported
+  models: Responses, Anthropic Messages, or OpenAI-compatible Chat Completions.
+  (#1080)
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a

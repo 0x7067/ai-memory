@@ -1,7 +1,7 @@
 //! OpenCode Go/Zen provider.
 //!
-//! Selects the wire API published for each model: GPT-5.6 Luna uses the
-//! Responses API and other models use OpenAI-compatible Chat Completions.
+//! Selects the wire API published for each model: Responses, Anthropic Messages,
+//! or OpenAI-compatible Chat Completions.
 //! Defaults to Go's catalogue at `https://opencode.ai/zen/go/v1`; set
 //! `AI_MEMORY_LLM_BASE_URL` (or call [`OpenCodeProvider::with_base_url`]) to
 //! point at Zen's general catalogue instead. Accepts an `sk-...` API key from
@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
+use crate::AnthropicProvider;
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{
     STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas, normalize_openai_base,
@@ -45,8 +46,8 @@ pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 /// OpenCode Go LLM provider.
 ///
 /// Routes through `https://opencode.ai/zen/go/v1` using the model's published
-/// Responses or Chat Completions wire format. Authenticate with the `sk-...`
-/// key obtained from <https://opencode.ai/auth>.
+/// Responses, Anthropic Messages, or Chat Completions wire format. Authenticate
+/// with the `sk-...` key obtained from <https://opencode.ai/auth>.
 pub struct OpenCodeProvider {
     transport: OpenCodeTransport,
 }
@@ -54,6 +55,7 @@ pub struct OpenCodeProvider {
 enum OpenCodeTransport {
     ChatCompletions(OpenAiCompatProvider),
     Responses(OpenCodeResponsesProvider),
+    AnthropicMessages(AnthropicProvider),
 }
 
 impl OpenCodeProvider {
@@ -72,13 +74,18 @@ impl OpenCodeProvider {
     ) -> LlmResult<Self> {
         let model = model.into();
         let base_url = base_url.into();
-        let transport = if model_uses_responses_api(&model) {
-            OpenCodeTransport::Responses(OpenCodeResponsesProvider::new(api_key, model, base_url)?)
-        } else {
-            OpenCodeTransport::ChatCompletions(
+        let transport = match model_api(&model) {
+            OpenCodeApi::Responses => OpenCodeTransport::Responses(OpenCodeResponsesProvider::new(
+                api_key, model, base_url,
+            )?),
+            OpenCodeApi::AnthropicMessages => OpenCodeTransport::AnthropicMessages(
+                AnthropicProvider::new(api_key, model)?
+                    .with_base_url(anthropic_base_url(&base_url)),
+            ),
+            OpenCodeApi::ChatCompletions => OpenCodeTransport::ChatCompletions(
                 OpenAiCompatProvider::new(base_url, Some(api_key), model)?
                     .with_client_headers(crate::DEFAULT_USER_AGENT, OPENCODE_SESSION_HEADER),
-            )
+            ),
         };
         Ok(Self { transport })
     }
@@ -106,6 +113,9 @@ impl OpenCodeProvider {
             OpenCodeTransport::Responses(provider) => {
                 OpenCodeTransport::Responses(provider.with_timeout_secs(secs))
             }
+            OpenCodeTransport::AnthropicMessages(provider) => {
+                OpenCodeTransport::AnthropicMessages(provider.with_timeout_secs(secs))
+            }
         };
         self
     }
@@ -119,6 +129,9 @@ impl OpenCodeProvider {
             }
             OpenCodeTransport::Responses(provider) => {
                 OpenCodeTransport::Responses(provider.with_reasoning_effort(effort))
+            }
+            OpenCodeTransport::AnthropicMessages(provider) => {
+                OpenCodeTransport::AnthropicMessages(provider.with_reasoning_effort(effort))
             }
         };
         self
@@ -137,6 +150,9 @@ impl OpenCodeProvider {
             OpenCodeTransport::Responses(provider) => {
                 OpenCodeTransport::Responses(provider.with_base_url(url))
             }
+            OpenCodeTransport::AnthropicMessages(provider) => OpenCodeTransport::AnthropicMessages(
+                provider.with_base_url(anthropic_base_url(&url)),
+            ),
         };
         self
     }
@@ -153,6 +169,9 @@ impl OpenCodeProvider {
             OpenCodeTransport::Responses(provider) => {
                 OpenCodeTransport::Responses(provider.with_extra_headers(headers))
             }
+            OpenCodeTransport::AnthropicMessages(provider) => {
+                OpenCodeTransport::AnthropicMessages(provider.with_extra_headers(headers))
+            }
         };
         self
     }
@@ -162,6 +181,7 @@ impl OpenCodeProvider {
         match &self.transport {
             OpenCodeTransport::ChatCompletions(provider) => provider.base_url(),
             OpenCodeTransport::Responses(provider) => &provider.base_url,
+            OpenCodeTransport::AnthropicMessages(_) => "",
         }
     }
 }
@@ -176,6 +196,7 @@ impl LlmProvider for OpenCodeProvider {
         match &self.transport {
             OpenCodeTransport::ChatCompletions(provider) => provider.model(),
             OpenCodeTransport::Responses(provider) => &provider.model,
+            OpenCodeTransport::AnthropicMessages(provider) => provider.model(),
         }
     }
 
@@ -198,6 +219,7 @@ impl LlmProvider for OpenCodeProvider {
             OpenCodeTransport::Responses(provider) => {
                 provider.complete(request, operation_id).await
             }
+            OpenCodeTransport::AnthropicMessages(provider) => provider.complete(request).await,
         }
     }
 
@@ -227,15 +249,97 @@ impl LlmProvider for OpenCodeProvider {
                     .complete_structured(request, schema, operation_id)
                     .await
             }
+            OpenCodeTransport::AnthropicMessages(provider) => {
+                provider.complete_structured_raw(request, schema).await
+            }
         }
     }
 }
 
-fn model_uses_responses_api(model: &str) -> bool {
-    // OpenCode Go publishes Luna only through /responses. Its
-    // /chat/completions route returns an internal-server error for these calls.
-    model.eq_ignore_ascii_case("gpt-5.6-luna")
+enum OpenCodeApi {
+    Responses,
+    AnthropicMessages,
+    ChatCompletions,
 }
+
+fn model_api(model: &str) -> OpenCodeApi {
+    if matches_model(model, RESPONSES_MODELS) {
+        OpenCodeApi::Responses
+    } else if matches_model(model, ANTHROPIC_MESSAGES_MODELS) {
+        OpenCodeApi::AnthropicMessages
+    } else {
+        OpenCodeApi::ChatCompletions
+    }
+}
+
+fn matches_model(model: &str, models: &[&str]) -> bool {
+    models
+        .iter()
+        .any(|candidate| model.eq_ignore_ascii_case(candidate))
+}
+
+fn anthropic_base_url(base_url: &str) -> String {
+    base_url
+        .trim_end_matches('/')
+        .strip_suffix("/v1/messages")
+        .or_else(|| base_url.trim_end_matches('/').strip_suffix("/v1"))
+        .unwrap_or_else(|| base_url.trim_end_matches('/'))
+        .to_string()
+}
+
+const RESPONSES_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-nano",
+    "grok-4.7",
+    "grok-4.6",
+    "grok-4.5",
+    "grok-build-0.1",
+    "muse-spark-1.3",
+    "muse-spark-1.2",
+    "muse-spark-1.3-contributor-free",
+];
+
+const ANTHROPIC_MESSAGES_MODELS: &[&str] = &[
+    "claude-fable-5.1",
+    "claude-fable-5",
+    "claude-opus-5.5",
+    "claude-opus-5",
+    "claude-opus-4.8",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-opus-4.5",
+    "claude-sonnet-5",
+    "claude-sonnet-4.6",
+    "claude-sonnet-4.5",
+    "claude-haiku-4.5",
+    "qwen3.8-flash",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.6-plus",
+    "qwen3.5-plus",
+];
 
 struct OpenCodeResponsesProvider {
     client: reqwest::Client,
@@ -486,11 +590,19 @@ mod tests {
 
     fn responses_response_with_content(content: &str) -> serde_json::Value {
         json!({
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "output": [{
                 "type": "message",
                 "content": [{ "type": "output_text", "text": content }],
             }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 },
+        })
+    }
+
+    fn anthropic_response_with_content(content: &str) -> serde_json::Value {
+        json!({
+            "model": "claude-sonnet-4.6",
+            "content": [{ "type": "text", "text": content }],
             "usage": { "input_tokens": 1, "output_tokens": 1 },
         })
     }
@@ -530,8 +642,71 @@ mod tests {
         assert_eq!(provider.base_url(), "https://opencode.ai/zen/v1");
     }
 
+    #[test]
+    fn luna_models_select_the_responses_transport() {
+        for model in ["gpt-5.6-luna", "gpt-6-luna", "GPT-6-LUNA"] {
+            let provider = OpenCodeProvider::new(SecretString::from("sk-test"), model).unwrap();
+            assert!(matches!(
+                provider.transport,
+                OpenCodeTransport::Responses(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn published_models_select_their_documented_transports() {
+        for model in RESPONSES_MODELS {
+            let provider = OpenCodeProvider::new(SecretString::from("sk-test"), *model).unwrap();
+            assert!(matches!(
+                provider.transport,
+                OpenCodeTransport::Responses(_)
+            ));
+        }
+        for model in ANTHROPIC_MESSAGES_MODELS {
+            let provider = OpenCodeProvider::new(SecretString::from("sk-test"), *model).unwrap();
+            assert!(matches!(
+                provider.transport,
+                OpenCodeTransport::AnthropicMessages(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn chat_completions_models_keep_the_existing_transport() {
+        let provider =
+            OpenCodeProvider::new(SecretString::from("sk-test"), "deepseek-v4-flash").unwrap();
+        assert!(matches!(
+            provider.transport,
+            OpenCodeTransport::ChatCompletions(_)
+        ));
+    }
+
+    #[test]
+    fn responses_provider_preserves_custom_base_url() {
+        let provider = OpenCodeProvider::new(SecretString::from("sk-test"), "gpt-6-luna")
+            .unwrap()
+            .with_base_url("https://opencode.ai/zen/v1");
+        assert_eq!(provider.base_url(), "https://opencode.ai/zen/v1");
+    }
+
+    #[test]
+    fn responses_endpoint_normalizes_custom_base_urls() {
+        assert_eq!(
+            normalize_openai_base("https://opencode.ai/zen/v1", "responses"),
+            "https://opencode.ai/zen/v1/responses"
+        );
+        assert_eq!(
+            normalize_openai_base("https://opencode.ai/zen", "responses"),
+            "https://opencode.ai/zen/v1/responses"
+        );
+        assert_eq!(
+            normalize_openai_base("https://opencode.ai/zen/v1/responses", "responses"),
+            "https://opencode.ai/zen/v1/responses"
+        );
+    }
+
     #[tokio::test]
-    async fn luna_completion_uses_responses_api() {
+    async fn gpt_6_luna_completion_uses_responses_api() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -543,7 +718,7 @@ mod tests {
 
         let provider = OpenCodeProvider::new_with_base_url(
             SecretString::from("sk-test"),
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             server.uri(),
         )
         .unwrap();
@@ -554,7 +729,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.text, "ok");
-        assert_eq!(response.model, "gpt-5.6-luna");
+        assert_eq!(response.model, "gpt-6-luna");
         assert_eq!(response.usage.unwrap().input_tokens, 1);
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -569,6 +744,34 @@ mod tests {
             header_value(&requests[0], OPENCODE_SESSION_HEADER),
             Some(operation_id.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn claude_completion_uses_anthropic_messages_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/zen/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(anthropic_response_with_content("ok")),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenCodeProvider::new_with_base_url(
+            SecretString::from("sk-test"),
+            "claude-sonnet-4.6",
+            format!("{}/zen/v1", server.uri()),
+        )
+        .unwrap();
+        let response = provider
+            .complete(ChatRequest::user_prompt("hello"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(header_value(&requests[0], "x-api-key"), Some("sk-test"));
     }
 
     #[tokio::test]
