@@ -280,6 +280,9 @@ pub enum AgentKind {
     Pool,
     /// ZCode (z.ai) coding agent.
     Zcode,
+    /// GitHub Copilot CLI (`copilot`), configured with PascalCase hook event
+    /// names for a Claude Code/VS-Code-compatible payload shape (#1040).
+    CopilotCli,
     /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
     Grizzybot,
     /// Anything else (manual capture, future agents).
@@ -292,7 +295,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -313,6 +316,7 @@ impl AgentKind {
         Self::Hermes,
         Self::Pool,
         Self::Zcode,
+        Self::CopilotCli,
         Self::Grizzybot,
         Self::Other,
     ];
@@ -341,6 +345,7 @@ impl AgentKind {
             Self::Hermes => "hermes",
             Self::Pool => "pool",
             Self::Zcode => "zcode",
+            Self::CopilotCli => "copilot-cli",
             Self::Grizzybot => "grizzybot",
             Self::Other => "other",
         }
@@ -372,6 +377,7 @@ impl AgentKind {
             "hermes" | "hermes-agent" => Self::Hermes,
             "pool" | "poolside" => Self::Pool,
             "zcode" | "zai" => Self::Zcode,
+            "copilot-cli" | "copilot_cli" => Self::CopilotCli,
             "grizzybot" | "grizzy-bot" => Self::Grizzybot,
             _ => Self::Other,
         }
@@ -412,6 +418,11 @@ impl AgentKind {
     /// `<system-reminder>` text block of the first user message sent to the
     /// model (verified live against the embedded engine v0.16.5, capture logs
     /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
+    ///
+    /// GitHub Copilot CLI injects `SessionStart` context from a top-level
+    /// `additionalContext` key (GitHub's hooks reference), not Claude Code's
+    /// `hookSpecificOutput` envelope, even in its PascalCase payload mode; the
+    /// native hook prints that top-level envelope for it.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -622,6 +633,31 @@ mod tests {
         // destructive handoff fetch must not happen from its native hook.
         assert!(!AgentKind::Pool.session_start_injects_handoff());
         assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_copilot_cli_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::CopilotCli.as_str(), "copilot-cli");
+        assert_eq!(AgentKind::from_wire("copilot-cli"), AgentKind::CopilotCli);
+        assert_eq!(AgentKind::from_wire("copilot_cli"), AgentKind::CopilotCli);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CopilotCli).unwrap(),
+            "\"copilot-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"copilot-cli\"").unwrap(),
+            AgentKind::CopilotCli
+        );
+        // The bare "copilot" word is deliberately NOT an alias here: it is
+        // already claimed by the unrelated `McpClient::VsCodeCopilot` client
+        // (#1040), and aliasing both to different things would be confusing.
+        assert_eq!(AgentKind::from_wire("copilot"), AgentKind::Other);
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("copilot-cli-2"), AgentKind::Other);
+        // Copilot CLI reads a top-level `additionalContext` at SessionStart,
+        // which the native hook prints for it.
+        assert!(AgentKind::CopilotCli.session_start_injects_handoff());
+        assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
     }
 
     #[test]

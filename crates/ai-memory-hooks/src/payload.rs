@@ -726,6 +726,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Hermes
             | AgentKind::Pool
             | AgentKind::Zcode
+            | AgentKind::CopilotCli
             | AgentKind::Grizzybot
     )
 }
@@ -801,6 +802,14 @@ fn safe_tool_body(
                 // Codex's native schema has one top-level JSON response.
                 // Do not promote unrelated aliases or nested payloads to output.
                 raw.get("tool_response").and_then(value_to_text)
+            } else if agent == AgentKind::CopilotCli {
+                // Copilot CLI's VS-Code-compatible `PostToolUse` nests the
+                // model-facing text at `tool_result.text_result_for_llm`
+                // (#1040); read only that documented field so `result_type`
+                // never leaks in through an object-stringify fallback.
+                raw.pointer("/tool_result/text_result_for_llm")
+                    .and_then(value_to_text)
+                    .or_else(|| extract_content(raw, &["error"]))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -2434,6 +2443,40 @@ mod tests {
             body.contains("MARKER_GROK_931"),
             "grok tool_response should be serialized into the body: {body:?}"
         );
+    }
+
+    /// Copilot CLI's VS-Code-compatible `PostToolUse` nests the output at
+    /// `tool_result.text_result_for_llm` (#1040). Without Copilot in
+    /// `closed_tool_agent` the observation would be stored with an empty body,
+    /// the #931 failure mode Grok had; without the dedicated path the
+    /// `result_type` envelope would leak into the excerpt.
+    #[test]
+    fn copilot_cli_post_tool_excerpt_reads_text_result_for_llm() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("copilot-cli".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "copilot-session",
+                "cwd": "/repo",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "tool_result": {
+                    "result_type": "success",
+                    "text_result_for_llm": "MARKER_COPILOT_1040",
+                },
+            }),
+        );
+        let body = env
+            .body_excerpt
+            .expect("copilot-cli post-tool body should not be empty");
+        assert!(body.contains("MARKER_COPILOT_1040"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(!body.contains("result_type"), "{body:?}");
     }
 
     /// End-to-end: a native-hook user prompt (`event=user-prompt-submit`,

@@ -2249,6 +2249,18 @@ pub enum AgentChoice {
     /// `install-hooks --agent hermes` prints the ready-to-paste block.
     #[value(alias = "hermes-agent")]
     Hermes,
+    /// GitHub Copilot CLI — JSON-config lifecycle hooks in
+    /// `$COPILOT_HOME/hooks/ai-memory.json` (default
+    /// `~/.copilot/hooks/ai-memory.json`). Configured with PascalCase event
+    /// names, so Copilot sends the VS Code/Claude-compatible payload and the
+    /// existing key-based extraction applies (#1040). No bare `copilot`
+    /// alias: that word is already `install-mcp --client copilot`'s alias for
+    /// the unrelated VS Code MCP client. NOTE: Copilot CLI reads a top-level
+    /// `additionalContext` on `SessionStart`, not Claude Code's envelope, so
+    /// capture works but handoff injection does not yet — recover the prior
+    /// session's handoff via the MCP `memory_handoff_accept` tool.
+    #[value(name = "copilot-cli")]
+    CopilotCli,
 }
 
 impl AgentChoice {
@@ -2279,6 +2291,7 @@ impl AgentChoice {
             Self::Pool => AgentKind::Pool,
             Self::Zcode => AgentKind::Zcode,
             Self::Hermes => AgentKind::Hermes,
+            Self::CopilotCli => AgentKind::CopilotCli,
         }
     }
 
@@ -4168,6 +4181,21 @@ mod tests {
             };
             assert_eq!(args.agent, AgentChoice::CommandCode);
         }
+    }
+
+    #[test]
+    fn copilot_cli_install_hooks_agent_parses_without_a_bare_copilot_alias() {
+        let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "copilot-cli"])
+            .expect("copilot-cli should parse");
+        let Command::InstallHooks(args) = hooks.command else {
+            panic!("expected install-hooks");
+        };
+        assert_eq!(args.agent, AgentChoice::CopilotCli);
+        assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CopilotCli);
+        assert_eq!(args.agent.script_hook_subdir(), Some("copilot-cli"));
+        // `copilot` already means the VS Code MCP client on `install-mcp`;
+        // it must not silently select the CLI hook agent here.
+        assert!(Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "copilot"]).is_err());
     }
 
     #[test]
