@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 
 /// Bounded receipt and report vocabulary. Future server strings become unknown.
-pub const OUTCOMES: [&str; 9] = [
+pub const OUTCOMES: [&str; 10] = [
     "stored",
     "replayed",
     "resumed",
@@ -16,6 +16,7 @@ pub const OUTCOMES: [&str; 9] = [
     "dropped_subagent",
     "dropped_unauthorized",
     "dropped_collision",
+    "dropped_invalid",
     "unknown",
 ];
 

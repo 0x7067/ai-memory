@@ -1134,6 +1134,7 @@ fn finish_authority(
 
 fn finish_input(run_id: ai_memory_core::ManagedRunId) -> ai_memory_store::FinishWorkstreamRun {
     ai_memory_store::FinishWorkstreamRun {
+        sanitizer: ai_memory_core::Sanitizer::default(),
         run_id,
         native_session_id: Some("native-finish".into()),
         source_cursor: Some("cursor-finish".into()),

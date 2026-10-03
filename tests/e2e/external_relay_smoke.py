@@ -23,6 +23,7 @@ import http.client
 import http.server
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -48,6 +49,39 @@ EVENTS = ("session-start", "user-prompt-submit", "session-end")
 
 class SmokeFailure(RuntimeError):
     """An assertion or subprocess failed."""
+
+
+def subprocess_diagnostics(stderr: str) -> str:
+    """Expose bounded error markers, never arbitrary subprocess text or payloads."""
+    # Regex redaction cannot reliably distinguish unknown secrets from prose.
+    # Emit only fixed vocabulary and bounded numeric codes from captured stderr.
+    sample = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stderr[:65536])
+    markers = [
+        marker for marker in (
+            "open relay queue", "configure relay queue", "relay queue busy",
+            "database is locked", "database table is locked", "disk I/O error",
+            "unable to open database file", "database or disk is full",
+            "another flush already holds", "not a usable relay queue",
+            "hook batch transport failure: timeout",
+            "hook batch transport failure: connect",
+            "hook batch transport failure: redirect refused",
+            "hook batch transport failure: request",
+            "hook batch transport failure: io",
+            "hook batch transport failure: flush budget exhausted",
+            "unreadable ack", "inconsistent ack", "hook batch ack exceeded",
+        ) if marker in sample
+    ]
+    for pattern, prefix in (
+        (r"\bHTTP ([1-5][0-9]{2}) from /hook/batch\b", "HTTP "),
+        (r"\(os error ([0-9]{1,5})\)", "os error "),
+    ):
+        for code in re.findall(pattern, sample)[:4]:
+            marker = prefix + code
+            if marker not in markers:
+                markers.append(marker)
+    if not markers:
+        return "unrecognized stderr omitted" if stderr else "stderr empty"
+    return "stderr markers: " + "; ".join(markers)[:512]
 
 
 class DropFirstResponseProxy:
@@ -212,7 +246,8 @@ def parse_status(stdout: str, label: str) -> dict[str, Any]:
     outcomes = parsed.get("receipt_outcomes")
     expected = {
         "stored", "replayed", "resumed", "ignored_end", "dropped_policy",
-        "dropped_subagent", "dropped_unauthorized", "dropped_collision", "unknown",
+        "dropped_subagent", "dropped_unauthorized", "dropped_collision", "dropped_invalid",
+        "unknown",
     }
     if not isinstance(outcomes, dict) or set(outcomes) != expected:
         raise SmokeFailure(f"{label} status JSON has incomplete receipt outcomes")
@@ -330,7 +365,10 @@ class Harness:
             },
         )
         if expect is not None and result.returncode != expect:
-            raise SmokeFailure(f"{label} exited {result.returncode}, expected {expect}")
+            raise SmokeFailure(
+                f"{label} exited {result.returncode}, expected {expect}; "
+                f"{subprocess_diagnostics(result.stderr)}"
+            )
         return result
 
     def relay(self, arguments: Iterable[str | Path], **kwargs: Any) -> subprocess.CompletedProcess[str]:

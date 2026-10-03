@@ -32,6 +32,8 @@ struct IngestReport {
     #[serde(default)]
     dropped_collision: u64,
     #[serde(default)]
+    dropped_invalid: u64,
+    #[serde(default)]
     failed: u64,
 
     dropped_by_policy: u64,
@@ -365,8 +367,8 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
             );
             println!(
-                "    drops:      {} unauthorized, {} collision",
-                ingest.dropped_unauthorized, ingest.dropped_collision
+                "    drops:      {} unauthorized, {} collision, {} invalid",
+                ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
             );
             println!(
                 "    shed:       {} saturated, {} rate-limited",
@@ -517,6 +519,7 @@ mod tests {
             "ignored_end",
             "dropped_unauthorized",
             "dropped_collision",
+            "dropped_invalid",
             "failed",
         ] {
             assert_eq!(value[name], 0);

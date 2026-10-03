@@ -419,6 +419,45 @@ another shell, pass `--workstream-id <uuid>` explicitly. Search results preserve
 the source harness, role, event sequence, and content. Historical tool activity
 is labelled completed evidence and must never be replayed as a pending call.
 
+Search and tail also return optional `source_record_id` and `metadata` fields.
+The text CLI prints the source record and correlation metadata as escaped JSON;
+`--json` preserves these fields for consumers. Older server responses without
+them remain readable. Startup context packets keep their existing format and
+omit these additional fields.
+
+Source labels and string metadata values are scrubbed with the server's
+configured sanitizer **before** the 512-byte UTF-8 cap. The metadata allowlist
+matches the shipped adapters: string `tool`, `tool_call_id`, `tool_use_id`,
+`parent_id`, `summary_type`, and `status`; boolean `is_error`; signed 32-bit
+`exit_code`; and unsigned 64-bit `loss_count`. Unknown keys, nested objects,
+arrays, and wrong scalar types are discarded. Empty metadata is omitted. These
+labels describe untrusted historical evidence; they cannot grant authority,
+choose a project, or prove a tool's success independently.
+
+The same scrub and allowlist protect legacy SQLite rows during search/tail,
+without rewriting them. Malformed metadata or legacy dumps over 16 KiB return
+no metadata. Existing raw segments are not rewritten by a read. The ledger's
+FTS query, ranking, ordering, and limits remain unchanged; provenance is fetched
+in the existing event query, without additional per-result SQL reads.
+
+`event_id` remains the deduplication key. Native adapters derive it from the
+original source before provenance redaction; truncating or redacting two source
+labels therefore cannot merge distinct event ids. Repeating an event is a
+no-op when its stable identity (`agent`, `native_session_id`, `kind`) matches.
+The first indexed content, role, timestamp and provenance remain unchanged,
+even if a later upload differs or the sanitizer's patterns have changed. This
+also permits replay of legacy rows above today's write bounds; read-time
+provenance sanitization still applies. Changing the stable identity is rejected
+and the SQL batch rolls back. A rejected immutable raw segment is not indexed;
+a corrected retry can import the valid batch without advancing history for the
+rejected one. Finished runs retain the existing no-op behavior for late events,
+including new event ids; their history and latest sequence do not advance.
+
+Client event ids beginning with `managed-run:` are refused before raw storage,
+including on retries of a finished run. This namespace belongs to the server's
+checkpoint and extraction-loss events, which it appends when completing an
+active run.
+
 ## Native adapter behavior
 
 | Harness | Fresh native session | Returning native session | Read-only source |
@@ -462,6 +501,51 @@ An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
+
+When the linked Claude session is a Claude Code background session that is
+still running in the daemon, Claude refuses `--resume <id>` when another flag
+comes with it (seen with `--model`, `--effort` and
+`--dangerously-skip-permissions` on Claude Code 2.1.287; a bare `--resume`
+attaches) and points at `claude attach <id>`. Only when the
+transcript shows the session ran in the background (`sessionKind: "bg"`)
+does ai-memory ask `claude agents --json --cwd <checkout>`. When that lists the
+session as a live background one in this checkout, it launches
+`claude attach <id>` with the listing's short id instead. Native arguments are
+not passed to the attach client. In the Claude Code 2.1.288 lifecycle validation,
+no new `SessionStart` was observed from the attach client; the background
+worker's hooks carried the background session id. Delivery of a pending
+workstream context packet through attach remains unverified: that validation
+did not exercise a pending packet. The launcher reports this limitation and
+suppresses the missing-acknowledgement warning for attach. (#1052)
+
+When the attach client detaches or exits early, the managed run finishes with
+the client's exit status and imports the linked transcript available at finish.
+It neither stops the daemon nor waits for the background turn to complete;
+events written after that import remain outside it. In the same validation,
+Ctrl-Z detached with exit 0, and terminating only the attach client produced
+exit 1 while the daemon continued and emitted `Stop` after the run finished.
+
+A failed, unavailable or unexpected `claude agents` listing keeps the native
+resume and its original flags. That fallback can still encounter Claude's
+refusal to resume a live background session with flags. The lifecycle test
+injected an exit-127 listing and an incompatible JSON object, then exercised
+the real resume and backend; an older Claude binary without `agents` was not
+tested. These observations are recorded in the
+[PR #1067 lifecycle validation](https://github.com/akitaonrails/ai-memory/pull/1067#issuecomment-5962340148).
+
+Claude Code background sessions run inside the Claude Code daemon, separately
+from the attach client. Their hooks use the daemon worker's inherited
+environment: the 2.1.288 validation observed an `AI_MEMORY_RUN_ID` from an
+earlier launch, different from the current attach runs. A daemon hook therefore
+does not by itself identify the current attaching run. When a managed Claude
+session attaches to one (`/resume` on a session shown as
+"running in the background"), the conversation goes on in the background
+session's transcript. At the end of the run, ai-memory looks for a transcript
+written during the run whose `sessionKind: "bg"` records name the run's own
+session as the attached client and this checkout as `cwd`, and finishes the run
+on that background session, so the next launch resumes it instead of the empty
+foreground session. A background session attached by another launch is never
+taken. (#1050)
 
 Crush has no hooks to link its session: a fresh Crush launch claims the one top-level session
 created while it ran (its title and sub-agent sessions do not count), and
@@ -516,6 +600,19 @@ variable into the invoking shell first. A later `--env` overrides a same-key
 expand `$HOME` on the command line and write absolute paths in an
 `--env-file`. Manual `install-hooks` / `install-mcp` do not take `--env`; they
 read their own environment.
+
+Automatic harness selection (bare `run`, `continue` and `resume`) scans the
+store the launch resolves from that same environment, so a checkout whose
+sessions live under a custom `CLAUDE_CONFIG_DIR` is found when the variable is
+set. Whenever the client links a session, at launch or when the run finishes,
+it also records that session's store in the client-local `client-projects.json`.
+If a later launch cannot find the linked session in the store it resolves and
+the recorded store is a different directory, the launch stops with an error
+naming both directories instead of starting fresh and repointing the workstream
+away from a session that still exists. Relaunch with the same variable (or
+store flag) to resume it, or pass `--fresh` to start a new session. Sessions linked before this record
+existed, and a session missing from its own recorded store, still start fresh
+as before.
 
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
