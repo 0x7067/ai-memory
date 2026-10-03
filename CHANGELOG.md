@@ -152,6 +152,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reselects the transport while preserving configured headers, reasoning,
   and timeout.
   (#1080)
+- Fixed `[[_global:path]]` resolving against the source page's workspace
+  instead of the reserved `_global` project in the default workspace. A
+  page outside `default` can now graph-link to standing global pages, and
+  `/web` points at the same home. Sibling `[[project:path]]` and explicit
+  `[[workspace/project:path]]` are unchanged. Legacy rows that stored the
+  project-only form with a NULL workspace resolve when the reserved page
+  is next written. (#1042)
 
 ### Docs
 - Corrected the Codex support matrix to describe managed-run recovery from a
