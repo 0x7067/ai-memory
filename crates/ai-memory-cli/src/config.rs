@@ -4567,7 +4567,8 @@ mod tests {
 
             let provider = cfg.llm_provider_config().unwrap().unwrap();
             assert_eq!(provider.provider, ProviderChoice::OpenCode, "{spelling}");
-            assert_eq!(provider.model, "claude-sonnet-4-6", "{spelling}");
+            assert_eq!(provider.model, "mimo-v2.6-flash", "{spelling}");
+            assert!(provider.base_url.is_none(), "{spelling}");
             assert_eq!(
                 provider.auth.requirement(),
                 AuthRequirement::RequiredApiKey {
