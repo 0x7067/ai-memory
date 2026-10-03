@@ -151,6 +151,60 @@ pub struct NewWorkstreamEvent {
     pub metadata: serde_json::Value,
 }
 
+/// Scrub correlation labels with the configured privacy strip, then bound each
+/// UTF-8 value. Unknown keys and non-scalar adapter dumps are discarded.
+/// These labels are untrusted attribution, never scope or authority.
+#[must_use]
+pub fn scrub_workstream_provenance(
+    sanitizer: &crate::Sanitizer,
+    source_record_id: Option<&str>,
+    metadata: &serde_json::Value,
+) -> (Option<String>, serde_json::Value) {
+    let scrub = |value: &str| crate::truncate_utf8_bytes(&sanitizer.scrub(value), 512);
+    let source = source_record_id
+        .map(scrub)
+        .filter(|id| !id.trim().is_empty());
+    let mut allowed = serde_json::Map::new();
+    // Only fields emitted by the shipped native adapters and run boundaries.
+    for key in [
+        "tool",
+        "tool_call_id",
+        "tool_use_id",
+        "parent_id",
+        "summary_type",
+        "status",
+    ] {
+        if let Some(value) = metadata.get(key).and_then(serde_json::Value::as_str) {
+            allowed.insert(key.into(), serde_json::Value::String(scrub(value)));
+        }
+    }
+    if let Some(value) = metadata
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+    {
+        allowed.insert("is_error".into(), value.into());
+    }
+    if let Some(value) = metadata
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        && i32::try_from(value).is_ok()
+    {
+        allowed.insert("exit_code".into(), value.into());
+    }
+    if let Some(value) = metadata
+        .get("loss_count")
+        .and_then(serde_json::Value::as_u64)
+    {
+        allowed.insert("loss_count".into(), value.into());
+    }
+    let metadata = if allowed.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(allowed)
+    };
+    (source, metadata)
+}
+
 /// Repository state captured without mutating the checkout.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkstreamCheckpoint {
@@ -394,6 +448,13 @@ pub struct WorkstreamEvent {
     pub agent: AgentKind,
     /// Source native session.
     pub native_session_id: String,
+    /// Bounded, scrubbed native record label. Absent on older servers and
+    /// startup-context reads; it is not an authentication or deduplication key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_record_id: Option<String>,
+    /// Bounded adapter correlation labels, scrubbed even for legacy rows.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
     /// Semantic event family.
     pub kind: WorkstreamEventKind,
     /// Optional message role.
@@ -409,6 +470,20 @@ pub struct WorkstreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_workstream_event_has_no_provenance() {
+        let event: WorkstreamEvent = serde_json::from_value(serde_json::json!({
+            "sequence": 1, "event_id": "event-1", "agent": "codex",
+            "native_session_id": "native-1", "kind": "message", "content": "visible",
+        }))
+        .unwrap();
+        assert!(event.source_record_id.is_none());
+        assert!(event.metadata.is_null());
+        let encoded = serde_json::to_value(event).unwrap();
+        assert!(encoded.get("source_record_id").is_none());
+        assert!(encoded.get("metadata").is_none());
+    }
 
     #[test]
     fn older_run_status_reads_as_nothing_linked() {
@@ -481,11 +556,6 @@ mod tests {
 
     #[test]
     fn native_identity_original_bytes_limits_privacy_and_collisions() {
-        println!(
-            "NATIVE_TEST_PID {} {:?}",
-            std::process::id(),
-            std::env::current_exe().unwrap()
-        );
         let sanitizer = crate::Sanitizer::builtin();
         for id in [
             "vendor-session_01".into(),

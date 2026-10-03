@@ -40,9 +40,9 @@ use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::install_mcp;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
-    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_claude_code_payload, build_devin_payload, build_grok_payload, build_pool_settings_yaml,
-    hook_script_for_current_platform,
+    COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
+    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_grok_payload,
+    build_pool_settings_yaml, hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -176,6 +176,9 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
         AgentChoice::Pool => emit_pool(&emit_root, &args),
+        AgentChoice::CopilotCli => {
+            emit_other(&emit_root, agent_sub, &args, &[COPILOT_CLI_PROFILE.events]);
+        }
         AgentChoice::OpenCode
         | AgentChoice::OpenCode2
         | AgentChoice::Pi

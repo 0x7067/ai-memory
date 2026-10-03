@@ -198,7 +198,10 @@ the complete startup response has been assembled. With server-wide
 `[handoff].claim_on_session_start = false`, SessionStart instead emits a
 metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.
-Manual handoffs take precedence;
+With server-wide `[handoff].create_on_session_end = false`, session end writes
+the summary page and enqueues consolidation but skips creating an automatic
+baton, and an OpenCode root-turn checkpoint refreshes the page without one
+(#1043). Manual handoffs take precedence;
 otherwise the newest cwd-eligible automatic handoff is delivered, and that
 same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
@@ -443,6 +446,11 @@ so that dependencies between projects become explicit edges in the graph:
 
 * `[[project:path.md]]` — a sibling project in the same workspace.
 * `[[workspace/project:path.md]]` — a project in another workspace.
+* `[[_global:path.md]]` — the reserved `_global` preferences project in
+  the default workspace, even when the source page lives elsewhere.
+  Bare `[[name]]` stays project-local; this is the form that names the
+  shared scope. An explicit `[[workspace/_global:path.md]]` keeps the
+  named workspace.
 
 The parser (`ai-memory-wiki::extract_links`) yields a `LinkTarget
 { workspace, project, path }`; the store resolves it against the named
@@ -524,7 +532,7 @@ long-lived entry appearing there is that policy working rather than a fault.
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out; an update whose path names an existing pinned page is skipped (`_slots/` excepted). Omitting `session_id` (or sending a blank one) consolidates the latest completed session in the resolved project; the same omission on a project with none fails as `no completed session in <scope>`. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
 | `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
-| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
+| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL; optional `session_id` cites a session of the same project as evidence, and on `sessions/<id>.md` stamps the session-page frontmatter and settles the queued consolidation job. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the `contradiction_band_min`–`contradiction_band_max` cosine-similarity band (default 0.4–0.75; "same topic, not a near-duplicate" — at/above the max is A3 dedup, below the min unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only — never deletes/edits/supersedes a page and persists no edge (invariants #13, #16, #2), so no migration. On a single-language or single-domain store, background similarity between unrelated pages already sits well above the default floor, so the band measures domain proximity more than conflict and produces noisy findings — raise `contradiction_band_min` (`config.toml` or `AI_MEMORY_CONTRADICTION_BAND_MIN`) for such a store. |
@@ -811,8 +819,9 @@ dedup_cold_clusters = false        # A3 opt-in: cluster near-duplicate cold
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
 
-[handoff]                         # optional server-wide delivery policy
+[handoff]                         # optional server-wide handoff policy
 claim_on_session_start = true     # false offers metadata; explicit accept claims
+create_on_session_end = true      # false stops automatic handoffs at session end and OpenCode turn checkpoints
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000
@@ -871,8 +880,8 @@ enabled = false                  # true: skip low-information session pages from
 
 [retrieval]                       # opt-in ranking signals; all off by default
 query_intent = false              # lexical session-recall routing: queries phrased as
-                                  # "上次 / …的会话 / last time / yesterday" hand session
-                                  # pages back their default kind/tier authority penalty
+                                  # "上次 / …的会话 / last time / yesterday / última sessão"
+                                  # hand session pages back their default kind/tier authority penalty
 session_recall_bonus = 0.25       # extra authority on top of the cancelled penalty;
                                   # lower it (e.g. 0.15) if rank drift on
                                   # "之前/上次"-prefixed fact queries matters more
@@ -954,6 +963,16 @@ idle_window_secs = 300            # operator must be quiet this long before a ru
 # max_clusters_per_run = 8        # bounded fan-out per run (invariant #5; 0 ⇒ default 8)
 # min_cold_pages = 2             # events-accrued gate: skip a run below this many cold pages
 ```
+
+The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese
+history phrases: "o que fizemos na última sessão", "onde paramos ontem", and
+"lembre a decisão anterior", plus "sessão anterior".
+Accented and unaccented spellings are accepted, including "ultima sessao" and
+"decisao anterior". Latin markers match whole words. Technical queries such as
+"erro na sessão do usuário", "sessão expira", "antes de salvar", and bare
+"sessão" or "antes" do not trigger routing. It remains off by default; enabling
+it reuses the existing session authority adjustment without changing FTS
+stopwords or adding a ranking signal.
 
 **LLM provider env** (opt-in):
 ```

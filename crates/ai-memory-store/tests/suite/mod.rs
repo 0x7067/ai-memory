@@ -28,3 +28,4 @@ mod session_scope_from_observations;
 mod sessions_by_agent;
 mod slot_visibility;
 mod stress_writer_throughput;
+mod workstream_provenance;

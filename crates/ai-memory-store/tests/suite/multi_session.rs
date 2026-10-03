@@ -1119,8 +1119,8 @@ fn finish_authority(
     level: ai_memory_core::AuthLevel,
     user: Option<ai_memory_core::UserId>,
     name: Option<&str>,
-) -> ai_memory_store::WorkstreamFinishAuthority {
-    ai_memory_store::WorkstreamFinishAuthority::from_auth(
+) -> ai_memory_store::ManagedRunAuthority {
+    ai_memory_store::ManagedRunAuthority::from_auth(
         level,
         user.map(ai_memory_core::AuthorizedViewer),
         user,
@@ -1134,6 +1134,7 @@ fn finish_authority(
 
 fn finish_input(run_id: ai_memory_core::ManagedRunId) -> ai_memory_store::FinishWorkstreamRun {
     ai_memory_store::FinishWorkstreamRun {
+        sanitizer: ai_memory_core::Sanitizer::default(),
         run_id,
         native_session_id: Some("native-finish".into()),
         source_cursor: Some("cursor-finish".into()),
@@ -1240,7 +1241,7 @@ impl FinishFixture {
         }
     }
 
-    fn alice(&self) -> ai_memory_store::WorkstreamFinishAuthority {
+    fn alice(&self) -> ai_memory_store::ManagedRunAuthority {
         finish_authority(
             ai_memory_core::AuthLevel::User,
             Some(self.alice),
@@ -1277,13 +1278,13 @@ impl FinishFixture {
     async fn refused_unchanged(
         &self,
         run_id: ai_memory_core::ManagedRunId,
-        authority: ai_memory_store::WorkstreamFinishAuthority,
+        authority: ai_memory_store::ManagedRunAuthority,
     ) {
         let before = finish_snapshot(&self.store).await;
         assert!(
             self.store
                 .reader
-                .authorize_workstream_finish(run_id, authority.clone())
+                .authorize_managed_run(run_id, authority.clone())
                 .await
                 .is_err(),
             "preflight must refuse"
@@ -1314,7 +1315,7 @@ async fn owner_finish_store_refuses_another_writer_including_finished_retry() {
         assert!(matches!(
             f.store
                 .reader
-                .authorize_workstream_finish(run.run_id, bob.clone())
+                .authorize_managed_run(run.run_id, bob.clone())
                 .await,
             Err(StoreError::Forbidden(_))
         ));
@@ -1340,7 +1341,7 @@ async fn owner_finish_store_refuses_another_writer_including_finished_retry() {
     .await;
     f.store
         .reader
-        .authorize_workstream_finish(run.run_id, f.alice())
+        .authorize_managed_run(run.run_id, f.alice())
         .await
         .unwrap();
     let result = f
@@ -1380,7 +1381,7 @@ async fn owner_finish_store_refuses_another_writer_including_finished_retry() {
         let shared = f.run(name, None).await;
         f.store
             .reader
-            .authorize_workstream_finish(shared.run_id, auth.clone())
+            .authorize_managed_run(shared.run_id, auth.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -1402,7 +1403,7 @@ async fn owner_finish_store_rechecks_write_after_preflight() {
     let auth = f.alice();
     f.store
         .reader
-        .authorize_workstream_finish(run.run_id, auth.clone())
+        .authorize_managed_run(run.run_id, auth.clone())
         .await
         .unwrap();
     f.store
@@ -1435,7 +1436,7 @@ async fn owner_finish_store_rechecks_write_after_preflight() {
         .unwrap();
     f.store
         .reader
-        .authorize_workstream_finish(run.run_id, auth.clone())
+        .authorize_managed_run(run.run_id, auth.clone())
         .await
         .unwrap();
     f.store
@@ -1445,11 +1446,11 @@ async fn owner_finish_store_rechecks_write_after_preflight() {
         .unwrap();
     f.store
         .reader
-        .authorize_workstream_finish(run.run_id, auth.clone())
+        .authorize_managed_run(run.run_id, auth.clone())
         .await
         .unwrap();
     // Attribution UserId is real middleware data even if a viewer marker is absent.
-    let fallback = ai_memory_store::WorkstreamFinishAuthority::from_auth(
+    let fallback = ai_memory_store::ManagedRunAuthority::from_auth(
         ai_memory_core::AuthLevel::User,
         None,
         Some(f.alice),
@@ -1462,7 +1463,7 @@ async fn owner_finish_store_rechecks_write_after_preflight() {
     assert!(
         f.store
             .reader
-            .authorize_workstream_finish(run.run_id, fallback.clone())
+            .authorize_managed_run(run.run_id, fallback.clone())
             .await
             .is_ok(),
         "the real DB-user attribution id must retain its Write grant without a viewer marker"
@@ -1490,7 +1491,7 @@ async fn owner_finish_store_refuses_a_deleted_user_after_preflight() {
         .unwrap();
     f.store
         .reader
-        .authorize_workstream_finish(run.run_id, auth.clone())
+        .authorize_managed_run(run.run_id, auth.clone())
         .await
         .unwrap();
     let conn = rusqlite::Connection::open(f.store.db_path()).unwrap();
@@ -1508,7 +1509,7 @@ async fn owner_finish_store_refuses_a_deleted_user_after_preflight() {
         matches!(
             f.store
                 .reader
-                .authorize_workstream_finish(run.run_id, auth.clone())
+                .authorize_managed_run(run.run_id, auth.clone())
                 .await,
             Err(StoreError::Forbidden(_))
         ),
@@ -1567,7 +1568,7 @@ async fn owner_finish_store_proxy_policy_requires_server_and_authenticated_ident
             "proxy compatibility requires trusted server configuration",
         ),
     ] {
-        let auth = ai_memory_store::WorkstreamFinishAuthority::from_auth(
+        let auth = ai_memory_store::ManagedRunAuthority::from_auth(
             level, None, None, &identity, configured,
         );
         let before = finish_snapshot(&f.store).await;
@@ -1575,7 +1576,7 @@ async fn owner_finish_store_proxy_policy_requires_server_and_authenticated_ident
             matches!(
                 f.store
                     .reader
-                    .authorize_workstream_finish(run.run_id, auth.clone())
+                    .authorize_managed_run(run.run_id, auth.clone())
                     .await,
                 Err(StoreError::Forbidden(_))
             ),
@@ -1593,7 +1594,7 @@ async fn owner_finish_store_proxy_policy_requires_server_and_authenticated_ident
         );
         assert_eq!(finish_snapshot(&f.store).await, before);
     }
-    let proxy = ai_memory_store::WorkstreamFinishAuthority::from_auth(
+    let proxy = ai_memory_store::ManagedRunAuthority::from_auth(
         ai_memory_core::AuthLevel::User,
         None,
         None,
@@ -1732,7 +1733,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
     let anonymous = finish_authority(ai_memory_core::AuthLevel::Anonymous, None, None);
     store
         .reader
-        .authorize_workstream_finish(run.run_id, anonymous.clone())
+        .authorize_managed_run(run.run_id, anonymous.clone())
         .await
         .unwrap();
     store
@@ -1754,7 +1755,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
         matches!(
             store
                 .reader
-                .authorize_workstream_finish(run.run_id, anonymous.clone())
+                .authorize_managed_run(run.run_id, anonymous.clone())
                 .await,
             Err(StoreError::Forbidden(_))
         ),
@@ -1779,7 +1780,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
     assert!(
         store
             .reader
-            .authorize_workstream_finish(run.run_id, anonymous.clone())
+            .authorize_managed_run(run.run_id, anonymous.clone())
             .await
             .is_err(),
         "unreadable topology must fail closed in preflight"
@@ -1802,7 +1803,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
     .unwrap();
     store
         .reader
-        .authorize_workstream_finish(run.run_id, root.clone())
+        .authorize_managed_run(run.run_id, root.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -1883,7 +1884,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
     assert!(matches!(
         store
             .reader
-            .authorize_workstream_finish(ai_memory_core::ManagedRunId::new(), root.clone())
+            .authorize_managed_run(ai_memory_core::ManagedRunId::new(), root.clone())
             .await,
         Err(StoreError::NotFound(_))
     ));
@@ -1999,7 +2000,7 @@ async fn owner_finish_store_strict_resolution_refuses_pairing_missing_and_sql_fa
     .unwrap();
     f.store
         .reader
-        .authorize_workstream_finish(run.run_id, f.alice())
+        .authorize_managed_run(run.run_id, f.alice())
         .await
         .unwrap();
     assert_eq!(
@@ -2023,7 +2024,7 @@ async fn owner_finish_store_keeps_qualified_identity_namespaces() {
     let run = f.run("subject-owned", Some(identity.storage_key())).await;
     // A display username matching another identity's subject is a different owner.
     f.refused_unchanged(run.run_id, f.alice()).await;
-    let subject = ai_memory_store::WorkstreamFinishAuthority::from_auth(
+    let subject = ai_memory_store::ManagedRunAuthority::from_auth(
         ai_memory_core::AuthLevel::User,
         Some(ai_memory_core::AuthorizedViewer(f.alice)),
         Some(f.alice),
@@ -2034,7 +2035,7 @@ async fn owner_finish_store_keeps_qualified_identity_namespaces() {
         issuer: "https://other-idp.example".into(),
         subject: "alice".into(),
     };
-    let foreign = ai_memory_store::WorkstreamFinishAuthority::from_auth(
+    let foreign = ai_memory_store::ManagedRunAuthority::from_auth(
         ai_memory_core::AuthLevel::User,
         Some(ai_memory_core::AuthorizedViewer(f.alice)),
         Some(f.alice),
@@ -2044,7 +2045,7 @@ async fn owner_finish_store_keeps_qualified_identity_namespaces() {
     f.refused_unchanged(run.run_id, foreign).await;
     f.store
         .reader
-        .authorize_workstream_finish(run.run_id, subject.clone())
+        .authorize_managed_run(run.run_id, subject.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -2060,11 +2061,6 @@ async fn owner_finish_store_keeps_qualified_identity_namespaces() {
 
 #[tokio::test]
 async fn native_identity_store_link_refuses_original_dirty_bytes() {
-    println!(
-        "NATIVE_TEST_PID {} {:?}",
-        std::process::id(),
-        std::env::current_exe().unwrap()
-    );
     let f = FinishFixture::new().await;
     let run = f.run("identity-link", Some(operator("alice"))).await;
     for id in [
@@ -2108,11 +2104,6 @@ async fn native_identity_store_link_refuses_original_dirty_bytes() {
 
 #[tokio::test]
 async fn native_identity_store_adoption_refuses_before_link() {
-    println!(
-        "NATIVE_TEST_PID {} {:?}",
-        std::process::id(),
-        std::env::current_exe().unwrap()
-    );
     let f = FinishFixture::new().await;
     let run = f.run("identity-adopt", Some(operator("alice"))).await;
     let input = |id: &str| LinkOrAdoptManagedRunSession {
@@ -2147,11 +2138,6 @@ async fn native_identity_store_adoption_refuses_before_link() {
 
 #[tokio::test]
 async fn native_identity_store_finish_refuses_without_sql_or_index_mutation() {
-    println!(
-        "NATIVE_TEST_PID {} {:?}",
-        std::process::id(),
-        std::env::current_exe().unwrap()
-    );
     let f = FinishFixture::new().await;
     let run = f.run("identity-finish", Some(operator("alice"))).await;
     for (run_id, event_id) in [
@@ -2202,11 +2188,6 @@ async fn native_identity_store_finish_refuses_without_sql_or_index_mutation() {
 
 #[tokio::test]
 async fn native_identity_store_history_projects_unknown_without_rewriting() {
-    println!(
-        "NATIVE_TEST_PID {} {:?}",
-        std::process::id(),
-        std::env::current_exe().unwrap()
-    );
     let f = FinishFixture::new().await;
     let run = f.run("identity-history", Some(operator("alice"))).await;
     f.store
@@ -2226,7 +2207,12 @@ async fn native_identity_store_history_projects_unknown_without_rewriting() {
         let events = f
             .store
             .reader
-            .search_workstream_events(run.workstream_id, query.to_owned(), 10)
+            .search_workstream_events(
+                run.workstream_id,
+                query.to_owned(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
@@ -2252,7 +2238,12 @@ async fn native_identity_store_history_projects_unknown_without_rewriting() {
     assert_eq!(
         f.store
             .reader
-            .search_workstream_events(run.workstream_id, "".into(), 10)
+            .search_workstream_events(
+                run.workstream_id,
+                "".into(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap()[0]
             .native_session_id,

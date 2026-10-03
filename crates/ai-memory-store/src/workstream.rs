@@ -4,7 +4,7 @@ use std::str::FromStr as _;
 
 use ai_memory_core::{
     AgentKind, ManagedRunId, NativeSessionIdentity, NewWorkstreamEvent, ProjectId, Sanitizer,
-    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId,
+    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -30,25 +30,27 @@ pub enum WorkstreamSelection {
     New(String),
 }
 
-/// Authenticated authority shared by finish preflight and the writer transaction.
+/// Authenticated authority for a managed-run mutation: finish (its preflight
+/// and its import transaction), cancel, heartbeat, native-session link and
+/// context acceptance.
 ///
 /// Construct only from middleware extensions, never transcript metadata. Owner
 /// filters are derived here so this boundary cannot request `OwnerFilter::Any`.
 #[derive(Debug, Clone)]
-pub struct WorkstreamFinishAuthority {
+pub struct ManagedRunAuthority {
     principal: crate::ProjectPrincipal,
     owner: ai_memory_core::OwnerFilter,
     distinguishes_operators: bool,
-    project_policy: FinishProjectPolicy,
+    project_policy: RunProjectPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum FinishProjectPolicy {
+enum RunProjectPolicy {
     Grants,
     TrustedProxyLegacy,
 }
 
-impl WorkstreamFinishAuthority {
+impl ManagedRunAuthority {
     /// Reduce the actual HTTP auth extensions to one immutable finish authority.
     /// A DB user's attribution id remains authoritative without a viewer marker.
     #[must_use]
@@ -80,8 +82,8 @@ impl WorkstreamFinishAuthority {
         // no DB principal. Preserve its viewer-less project policy only when
         // this server actually enables trusted proxy authentication.
         let project_policy = match (level, user, actor.identity_key(), trusted_proxy_identity) {
-            (AuthLevel::User, None, Some(_), true) => FinishProjectPolicy::TrustedProxyLegacy,
-            _ => FinishProjectPolicy::Grants,
+            (AuthLevel::User, None, Some(_), true) => RunProjectPolicy::TrustedProxyLegacy,
+            _ => RunProjectPolicy::Grants,
         };
         Self {
             principal,
@@ -94,10 +96,10 @@ impl WorkstreamFinishAuthority {
 
 /// Resolve only the real run scope and owner, without creating a scope or
 /// changing the active-project pointer. Both callers supply a SQL snapshot.
-pub(crate) fn authorize_finish(
+pub(crate) fn authorize_run_mutation(
     conn: &Connection,
     run_id: ManagedRunId,
-    authority: &WorkstreamFinishAuthority,
+    authority: &ManagedRunAuthority,
 ) -> StoreResult<()> {
     let (owner, workspace, project) = conn
         .query_row(
@@ -121,7 +123,7 @@ pub(crate) fn authorize_finish(
     }
     let workspace = WorkspaceId::from_slice(&workspace)?;
     let project = ProjectId::from_slice(&project)?;
-    let project_authz = crate::project_authz::resolve_finish_project_authz(
+    let project_authz = crate::project_authz::resolve_project_authz_strict(
         conn,
         workspace,
         project,
@@ -129,8 +131,8 @@ pub(crate) fn authorize_finish(
         authority.distinguishes_operators,
     )?;
     match authority.project_policy {
-        FinishProjectPolicy::TrustedProxyLegacy => Ok(()),
-        FinishProjectPolicy::Grants => project_authz
+        RunProjectPolicy::TrustedProxyLegacy => Ok(()),
+        RunProjectPolicy::Grants => project_authz
             .authorize(crate::ProjectAccess::Write)
             .map_err(|failure| StoreError::Forbidden(failure.message())),
     }
@@ -222,6 +224,8 @@ pub struct LinkOrAdoptManagedRunSession {
 /// Store-level finish input after the raw segment has been made durable.
 #[derive(Debug, Clone)]
 pub struct FinishWorkstreamRun {
+    /// Configured, reusable privacy strip for the provenance storage boundary.
+    pub sanitizer: Sanitizer,
     /// Managed invocation.
     pub run_id: ManagedRunId,
     /// Actual native session, when observed.
@@ -934,12 +938,12 @@ fn accept_context_in_transaction(
 /// Index one immutable source segment and close the run atomically.
 pub(crate) fn finish_run(
     conn: &mut Connection,
-    authority: &WorkstreamFinishAuthority,
+    authority: &ManagedRunAuthority,
     input: &FinishWorkstreamRun,
 ) -> StoreResult<FinishedWorkstreamRun> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    authorize_finish(&tx, input.run_id, authority)?;
+    authorize_run_mutation(&tx, input.run_id, authority)?;
     let run: Option<FinishRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, state, \
@@ -1031,25 +1035,40 @@ pub(crate) fn finish_run(
                 event.event_id, event.native_session_id
             )));
         }
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workstream_events \
-             WHERE workstream_id = ?1 AND event_id = ?2)",
-            params![workstream, event.event_id],
-            |row| row.get(0),
-        )?;
-        if exists {
+        let existing: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT agent_kind, native_session_id, kind FROM workstream_events \
+             WHERE workstream_id = ?1 AND event_id = ?2",
+                params![workstream, event.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            // Privacy patterns and bounds can change between uploads. Replay
+            // keeps the first indexed data and compares only stable identity.
+            if existing.0 != event.agent.as_str()
+                || existing.1 != event.native_session_id
+                || existing.2 != event.kind.as_str()
+            {
+                return Err(StoreError::InvalidState(
+                    "workstream event id reused with different identity".into(),
+                ));
+            }
             continue;
         }
+        let (source_record_id, metadata) = scrub_workstream_provenance(
+            &input.sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let content =
+            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES);
         latest += 1;
         // Store-boundary bound (defense in depth): the hook layer already
         // scrubs and normalizes event content, but the store is the last gate
         // before durable persistence — bound the free-text `content` so a
         // caller that ever forgets cannot write unbounded prose to the DB.
-        // `metadata_json` is left intact: it is structured JSON and
-        // truncating the serialized form would corrupt it; its size is
-        // bounded by the event schema, not free text.
-        let content =
-            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES);
         tx.execute(
             "INSERT INTO workstream_events( \
                  workstream_id, sequence, event_id, agent_kind, native_session_id, \
@@ -1062,12 +1081,12 @@ pub(crate) fn finish_run(
                 event.event_id,
                 event.agent.as_str(),
                 event_identity.as_str(),
-                event.source_record_id,
+                source_record_id,
                 event.kind.as_str(),
                 event.role,
                 content,
                 event.occurred_at,
-                serde_json::to_string(&event.metadata)?,
+                metadata_json,
                 input.segment_path,
                 now,
             ],
@@ -1430,6 +1449,8 @@ pub(crate) fn run_context(
             event_id,
             agent: AgentKind::from_wire(&agent),
             native_session_id,
+            source_record_id: None,
+            metadata: serde_json::Value::Null,
             kind: WorkstreamEventKind::from_str(&kind)?,
             role,
             content,
@@ -1457,6 +1478,7 @@ pub(crate) fn search_events(
     query: &str,
     limit: usize,
     stopwords: &crate::fts_query::FtsStopwords,
+    sanitizer: &Sanitizer,
 ) -> StoreResult<Vec<WorkstreamEvent>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
     let free_text = query
@@ -1465,67 +1487,92 @@ pub(crate) fn search_events(
         .replace("content:", "");
     let fts_query = crate::prepare_fts5_query(&free_text, stopwords);
     let sql = if fts_query.is_empty() {
-        "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at \
+        "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at, \
+                source_record_id, metadata_json \
          FROM workstream_events WHERE workstream_id = ?1 ORDER BY sequence DESC LIMIT ?2"
     } else {
         "SELECT e.sequence, e.event_id, e.agent_kind, e.native_session_id, e.kind, \
-                e.role, e.content, e.occurred_at \
+                e.role, e.content, e.occurred_at, e.source_record_id, e.metadata_json \
          FROM workstream_events_fts f \
          JOIN workstream_events e ON e.rowid = f.rowid \
          WHERE workstream_events_fts MATCH ?2 AND e.workstream_id = ?1 \
          ORDER BY f.rank LIMIT ?3"
     };
     let mut statement = conn.prepare(sql)?;
-    let read_row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Option<String>>(7)?,
-        ))
-    };
     let mut events = Vec::new();
-    let sanitizer = Sanitizer::builtin();
     if fts_query.is_empty() {
-        let rows = statement.query_map(params![workstream_id.as_bytes(), limit], read_row)?;
+        let rows = statement.query_map(params![workstream_id.as_bytes(), limit], read_event_row)?;
         for row in rows {
-            events.push(stored_event(row?, &sanitizer)?);
+            events.push(stored_event(row?, sanitizer)?);
         }
     } else {
         let rows = statement.query_map(
             params![workstream_id.as_bytes(), fts_query, limit],
-            read_row,
+            read_event_row,
         )?;
         for row in rows {
-            events.push(stored_event(row?, &sanitizer)?);
+            events.push(stored_event(row?, sanitizer)?);
         }
     }
     Ok(events)
 }
 
-fn stored_event(
-    row: (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-    ),
-    sanitizer: &Sanitizer,
-) -> StoreResult<WorkstreamEvent> {
-    let (sequence, event_id, agent, native_session_id, kind, role, content, occurred_at) = row;
+type EventRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamEvent> {
+    let (
+        sequence,
+        event_id,
+        agent,
+        native_session_id,
+        kind,
+        role,
+        content,
+        occurred_at,
+        source,
+        metadata,
+    ) = row;
+    // Oversized or malformed legacy dumps carry no trusted correlation data.
+    let metadata = if metadata.len() <= 16 * 1024 {
+        serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
+    let (source_record_id, metadata) =
+        scrub_workstream_provenance(sanitizer, source.as_deref(), &metadata);
     Ok(WorkstreamEvent {
         sequence,
         event_id,
         agent: AgentKind::from_wire(&agent),
         native_session_id: NativeSessionIdentity::project(&native_session_id, sanitizer),
+        source_record_id,
+        metadata,
         kind: WorkstreamEventKind::from_str(&kind)?,
         role,
         content,

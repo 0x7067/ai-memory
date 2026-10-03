@@ -19,6 +19,13 @@ use ai_memory_relay::identity::{self, InputEvent, ValidEvent};
 use ai_memory_relay::queue::Queue;
 use ai_memory_relay::relay::{self, FlushOptions};
 
+// Compile the same queue source with private test hooks; the shipped library
+// has no hook API. These hooks place a real SQLite holder at the WAL transition.
+use ai_memory_relay::fsguard;
+#[allow(dead_code)]
+#[path = "../src/queue.rs"]
+mod queue_under_test;
+
 // ---------------------------------------------------------------- fixtures
 
 /// A kept sandbox. The path is printed so a failure points at the evidence.
@@ -1483,6 +1490,398 @@ fn v1_migration_preserves_every_existing_value_and_concurrent_reopens() {
 }
 
 #[test]
+fn journal_transition_retries_sqlite_lock_without_losing_v1_values() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("journal-transition");
+    let holder = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+    let before = snapshot(&holder);
+    let mut busy = 0;
+    let result = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_secs(10),
+        &mut |phase| match phase {
+            OpenPhase::BeforeJournal => holder.execute_batch("BEGIN IMMEDIATE;").unwrap(),
+            OpenPhase::JournalBusy => {
+                busy += 1;
+                holder.execute_batch("ROLLBACK;").unwrap();
+            }
+            _ => {}
+        },
+    );
+    assert_eq!(busy, 1, "the real holder must force SQLITE_BUSY");
+    let queue = result.unwrap();
+    assert_eq!(snapshot(&holder), before);
+    assert_eq!(queue.stats(200).unwrap().receipt_outcomes["unknown"], 1);
+    assert_eq!(
+        holder
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["relay.sqlite", "relay.sqlite-wal", "relay.sqlite-shm"] {
+            assert_eq!(
+                std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn a_foreign_identity_after_preflight_is_refused_without_mutation() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("foreign-after-preflight");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    let mut before = Vec::new();
+    let result = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_secs(10),
+        &mut |phase| {
+            if phase == OpenPhase::AfterPreflight {
+                holder
+                    .execute("UPDATE meta SET value='foreign' WHERE key='identity'", [])
+                    .unwrap();
+                before = std::fs::read(&path).unwrap();
+            }
+        },
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("not a usable relay queue"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    for name in fsguard::SIDECARS {
+        assert!(!dir.join(name).exists(), "foreign queue gained {name}");
+    }
+}
+
+#[test]
+fn journal_transition_has_one_bounded_wait_budget() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("journal-timeout");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    let before = snapshot(&holder);
+    let timeout = std::time::Duration::from_millis(40);
+    let start = std::time::Instant::now();
+    let mut busy = 0;
+    let error = queue_under_test::Queue::open_for_test(&dir, timeout, &mut |phase| match phase {
+        OpenPhase::BeforeJournal => holder.execute_batch("BEGIN IMMEDIATE;").unwrap(),
+        OpenPhase::JournalBusy => busy += 1,
+        _ => {}
+    })
+    .unwrap_err();
+    assert!(queue_under_test::is_lock_contention(&error), "{error:#}");
+    assert!(busy > 0);
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(snapshot(&holder), before);
+    assert_eq!(
+        holder
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    holder.execute_batch("ROLLBACK;").unwrap();
+    // The committed migration is usable after contention clears.
+    Queue::open(&dir).unwrap();
+}
+
+#[test]
+fn journal_reclassification_busy_preserves_committed_migration_and_retries_same_queue() {
+    use queue_under_test::OpenPhase;
+    let dir = v1_fixture("exclusive-reclassification");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    let before = snapshot(&holder);
+    let mut committed = Vec::new();
+    let mut busy = 0;
+    let start = std::time::Instant::now();
+    let result = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_millis(40),
+        &mut |phase| match phase {
+            OpenPhase::BeforeJournal => {
+                assert_eq!(
+                    holder
+                        .query_row(
+                            "SELECT value FROM meta WHERE key='schema_version'",
+                            [],
+                            |r| r.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "2"
+                );
+                holder.prepare("SELECT outcome FROM receipt").unwrap();
+                committed = std::fs::read(&path).unwrap();
+                holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+            }
+            OpenPhase::JournalBusy => busy += 1,
+            _ => {}
+        },
+    );
+    let error = result.unwrap_err();
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert!(busy > 1, "one short budget must contain retries");
+    assert!(queue_under_test::is_lock_contention(&error));
+    let display = format!("{error:#}");
+    assert!(display.contains("queue busy"), "{display}");
+    assert!(
+        display.contains("retry opening the same queue"),
+        "{display}"
+    );
+    for misleading in [
+        "not a usable relay queue",
+        "nothing was modified",
+        "empty directory",
+        "restore",
+    ] {
+        assert!(!display.contains(misleading), "{display}");
+    }
+    let cause = error.downcast_ref::<rusqlite::Error>().unwrap().to_string();
+    assert_eq!(display.matches(&cause).count(), 1, "{display}");
+    assert!(std::fs::read(&path).unwrap() == committed);
+    assert_eq!(snapshot(&holder), before);
+    holder.execute_batch("ROLLBACK;").unwrap();
+    let queue = Queue::open(&dir).unwrap();
+    assert_eq!(queue.stats(200).unwrap().receipt_outcomes["unknown"], 1);
+    assert_eq!(snapshot(&holder), before);
+}
+
+#[test]
+fn classification_read_failures_display_the_sqlite_cause_once_and_preserve_foreign_bytes() {
+    for malformed_file in [false, true] {
+        let dir = if malformed_file {
+            let dir = fsguard::prepare_queue_dir(&queue_dir(&fixture("invalid-sqlite"))).unwrap();
+            let path = dir.join("relay.sqlite");
+            fsguard::create_private_file(&path).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"not a SQLite database")
+                .unwrap();
+            dir
+        } else {
+            let dir = v1_fixture("missing-meta");
+            let conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+            conn.execute_batch("DROP TABLE meta;").unwrap();
+            dir
+        };
+        let path = dir.join("relay.sqlite");
+        let before = std::fs::read(&path).unwrap();
+        let error = Queue::open(&dir).unwrap_err();
+        assert!(!queue_under_test::is_lock_contention(&error));
+        let display = format!("{error:#}");
+        assert!(display.contains("not a usable relay queue"), "{display}");
+        let cause = error.downcast_ref::<rusqlite::Error>().unwrap().to_string();
+        assert_eq!(display.matches(&cause).count(), 1, "{display}");
+        assert!(std::fs::read(&path).unwrap() == before);
+        for name in fsguard::SIDECARS {
+            assert!(!dir.join(name).exists());
+        }
+    }
+}
+
+#[test]
+fn a_foreign_database_with_a_writer_is_refused_before_write_coordination() {
+    let dir = v1_fixture("foreign-with-writer");
+    let path = dir.join("relay.sqlite");
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder
+        .execute_batch("UPDATE meta SET value='foreign' WHERE key='identity'; BEGIN IMMEDIATE;")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut reached_after_preflight = false;
+    let error = queue_under_test::Queue::open_for_test(
+        &dir,
+        std::time::Duration::from_millis(40),
+        &mut |_| reached_after_preflight = true,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not a usable relay queue"),
+        "{error:#}"
+    );
+    assert!(!reached_after_preflight);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    holder.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn a_foreign_identity_during_journal_retry_is_refused_without_mutation() {
+    use queue_under_test::OpenPhase;
+    for begin in ["BEGIN IMMEDIATE;", "BEGIN EXCLUSIVE;"] {
+        let dir = v1_fixture("foreign-during-retry");
+        let path = dir.join("relay.sqlite");
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        let mut before = Vec::new();
+        let mut busy = 0;
+        let result = queue_under_test::Queue::open_for_test(
+            &dir,
+            std::time::Duration::from_secs(10),
+            &mut |phase| match phase {
+                OpenPhase::BeforeJournal => holder.execute_batch(begin).unwrap(),
+                OpenPhase::JournalBusy => {
+                    busy += 1;
+                    holder
+                        .execute_batch(
+                            "ROLLBACK; UPDATE meta SET value='foreign' WHERE key='identity';",
+                        )
+                        .unwrap();
+                    before = std::fs::read(&path).unwrap();
+                }
+                _ => {}
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("not a usable relay queue"));
+        assert!(!queue_under_test::is_lock_contention(&error));
+        assert_eq!(busy, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for name in fsguard::SIDECARS {
+            assert!(!dir.join(name).exists(), "foreign queue gained {name}");
+        }
+    }
+}
+
+#[test]
+fn only_sqlite_busy_and_locked_are_retryable() {
+    for (code, retry) in [
+        (5, true),
+        (6, true),
+        (517, true),
+        (262, true),
+        (1, false),
+        (8, false),
+        (11, false),
+        (17, false),
+        (26, false),
+    ] {
+        let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("database is locked".into()),
+        ))
+        .context("configure queue");
+        assert_eq!(
+            queue_under_test::is_lock_contention(&error),
+            retry,
+            "code {code}"
+        );
+    }
+    assert!(!queue_under_test::is_lock_contention(&anyhow::anyhow!(
+        "database is locked"
+    )));
+    assert!(!queue_under_test::is_lock_contention(
+        &rusqlite::Error::InvalidQuery.into()
+    ));
+}
+
+#[test]
+fn journal_retry_refuses_a_changed_version_or_empty_database_without_mutation() {
+    use queue_under_test::OpenPhase;
+    for mutation in [
+        "UPDATE meta SET value='1' WHERE key='schema_version';",
+        "DROP TABLE meta; DROP TABLE binding; DROP TABLE pending; DROP TABLE receipt; DROP TABLE session_agent;",
+    ] {
+        let dir = v1_fixture("changed-version-or-empty-db");
+        let path = dir.join("relay.sqlite");
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        let mut before = Vec::new();
+        let mut busy = 0;
+        let result = queue_under_test::Queue::open_for_test(
+            &dir,
+            std::time::Duration::from_secs(10),
+            &mut |phase| match phase {
+                OpenPhase::BeforeJournal => holder.execute_batch("BEGIN IMMEDIATE;").unwrap(),
+                OpenPhase::JournalBusy => {
+                    busy += 1;
+                    holder.execute_batch("ROLLBACK;").unwrap();
+                    holder.execute_batch(mutation).unwrap();
+                    before = std::fs::read(&path).unwrap();
+                }
+                _ => {}
+            },
+        );
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("changed before journal configuration")
+        );
+        assert_eq!(busy, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for name in fsguard::SIDECARS {
+            assert!(!dir.join(name).exists(), "changed queue gained {name}");
+        }
+    }
+}
+
+#[test]
+fn fresh_queue_init_and_v1_reopens_work_across_processes() {
+    for legacy in [false, true] {
+        let dir = if legacy {
+            v1_fixture("process-reopen")
+        } else {
+            fsguard::prepare_queue_dir(&queue_dir(&fixture("process-init"))).unwrap()
+        };
+        let before = legacy
+            .then(|| snapshot(&rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap()));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let mut command =
+                        std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory-relay"));
+                    if legacy {
+                        command.arg("status");
+                    } else {
+                        command.args([
+                            "init",
+                            "--server-url",
+                            "http://127.0.0.1:9/",
+                            "--producer",
+                            "example.runtime",
+                            "--actor",
+                            "operator-a",
+                            "--workspace",
+                            "team",
+                            "--project",
+                            "app",
+                        ]);
+                    }
+                    command.arg("--queue-dir").arg(dir);
+                    barrier.wait();
+                    command.output().unwrap()
+                })
+            })
+            .collect();
+        let outputs: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let queue = Queue::open(&dir).unwrap();
+        if let Some(before) = before {
+            assert_eq!(
+                snapshot(&rusqlite::Connection::open(queue.path()).unwrap()),
+                before
+            );
+        }
+        assert_eq!(queue.binding().unwrap().project, "app");
+    }
+}
+
+#[test]
 fn interrupted_and_failed_migrations_roll_back_and_recover() {
     let dir = v1_fixture("rollback-migration");
     let mut conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
@@ -1684,18 +2083,19 @@ fn receipt_conflicts_promote_legacy_unknown_outcomes() {
 #[test]
 fn every_current_outcome_is_persisted_and_flush_counts_acknowledgements() {
     let root = fixture("all-outcomes");
-    let results: Vec<_> = ack::OUTCOMES[..8]
+    let known = &ack::OUTCOMES[..ack::OUTCOMES.len() - 1];
+    let results: Vec<_> = known
         .iter()
         .enumerate()
         .map(|(index, outcome)| serde_json::json!({"index":index,"outcome":outcome}))
         .collect();
-    let body = serde_json::json!({"accepted":8,"accepted_indices":(0..8).collect::<Vec<_>>(),"results":results});
+    let body = serde_json::json!({"accepted":known.len(),"accepted_indices":(0..known.len()).collect::<Vec<_>>(),"results":results});
     let server = stub(vec![Reply::Json(200, body.to_string())]);
     let dir = bind(&root, &server.url());
     let mut queue = Queue::open(&dir).unwrap();
     queue
         .enqueue(
-            &(0..8)
+            &(0..known.len())
                 .map(|i| valid(&format!("e{i}"), "codex", "session-start", &format!("s{i}")))
                 .collect::<Vec<_>>(),
             ai_memory_relay::now_ms(),
@@ -1715,7 +2115,7 @@ fn every_current_outcome_is_persisted_and_flush_counts_acknowledgements() {
         .find_map(|s| s.strip_prefix("acknowledged_outcomes: "))
         .unwrap();
     let counts: serde_json::Value = serde_json::from_str(summary).unwrap();
-    for outcome in &ack::OUTCOMES[..8] {
+    for outcome in known {
         assert_eq!(stats.receipt_outcomes[*outcome], 1);
         assert_eq!(counts[*outcome], 1);
     }
@@ -1744,4 +2144,464 @@ fn results_match_sparse_partial_failure_and_empty_acks() {
         let parsed: BatchAck = serde_json::from_str(body).unwrap();
         assert_eq!(ack::validate(len, &parsed).unwrap(), expected);
     }
+}
+
+#[test]
+fn sensitive_envelope_is_rejected_before_enqueue_with_clean_control() {
+    let root = fixture("sensitive-envelope");
+    let dir = bind(&root, "http://127.0.0.1:49374");
+    enqueue(
+        &dir,
+        &root,
+        "before.json",
+        serde_json::json!([event("opaque-界", "codex", "session-start", "sessão-界")]),
+    )
+    .unwrap();
+    assert_eq!(pending_count(&dir), 1);
+    for field in [
+        "session_id",
+        "cwd",
+        "producer",
+        "actor",
+        "event_id",
+        "agent",
+        "event",
+        "ingest_key",
+    ] {
+        let mut input = event("a", "codex", "session-start", "a");
+        input["body"][field] = "Bearer abcdefghijklmnop".into();
+        let error = enqueue(&dir, &root, "input.json", serde_json::json!([input])).unwrap_err();
+        assert!(!error.to_string().contains("abcdefghijklmnop"));
+        assert_eq!(pending_count(&dir), 1);
+    }
+    enqueue(
+        &dir,
+        &root,
+        "control.json",
+        serde_json::json!([event("a", "codex", "session-start", "a")]),
+    )
+    .unwrap();
+    assert_eq!(pending_count(&dir), 2);
+}
+
+#[test]
+fn new_native_bodies_are_sanitized_before_hash_enqueue_and_exact_retry() {
+    let root = fixture("ingress-sanitized-retry");
+    let server = stub(vec![Reply::Close, Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut raw = event("native-event", "codex", "post-tool-use", "native-session");
+    for (name, value) in [
+        ("producer", "example.runtime"),
+        ("event_id", "native-event"),
+        ("agent", "codex"),
+        ("event", "post-tool-use"),
+        ("ingest_key", "native-ingest-key"),
+    ] {
+        raw["body"][name] = value.into();
+    }
+    raw["body"]["output"] =
+        "\u{1b}[32mresult\u{1b}[0m\u{202e} token=getToken() Bearer abcdefghijklmnop".into();
+    raw["body"]["tool_input"] = serde_json::json!({"nested": {"password": "process.env.X", "api-key": "tiny", "items": ["password=abcdefghi", "token=abcdefghijklmnop[REDACTED]"]}});
+    raw["body"]["key_cases"] = serde_json::json!([{
+        "accessToken":"fixture-value", "refreshToken":"fixture-value", "clientSecret":"fixture-value", "privateKey":"fixture-value", "x-api-key":"fixture-value", "OPENAI_API_KEY":"fixture-value", "credentials":"fixture-value", "cookie":"fixture-value"
+    }]);
+    raw["body"]["key_forms"] = serde_json::json!([{"auth":"fixture-value","jwt":"fixture-value","pwd":"fixture-value","bearer":"fixture-value","sessionKey":"fixture-value","signature":"fixture-value"}]);
+    raw["body"]["plural_forms"] = serde_json::json!([{
+        "api_keys":"fixture-value", "access_keys":"fixture-value", "private_keys":"fixture-value", "session_keys":"fixture-value",
+        "apiKeys":["fixture-value"], "accessKeys":["fixture-value"], "privateKeys":["fixture-value"], "sessionKeys":["fixture-value"]
+    }]);
+    raw["body"]["controls"] = serde_json::json!({"author":"fixture-value","authority":"fixture-value","key":"fixture-value","keys":["fixture-value"]});
+    raw["body"]["numeric_cases"] = serde_json::json!({"token":123456,"access_tokens":123456,"private_token_count":123456,"auth_token_usage":123456,"token_usage":{"input_tokens":12}});
+    let metrics = serde_json::json!({"max_tokens":12,"input_tokens":34,"token_count":0,"token_usage":1.25,"output_tokens":9007199254740993_u64,"total_tokens":89,"totalTokens":89,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"prompt_tokens":5,"completion_tokens":7,"reasoning_tokens":11});
+    raw["body"]["metrics"] = metrics.clone();
+    enqueue(&dir, &root, "native.json", serde_json::json!([raw.clone()])).unwrap();
+    enqueue(&dir, &root, "repeat.json", serde_json::json!([raw])).unwrap();
+    assert_eq!(pending_count(&dir), 1);
+    let conn = rusqlite::Connection::open(dir.join(ai_memory_relay::fsguard::DB_FILE)).unwrap();
+    let (body, digest, key, id, agent, event, session): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT body_json,body_sha256,ingest_key,event_id,agent,event,session_id FROM pending",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    let safe: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (&id[..], &agent[..], &event[..], &session[..]),
+        ("native-event", "codex", "post-tool-use", "native-session")
+    );
+    assert_eq!(
+        key,
+        identity::ingest_key(
+            "example.runtime",
+            "operator-a",
+            &agent,
+            &session,
+            &event,
+            &id
+        )
+    );
+    for (name, value) in [
+        ("producer", "example.runtime"),
+        ("event_id", "native-event"),
+        ("agent", "codex"),
+        ("event", "post-tool-use"),
+        ("ingest_key", "native-ingest-key"),
+    ] {
+        assert_eq!(safe[name], value);
+    }
+    assert_eq!(safe["cwd"], "/work/app");
+    assert!(
+        !safe["output"]
+            .as_str()
+            .unwrap()
+            .contains(['\u{1b}', '\u{202e}'])
+    );
+    assert!(!body.contains("abcdefghijklmnop"));
+    assert!(!body.contains("process.env.X"));
+    assert!(!body.contains("tiny"));
+    assert_eq!(safe["tool_input"]["nested"]["api-key"], "[REDACTED]");
+    assert!(
+        safe["key_forms"][0]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(
+        safe["plural_forms"][0]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(
+        safe["numeric_cases"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(
+        safe["controls"]
+            == serde_json::json!({"author":"fixture-value","authority":"fixture-value","key":"fixture-value","keys":["fixture-value"]})
+    );
+    assert!(
+        safe["key_cases"][0]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "[REDACTED]")
+    );
+    assert!(safe["metrics"] == metrics);
+    assert!(serde_json::to_vec(&safe["metrics"]).unwrap() == serde_json::to_vec(&metrics).unwrap());
+    assert_eq!(
+        safe["output"],
+        ai_memory_client::sanitize_external_text(
+            "\u{1b}[32mresult\u{1b}[0m\u{202e} token=getToken() Bearer abcdefghijklmnop"
+        )
+    );
+
+    ai_memory_client::check_body(&safe).unwrap();
+    let validated = identity::validate(
+        0,
+        InputEvent {
+            event_id: id,
+            agent,
+            event,
+            body: safe.clone(),
+        },
+        "example.runtime",
+        "operator-a",
+    )
+    .unwrap();
+    assert_eq!(validated.body_json, body);
+    assert_eq!(validated.body_sha256, digest);
+    assert!(flush(&dir).failure.is_none());
+    assert_eq!(pending_count(&dir), 0);
+    let sent = server.bodies();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0], sent[1]);
+    assert_eq!(sent[0][0]["body"], safe);
+    assert_eq!(serde_json::to_string(&sent[0][0]["body"]).unwrap(), body);
+    assert_eq!(
+        Queue::open(&dir)
+            .unwrap()
+            .stats(ai_memory_relay::now_ms())
+            .unwrap()
+            .receipts,
+        1
+    );
+}
+
+#[test]
+fn unsafe_legacy_pending_is_dropped_locally_and_never_blocks_its_session() {
+    let root = fixture("unsafe-legacy-pending");
+    let server = stub(vec![Reply::AcceptAll, Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut legacy = valid("native-event", "codex", "session-start", "native-session");
+    legacy.body_json = "{ \"prompt\": \"Bearer abcdefghijklmnop\", \"cwd\": \"/native/path\", \"session_id\": \"native-session\" }".into();
+    let mut queue = Queue::open(&dir).unwrap();
+    queue
+        .enqueue(&[legacy.clone()], ai_memory_relay::now_ms())
+        .unwrap();
+    let later = valid("later-clean", "codex", "session-end", "native-session");
+    let clean = valid("clean-event", "codex", "session-start", "clean-session");
+    queue
+        .enqueue(&[later.clone(), clean.clone()], ai_memory_relay::now_ms())
+        .unwrap();
+    drop(queue);
+
+    let report = relay::flush(&dir, &FlushOptions::default()).unwrap();
+    assert!(report.failure.is_none(), "{report:?}");
+    assert!(!format!("{report:?}").contains("abcdefghijklmnop"));
+    assert!(
+        report
+            .summary
+            .iter()
+            .any(|line| line.starts_with("1 event(s) queued before local sanitation")),
+        "{report:?}"
+    );
+    assert!(!report.pending);
+    assert_eq!(pending_count(&dir), 0);
+
+    // The unsafe head never reached the wire; the clean session and the unsafe
+    // session's later event both did.
+    let sent: Vec<serde_json::Value> = server
+        .bodies()
+        .iter()
+        .flat_map(|batch| batch.as_array().unwrap().clone())
+        .collect();
+    assert!(
+        !serde_json::to_string(&sent)
+            .unwrap()
+            .contains("abcdefghijklmnop")
+    );
+    let ids: Vec<&str> = sent
+        .iter()
+        .map(|item| item["body"]["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"clean-session"));
+    assert!(ids.contains(&"native-session"));
+
+    let conn = rusqlite::Connection::open(dir.join(ai_memory_relay::fsguard::DB_FILE)).unwrap();
+    let outcome: Option<String> = conn
+        .query_row(
+            "SELECT outcome FROM receipt WHERE ingest_key = ?1",
+            [&legacy.ingest_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(outcome.as_deref(), Some("dropped_policy"));
+}
+
+#[test]
+fn legacy_binding_scope_spaces_are_preserved_on_delivery() {
+    let root = fixture("legacy-scope-spaces");
+    let server = stub(vec![Reply::AcceptAll]);
+    let dir = queue_dir(&root);
+    relay::init(
+        &dir,
+        &server.url(),
+        "example.runtime",
+        "operator-a",
+        " team ",
+        " app ",
+    )
+    .unwrap();
+    enqueue(
+        &dir,
+        &root,
+        "native.json",
+        serde_json::json!([event("e", "codex", "session-start", "s")]),
+    )
+    .unwrap();
+    assert!(flush(&dir).failure.is_none());
+    let bodies = server.bodies();
+    let url = url::Url::parse(bodies[0][0]["url"].as_str().unwrap()).unwrap();
+    let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(pairs["workspace"], " team ");
+    assert_eq!(pairs["project"], " app ");
+}
+
+#[test]
+fn opaque_unicode_native_identity_ships_unchanged() {
+    let root = fixture("privacy-unicode-control");
+    let server = stub(vec![Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut input = event("event-界", "codex", "session-start", " sessão-界/opaque ");
+    input["body"]["cwd"] = "/work/界".into();
+    input["body"]["_ai_memory_capture"] =
+        serde_json::json!({"actor":"untrusted-label", "authority":"untrusted provenance"});
+    let original = input["body"].clone();
+    enqueue(&dir, &root, "input.json", serde_json::json!([input])).unwrap();
+    assert!(flush(&dir).failure.is_none());
+    assert_eq!(server.bodies()[0][0]["body"], original);
+    let bodies = server.bodies();
+    let url = url::Url::parse(bodies[0][0]["url"].as_str().unwrap()).unwrap();
+    assert_eq!(bodies[0][0]["body"]["session_id"], " sessão-界/opaque ");
+    assert_eq!(
+        url.query_pairs()
+            .find(|(key, _)| key == "ingest_key")
+            .unwrap()
+            .1,
+        identity::ingest_key(
+            "example.runtime",
+            "operator-a",
+            "codex",
+            " sessão-界/opaque ",
+            "session-start",
+            "event-界"
+        )
+    );
+    assert!(
+        server
+            .heads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|head| head.starts_with("POST /hook/batch "))
+    );
+}
+
+#[test]
+fn sensitive_outer_identity_and_body_authority_are_refused_before_enqueue() {
+    let root = fixture("privacy-outer-refusal");
+    let dir = bind(&root, "http://127.0.0.1:49374");
+    enqueue(
+        &dir,
+        &root,
+        "before.json",
+        serde_json::json!([event("before", "codex", "session-start", "control")]),
+    )
+    .unwrap();
+    for field in ["event_id", "agent", "event"] {
+        let mut attack = event("native", "codex", "session-start", "session");
+        attack[field] = "sk-1234567890abcdefghijklmnop".into();
+        let result = enqueue(&dir, &root, "attack.json", serde_json::json!([attack]));
+        assert!(result.is_err(), "sensitive outer identity must be refused");
+        assert!(!result.unwrap_err().to_string().contains("abcdefghijklmnop"));
+        assert_eq!(pending_count(&dir), 1);
+    }
+    for field in ["workspace", "project", "actor", "author_id", "headers"] {
+        let mut attack = event("native", "codex", "session-start", "session");
+        attack["body"][field] = "forged".into();
+        assert!(enqueue(&dir, &root, "attack.json", serde_json::json!([attack])).is_err());
+        assert_eq!(pending_count(&dir), 1);
+    }
+    enqueue(
+        &dir,
+        &root,
+        "after.json",
+        serde_json::json!([event("after", "codex", "session-end", "control")]),
+    )
+    .unwrap();
+    assert_eq!(pending_count(&dir), 2);
+}
+
+#[test]
+fn sensitive_binding_is_refused_before_queue_creation() {
+    let root = fixture("privacy-binding-refusal");
+    let safe = ["example.runtime", "operator-a", "team", "app"];
+    let before = root.join("control-before");
+    relay::init(
+        &before,
+        "http://127.0.0.1:49374",
+        safe[0],
+        safe[1],
+        safe[2],
+        safe[3],
+    )
+    .unwrap();
+    for field in 0..4 {
+        let mut attack = safe;
+        attack[field] = "sk-1234567890abcdefghijklmnop";
+        let dir = root.join(format!("attack-{field}"));
+        let result = relay::init(
+            &dir,
+            "http://127.0.0.1:49374",
+            attack[0],
+            attack[1],
+            attack[2],
+            attack[3],
+        );
+        assert!(result.is_err(), "sensitive binding must be refused");
+        assert!(!result.unwrap_err().to_string().contains("abcdefghijklmnop"));
+        assert!(!dir.exists(), "sensitive binding must not create the queue");
+    }
+    relay::init(
+        &root.join("control-after"),
+        "http://127.0.0.1:49374",
+        safe[0],
+        safe[1],
+        safe[2],
+        safe[3],
+    )
+    .unwrap();
+}
+
+#[test]
+fn unsafe_legacy_native_identity_is_dropped_and_its_session_continues() {
+    let root = fixture("privacy-legacy-native-id");
+    let server = stub(vec![Reply::AcceptAll, Reply::AcceptAll]);
+    let dir = bind(&root, &server.url());
+    let mut legacy = valid("old-event", "codex", "session-start", "old-session");
+    legacy.event_id = "sk-1234567890abcdefghijklmnop".into();
+    let mut queue = Queue::open(&dir).unwrap();
+    let before = valid("before", "codex", "session-start", "clean-before");
+    queue
+        .enqueue(&[legacy.clone(), before.clone()], ai_memory_relay::now_ms())
+        .unwrap();
+    drop(queue);
+    let report = flush(&dir);
+    assert!(report.failure.is_none(), "{report:?}");
+    assert!(!format!("{report:?}").contains("abcdefghijklmnop"));
+    assert_eq!(pending_count(&dir), 0);
+
+    enqueue(
+        &dir,
+        &root,
+        "after.json",
+        serde_json::json!([event("after", "codex", "session-end", "old-session")]),
+    )
+    .unwrap();
+    let report = flush(&dir);
+    assert!(report.failure.is_none(), "{report:?}");
+    assert_eq!(pending_count(&dir), 0);
+
+    let sent = server.bodies();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[0][0]["body"],
+        serde_json::from_str::<serde_json::Value>(&before.body_json).unwrap()
+    );
+    assert_eq!(sent[1][0]["body"]["session_id"], "old-session");
+    assert!(
+        server
+            .heads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|head| !head.contains("abcdefghijklmnop")),
+        "the unsafe native identity must never reach a request line"
+    );
 }

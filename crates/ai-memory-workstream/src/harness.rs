@@ -3316,11 +3316,6 @@ mod tests {
 
     #[test]
     fn native_identity_selector_rejects_original_before_resume_arguments() {
-        println!(
-            "NATIVE_TEST_PID {} {:?}",
-            std::process::id(),
-            std::env::current_exe().unwrap()
-        );
         let bad = "sk-abcdefghijklmnopqrstuvwx";
         for (args, linked) in [
             (vec![OsString::from("resume"), OsString::from(bad)], None),

@@ -98,9 +98,9 @@ pub use users::{
 };
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunContext,
-    ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamFinishAuthority,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
+    ManagedRunContext, ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
     WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
@@ -5016,7 +5016,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5024,6 +5024,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: first.run_id,
                     native_session_id: Some("native-1".into()),
                     source_cursor: None,
@@ -5069,6 +5070,7 @@ mod tests {
         );
         assert_eq!(status(second.run_id).await, (Some("native-1".into()), true));
         let finish = |native: &str, complete: bool| FinishWorkstreamRun {
+            sanitizer: ai_memory_core::Sanitizer::default(),
             run_id: second.run_id,
             native_session_id: Some(native.into()),
             source_cursor: None,
@@ -5080,7 +5082,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5095,7 +5097,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5121,7 +5123,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5196,6 +5198,7 @@ mod tests {
             metadata: serde_json::json!({}),
         };
         let partial = FinishWorkstreamRun {
+            sanitizer: ai_memory_core::Sanitizer::default(),
             run_id: run.run_id,
             native_session_id: Some("native-1".into()),
             source_cursor: None,
@@ -5208,7 +5211,7 @@ mod tests {
             store
                 .writer
                 .finish_workstream_run(
-                    WorkstreamFinishAuthority::from_auth(
+                    ManagedRunAuthority::from_auth(
                         ai_memory_core::AuthLevel::Anonymous,
                         None,
                         None,
@@ -5226,7 +5229,7 @@ mod tests {
             store
                 .writer
                 .finish_workstream_run(
-                    WorkstreamFinishAuthority::from_auth(
+                    ManagedRunAuthority::from_auth(
                         ai_memory_core::AuthLevel::Anonymous,
                         None,
                         None,
@@ -5254,7 +5257,7 @@ mod tests {
         let finished = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5262,6 +5265,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: run.run_id,
                     native_session_id: Some("native-1".into()),
                     source_cursor: Some("cursor-1".into()),
@@ -5276,7 +5280,12 @@ mod tests {
         assert_eq!(finished.imported_events, 0);
         let search = store
             .reader
-            .search_workstream_events(run.workstream_id, "portable".into(), 10)
+            .search_workstream_events(
+                run.workstream_id,
+                "portable".into(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(search.len(), 1);
@@ -5324,7 +5333,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5332,6 +5341,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: next.run_id,
                     native_session_id: Some("native-2".into()),
                     source_cursor: Some("cursor-2".into()),
@@ -5364,7 +5374,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5372,6 +5382,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: retry.run_id,
                     native_session_id: Some("native-3".into()),
                     source_cursor: Some("cursor-3".into()),
@@ -5484,7 +5495,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5492,6 +5503,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: blank.run_id,
                     native_session_id: None,
                     source_cursor: None,
@@ -5523,7 +5535,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5531,6 +5543,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: first.run_id,
                     native_session_id: Some("claude-native".into()),
                     source_cursor: None,
@@ -5589,7 +5602,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5597,6 +5610,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: claude.run_id,
                     native_session_id: Some("claude-current".into()),
                     source_cursor: Some("cursor".into()),
@@ -5662,7 +5676,7 @@ mod tests {
             store
                 .writer
                 .finish_workstream_run(
-                    WorkstreamFinishAuthority::from_auth(
+                    ManagedRunAuthority::from_auth(
                         ai_memory_core::AuthLevel::Anonymous,
                         None,
                         None,
@@ -5670,6 +5684,7 @@ mod tests {
                         false,
                     ),
                     FinishWorkstreamRun {
+                        sanitizer: ai_memory_core::Sanitizer::default(),
                         run_id: run.run_id,
                         native_session_id: Some(format!("native-{workspace_name}")),
                         source_cursor: Some("cursor".into()),
@@ -5697,12 +5712,22 @@ mod tests {
         assert_ne!(runs[0].workstream_id, runs[1].workstream_id);
         let first = store
             .reader
-            .search_workstream_events(runs[0].workstream_id, "visible".into(), 10)
+            .search_workstream_events(
+                runs[0].workstream_id,
+                "visible".into(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         let second = store
             .reader
-            .search_workstream_events(runs[1].workstream_id, "visible".into(), 10)
+            .search_workstream_events(
+                runs[1].workstream_id,
+                "visible".into(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -5768,6 +5793,7 @@ mod tests {
         events: Vec<NewWorkstreamEvent>,
     ) -> FinishWorkstreamRun {
         FinishWorkstreamRun {
+            sanitizer: ai_memory_core::Sanitizer::default(),
             run_id,
             native_session_id: None,
             source_cursor: None,
@@ -5847,7 +5873,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5935,6 +5961,7 @@ mod tests {
         );
 
         let finish = FinishWorkstreamRun {
+            sanitizer: ai_memory_core::Sanitizer::default(),
             run_id: run.run_id,
             native_session_id: Some("native-1".into()),
             source_cursor: Some("cursor-1".into()),
@@ -5949,7 +5976,7 @@ mod tests {
         let first = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5967,7 +5994,7 @@ mod tests {
         let second = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -5992,7 +6019,12 @@ mod tests {
         );
         let events = store
             .reader
-            .search_workstream_events(run.workstream_id, String::new(), 10)
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -6017,7 +6049,7 @@ mod tests {
         let cancelled = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6036,7 +6068,7 @@ mod tests {
         let unknown = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6072,7 +6104,7 @@ mod tests {
         let wrong_agent = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6080,6 +6112,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: run.run_id,
                     native_session_id: Some("native-1".into()),
                     source_cursor: None,
@@ -6101,7 +6134,12 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_workstream_events(run.workstream_id, String::new(), 10)
+                .search_workstream_events(
+                    run.workstream_id,
+                    String::new(),
+                    10,
+                    ai_memory_core::Sanitizer::default()
+                )
                 .await
                 .unwrap()
                 .is_empty(),
@@ -6122,7 +6160,7 @@ mod tests {
         let wrong_session = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6130,6 +6168,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: run.run_id,
                     native_session_id: Some("native-1".into()),
                     source_cursor: None,
@@ -6155,7 +6194,7 @@ mod tests {
         let finished = store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6163,6 +6202,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: run.run_id,
                     native_session_id: Some("native-1".into()),
                     source_cursor: None,
@@ -6224,7 +6264,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6438,7 +6478,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6549,7 +6589,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6577,14 +6617,24 @@ mod tests {
         // An empty query tails the ledger, newest first.
         let all = store
             .reader
-            .search_workstream_events(run.workstream_id, String::new(), 10)
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ids(all), ["ev-5", "ev-4", "ev-3", "ev-2", "ev-1"]);
 
         let top_two = store
             .reader
-            .search_workstream_events(run.workstream_id, String::new(), 2)
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                2,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ids(top_two), ["ev-5", "ev-4"]);
@@ -6592,13 +6642,23 @@ mod tests {
         // The limit is clamped into 1..=100.
         let clamped_low = store
             .reader
-            .search_workstream_events(run.workstream_id, String::new(), 0)
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                0,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ids(clamped_low), ["ev-5"]);
         let clamped_high = store
             .reader
-            .search_workstream_events(run.workstream_id, String::new(), 500)
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                500,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(clamped_high.len(), 5);
@@ -6607,14 +6667,24 @@ mod tests {
         // accepted by the search surface are stripped before matching.
         let fts = store
             .reader
-            .search_workstream_events(run.workstream_id, "zebra".into(), 10)
+            .search_workstream_events(
+                run.workstream_id,
+                "zebra".into(),
+                10,
+                ai_memory_core::Sanitizer::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ids(fts), ["ev-3"]);
         for prefixed in ["title:zebra", "body:zebra", "content:zebra"] {
             let hit = store
                 .reader
-                .search_workstream_events(run.workstream_id, prefixed.into(), 10)
+                .search_workstream_events(
+                    run.workstream_id,
+                    prefixed.into(),
+                    10,
+                    ai_memory_core::Sanitizer::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(ids(hit), ["ev-3"], "prefix must be stripped: {prefixed}");
@@ -6772,7 +6842,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6780,6 +6850,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: current.run_id,
                     native_session_id: Some("codex-native".into()),
                     source_cursor: None,
@@ -6803,7 +6874,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6811,6 +6882,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: claude.run_id,
                     native_session_id: Some("claude-native".into()),
                     source_cursor: None,
@@ -6827,7 +6899,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                WorkstreamFinishAuthority::from_auth(
+                ManagedRunAuthority::from_auth(
                     ai_memory_core::AuthLevel::Anonymous,
                     None,
                     None,
@@ -6835,6 +6907,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: older.run_id,
                     native_session_id: Some("open-code-native".into()),
                     source_cursor: None,

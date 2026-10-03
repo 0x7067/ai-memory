@@ -31,7 +31,6 @@ use tracing::warn;
 const MAX_EVENTS_PER_FINISH: usize = 4_096;
 const MAX_EVENT_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_ID_BYTES: usize = 512;
-const MAX_METADATA_BYTES: usize = 16 * 1024;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_CWD_BYTES: usize = 16 * 1024;
 
@@ -154,6 +153,36 @@ async fn authorize_run(
     crate::grants::authorize_resolved(&state.reader, scope, viewer, required)
         .await
         .map_err(scope_refusal)
+}
+
+/// Admit a mutation of `run_id` only for its owner with current Write access
+/// on the run's project — the rule finish applies, shared by every route that
+/// releases, renews or rebinds a run so none of them is a side door around it.
+/// The authority comes from authenticated middleware extensions only.
+async fn authorize_run_owner(
+    state: &WorkstreamState,
+    run_id: ManagedRunId,
+    level: Option<Extension<AuthLevel>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+) -> Result<ai_memory_store::ManagedRunAuthority, Response> {
+    let authority = ai_memory_store::ManagedRunAuthority::from_auth(
+        level.map_or(AuthLevel::Anonymous, |Extension(level)| level),
+        viewer.map(|Extension(viewer)| viewer),
+        user_id.map(|Extension(user_id)| user_id),
+        &actor.map_or_else(
+            ai_memory_core::ActorContext::anonymous,
+            |Extension(actor)| actor,
+        ),
+        state.trusted_proxy_identity,
+    );
+    state
+        .reader
+        .authorize_managed_run(run_id, authority.clone())
+        .await
+        .map_err(store_error_response)?;
+    Ok(authority)
 }
 
 /// A refusal as a response: 403 for an access problem, 500 otherwise.
@@ -368,7 +397,9 @@ async fn run_status(
 async fn heartbeat_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -378,13 +409,7 @@ async fn heartbeat_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -398,7 +423,9 @@ async fn heartbeat_run(
 async fn cancel_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -408,13 +435,7 @@ async fn cancel_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -473,7 +494,9 @@ async fn run_context(
 async fn accept_run_context(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -483,13 +506,7 @@ async fn accept_run_context(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -746,7 +763,12 @@ async fn search_events(
     }
     match state
         .reader
-        .search_workstream_events(workstream_id, query.q, query.limit.clamp(1, 100))
+        .search_workstream_events(
+            workstream_id,
+            query.q,
+            query.limit.clamp(1, 100),
+            state.sanitizer.clone(),
+        )
         .await
     {
         Ok(mut events) => {
@@ -763,7 +785,9 @@ async fn search_events(
 async fn link_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
     Json(request): Json<LinkManagedRunRequest>,
 ) -> Response {
@@ -774,13 +798,7 @@ async fn link_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = authorize_run(
-        &state,
-        run_id,
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Write,
-    )
-    .await
+    if let Err(response) = authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await
     {
         return response;
     }
@@ -829,23 +847,10 @@ async fn finish_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
-    let authority = ai_memory_store::WorkstreamFinishAuthority::from_auth(
-        level.map_or(AuthLevel::Anonymous, |Extension(level)| level),
-        viewer.map(|Extension(viewer)| viewer),
-        user_id.map(|Extension(user_id)| user_id),
-        &actor.map_or_else(
-            ai_memory_core::ActorContext::anonymous,
-            |Extension(actor)| actor,
-        ),
-        state.trusted_proxy_identity,
-    );
-    if let Err(failure) = state
-        .reader
-        .authorize_workstream_finish(run_id, authority.clone())
-        .await
-    {
-        return store_error_response(failure);
-    }
+    let authority = match authorize_run_owner(&state, run_id, level, viewer, user_id, actor).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     #[cfg(test)]
     if let Some(barrier) = &state.finish_barrier {
         barrier.0.notify_one();
@@ -856,6 +861,13 @@ async fn finish_run(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("at most {MAX_EVENTS_PER_FINISH} events are accepted per finish"),
         );
+    }
+    if request
+        .events
+        .iter()
+        .any(|event| event.event_id.starts_with("managed-run:"))
+    {
+        return error(StatusCode::BAD_REQUEST, "reserved workstream event id");
     }
     for id in request.native_session_id.as_deref().into_iter().chain(
         request
@@ -881,6 +893,7 @@ async fn finish_run(
             .finish_workstream_run(
                 authority,
                 FinishWorkstreamRun {
+                    sanitizer: state.sanitizer.clone(),
                     run_id,
                     native_session_id: None,
                     source_cursor: None,
@@ -952,6 +965,7 @@ async fn finish_run(
         }
     };
     let input = FinishWorkstreamRun {
+        sanitizer: state.sanitizer.clone(),
         run_id,
         native_session_id: native_identity.map(NativeSessionIdentity::into_string),
         source_cursor: request.source_cursor,
@@ -1026,14 +1040,11 @@ fn sanitize_events(
         {
             return Err("invalid workstream message role".to_string());
         }
-        let raw_metadata = serde_json::to_string(&event.metadata).map_err(|e| e.to_string())?;
-        if raw_metadata.len() > MAX_METADATA_BYTES {
-            event.metadata = serde_json::json!({ "truncated": true });
-        } else {
-            let scrubbed = sanitizer.scrub(&raw_metadata);
-            event.metadata = serde_json::from_str(&scrubbed)
-                .unwrap_or_else(|_| serde_json::json!({ "redacted": true }));
-        }
+        (event.source_record_id, event.metadata) = ai_memory_core::scrub_workstream_provenance(
+            sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
     }
     Ok(())
 }
@@ -1215,6 +1226,272 @@ mod tests {
         (workspace_id, project_id)
     }
 
+    #[tokio::test]
+    async fn workstream_provenance_finish_scrubs_before_raw_segment_and_search() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        state.sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-correlation".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        let response = finish_run(
+            State(state.clone()), None, None, None, None, AxumPath(run.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-1".into()), source_cursor: None,
+                events: vec![NewWorkstreamEvent {
+                    event_id: "event-1".into(), agent: AgentKind::Codex,
+                    native_session_id: "native-1".into(),
+                    source_record_id: Some("private-correlation".into()),
+                    kind: WorkstreamEventKind::ToolResult, role: Some("tool".into()),
+                    content: "portable provenance sentinel".into(), occurred_at: None,
+                    metadata: serde_json::json!({"tool_call_id": "call-1", "parent_id": "private-correlation", "dump": "private payload"}),
+                }],
+                complete: false, checkpoint: Default::default(), exit_code: None, losses: Vec::new(),
+            }),
+        ).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(run.workstream_id.to_string())
+            .join("segments");
+        let path = std::fs::read_dir(segment_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !raw.contains("private-correlation"),
+            "raw segment leaked source id"
+        );
+        assert!(!raw.contains("private payload"));
+        for q in ["", "portable"] {
+            let response = search_events(
+                State(state.clone()),
+                None,
+                None,
+                AxumPath(run.workstream_id.to_string()),
+                Query(EventQuery {
+                    q: q.into(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(events[0]["source_record_id"], "[REDACTED:custom]");
+            assert_eq!(events[0]["metadata"]["parent_id"], "[REDACTED:custom]");
+            assert_eq!(events[0]["metadata"]["tool_call_id"], "call-1");
+            assert!(events[0]["metadata"].get("dump").is_none());
+        }
+        let original: NewWorkstreamEvent = serde_json::from_str(raw.trim()).unwrap();
+        let mut next = original.clone();
+        next.event_id = "event-2".into();
+        next.source_record_id = Some("record-2".into());
+        let mut collision = original.clone();
+        collision.kind = WorkstreamEventKind::Message;
+        let import = |events| {
+            finish_run(
+                State(state.clone()),
+                None,
+                None,
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(FinishManagedRunRequest {
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events,
+                    complete: false,
+                    checkpoint: Default::default(),
+                    exit_code: None,
+                    losses: Vec::new(),
+                }),
+            )
+        };
+        assert_eq!(
+            import(vec![next.clone(), collision]).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let read = || {
+            store.reader.search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                state.sanitizer.clone(),
+            )
+        };
+        assert_eq!(
+            read().await.unwrap().len(),
+            1,
+            "failed segment must not become indexed history"
+        );
+        let recovered = import(vec![next, original]).await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let body = to_bytes(recovered.into_body(), 64 * 1024).await.unwrap();
+        let recovered: FinishManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recovered.imported_events, 1);
+        assert_eq!(recovered.latest_sequence, 2);
+        assert_eq!(read().await.unwrap().len(), 2);
+        let original: NewWorkstreamEvent = serde_json::from_str(raw.trim()).unwrap();
+        let complete = |events| {
+            finish_run(
+                State(state.clone()),
+                None,
+                None,
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(FinishManagedRunRequest {
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events,
+                    complete: true,
+                    checkpoint: Default::default(),
+                    exit_code: None,
+                    losses: Vec::new(),
+                }),
+            )
+        };
+        assert_eq!(
+            complete(vec![original.clone()]).await.status(),
+            StatusCode::OK
+        );
+        let mut changed = original.clone();
+        changed.source_record_id = Some("different-record".into());
+        let mut late = original.clone();
+        late.event_id = "late-new-event".into();
+        assert_eq!(complete(vec![changed, late]).await.status(), StatusCode::OK);
+        assert_eq!(complete(vec![original]).await.status(), StatusCode::OK);
+        let hits = read().await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.kind == WorkstreamEventKind::Checkpoint)
+        );
+        assert!(!hits.iter().any(|hit| hit.event_id == "late-new-event"));
+    }
+
+    #[tokio::test]
+    async fn workstream_provenance_client_cannot_use_server_event_ids() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        let import = |id: String, complete| {
+            finish_run(
+                State(state.clone()),
+                None,
+                None,
+                None,
+                None,
+                AxumPath(run.run_id.to_string()),
+                Json(FinishManagedRunRequest {
+                    native_session_id: Some("native-1".into()),
+                    source_cursor: None,
+                    events: vec![NewWorkstreamEvent {
+                        event_id: id,
+                        agent: AgentKind::Codex,
+                        native_session_id: "native-1".into(),
+                        source_record_id: Some("record-1".into()),
+                        kind: WorkstreamEventKind::Message,
+                        role: Some("assistant".into()),
+                        content: "legitimate native event".into(),
+                        occurred_at: None,
+                        metadata: serde_json::Value::Null,
+                    }],
+                    complete,
+                    checkpoint: Default::default(),
+                    exit_code: Some(0),
+                    losses: if complete {
+                        vec!["missing native record".into()]
+                    } else {
+                        Vec::new()
+                    },
+                }),
+            )
+        };
+        // Legitimate native ids work before and after the attempted forgery.
+        assert_eq!(
+            import("native-event".into(), false).await.status(),
+            StatusCode::OK
+        );
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(run.workstream_id.to_string())
+            .join("segments");
+        for id in [
+            format!("managed-run:{}:checkpoint", run.run_id),
+            format!("managed-run:{}:losses", run.run_id),
+            "managed-run:other-run:annotation".into(),
+        ] {
+            assert_eq!(import(id, false).await.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                std::fs::read_dir(&segment_dir).unwrap().count(),
+                1,
+                "reserved ids must be refused before writing raw segments"
+            );
+        }
+        assert_eq!(
+            import("native-event".into(), true).await.status(),
+            StatusCode::OK
+        );
+        let hits = store
+            .reader
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                state.sanitizer.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().any(|hit| hit.event_id == "native-event"));
+        for (suffix, kind) in [
+            ("checkpoint", WorkstreamEventKind::Checkpoint),
+            ("losses", WorkstreamEventKind::Annotation),
+        ] {
+            assert!(hits.iter().any(|hit| hit.event_id
+                == format!("managed-run:{}:{suffix}", run.run_id)
+                && hit.kind == kind
+                && hit.source_record_id.is_none()));
+        }
+        assert_eq!(
+            import("managed-run:late:checkpoint".into(), false)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     /// The launcher reads whether the run's child linked a session from the
     /// run status, so the route must carry it.
     #[tokio::test]
@@ -1372,7 +1649,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1380,6 +1657,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: prepared.run_id,
                     native_session_id: Some("private-native-id".into()),
                     source_cursor: None,
@@ -1474,7 +1752,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1482,6 +1760,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: claude.run_id,
                     native_session_id: Some("claude-current".into()),
                     source_cursor: Some("cursor".into()),
@@ -1561,7 +1840,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1569,6 +1848,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: prepared.run_id,
                     native_session_id: Some("session_abc".into()),
                     source_cursor: None,
@@ -1695,6 +1975,154 @@ mod tests {
                 .unwrap(),
             ai_memory_store::ManagedRunSessionLink::Exact(prepared.run_id)
         );
+    }
+
+    /// #1075: every route that renews, rebinds, accepts for or releases a run
+    /// applies finish's owner rule, so none is a side door around it. Another
+    /// operator — even one who may write the project, and root acting under a
+    /// different identity — is refused on all four, and the run stays intact;
+    /// the owner is admitted (legitimate control).
+    #[tokio::test]
+    async fn run_mutation_routes_refuse_another_operator() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        for name in ["alice", "bob"] {
+            store
+                .writer
+                .create_human_user(
+                    ai_memory_core::NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    ai_memory_core::UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let actor = |name: &str| {
+            Some(Extension(ai_memory_core::ActorContext {
+                user: Some(name.into()),
+                ..ai_memory_core::ActorContext::default()
+            }))
+        };
+        let user = || Some(Extension(AuthLevel::User));
+        let prepared = prepare_run(
+            State(state.clone()),
+            None,
+            actor("alice"),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed-owner-routes".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Grok,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                force_unlock: false,
+                lease_owner: "alice:1".into(),
+            }),
+        )
+        .await;
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let body = to_bytes(prepared.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        let run = || AxumPath(prepared.run_id.to_string());
+        let link = || {
+            Json(LinkManagedRunRequest {
+                native_session_id: "native-link".into(),
+            })
+        };
+
+        for (who, level) in [("bob", user()), ("admin", Some(Extension(AuthLevel::Root)))] {
+            let statuses = [
+                heartbeat_run(State(state.clone()), level, None, actor(who), None, run())
+                    .await
+                    .status(),
+                link_run(
+                    State(state.clone()),
+                    level,
+                    None,
+                    actor(who),
+                    None,
+                    run(),
+                    link(),
+                )
+                .await
+                .status(),
+                accept_run_context(State(state.clone()), level, None, actor(who), None, run())
+                    .await
+                    .status(),
+                cancel_run(State(state.clone()), level, None, actor(who), None, run())
+                    .await
+                    .status(),
+            ];
+            assert_eq!(statuses, [StatusCode::FORBIDDEN; 4], "{who}");
+        }
+        let status = store
+            .reader
+            .managed_run_status(prepared.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status.state, "active",
+            "refused callers must not end the run"
+        );
+        assert!(!status.context_delivered);
+        assert_eq!(status.native_session_id, None);
+
+        let statuses = [
+            heartbeat_run(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+            )
+            .await
+            .status(),
+            link_run(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+                link(),
+            )
+            .await
+            .status(),
+            accept_run_context(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+            )
+            .await
+            .status(),
+            cancel_run(
+                State(state.clone()),
+                user(),
+                None,
+                actor("alice"),
+                None,
+                run(),
+            )
+            .await
+            .status(),
+        ];
+        assert_eq!(statuses, [StatusCode::NO_CONTENT; 4]);
     }
 
     #[tokio::test]
@@ -1831,7 +2259,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1839,6 +2267,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: prepared.run_id,
                     native_session_id: Some("7c1d5698-204a-4c0f-ae9c-43db7fc4e41d".into()),
                     source_cursor: None,
@@ -1909,7 +2338,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1917,6 +2346,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: prepared.run_id,
                     native_session_id: Some("2cce5126-f57d-4ddd-8f66-e5bb409f60db".into()),
                     source_cursor: None,
@@ -1987,7 +2417,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -1995,6 +2425,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: prepared.run_id,
                     native_session_id: Some("019f-session".into()),
                     source_cursor: None,
@@ -2068,7 +2499,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2076,6 +2507,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: prepared.run_id,
                     native_session_id: Some("a0d5ac62-2501-4780-b783-76d159c56cb3".into()),
                     source_cursor: None,
@@ -2134,6 +2566,8 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
+            None,
             AxumPath(prepared.run_id.to_string()),
         )
         .await;
@@ -2172,6 +2606,8 @@ mod tests {
                 State(state.clone()),
                 None,
                 None,
+                None,
+                None,
                 AxumPath(prepared.run_id.to_string()),
             )
             .await;
@@ -2199,7 +2635,7 @@ mod tests {
         store
             .writer
             .finish_workstream_run(
-                ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                ai_memory_store::ManagedRunAuthority::from_auth(
                     AuthLevel::Anonymous,
                     None,
                     None,
@@ -2207,6 +2643,7 @@ mod tests {
                     false,
                 ),
                 FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: codex.run_id,
                     native_session_id: Some("codex-native".into()),
                     source_cursor: None,
@@ -2271,6 +2708,8 @@ mod tests {
 
         let accepted = accept_run_context(
             State(state.clone()),
+            None,
+            None,
             None,
             None,
             AxumPath(crush.run_id.to_string()),
@@ -2395,6 +2834,39 @@ mod tests {
             .await
             .unwrap()
             .expect("the run was just prepared");
+        store
+            .writer
+            .finish_workstream_run(
+                ai_memory_store::ManagedRunAuthority::from_auth(
+                    AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: state.sanitizer.clone(),
+                    run_id: prepared.run_id,
+                    native_session_id: Some("claude-native".into()),
+                    source_cursor: None,
+                    events: vec![NewWorkstreamEvent {
+                        event_id: "scope-provenance".into(),
+                        agent: AgentKind::ClaudeCode,
+                        native_session_id: "claude-native".into(),
+                        source_record_id: Some("record-1".into()),
+                        kind: WorkstreamEventKind::ToolResult,
+                        role: Some("tool".into()),
+                        content: "scope provenance sentinel".into(),
+                        occurred_at: None,
+                        metadata: serde_json::json!({"tool_use_id": "call-1"}),
+                    }],
+                    complete: false,
+                    segment_path: None,
+                    exit_code: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let human = |name: &'static str| {
             let writer = store.writer.clone();
@@ -2429,6 +2901,7 @@ mod tests {
             .await
             .unwrap();
         let as_viewer = |user| Some(Extension(AuthorizedViewer(user)));
+        let as_user = || Some(Extension(AuthLevel::User));
         let run = || AxumPath(prepared.run_id.to_string());
 
         // Status is a read: bob (nothing) is refused, carol (reader) is not.
@@ -2450,24 +2923,45 @@ mod tests {
         // Acting on the run needs write: carol's read is not enough.
         for viewer in [bob, carol] {
             assert_eq!(
-                heartbeat_run(State(state.clone()), None, as_viewer(viewer), run())
-                    .await
-                    .status(),
+                heartbeat_run(
+                    State(state.clone()),
+                    as_user(),
+                    as_viewer(viewer),
+                    None,
+                    None,
+                    run()
+                )
+                .await
+                .status(),
                 StatusCode::FORBIDDEN,
                 "heartbeat"
             );
             assert_eq!(
-                cancel_run(State(state.clone()), None, as_viewer(viewer), run())
-                    .await
-                    .status(),
+                cancel_run(
+                    State(state.clone()),
+                    as_user(),
+                    as_viewer(viewer),
+                    None,
+                    None,
+                    run()
+                )
+                .await
+                .status(),
                 StatusCode::FORBIDDEN,
                 "cancel"
             );
         }
         assert_eq!(
-            heartbeat_run(State(state.clone()), None, as_viewer(alice), run())
-                .await
-                .status(),
+            heartbeat_run(
+                State(state.clone()),
+                as_user(),
+                as_viewer(alice),
+                None,
+                None,
+                run()
+            )
+            .await
+            .status(),
             StatusCode::NO_CONTENT,
             "alice's own run keeps working"
         );
@@ -2482,8 +2976,16 @@ mod tests {
                 Query(EventQuery::default()),
             )
         };
-        assert_eq!(events(as_viewer(bob)).await.status(), StatusCode::FORBIDDEN);
-        assert_eq!(events(as_viewer(carol)).await.status(), StatusCode::OK);
+        let refused = events(as_viewer(bob)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(refused.into_body(), 64 * 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("record-1"));
+        let allowed = events(as_viewer(carol)).await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let body = to_bytes(allowed.into_body(), 64 * 1024).await.unwrap();
+        let provenance: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(provenance[0]["source_record_id"], "record-1");
+        assert_eq!(provenance[0]["metadata"]["tool_use_id"], "call-1");
 
         // No viewer — an install with no database users, or root — is unchanged.
         assert_eq!(
@@ -2588,7 +3090,7 @@ mod tests {
                 store
                     .writer
                     .finish_workstream_run(
-                        ai_memory_store::WorkstreamFinishAuthority::from_auth(
+                        ai_memory_store::ManagedRunAuthority::from_auth(
                             AuthLevel::User,
                             Some(ai_memory_core::AuthorizedViewer(alice)),
                             Some(alice),
@@ -2596,6 +3098,7 @@ mod tests {
                             false,
                         ),
                         FinishWorkstreamRun {
+                            sanitizer: ai_memory_core::Sanitizer::default(),
                             run_id: run.run_id,
                             native_session_id: None,
                             source_cursor: None,
@@ -2691,11 +3194,6 @@ mod tests {
 
     #[tokio::test]
     async fn native_identity_http_link_refuses_before_status_or_sql() {
-        println!(
-            "NATIVE_TEST_PID {} {:?}",
-            std::process::id(),
-            std::env::current_exe().unwrap()
-        );
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let mut state = test_state(&store, temp.path());
@@ -2719,6 +3217,8 @@ mod tests {
                 State(state.clone()),
                 None,
                 None,
+                None,
+                None,
                 AxumPath(run.run_id.to_string()),
                 Json(LinkManagedRunRequest {
                     native_session_id: id,
@@ -2735,6 +3235,8 @@ mod tests {
         }
         let response = link_run(
             State(state),
+            None,
+            None,
             None,
             None,
             AxumPath(run.run_id.to_string()),
@@ -2759,11 +3261,6 @@ mod tests {
 
     #[tokio::test]
     async fn native_identity_http_finish_refuses_before_segment_or_sql() {
-        println!(
-            "NATIVE_TEST_PID {} {:?}",
-            std::process::id(),
-            std::env::current_exe().unwrap()
-        );
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let state = test_state(&store, temp.path());
@@ -2831,18 +3328,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let events = store
             .reader
-            .search_workstream_events(run.workstream_id, "".into(), 10)
+            .search_workstream_events(run.workstream_id, "".into(), 10, Sanitizer::default())
             .await
             .unwrap();
         assert!(events.iter().all(|e| e.native_session_id == "vendor-界-01"));
     }
     #[tokio::test]
     async fn native_identity_http_event_guard_and_configured_history_projection() {
-        println!(
-            "NATIVE_TEST_PID {} {:?}",
-            std::process::id(),
-            std::env::current_exe().unwrap()
-        );
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let mut state = test_state(&store, temp.path());
@@ -2930,11 +3422,6 @@ mod tests {
 
     #[tokio::test]
     async fn native_identity_http_stored_identity_refuses_before_raw_segment() {
-        println!(
-            "NATIVE_TEST_PID {} {:?}",
-            std::process::id(),
-            std::env::current_exe().unwrap()
-        );
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let mut state = test_state(&store, temp.path());

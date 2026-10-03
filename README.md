@@ -132,10 +132,12 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Kimi Code | Supported |
 | Kiro CLI | Supported |
 | Pool | Hooks-only |
+| GitHub Copilot CLI | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | Muse Code | MCP-only |
 | Hermes Agent | Supported |
+| GrizzyBot | Supported |
 | LLM/auth providers | Supported |
 | Embedding providers | Supported |
 
@@ -311,7 +313,7 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
 #    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent opencode2`, `--agent gemini-cli`,
-#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent omp`,
+#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
 #    for additional agents; full list in docs/install.md.
@@ -545,7 +547,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across harnesses: auto harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation, plus per-repository server profiles. |
-| [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
+| [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: the default `per_actor` isolation, session-aware `per_session` isolation, and the pre-v1.39 `single` slot. |
 | [`docs/macos.md`](docs/macos.md) | macOS install paths: menu bar app, native release tarball, source build, Docker wrapper, launchd, and current limitations. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes, handoff-injection limits, and community bridge guidance. |

@@ -171,11 +171,18 @@ pub(crate) fn tool_observation_metadata(
         // Grok Build CLI posts Claude Code's snake_case aliases
         // (`tool_name` / `tool_input` / `tool_use_id`) on its tool hooks
         // alongside camelCase, so it shares this mapping (#931).
+        // GitHub Copilot CLI, configured with PascalCase hook event names per
+        // its own docs, emits the same Claude-compatible `tool_name`/
+        // `tool_input` shape (#1040) — unverified against a real tool-call id
+        // field, but `tool_use_id` extraction degrades to `None` gracefully
+        // if absent.
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
         | AgentKind::Grok
-        | AgentKind::Zcode => (
+        | AgentKind::Grizzybot
+        | AgentKind::Zcode
+        | AgentKind::CopilotCli => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -225,6 +232,8 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::KiroCli
                             | AgentKind::Pool
                             | AgentKind::Zcode
+                            | AgentKind::CopilotCli
+                            | AgentKind::Grizzybot
                     ) {
                         "tool_input"
                     } else {
@@ -277,6 +286,29 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         {
             ToolOutcome::Error
         }
+        // GitHub Copilot CLI's VS-Code-compatible `PostToolUse` carries
+        // `tool_result.result_type` (#1040). Only `success` and an explicit
+        // failure prove an outcome; any other value (a denied or rejected
+        // call, a future type) stays unknown. `PostToolUseFailure` is aliased
+        // to `PostToolUse`, so an `error` string with no `tool_result` is the
+        // failure form, as for ZCode.
+        AgentKind::CopilotCli => match raw
+            .get("tool_result")
+            .and_then(|result| result.get("result_type"))
+            .and_then(Value::as_str)
+        {
+            Some("success") => ToolOutcome::Success,
+            Some("failure" | "error") => ToolOutcome::Error,
+            Some(_) => ToolOutcome::Unknown,
+            None if raw
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| !error.is_empty()) =>
+            {
+                ToolOutcome::Error
+            }
+            None => ToolOutcome::Unknown,
+        },
         // Codex PostToolUse also fires for failed commands. Its native exec
         // response is output text, with no separate success/exit-code field;
         // neither the event nor arbitrary response JSON proves an outcome.
@@ -720,7 +752,13 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Pool
         // ZCode mirrors Claude Code's snake_case `tool_name`/`tool_input`
         // aliases on every tool event (live-captured, #512).
-        | AgentKind::Zcode => object
+        // GrizzyBot posts the same Claude Code-shaped payload from its agent
+        // loop.
+        | AgentKind::Grizzybot
+        | AgentKind::Zcode
+        // GitHub Copilot CLI, PascalCase-configured for the Claude-compatible
+        // payload shape (#1040).
+        | AgentKind::CopilotCli => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -1803,6 +1841,23 @@ mod tests {
     }
 
     #[test]
+    fn grizzybot_tool_shape_is_closed_and_unknown_agents_stay_unsupported() {
+        let raw = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "web_search",
+            "tool_input": {"query": "swift"},
+            "session_id": "gb-session",
+            "cwd": "/bot/home"
+        });
+        let metadata = tool_observation_metadata(AgentKind::Grizzybot, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        // A PreToolUse without an input is not a proven shape.
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, true).is_none());
+        assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, false).is_some());
+    }
+
+    #[test]
     fn zcode_post_tool_use_failure_error_maps_to_error_outcome() {
         // Live-captured PostToolUseFailure payload (run 10, real model, #512):
         // `error` is a plain string, `error_details` carries the internal
@@ -1827,6 +1882,41 @@ mod tests {
             tool_observation_outcome(AgentKind::Zcode, &ok),
             ToolOutcome::Unknown
         );
+    }
+
+    #[test]
+    fn copilot_cli_outcome_reads_only_proven_result_types() {
+        let outcome = |raw: Value| tool_observation_outcome(AgentKind::CopilotCli, &raw);
+        let with_type = |result_type: &str| {
+            json!({"tool_name": "bash", "tool_result": {
+                "result_type": result_type, "text_result_for_llm": "x"
+            }})
+        };
+        assert_eq!(outcome(with_type("success")), ToolOutcome::Success);
+        assert_eq!(outcome(with_type("failure")), ToolOutcome::Error);
+        assert_eq!(outcome(with_type("error")), ToolOutcome::Error);
+        // A denied or rejected call is not a tool failure, and a future type
+        // proves nothing.
+        assert_eq!(outcome(with_type("denied")), ToolOutcome::Unknown);
+        // PostToolUseFailure (aliased to PostToolUse) carries `error` and no
+        // `tool_result`.
+        assert_eq!(
+            outcome(json!({"tool_name": "bash", "error": "permission denied"})),
+            ToolOutcome::Error
+        );
+        assert_eq!(outcome(json!({"tool_name": "bash"})), ToolOutcome::Unknown);
+    }
+
+    #[test]
+    fn copilot_cli_tool_metadata_uses_the_claude_compatible_keys() {
+        let pre = json!({
+            "tool_name": "edit",
+            "tool_input": {"path": "src/lib.rs"},
+        });
+        assert!(tool_observation_metadata(AgentKind::CopilotCli, &pre, true).is_some());
+        // PreToolUse without a proven input shape stays metadata-less.
+        let no_input = json!({"tool_name": "edit"});
+        assert!(tool_observation_metadata(AgentKind::CopilotCli, &no_input, true).is_none());
     }
 
     #[test]

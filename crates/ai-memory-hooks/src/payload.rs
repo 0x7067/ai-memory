@@ -221,11 +221,12 @@ impl std::fmt::Debug for HookEnvelope {
 
 /// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
 /// (a nested/spawned agent session) rather than the top-level session. Grok
-/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_type`
-/// and `agent_id` (on its `SubagentStart`/`SubagentStop` and subagent tool
-/// events). The set is a union so one check covers every harness that signals
-/// subagent-ness; a harness that does not signal it simply never matches.
-const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_type", "agent_id"];
+/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_id`
+/// on subagent events. `agent_type` alone is not a subagent marker: Claude
+/// Code also sets it on top-level sessions launched with `--agent`. The set
+/// is a union so one check covers every harness that signals subagent-ness;
+/// a harness that does not signal it simply never matches.
+const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_id"];
 
 /// True when the raw hook payload carries a non-empty subagent marker — i.e.
 /// the event originates from a spawned subagent session. The ingest router
@@ -725,6 +726,8 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Hermes
             | AgentKind::Pool
             | AgentKind::Zcode
+            | AgentKind::CopilotCli
+            | AgentKind::Grizzybot
     )
 }
 
@@ -799,6 +802,14 @@ fn safe_tool_body(
                 // Codex's native schema has one top-level JSON response.
                 // Do not promote unrelated aliases or nested payloads to output.
                 raw.get("tool_response").and_then(value_to_text)
+            } else if agent == AgentKind::CopilotCli {
+                // Copilot CLI's VS-Code-compatible `PostToolUse` nests the
+                // model-facing text at `tool_result.text_result_for_llm`
+                // (#1040); read only that documented field so `result_type`
+                // never leaks in through an object-stringify fallback.
+                raw.pointer("/tool_result/text_result_for_llm")
+                    .and_then(value_to_text)
+                    .or_else(|| extract_content(raw, &["error"]))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -1368,13 +1379,33 @@ mod tests {
         assert!(body_is_subagent(
             &serde_json::json!({ "sessionId": "s", "subagentType": "general-purpose" })
         ));
-        // Claude Code tags its subagent events with `agent_type` / `agent_id`.
+        // Claude Code identifies spawned agents with `agent_id`.
         assert!(body_is_subagent(
-            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent" })
+            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent", "agent_id": "agent-abc123" })
         ));
         assert!(body_is_subagent(
             &serde_json::json!({ "agent_id": "agent-abc123" })
         ));
+    }
+
+    #[test]
+    fn body_is_subagent_keeps_top_level_claude_agent_sessions() {
+        // `claude --agent <name>` also sets agent_type on the main session.
+        let mut raw = serde_json::json!({
+            "session_id": "main-session",
+            "agent_type": "regulus:regulus",
+        });
+        assert!(!body_is_subagent(&raw), "agent_id absent");
+        for agent_id in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!(42),
+            serde_json::json!(false),
+        ] {
+            raw["agent_id"] = agent_id;
+            assert!(!body_is_subagent(&raw), "{raw}");
+        }
     }
 
     #[test]
@@ -2092,6 +2123,30 @@ mod tests {
         assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
     }
 
+    #[test]
+    fn grizzybot_tool_title_is_a_closed_family() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write_file",
+            "tool_input": {"path": "notes.md", "content": "untrusted"},
+            "tool_response": "ok",
+            "session_id": "gb-session",
+            "cwd": "/bot/home"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("grizzybot".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Grizzybot);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("gb-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
+    }
+
     /// Body is well-formed JSON but the expected `session_id` /
     /// `cwd` keys are missing — extraction returns None per key.
     #[test]
@@ -2388,6 +2443,40 @@ mod tests {
             body.contains("MARKER_GROK_931"),
             "grok tool_response should be serialized into the body: {body:?}"
         );
+    }
+
+    /// Copilot CLI's VS-Code-compatible `PostToolUse` nests the output at
+    /// `tool_result.text_result_for_llm` (#1040). Without Copilot in
+    /// `closed_tool_agent` the observation would be stored with an empty body,
+    /// the #931 failure mode Grok had; without the dedicated path the
+    /// `result_type` envelope would leak into the excerpt.
+    #[test]
+    fn copilot_cli_post_tool_excerpt_reads_text_result_for_llm() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("copilot-cli".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "copilot-session",
+                "cwd": "/repo",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "tool_result": {
+                    "result_type": "success",
+                    "text_result_for_llm": "MARKER_COPILOT_1040",
+                },
+            }),
+        );
+        let body = env
+            .body_excerpt
+            .expect("copilot-cli post-tool body should not be empty");
+        assert!(body.contains("MARKER_COPILOT_1040"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(!body.contains("result_type"), "{body:?}");
     }
 
     /// End-to-end: a native-hook user prompt (`event=user-prompt-submit`,

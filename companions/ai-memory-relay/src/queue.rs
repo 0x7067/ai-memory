@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -28,6 +28,14 @@ pub const MAX_SESSION_PINS: i64 = 50_000;
 
 const SCHEMA_VERSION: &str = "2";
 const IDENTITY: &str = "ai-memory-relay-queue";
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenPhase {
+    AfterPreflight,
+    BeforeJournal,
+    JournalBusy,
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta(
@@ -169,6 +177,30 @@ impl Queue {
     /// metadata commit together, so an interrupted initialization can reopen
     /// the empty database left by rollback.
     pub fn open(dir: &Path) -> Result<Self> {
+        #[cfg(test)]
+        {
+            Self::open_for_test(dir, Duration::from_secs(10), &mut |_| {})
+        }
+        #[cfg(not(test))]
+        {
+            Self::open_inner(dir, Duration::from_secs(10))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(
+        dir: &Path,
+        timeout: Duration,
+        hook: &mut dyn FnMut(OpenPhase),
+    ) -> Result<Self> {
+        Self::open_inner(dir, timeout, hook)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        timeout: Duration,
+        #[cfg(test)] hook: &mut dyn FnMut(OpenPhase),
+    ) -> Result<Self> {
         let path = dir.join(fsguard::DB_FILE);
         fsguard::check_queue_file(&path)?;
         for name in fsguard::SIDECARS {
@@ -183,8 +215,10 @@ impl Queue {
         }
         let mut conn = Connection::open(&path)
             .with_context(|| format!("open relay queue at {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(10))?;
+        conn.busy_timeout(timeout)?;
         classify(&conn, &path)?;
+        #[cfg(test)]
+        hook(OpenPhase::AfterPreflight);
         // Recheck under the write lock: another opener may have initialized or
         // migrated since the read-only preflight.
         {
@@ -208,8 +242,14 @@ impl Queue {
             }
             tx.commit()?;
         }
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA foreign_keys=ON;",
+        #[cfg(test)]
+        hook(OpenPhase::BeforeJournal);
+        configure(
+            &conn,
+            &path,
+            timeout,
+            #[cfg(test)]
+            hook,
         )
         .with_context(|| format!("configure relay queue at {}", path.display()))?;
         Ok(Self { conn, path })
@@ -695,6 +735,63 @@ enum DbState {
     V1,
 }
 
+fn configure(
+    conn: &Connection,
+    path: &Path,
+    timeout: Duration,
+    #[cfg(test)] hook: &mut dyn FnMut(OpenPhase),
+) -> Result<()> {
+    // WAL needs an exclusive lock outside a transaction. SQLite can return
+    // BUSY without calling its busy handler when other openers hold read/write
+    // locks. Own this phase's wait budget instead of restarting a 10s wait.
+    let deadline = Instant::now() + timeout;
+    conn.busy_timeout(Duration::ZERO)?;
+    let result = loop {
+        let attempt = (|| -> Result<()> {
+            // Keep the same connection and recheck identity/version metadata
+            // before every WAL attempt, including after a lock was released.
+            if classify(conn, path)? != DbState::Ready {
+                bail!(
+                    "relay queue identity or schema version changed before journal configuration"
+                );
+            }
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA foreign_keys=ON;",
+            )?;
+            Ok(())
+        })();
+        match attempt {
+            Err(error) if is_lock_contention(&error) => {
+                #[cfg(test)]
+                hook(OpenPhase::JournalBusy);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break Err(error);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                if Instant::now() >= deadline {
+                    break Err(error);
+                }
+            }
+            other => break other,
+        }
+    };
+    conn.busy_timeout(timeout)?;
+    result.map_err(|error| {
+        if is_lock_contention(&error) {
+            error.context("relay queue busy; retry opening the same queue")
+        } else {
+            error
+        }
+    })
+}
+
+pub(crate) fn is_lock_contention(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(error, _))
+        if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+}
+
 /// Classify an existing file before touching it. Never mutates.
 fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
     let refuse = |detail: String| -> anyhow::Error {
@@ -713,7 +810,14 @@ fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
         |r| r.get(0),
     );
     // A file that is not a SQLite database fails right here, before any write.
-    let objects = objects.map_err(|e| refuse(format!("cannot read its object list: {e}")))?;
+    let objects = objects.map_err(|e| {
+        let error = anyhow::Error::new(e);
+        if is_lock_contention(&error) {
+            error
+        } else {
+            error.context(refuse("cannot read its object list".into()))
+        }
+    })?;
     if objects == 0 {
         return Ok(DbState::Fresh);
     }
@@ -724,7 +828,14 @@ fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
         mapped.collect()
     })();
     let meta: HashMap<String, String> = rows
-        .map_err(|e| refuse(format!("it carries no readable relay metadata: {e}")))?
+        .map_err(|e| {
+            let error = anyhow::Error::new(e);
+            if is_lock_contention(&error) {
+                error
+            } else {
+                error.context(refuse("it carries no readable relay metadata".into()))
+            }
+        })?
         .into_iter()
         .collect();
     match (
