@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Added a default checkout-local workstream picker for commandless terminal
-  launches, including `ai-jail ai-memory`. The Linux/macOS shell wrapper now
-  routes a bare interactive launch to its native host client. Scripted CLI
-  calls still require a subcommand; help/version behavior is unchanged. (#1039)
+- Added `ai-memory resume --search` with immediate type-to-filter name search,
+  and `resume --all`, which keeps the previous cross-checkout picker: every
+  linked checkout, the current one first, each listed with its own fully
+  paginated query. (#1039)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
@@ -186,11 +186,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued SessionEnd consolidation job completed. (#1038)
 
 ### Changed
-- Scoped `ai-memory resume` to the current checkout instead of every linked
-  project, removed its default result cutoff with bounded server pagination,
-  and added `--search` plus immediate type-to-filter name search while preserving
-  Left/Right harness selection. Explicit limits now apply after the initial
-  search; `continue` retained its cross-directory behavior. (#1039)
+- Scoped `ai-memory resume` to the current checkout by default instead of every
+  linked project (`--all` restores the old view) and removed its default result
+  cutoff with bounded server pagination, preserving Left/Right harness
+  selection. Explicit limits now apply after the initial search; against an
+  older server that ignores paging, the picker warns and shows the first page.
+  `continue` retained its cross-directory behavior. (#1039)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
@@ -214,8 +215,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Removed unnecessary working-tree scans from checkout-local workstream listing
-  and the resume picker, including `ai-jail ai-memory resume --yolo`; launching
-  a selected workstream still captured its full checkpoint. (#1039)
+  and the resume picker; launching a selected workstream still captured its
+  full checkpoint. (#1039)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)

@@ -94,12 +94,20 @@ pub(super) async fn list_all_for_checkout(
         if count < request.limit {
             break;
         }
-        // Older servers ignore offset. Do not loop forever or silently show
-        // only their first page when the user requested all workstreams.
-        anyhow::ensure!(
-            summaries.len() > before,
-            "server did not advance workstream pagination; upgrade the ai-memory server and retry"
-        );
+        // Older servers ignore offset and repeat their first page. Stop
+        // instead of looping, and say the list is partial rather than fail:
+        // the CLI and server may be upgraded on different machines.
+        if summaries.len() == before {
+            eprintln!(
+                "warning: the ai-memory server ignored workstream pagination; showing its first {} workstreams. Upgrade the server to list them all.",
+                summaries.len()
+            );
+            break;
+        }
+        // Pages are ordered by recency, so a workstream that becomes active
+        // between two requests can move ahead of the offset and be skipped
+        // until the next listing; `seen` keeps the reverse move from
+        // duplicating a row. A picker tolerates that.
         request.offset = request
             .offset
             .checked_add(count)

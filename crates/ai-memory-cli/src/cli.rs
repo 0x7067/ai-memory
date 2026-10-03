@@ -1,7 +1,6 @@
 //! Command-line interface definition (clap derive).
 
 use std::ffi::OsString;
-use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -17,40 +16,7 @@ use clap_complete::Shell;
 /// wrapper-after-harness recovery (`--yolo`, `--fresh`, etc.) explicit in the
 /// run command rather than dependent on clap's option-name knowledge.
 pub(crate) fn parse_process() -> Cli {
-    let mut args = std::env::args_os().collect::<Vec<_>>();
-    default_to_resume(
-        &mut args,
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-    );
-    try_parse_from(args).unwrap_or_else(|error| error.exit())
-}
-
-fn default_to_resume(args: &mut Vec<OsString>, interactive: bool) {
-    if !interactive || args.is_empty() {
-        return;
-    }
-    let mut index = 1;
-    while index < args.len() {
-        let Some(arg) = args[index].to_str() else {
-            return;
-        };
-        if matches!(arg, "--data-dir" | "--config") && index + 1 < args.len() {
-            if args[index + 1]
-                .to_str()
-                .is_some_and(|value| value.starts_with('-'))
-            {
-                return;
-            }
-            index += 2;
-        } else if arg.starts_with("--data-dir=") || arg.starts_with("--config=") {
-            index += 1;
-        } else {
-            // Explicit commands, help/version and invalid input keep clap's
-            // usual behavior. Only a commandless terminal launch gets a picker.
-            return;
-        }
-    }
-    args.push("resume".into());
+    try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
 }
 
 pub(crate) fn try_parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
@@ -124,10 +90,7 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
 
 /// Top-level CLI for the `ai-memory` binary.
 #[derive(Debug, Parser)]
-#[command(
-    name = "ai-memory", version, about, long_about = None,
-    after_help = "Run without a command in a terminal to pick a workstream in this checkout.\nTo run inside ai-jail: ai-jail ai-memory"
-)]
+#[command(name = "ai-memory", version, about, long_about = None)]
 pub struct Cli {
     /// Override the data directory.
     ///
@@ -650,12 +613,17 @@ pub struct ContinueArgs {
 ///
 /// The picker deliberately accepts only wrapper-owned flags. Harness selection
 /// happens interactively, then it delegates to `run --workstream NAME` in the
-/// current checkout.
+/// selected checkout (the current one unless `--all` is given).
 #[derive(Debug, Args)]
 pub struct ResumeArgs {
-    /// Require the current checkout to resolve to this workspace.
+    /// Require the current checkout to resolve to this workspace; with
+    /// `--all`, only consider checkouts resolving to it.
     #[arg(long)]
     pub workspace: Option<String>,
+    /// List workstreams from every locally linked checkout instead of only
+    /// the current one.
+    #[arg(long)]
+    pub all: bool,
     /// Maximum matching workstreams to show (defaults to all).
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub limit: Option<u32>,
@@ -3465,6 +3433,7 @@ mod tests {
         };
         assert!(defaults.limit.is_none());
         assert!(defaults.search.is_none());
+        assert!(!defaults.all);
         let Command::Resume(wide) = Cli::try_parse_from(["ai-memory", "resume", "--limit", "500"])
             .unwrap()
             .command
@@ -3481,6 +3450,7 @@ mod tests {
             "50",
             "--search",
             "refactor",
+            "--all",
             "--yolo",
         ])
         .expect("resume parses picker flags");
@@ -3490,6 +3460,7 @@ mod tests {
         assert_eq!(args.workspace.as_deref(), Some("work"));
         assert_eq!(args.limit, Some(50));
         assert_eq!(args.search.as_deref(), Some("refactor"));
+        assert!(args.all);
         assert!(args.yolo);
         assert!(!args.fresh);
 
@@ -3503,51 +3474,6 @@ mod tests {
                 Cli::try_parse_from(&rejected).is_err(),
                 "{rejected:?} must not parse"
             );
-        }
-    }
-
-    #[test]
-    fn commandless_terminal_launch_opens_the_checkout_picker() {
-        for input in [
-            vec!["ai-memory"],
-            vec![
-                "ai-memory",
-                "--data-dir",
-                "data with spaces",
-                "--config=resume",
-            ],
-            vec!["ai-memory", "--config", "resume", "--data-dir=data"],
-        ] {
-            let mut args = input.into_iter().map(OsString::from).collect();
-            default_to_resume(&mut args, true);
-            let parsed = try_parse_from(args).unwrap();
-            let Command::Resume(picker) = parsed.command else {
-                panic!("expected checkout picker");
-            };
-            assert!(picker.limit.is_none() && picker.search.is_none());
-            assert!(!picker.yolo && !picker.true_yolo && !picker.fresh);
-        }
-    }
-
-    #[test]
-    fn default_picker_preserves_explicit_commands_help_errors_and_scripts() {
-        for (input, interactive) in [
-            (vec!["ai-memory"], false),
-            (vec!["ai-memory", "--config", "config.toml"], false),
-            (vec!["ai-memory", "--help"], true),
-            (vec!["ai-memory", "--version"], true),
-            (vec!["ai-memory", "status"], true),
-            (vec!["ai-memory", "run", "codex"], true),
-            (vec!["ai-memory", "user"], true),
-            (vec!["ai-memory", "resumee"], true),
-            (vec!["ai-memory", "--config"], true),
-            (vec!["ai-memory", "--config", "--help"], true),
-            (vec!["ai-memory", "--unknown"], true),
-        ] {
-            let expected = input.into_iter().map(OsString::from).collect::<Vec<_>>();
-            let mut args = expected.clone();
-            default_to_resume(&mut args, interactive);
-            assert_eq!(args, expected);
         }
     }
 

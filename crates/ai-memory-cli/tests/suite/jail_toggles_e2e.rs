@@ -708,69 +708,6 @@ async fn yolo_offer_skips_the_checklist_for_a_project_ai_jail() {
     handle.abort();
 }
 
-/// Exercise direct external wrapping, including the installed shell wrapper.
-/// The forwarding stub preserves the terminal just like ai-jail's PTY proxy;
-/// no nested real jail is needed, so this also runs inside ai-jail.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bare_ai_memory_opens_the_picker_directly_and_through_ai_jail() {
-    for mode in ["native", "jail-native", "jail-wrapper"] {
-        for launch in [false, true] {
-            let fixture = Fixture::new(HELP_2_4_1, true, None);
-            let entry = if mode == "jail-wrapper" {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/ai-memory")
-            } else {
-                PathBuf::from(BIN)
-            };
-            std::os::unix::fs::symlink(entry, fixture.bin.join("ai-memory")).unwrap();
-            std::os::unix::fs::symlink(host_tool("bash"), fixture.bin.join("bash")).unwrap();
-            write_script(
-                &fixture.bin.join("ai-jail"),
-                &format!(
-                    "if [ \"$1\" = --dry-run ]; then exit 0; fi\n\
-                 if [ \"$1\" = --help ]; then exit 0; fi\n\
-                 printf '%s\\n' \"$@\" > '{}'\nexec \"$@\"\n",
-                    fixture.jail_argv.display(),
-                ),
-            );
-            let (server, requests, handle) = mock_server().await;
-            let jailed = mode != "native";
-            let output = terminal_run_program(
-                &fixture,
-                &server,
-                &fixture
-                    .bin
-                    .join(if jailed { "ai-jail" } else { "ai-memory" }),
-                if jailed { "ai-memory" } else { "" },
-                if launch { "\x1b[C\r" } else { "\x1b" },
-                Some("Resume workstream"),
-            )
-            .await;
-            assert!(output.contains("Resume workstream"), "{mode}: {output}");
-            if jailed {
-                assert_eq!(fixture.jail_argv().unwrap(), ["ai-memory"]);
-            } else {
-                assert!(fixture.jail_argv().is_none());
-            }
-            let requests = requests.lock().unwrap();
-            assert_eq!(
-                requests.first().map(String::as_str),
-                Some("/workstream/recent")
-            );
-            if launch {
-                assert!(fixture.claude_ran.exists(), "{mode}: {output}");
-                assert!(output.contains("with harness 'claude'"), "{output}");
-                assert!(requests.iter().any(|path| path == "/workstream/runs"));
-                assert!(requests.iter().any(|path| path.ends_with("/finish")));
-            } else {
-                assert_eq!(requests.as_slice(), ["/workstream/recent"]);
-                assert!(!fixture.claude_ran.exists(), "Escape cancels before launch");
-            }
-            handle.abort();
-        }
-    }
-}
-
 #[tokio::test]
 async fn bare_nonterminal_command_help_version_and_typos_do_not_launch_a_picker() {
     let fixture = Fixture::new(HELP_2_4_1, true, None);

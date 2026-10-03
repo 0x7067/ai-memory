@@ -372,10 +372,7 @@ ai-memory continue           # resume the newest managed checkout
 ai-memory run --force-unlock codex
 ai-memory resume             # pick from ALL workstreams in this checkout only
 ai-memory resume --search auth # find a workstream by name (case-insensitive)
-ai-memory                     # same picker, when run in a terminal
-ai-jail ai-memory             # picker + selected harness inside ai-jail
-ai-jail ai-memory resume --yolo # explicit picker + harness's dangerous mode
-ai-jail --ssh ai-memory       # also share SSH access
+ai-memory resume --all       # pick across every linked checkout
 ```
 
 `--force-unlock` immediately expires the selected workstream's active lease;
@@ -390,29 +387,11 @@ then cancels when the search is empty (Ctrl-C always cancels).
 The list scrolls and loads every checkout-local page;
 there is no default workstream cutoff. Use `--limit N` only when you want to
 cap the matching results. Workstreams from other repositories or worktrees
-never appear; `continue` still resumes the newest linked checkout from anywhere.
-
-Running `ai-memory` without a subcommand in a terminal opens the same picker.
-`ai-jail ai-memory` keeps both the picker and the selected harness inside
-ai-jail; add ai-jail options before `ai-memory`, such as `--ssh` above.
-This works with native installs and the Linux/macOS shell wrapper. Scripts
-still require an explicit CLI subcommand, and `ai-memory --help` shows help.
-Workstream discovery reads Git identity only; it does not scan the working tree
+are left out unless you pass `--all`, which lists every linked checkout (the
+current one first); `continue` still resumes the newest linked checkout from
+anywhere. Listing reads Git identity only; it does not scan the working tree
 with `git status` before showing the picker. Full checkpoints are still captured
 when launching the selected workstream.
-
-For an unreleased source build, install the native binary on your host `PATH`
-before entering ai-jail. A temporary `/tmp` build is not a reliable executable
-location inside the sandbox:
-
-```bash
-cargo build -p ai-memory-cli --bin ai-memory
-mkdir -p "$HOME/.local/bin"
-install -m755 target/debug/ai-memory "$HOME/.local/bin/ai-memory"
-export PATH="$HOME/.local/bin:$PATH"
-# Run from the checkout you want to resume:
-ai-jail ai-memory resume --yolo
-```
 
 Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with

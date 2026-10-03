@@ -272,17 +272,14 @@ linked checkout from any directory, use `ai-memory continue` instead.
 ai-memory resume
 ai-memory resume --search auth
 ai-memory resume --workspace work --limit 50
-ai-memory                     # no subcommand needed in a terminal
-ai-jail ai-memory             # picker and harness inside the jail
-ai-jail ai-memory resume --yolo # explicit picker with dangerous-mode launch
-ai-jail --ssh ai-memory       # optional SSH access
+ai-memory resume --all        # every linked checkout, current one first
 ```
 
-A commandless terminal launch opens the same checkout-local picker. Wrap it
-directly with `ai-jail ai-memory` to keep the selected harness in that jail.
-There is no extra ai-memory jail flag or nested sandbox. The Linux/macOS shell
-wrapper routes this interactive launch to its native host client. Non-terminal
-CLI calls still require a subcommand, and explicit help/version remain available.
+`--all` restores the cross-checkout view: it walks every checkout linked to
+this server in the client-local registry (one per project), current checkout
+first, with each checkout's own fingerprint-scoped, fully paginated query;
+`--workspace` filters the registry before any request, and a checkout that can
+no longer be resolved or queried is skipped with a note.
 Listing reads the stable repository/worktree fingerprints without running
 `git status`, so a working-tree scan or filesystem-monitor hook cannot hold up
 the picker. The selected launch still captures its normal Git checkpoint.
