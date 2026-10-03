@@ -113,7 +113,7 @@ By default, every unmanaged session end creates an open handoff for the next ses
 create_on_session_end = false
 ```
 
-When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolidation as usual, but skips creating an open handoff row (#1043). Explicit batons created with `memory_handoff_begin` and managed workstream runs remain unaffected. Like `claim_on_session_start`, this setting is server-wide.
+When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolidation as usual, but skips creating an open handoff row (#1043). OpenCode's per-turn checkpoint, which stands in for its session end, likewise refreshes the summary page without creating or refreshing a baton. Explicit batons created with `memory_handoff_begin` and managed workstream runs remain unaffected. Like `claim_on_session_start`, this setting is server-wide.
 
 ## Compaction recovery
 

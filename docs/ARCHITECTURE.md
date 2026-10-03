@@ -200,7 +200,8 @@ metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.
 With server-wide `[handoff].create_on_session_end = false`, session end writes
 the summary page and enqueues consolidation but skips creating an automatic
-baton (#1043). Manual handoffs take precedence;
+baton, and an OpenCode root-turn checkpoint refreshes the page without one
+(#1043). Manual handoffs take precedence;
 otherwise the newest cwd-eligible automatic handoff is delivered, and that
 same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
@@ -815,7 +816,7 @@ per_user = false                  # shared + own slots in agent context
 
 [handoff]                         # optional server-wide handoff policy
 claim_on_session_start = true     # false offers metadata; explicit accept claims
-create_on_session_end = true      # false stops automatic handoff creation at session end
+create_on_session_end = true      # false stops automatic handoffs at session end and OpenCode turn checkpoints
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000

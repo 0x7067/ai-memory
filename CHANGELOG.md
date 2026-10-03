@@ -61,7 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `[handoff].create_on_session_end` (default `true` - unchanged
   behavior). When set to `false`, unmanaged session ends write the session
   summary page and enqueue consolidation as usual, but skip creating an
-  automatic open handoff for the next session. Explicit handoffs created via
+  automatic open handoff for the next session; OpenCode turn checkpoints
+  refresh the page without a baton too. Explicit handoffs created via
   `memory_handoff_begin` and managed workstream runs remain unaffected.
   Server-wide: applies to every operator on this server. (#1043)
 - Added a default-quit prompt after a successful interactive managed run so the

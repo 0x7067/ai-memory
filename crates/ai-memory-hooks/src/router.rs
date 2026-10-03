@@ -3523,8 +3523,12 @@ async fn process_authorized(
         // Other harnesses are not gated: Claude Code also sets `agent_type` on
         // a top-level `--agent` session, which still owns its baton.
         let child_session = env.agent == AgentKind::OpenCode && body_is_subagent(&env.raw);
+        // The opt-out covers both automatic batons: a session's end and an
+        // OpenCode root-turn checkpoint, which is OpenCode's only baton since
+        // a plugin unload no longer ends its sessions. The checkpoint still
+        // refreshes the summary page.
         let should_create_handoff =
-            !managed && !child_session && (turn_checkpoint || state.create_handoff_on_session_end);
+            !managed && !child_session && state.create_handoff_on_session_end;
         let handoff = should_create_handoff.then(|| {
             build_auto_handoff(
                 page_ws,
@@ -11387,6 +11391,77 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "create_on_session_end = false must not create an automatic handoff"
+        );
+    }
+
+    async fn end_direct_codex_session(
+        state: &HookState,
+        tmp: &TempDir,
+        managed_run: Option<String>,
+    ) {
+        let session = SessionId::new();
+        for event in ["session-start", "user-prompt", "session-end"] {
+            let envelope = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    managed_run: managed_run.clone(),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session.to_string(),
+                    "cwd": tmp.path(),
+                    "prompt": "Ship the parser fix",
+                }),
+            );
+            process(state, envelope, None, Vec::new()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_end_opt_out_leaves_managed_runs_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.create_handoff_on_session_end = false;
+        end_direct_codex_session(&state, &tmp, Some(ManagedRunId::new().to_string())).await;
+        assert!(
+            !session_pages(&state).await.is_empty(),
+            "a managed session end still writes its summary page"
+        );
+        assert!(!open_handoff_exists(&state).await);
+    }
+
+    /// OpenCode's root-turn checkpoint is its baton (a plugin unload no longer
+    /// ends the session), so the opt-out must cover it too. The checkpoint
+    /// still refreshes the summary page.
+    #[tokio::test]
+    async fn opencode_turn_checkpoint_honours_create_on_session_end_opt_out() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.create_handoff_on_session_end = false;
+        let session = SessionId::new();
+        let text = "Implemented the opt-out turn";
+        process(
+            &state,
+            opencode_turn_event(&session.to_string(), "user-prompt", text),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut stop = opencode_turn_event(&session.to_string(), "stop", text);
+        crate::assistant_capture::apply_assistant_backstop(&mut stop, true);
+        process(&state, stop, None, Vec::new()).await.unwrap();
+        assert!(
+            !session_pages(&state).await.is_empty(),
+            "the checkpoint still refreshes the summary page"
+        );
+        assert!(
+            !open_handoff_exists(&state).await,
+            "create_on_session_end = false must not write a checkpoint baton"
         );
     }
 
