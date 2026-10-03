@@ -228,8 +228,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#1024)
 - Fixed watcher reindexing racing with writes and batches to the same page by
   sharing their per-page mutex from disk read through SQLite upsert. Both
-  mutation guards were released before embedding; external editors remained
+  mutation guards are released before embedding; external editors remain
   outside this coordination. (#1059)
+- Fixed a managed Claude Code run losing its conversation after `/resume` on a
+  Claude Code background session. The run used to finish on the foreground
+  session it started with, which held none of the conversation, so the next
+  `ai-memory run claude` or `continue` resumed it and Claude opened an empty
+  session. A Claude run now finishes on the background session its own
+  session attached to in this checkout, found from that transcript's
+  `sessionKind: "bg"` records; another launch's background session is never
+  taken. (#1050)
+- Fixed `continue`, `resume` and bare `ai-memory run` losing sessions launched
+  under a custom native store, such as a second Claude Code config home set
+  with `CLAUDE_CONFIG_DIR`. Automatic harness selection now scans the store the
+  launch resolves (`--env`, then the process environment) instead of always the
+  default one. The client records the store of every session it links, at
+  launch or when the run finishes, in `client-projects.json`. A later launch
+  that cannot find that session and resolves a different store now stops with
+  an error naming both stores and keeps the workstream link, where it used to
+  start fresh and repoint the workstream. `--fresh` still starts a new session.
+  (#1047)
+- Fixed Claude Code sessions never seeing the "broaden when the current project
+  comes up empty" and "maintained pages are evidence, not authority" rules,
+  because Claude Code truncates MCP server instructions at 2,048 characters.
+  The instructions now open with a self-contained core under that cap, and a
+  regression test keeps it there. (#1035)
+- Fixed the macOS menu-bar app showing only a red status item when the bundled
+  server cannot start (for example a port already in use; #1044 reports OpenCode
+  v2's background service on `127.0.0.1:49374`). The menu extra now surfaces a
+  fatal `stderr.log` line written since the last start, and `docs/macos.md`
+  documents the port collision and how to move one side. (#1044)
+- Fixed hook-spool drains stalling behind an event that has no session id.
+  `/hook/batch` reported such an event (anything but a session start) as a
+  failed item, so the drain retried it up to its attempt budget while every
+  event queued behind it waited. The server now acknowledges and drops it,
+  counted as `dropped_invalid` in the ingest metrics, and keeps processing the
+  rest of the batch. (#1062)
+- Fixed `drop_subagent_captures` discarding entire top-level Claude Code
+  sessions launched with `--agent`. An `agent_type` alone no longer marks a
+  session as a subagent; `agent_id` and Grok's `subagentType` still do, so
+  actual subagent filtering remains enabled. Claude Code reports a Task
+  subagent under its parent's session id, so a subagent's events no longer
+  mark that session as a subagent: the parent's Stop, SessionEnd, summary and
+  handoff are kept. (#1041, #1048)
+
+### Docs
+- Corrected the Codex support matrix to describe managed-run recovery from a
+  stale shared-daemon run id; `--no-daemon` remains an optional diagnostic and
+  isolation switch. (#987)
 
 ## [2.5.2] - 2026-10-01
 

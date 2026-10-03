@@ -2083,18 +2083,19 @@ fn receipt_conflicts_promote_legacy_unknown_outcomes() {
 #[test]
 fn every_current_outcome_is_persisted_and_flush_counts_acknowledgements() {
     let root = fixture("all-outcomes");
-    let results: Vec<_> = ack::OUTCOMES[..8]
+    let known = &ack::OUTCOMES[..ack::OUTCOMES.len() - 1];
+    let results: Vec<_> = known
         .iter()
         .enumerate()
         .map(|(index, outcome)| serde_json::json!({"index":index,"outcome":outcome}))
         .collect();
-    let body = serde_json::json!({"accepted":8,"accepted_indices":(0..8).collect::<Vec<_>>(),"results":results});
+    let body = serde_json::json!({"accepted":known.len(),"accepted_indices":(0..known.len()).collect::<Vec<_>>(),"results":results});
     let server = stub(vec![Reply::Json(200, body.to_string())]);
     let dir = bind(&root, &server.url());
     let mut queue = Queue::open(&dir).unwrap();
     queue
         .enqueue(
-            &(0..8)
+            &(0..known.len())
                 .map(|i| valid(&format!("e{i}"), "codex", "session-start", &format!("s{i}")))
                 .collect::<Vec<_>>(),
             ai_memory_relay::now_ms(),
@@ -2114,7 +2115,7 @@ fn every_current_outcome_is_persisted_and_flush_counts_acknowledgements() {
         .find_map(|s| s.strip_prefix("acknowledged_outcomes: "))
         .unwrap();
     let counts: serde_json::Value = serde_json::from_str(summary).unwrap();
-    for outcome in &ack::OUTCOMES[..8] {
+    for outcome in known {
         assert_eq!(stats.receipt_outcomes[*outcome], 1);
         assert_eq!(counts[*outcome], 1);
     }

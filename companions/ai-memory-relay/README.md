@@ -226,9 +226,9 @@ events to `unknown`; future outcome strings also map to `unknown`.
 
 Receipts persist `stored`, `replayed`, `resumed`, `ignored_end`,
 `dropped_policy`, `dropped_subagent`, `dropped_unauthorized`,
-`dropped_collision` or `unknown`. All acknowledged outcomes release events,
+`dropped_collision`, `dropped_invalid` or `unknown`. All acknowledged outcomes release events,
 including drops. Flush reports `acknowledged_outcomes` for that invocation.
-Status adds `receipt_outcomes`, with all nine fixed keys, including zero counts,
+Status adds `receipt_outcomes`, with all ten fixed keys, including zero counts,
 for receipts within the retained 30-day window measured from first attempt.
 These are bounded delivery counts, not lifetime observation totals.
 
