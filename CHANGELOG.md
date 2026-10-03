@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `*_PEPPER` and `*_SALT` assignments (e.g. an S3 `…_ACCESS_KEY_ID`, an auth
   token pepper) and dotless base64 JSON tokens such as Cloudflare tunnel
   tokens (`eyJ…`, 40+ characters); SHAs, UUIDs and short `eyJ` fragments are
-  left alone.
+  left alone. (#1084)
 - Fixed interrupted launchers blocking an immediate managed-workstream restart
   by adding explicit `ai-memory run --force-unlock` recovery. The server
   atomically expires and replaces only a lease attributed to the same
