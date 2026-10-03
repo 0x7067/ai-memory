@@ -289,6 +289,61 @@ pub fn split_name_base(identity: &str) -> String {
     }
 }
 
+/// How a remote-derived key spells a repository (#1033).
+///
+/// `HostPath` is the #708 identity exactly as it is stored and routed today,
+/// and stays the default: nothing changes until a later step adopts `Path` as
+/// a project's name. `Path` drops the host, so worktrees and clones of one
+/// repository share a short `owner/repo` key; two forges hosting the same path
+/// must still never share a project, which is why adoption has to detect that
+/// collision rather than trust the key alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdentityStyle {
+    /// `acme/api` — the repository path without its host.
+    Path,
+    /// `github.com/acme/api` — the full #708 identity.
+    #[default]
+    HostPath,
+}
+
+impl IdentityStyle {
+    /// The marker spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::HostPath => "host_path",
+        }
+    }
+
+    /// Parse the marker spelling. Unknown values are `None`, so a typo is
+    /// reported instead of silently picking a style.
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim() {
+            "path" => Some(Self::Path),
+            "host_path" => Some(Self::HostPath),
+            _ => None,
+        }
+    }
+}
+
+/// The key `identity` takes under `style`.
+///
+/// Only a git-remote identity has a host to drop. A declared identity, a
+/// manifest name or a folder name is already the key a person chose (or the
+/// only one there is), so every style returns it unchanged.
+#[must_use]
+pub fn styled_key(identity: &RepositoryIdentity, style: IdentityStyle) -> String {
+    if style == IdentityStyle::HostPath || identity.source != IdentitySource::GitRemote {
+        return identity.identity.clone();
+    }
+    match identity.identity.split_once('/') {
+        Some((_host, path)) if !path.is_empty() => path.to_owned(),
+        _ => identity.identity.clone(),
+    }
+}
+
 fn non_empty(s: &str) -> Option<&str> {
     let t = s.trim();
     (!t.is_empty()).then_some(t)
@@ -732,6 +787,61 @@ mod tests {
     }
 
     const CASES: &str = include_str!("../fixtures/remote_identity_cases.json");
+
+    /// #1033: `path` drops only a git remote's host, `host_path` is the #708
+    /// identity unchanged, and declared or folder keys never change.
+    #[test]
+    fn styled_keys_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in cases["styled_key"].as_array().unwrap() {
+            let identity = RepositoryIdentity {
+                identity: case["identity"].as_str().unwrap().to_owned(),
+                source: IdentitySource::from_str_opt(case["source"].as_str().unwrap()).unwrap(),
+            };
+            for (style, field) in [
+                (IdentityStyle::Path, "path"),
+                (IdentityStyle::HostPath, "host_path"),
+            ] {
+                assert_eq!(
+                    styled_key(&identity, style),
+                    case[field].as_str().unwrap(),
+                    "{} as {field}",
+                    identity.identity
+                );
+            }
+        }
+    }
+
+    /// The same path on two forges keeps two `host_path` keys but shares one
+    /// `path` key — the collision adoption must detect, never merge.
+    #[test]
+    fn the_path_style_alone_cannot_tell_two_forges_apart() {
+        let remote = |identity: &str| RepositoryIdentity {
+            identity: identity.to_owned(),
+            source: IdentitySource::GitRemote,
+        };
+        let github = remote("github.com/acme/api");
+        let gitlab = remote("gitlab.com/acme/api");
+        assert_eq!(
+            styled_key(&github, IdentityStyle::Path),
+            styled_key(&gitlab, IdentityStyle::Path)
+        );
+        assert_ne!(
+            styled_key(&github, IdentityStyle::HostPath),
+            styled_key(&gitlab, IdentityStyle::HostPath)
+        );
+    }
+
+    #[test]
+    fn identity_style_parses_only_its_marker_spellings() {
+        assert_eq!(IdentityStyle::default(), IdentityStyle::HostPath);
+        for style in [IdentityStyle::Path, IdentityStyle::HostPath] {
+            assert_eq!(IdentityStyle::from_str_opt(style.as_str()), Some(style));
+        }
+        for bad in ["", "Path", "host-path", "hostpath", "owner_repo"] {
+            assert_eq!(IdentityStyle::from_str_opt(bad), None, "{bad}");
+        }
+    }
 
     /// The fixture every client normaliser is checked against. The Rust core
     /// is the reference: a case that fails here is a wrong fixture, a case

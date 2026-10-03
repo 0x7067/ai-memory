@@ -220,3 +220,33 @@ flag. Opt-in would leave the same-basename grant hole open for anyone who did
 not opt in, defeating the authorization slices. The trade-off — that an upgrading
 install's captures re-bucket by repository identity (two same-name repos split; one
 repo opened from two folders converges) — is documented in the CHANGELOG.
+
+## Path-keyed coordinates (#1033 — staged)
+
+Identity routing already converges worktrees and clones of one repository into
+one project for **captures**. Two gaps remain: the project's **name** is still
+the first-seen folder basename, and MCP tools resolve `(workspace, project)` by
+that name, so a static client that passes a worktree folder misses the merged
+project. #1033 makes a remote-derived key the default name, landing in steps on
+`release/2.6`:
+
+1. **Normaliser and style (landed first).** `repository_identity::styled_key`
+   turns an identity into a key under `IdentityStyle`: `path` drops a git
+   remote's host (`github.com/acme/api` → `acme/api`); `host_path` is the #708
+   identity unchanged and stays the default. Declared and folder keys never
+   change. Checked against the `styled_key` section of
+   `fixtures/remote_identity_cases.json`. Nothing routes or names by it yet.
+2. **Default naming chain** (`upstream` → `origin` → folder) for **new**
+   projects, with marker `project`/`identity` still outranking remotes.
+   **Cross-forge collisions are detected, never merged:** when a newcomer's
+   `path` key is already held by a project under a different host
+   (`github.com/acme/api` vs `gitlab.com/acme/api`), the newcomer takes its
+   `host_path` key instead and `doctor` reports it. Needs an adversarial
+   isolation test and a security-boundaries row.
+3. **Dual-key resolve and in-place rename** (UUID foreign keys kept, no alias
+   table) until v3, so existing basename projects are renamed toward their
+   canonical key rather than split. Two operators on different clones of one
+   repository must land in one project (`multi_session.rs`).
+4. Marker `aliases`, then 5. identity- or path-keyed blocks in `~/.ai-memory.toml`.
+
+Paths stay lexically normalised throughout; nothing canonicalises.
