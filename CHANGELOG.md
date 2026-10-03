@@ -120,6 +120,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or distinct extensions, including backfill).
   Mixed-source counts preserve scope, session ownership and time-window filters;
   older servers leave unsupported fields unknown. (#1016)
+- Added shared capture privacy checks to the relay and the conversation importer,
+  run before an event is hashed, persisted, previewed or delivered: they refuse
+  credential-shaped native identities, scrub nested credentials while keeping
+  numeric token counts, and drop locally a relay item queued before them that
+  fails them, so it no longer holds its session. (#1072)
+- Added `[handoff].create_on_session_end` (default `true` - unchanged
+  behavior). When set to `false`, unmanaged session ends write the session
+  summary page and enqueue consolidation as usual, but skip creating an
+  automatic open handoff for the next session; OpenCode turn checkpoints
+  refresh the page without a baton too. Explicit handoffs created via
+  `memory_handoff_begin` and managed workstream runs remain unaffected.
+  Server-wide: applies to every operator on this server. (#1043)
+- Added bounded, sanitized native-record and adapter correlation provenance to
+  managed-workstream search/tail results and the CLI's text/JSON output, with
+  compatible optional fields and sanitization of legacy provenance on reads. (#1057)
+- Added Portuguese history phrases to the existing opt-in session-recall
+  router (`[retrieval] query_intent`), including accented and unaccented spellings of
+  "última sessão", "onde paramos ontem", and "decisão anterior". Word
+  boundaries and explicit history phrases keep technical session queries
+  unchanged; routing remains off by default. (#1056)
+- Added shared, typed and bounded `entities`, `abstract`, and `relations`
+  metadata to MCP `memory_write_page` and admin `/admin/write-page`, plus bounded
+  MCP `kind` while preserving the admin's legacy `kind` adapter. Kept existing
+  request shapes, entity normalization, authenticated attribution and the wiki
+  write pipeline. Documented whole-page replacement, raw-input metadata bounds
+  and trimmed relation scope components. (#1055)
+- Added structured results for the existing auto-improvement eval execution in
+  review reports, staged run metadata, and accepted proposal sidecars, with
+  server-generated eval IDs, evaluated request/body digests, checker invocation
+  identity, observed success/rejection/failure/timeout, and sanitized bounded
+  reasons. Report deserialization discarded supplied eval observations. (#1053)
+- Added `grizzybot` as a recognised agent (wire value `grizzybot`, alias
+  `grizzy-bot`), so GrizzyBot's lifecycle events are attributed to it instead
+  of `other` and its tool calls are captured as closed-schema tool families,
+  like other Claude Code-shaped agents. GrizzyBot posts to `/hook` and
+  `/mcp` itself, so there is nothing to install. Adds migration V72 to extend
+  the `sessions.agent_kind` CHECK constraint. (#1036)
+- Added GitHub Copilot CLI as a hooked agent: `install-hooks --agent
+  copilot-cli` writes `$COPILOT_HOME/hooks/ai-memory.json` (default
+  `~/.copilot/hooks/ai-memory.json`) with Copilot's flat, matcher-less entries
+  and PascalCase event names, so Copilot sends its VS Code/Claude-compatible
+  payload. Ten events — Claude Code's nine plus `PostToolUseFailure` — with
+  native commands enforcing capture exclusions; tool output is read from
+  `tool_result.text_result_for_llm` and the outcome from
+  `tool_result.result_type`. The `SessionStart` hook delivers the prior
+  session's handoff through Copilot's top-level `additionalContext` (ported
+  from #1069). There is deliberately no `--scope project`. The bare
+  `install-mcp --client copilot` alias keeps meaning VS Code Copilot;
+  `ai-memory run copilot` follows separately. (#1040)
+- Added `install-mcp --client copilot-cli`, which merges ai-memory's remote
+  entry (`type: "http"`, `url`, bearer `headers`, `tools: ["*"]`) into the root
+  `mcpServers` map of `$COPILOT_HOME/mcp-config.json` (default
+  `~/.copilot/mcp-config.json`), preserving other servers. `install-hooks
+  --agent copilot-cli` without `--server-url` now reads the server URL and
+  bearer back from that entry, and `uninstall` removes it. (#1040)
+- Added an optional `session_id` to `memory_write_page`, so an agent can
+  write a session's page with its own model and keep it traceable to the
+  session. The session must belong to the project the page is written to, and
+  the page records it as session evidence. A page that cites a session does
+  not overwrite a pinned page. Writing `sessions/<id>.md` also stamps the
+  frontmatter `memory_consolidate` writes there (`session_id`, `agent`,
+  `consolidated`, plus `consolidated_by: agent`), defaults the tier to
+  `episodic`, applies the same duplicate-title suffix, and marks the session's
+  queued SessionEnd consolidation job completed. (#1038)
 
 ### Changed
 - Scoped `ai-memory resume` to the current checkout instead of every linked
@@ -134,6 +198,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sandbox-parity). The `aarch64-darwin` package smoke and the privileged
   NixOS container smoke run only on schedule, `workflow_dispatch`, or a PR
   labelled `nix` / `full-ci`. (#989)
+- Restricted managed-workstream provenance to scrubbed source labels and an
+  explicit scalar metadata allowlist, with 512-byte string bounds. Client event
+  ids beginning with `managed-run:` are reserved for server checkpoints and
+  extraction-loss annotations. Active-run retries reject changes to an existing
+  event's agent, native session or kind, and retain its first indexed content
+  and provenance across sanitizer changes. (#1057)
+- The SessionEnd consolidation worker leaves a session page alone when the
+  agent wrote it through `memory_write_page` and no observation arrived after
+  it: the page records the session's observation count as
+  `observation_generation`, and the worker completes a job whose generation
+  that count reaches instead of replacing the page with the server's
+  provider. A page written before the session's last observation is
+  consolidated as before. (#1038)
 
 ### Fixed
 - Removed unnecessary working-tree scans from checkout-local workstream listing
@@ -203,6 +280,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+- Concurrent relay queue opens no longer report a locked queue as foreign:
+  journal setup now retries SQLite BUSY/LOCKED within one 10-second budget,
+  rechecking the queue's identity and schema version before each attempt.
+  (#1060)
+- Fixed watcher reindexing racing with writes and batches to the same page by
+  sharing their per-page mutex from disk read through SQLite upsert. Both
+  mutation guards are released before embedding; external editors remain
+  outside this coordination. (#1059)
+- Fixed a managed Claude Code run losing its conversation after `/resume` on a
+  Claude Code background session. The run used to finish on the foreground
+  session it started with, which held none of the conversation, so the next
+  `ai-memory run claude` or `continue` resumed it and Claude opened an empty
+  session. A Claude run now finishes on the background session its own
+  session attached to in this checkout, found from that transcript's
+  `sessionKind: "bg"` records; another launch's background session is never
+  taken. (#1050)
+- Fixed `continue`, `resume` and bare `ai-memory run` losing sessions launched
+  under a custom native store, such as a second Claude Code config home set
+  with `CLAUDE_CONFIG_DIR`. Automatic harness selection now scans the store the
+  launch resolves (`--env`, then the process environment) instead of always the
+  default one. The client records the store of every session it links, at
+  launch or when the run finishes, in `client-projects.json`. A later launch
+  that cannot find that session and resolves a different store now stops with
+  an error naming both stores and keeps the workstream link, where it used to
+  start fresh and repoint the workstream. `--fresh` still starts a new session.
+  (#1047)
+- Fixed Claude Code sessions never seeing the "broaden when the current project
+  comes up empty" and "maintained pages are evidence, not authority" rules,
+  because Claude Code truncates MCP server instructions at 2,048 characters.
+  The instructions now open with a self-contained core under that cap, and a
+  regression test keeps it there. (#1035)
+- Fixed the macOS menu-bar app showing only a red status item when the bundled
+  server cannot start (for example a port already in use; #1044 reports OpenCode
+  v2's background service on `127.0.0.1:49374`). The menu extra now surfaces a
+  fatal `stderr.log` line written since the last start, and `docs/macos.md`
+  documents the port collision and how to move one side. (#1044)
+- Fixed hook-spool drains stalling behind an event that has no session id.
+  `/hook/batch` reported such an event (anything but a session start) as a
+  failed item, so the drain retried it up to its attempt budget while every
+  event queued behind it waited. The server now acknowledges and drops it,
+  counted as `dropped_invalid` in the ingest metrics, and keeps processing the
+  rest of the batch. (#1062)
+- Fixed `drop_subagent_captures` discarding entire top-level Claude Code
+  sessions launched with `--agent`. An `agent_type` alone no longer marks a
+  session as a subagent; `agent_id` and Grok's `subagentType` still do, so
+  actual subagent filtering remains enabled. Claude Code reports a Task
+  subagent under its parent's session id, so a subagent's events no longer
+  mark that session as a subagent: the parent's Stop, SessionEnd, summary and
+  handoff are kept. (#1041, #1048)
+- Fixed the generated OpenCode 2 plugin ending every tracked session when
+  OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
+  host and its sessions stay alive, so each eviction froze a live session
+  (`SessionStart` cannot reopen an ended OpenCode session), fabricated a
+  spurious summary page and open handoff, and made the next baton fetch fail
+  with `invalid state: an ended session cannot accept a handoff`. Plugin
+  unload no longer posts `session-end`; deletion (`session.deleted`) remains
+  the end signal and a completed root turn already publishes its continuation
+  checkpoint and baton. Regenerate the plugin with
+  `ai-memory install-hooks --agent opencode2 --apply`. (#1074)
+- Corrected the `[auto_scope]` default in doc comments (`Config`,
+  `AutoScopeSettings`, the `ActiveProjectMode` module docs, `serve`) and the
+  README docs index: they still named `single` as the default or called
+  `per_actor` opt-in, but the default has been `per_actor` since v1.39. (#1065)
+- Fixed `gemini-3.8-flash` consolidation and lint spending hidden thinking
+  tokens on strict-JSON calls. The Gemini provider now sends
+  `thinkingBudget = 0` to 3.8 Flash as it already did for 2.5 and 3.5 Flash
+  (verified live: 0 thought tokens, about half the latency); 3.8 Flash-Lite
+  keeps the field omitted until verified. (#1077)
+- Fixed the secret scrubber missing Gemini authorization keys. AI Studio has
+  issued `AQ.Ab…` keys instead of `AIza…` since 2026-05-28, so a bare new key
+  reached capture unredacted; it is now redacted as `google_api_key`. (#1077)
+- Fixed the OpenCode provider sending every Go/Zen model through Chat
+  Completions. It now selects the published wire API per supported model:
+  Responses, Anthropic Messages, or OpenAI-compatible Chat Completions.
+  Claude Sonnet 5.5 and the legacy Sonnet 4 ID also use Messages.
+  Its default model is now `mimo-v2.6-flash`, matching the default Go catalogue;
+  Claude models require an explicit Zen base URL. Configured base URLs remain
+  authoritative, with no automatic switching between Go and Zen billing.
+  MiniMax M3/M2.7 and Qwen3.8 Max use Messages on Go and Chat Completions on
+  Zen; Go's Muse Contributor IDs use Responses. Changing the base URL also
+  reselects the transport while preserving configured headers, reasoning,
+  and timeout.
+  (#1080)
+- Fixed `[[_global:path]]` resolving against the source page's workspace
+  instead of the reserved `_global` project in the default workspace. A
+  page outside `default` can now graph-link to standing global pages, and
+  `/web` points at the same home. Sibling `[[project:path]]` and explicit
+  `[[workspace/project:path]]` are unchanged. Legacy rows that stored the
+  project-only form with a NULL workspace resolve when the reserved page
+  is next written. (#1042)
+- Fixed `ai-memory run claude` / `continue` exiting with Claude's "That session
+  is running in the background" error when the linked session is a Claude Code
+  background session that is still running and the launch carries any native
+  flag. The launcher now confirms the session is live in this checkout with
+  `claude agents --json` (only for a transcript recorded in the background) and
+  opens it with `claude attach <id>`; any failure keeps the native resume.
+  Documented the observed attach-hook behavior, early-exit import boundary and
+  fallback validation limits.
+  (#1052)
+
+### Security
+- Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
+  write grant on the reserved global preferences scope (`default/_global`)
+  could write it, and its pages are unioned into every user's queries,
+  including restricted projects. Writing it now needs root or an explicit
+  `write` grant on `_global`, whichever way the scope is named; creating it
+  grants nothing, reads stay open, and installs without database users are
+  unchanged. Reported by @Josehbr.
+
+### Docs
+- Corrected the Codex support matrix to describe managed-run recovery from a
+  stale shared-daemon run id; `--no-daemon` remains an optional diagnostic and
+  isolation switch. (#987)
+
 ## [2.5.2] - 2026-10-01
 
 ### Added

@@ -19,6 +19,18 @@ Write a page only when the user explicitly asks to remember something permanentl
 
 Put the page title as a `# H1` on the first line of the body and omit the separate title argument. ai-memory derives the title from that H1. Keep the content concise and fact-like, with enough context that a future agent can apply it without rereading the whole session.
 
+Optional top-level metadata: `kind` (64 characters), `entities` (10 names,
+64 characters each, normalized and deduplicated), `abstract` (1,024 characters),
+and `relations` (an object mapping `causes`, `fixes`, or `contradicts` to page
+target arrays, 32 targets total, 1,024 characters each). Relation targets use
+`path`, `project:path`, or `workspace/project:path`; extensionless page paths
+resolve with `.md`, and scope components must already be trimmed. Limits apply
+to raw values before trimming, normalization or deduplication. Arbitrary
+frontmatter and author fields are not editable.
+Every write replaces the whole page and its metadata; omitted fields are
+cleared. Read the current page first when preserving existing content matters.
+There is no patch or compare-and-write precondition.
+
 When the user explicitly wants a note to be temporary, pass `expires_at` as an
 RFC3339 instant or a bare `YYYY-MM-DD` (the end of that day in UTC). After the
 TTL, normal search, recent, and briefing reads hide the page; the next forget

@@ -1301,6 +1301,50 @@ ai-memory finalize-session --agent zcode --session-id <uuid>
 No first-party `install-mcp` client and no managed workstream
 (`ai-memory run zcode`) are claimed yet.
 
+### GitHub Copilot CLI
+
+Copilot CLI keeps its config in `~/.copilot` (or `$COPILOT_HOME`).
+`install-mcp --client copilot-cli` merges the remote server entry into
+`mcp-config.json` there, and `install-hooks --agent copilot-cli` writes
+`hooks/ai-memory.json` — Copilot's standalone `{"version": 1, "hooks": {…}}`
+format — merging around any third-party entries already in each file:
+
+```bash
+ai-memory install-mcp --client copilot-cli --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+ai-memory install-hooks --agent copilot-cli --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+See [the MCP guide](mcp-install.md#github-copilot-cli) for the exact entry and
+the project-level `.mcp.json` / `.github/mcp.json` alternatives.
+
+The events are configured with PascalCase names (`SessionStart`,
+`PreToolUse`, …), which makes Copilot send the VS Code/Claude-compatible
+snake_case payload (`session_id`, `cwd`, `tool_name`, `tool_input`,
+`tool_result`), so ai-memory's existing extraction applies and native commands
+enforce `[capture] ignore_paths`. Ten events are wired: Claude Code's nine plus
+`PostToolUseFailure`, which Copilot fires instead of `PostToolUse` when a tool
+errors. Entries sit directly in each event array with no `matcher`: Copilot
+rejects `matcher` on `SessionStart`, `Stop`, `SessionEnd`, and the subagent
+events, and omitting it elsewhere means "every invocation". Tool output is
+read from `tool_result.text_result_for_llm`.
+
+The `SessionStart` hook delivers the prior session's handoff: Copilot reads a
+top-level `additionalContext` from `SessionStart` stdout (not Claude Code's
+`hookSpecificOutput` envelope), and the hook prints exactly that, or `{}` when
+nothing is pending.
+
+`--scope project` is intentionally unsupported for Copilot CLI. Copilot's
+repository hook files (`.github/hooks/*.json`) are versioned, shared with the
+team and loaded by the Copilot cloud agent, while ai-memory's hook entries
+carry this machine's absolute executable and data-dir paths; committing them
+would point every teammate at one person's install and server.
+`ai-memory run copilot` is not shipped yet; `install-mcp --client copilot`
+remains the VS Code Copilot client.
+
 ### Hermes Agent (Nous Research)
 
 Hermes declares lifecycle hooks in the `hooks:` block of
@@ -1843,7 +1887,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=codex` | `gpt-5.6-luna` | Reuses only `access_token` and `account_id` from Codex's `auth.json`; token renewal is delegated to `codex app-server --stdio`. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. GPT-5.6 Luna uses Go's Responses endpoint; other models use Chat Completions. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias. |
+| `AI_MEMORY_LLM_PROVIDER=opencode` | `mimo-v2.6-flash` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. Published Responses models, including GPT-5.6 Luna and GPT-6 Luna, use `/responses`; supported Claude and Qwen Messages models use `/messages`. MiniMax M3/M2.7 and Qwen3.8 Max use Messages on Go and Chat Completions on Zen; Go Muse Contributor models use Responses. Changing the base URL reselects the transport and preserves request settings. See the [Go](https://opencode.ai/docs/go/#endpoints) and [Zen](https://opencode.ai/docs/zen/#endpoints) endpoint tables. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it, such as `claude-sonnet-5-5`; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias, with no automatic billing-product switch. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY`, with the OpenAI-compatible embedding client. |

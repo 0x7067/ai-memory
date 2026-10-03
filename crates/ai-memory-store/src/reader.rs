@@ -1922,10 +1922,18 @@ impl ReaderPool {
         workstream_id: WorkstreamId,
         query: String,
         limit: usize,
+        sanitizer: ai_memory_core::Sanitizer,
     ) -> StoreResult<Vec<WorkstreamEvent>> {
         let stopwords = self.fts_stopwords.clone();
         self.with_conn(move |conn| {
-            crate::workstream::search_events(conn, workstream_id, &query, limit, &stopwords)
+            crate::workstream::search_events(
+                conn,
+                workstream_id,
+                &query,
+                limit,
+                &stopwords,
+                &sanitizer,
+            )
         })
         .await
     }
@@ -3980,6 +3988,24 @@ impl ReaderPool {
             let proj = ProjectId::from_slice(&proj_bytes)
                 .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
             Ok(Some((ws, proj)))
+        })
+        .await
+    }
+
+    /// Number of observations captured for a session, in every scope: the
+    /// same count `session_consolidation::enqueue` stores as a job's
+    /// generation, so a page stamped with it can be compared to a queued job.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_observation_count(&self, session_id: SessionId) -> StoreResult<u64> {
+        self.with_conn(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count).unwrap_or(0))
         })
         .await
     }

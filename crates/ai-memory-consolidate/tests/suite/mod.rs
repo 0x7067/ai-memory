@@ -12,6 +12,8 @@ mod dream_pass;
 mod embed_backfill;
 mod embeddings;
 mod entropy_experience;
+#[cfg(unix)]
+mod eval_results;
 mod lifecycle;
 mod local_embeddings;
 mod multi_machine;
