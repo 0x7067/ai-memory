@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed the generated OpenCode 2 plugin ending every tracked session when
+  OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
+  host and its sessions stay alive, so each eviction froze a live session
+  (`SessionStart` cannot reopen an ended OpenCode session), fabricated a
+  spurious summary page and open handoff, and made the next baton fetch fail
+  with `invalid state: an ended session cannot accept a handoff`. Plugin
+  unload no longer posts `session-end`; deletion (`session.deleted`) remains
+  the end signal and a completed root turn already publishes its continuation
+  checkpoint and baton. Regenerate the plugin with
+  `ai-memory install-hooks --agent opencode2 --apply`. (#1074)
 - Fixed watcher reindexing racing with writes and batches to the same page by
   sharing their per-page mutex from disk read through SQLite upsert. Both
   mutation guards are released before embedding; external editors remain
