@@ -80,7 +80,8 @@ impl OpenCodeProvider {
             )?),
             OpenCodeApi::AnthropicMessages => OpenCodeTransport::AnthropicMessages(
                 AnthropicProvider::new(api_key, model)?
-                    .with_base_url(anthropic_base_url(&base_url)),
+                    .with_base_url(anthropic_base_url(&base_url))
+                    .with_client_headers(crate::DEFAULT_USER_AGENT, OPENCODE_SESSION_HEADER),
             ),
             OpenCodeApi::ChatCompletions => OpenCodeTransport::ChatCompletions(
                 OpenAiCompatProvider::new(base_url, Some(api_key), model)?
@@ -219,7 +220,11 @@ impl LlmProvider for OpenCodeProvider {
             OpenCodeTransport::Responses(provider) => {
                 provider.complete(request, operation_id).await
             }
-            OpenCodeTransport::AnthropicMessages(provider) => provider.complete(request).await,
+            OpenCodeTransport::AnthropicMessages(provider) => {
+                provider
+                    .complete_with_operation_id(request, operation_id)
+                    .await
+            }
         }
     }
 
@@ -250,7 +255,9 @@ impl LlmProvider for OpenCodeProvider {
                     .await
             }
             OpenCodeTransport::AnthropicMessages(provider) => {
-                provider.complete_structured_raw(request, schema).await
+                provider
+                    .complete_structured_raw_with_operation_id(request, schema, operation_id)
+                    .await
             }
         }
     }
@@ -322,18 +329,18 @@ const RESPONSES_MODELS: &[&str] = &[
 ];
 
 const ANTHROPIC_MESSAGES_MODELS: &[&str] = &[
-    "claude-fable-5.1",
+    "claude-fable-5-1",
     "claude-fable-5",
-    "claude-opus-5.5",
+    "claude-opus-5-5",
     "claude-opus-5",
-    "claude-opus-4.8",
-    "claude-opus-4.7",
-    "claude-opus-4.6",
-    "claude-opus-4.5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
     "claude-sonnet-5",
-    "claude-sonnet-4.6",
-    "claude-sonnet-4.5",
-    "claude-haiku-4.5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
     "qwen3.8-flash",
     "qwen3.7-max",
     "qwen3.7-plus",
@@ -601,7 +608,7 @@ mod tests {
 
     fn anthropic_response_with_content(content: &str) -> serde_json::Value {
         json!({
-            "model": "claude-sonnet-4.6",
+            "model": "claude-sonnet-4-6",
             "content": [{ "type": "text", "text": content }],
             "usage": { "input_tokens": 1, "output_tokens": 1 },
         })
@@ -669,6 +676,16 @@ mod tests {
                 OpenCodeTransport::AnthropicMessages(_)
             ));
         }
+    }
+
+    #[test]
+    fn default_model_selects_anthropic_messages_transport() {
+        let provider =
+            OpenCodeProvider::new(SecretString::from("sk-test"), OPENCODE_DEFAULT_MODEL).unwrap();
+        assert!(matches!(
+            provider.transport,
+            OpenCodeTransport::AnthropicMessages(_)
+        ));
     }
 
     #[test]
@@ -759,12 +776,13 @@ mod tests {
 
         let provider = OpenCodeProvider::new_with_base_url(
             SecretString::from("sk-test"),
-            "claude-sonnet-4.6",
+            "claude-sonnet-4-6",
             format!("{}/zen/v1", server.uri()),
         )
         .unwrap();
+        let operation_id = LlmOperationId::new();
         let response = provider
-            .complete(ChatRequest::user_prompt("hello"))
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
             .await
             .unwrap();
 
@@ -772,6 +790,14 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(header_value(&requests[0], "x-api-key"), Some("sk-test"));
+        assert_eq!(
+            header_value(&requests[0], "user-agent"),
+            Some(crate::DEFAULT_USER_AGENT)
+        );
+        assert_eq!(
+            header_value(&requests[0], OPENCODE_SESSION_HEADER),
+            Some(operation_id.to_string().as_str())
+        );
     }
 
     #[tokio::test]
