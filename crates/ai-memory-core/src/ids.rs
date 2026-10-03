@@ -295,7 +295,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,

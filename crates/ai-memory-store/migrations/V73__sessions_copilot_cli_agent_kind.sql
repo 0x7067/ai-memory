@@ -12,7 +12,7 @@ CREATE TABLE sessions_new (
     id                       BLOB PRIMARY KEY NOT NULL,
     workspace_id             BLOB NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     project_id               BLOB NOT NULL REFERENCES projects(id)   ON DELETE CASCADE,
-    agent_kind               TEXT NOT NULL CHECK (agent_kind IN ('claude-code','codex','open-code','cursor','gemini-cli','claude-desktop','openclaw','antigravity-cli','omp','pi','crush','grok','zero','devin','kimi-code','kiro-cli','command-code','hermes','pool','zcode','copilot-cli','other')),
+    agent_kind               TEXT NOT NULL CHECK (agent_kind IN ('claude-code','codex','open-code','cursor','gemini-cli','claude-desktop','openclaw','antigravity-cli','omp','pi','crush','grok','zero','devin','kimi-code','kiro-cli','command-code','hermes','pool','zcode','grizzybot','copilot-cli','other')),
     cwd                      TEXT,
     started_at               INTEGER NOT NULL,
     ended_at                 INTEGER,
