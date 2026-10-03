@@ -3355,10 +3355,27 @@ async fn process_authorized(
             ai_memory_core::NativeSessionIdentity::parse(value, &state.sanitizer).ok()
         })
     {
-        let _ = state
+        // The same run boundary as the SessionStart binding: the event's
+        // admitted scope and operator, not the run id alone.
+        let linked = state
             .writer
-            .link_managed_run_session(run_id, env.agent, native_session_id.into_string())
+            .link_managed_run_session_in_scope(ai_memory_store::LinkManagedRunSessionInScope {
+                run_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent: env.agent,
+                native_session_id: native_session_id.into_string(),
+                owner_user: owner_stamp.clone(),
+            })
             .await?;
+        if linked == ai_memory_store::ManagedRunSessionLink::Refused {
+            warn!(
+                managed_run = %run_id,
+                agent = %env.agent.as_str(),
+                event = ?env.event,
+                "hook event outside its managed run's project or operator; link refused"
+            );
+        }
     }
     if publishable_scope {
         publish_active_project_for_event(
@@ -9560,6 +9577,122 @@ mod tests {
                 .len(),
             observations_before.len(),
             "the rejected delivery must not insert an observation or ingest key"
+        );
+    }
+
+    async fn prepare_link_test_run(
+        state: &HookState,
+        owner: Option<&IdentityKey>,
+    ) -> ai_memory_store::PreparedWorkstreamRun {
+        let owner_user = ai_memory_core::owner_stamp(owner, owner.is_some());
+        state
+            .writer
+            .prepare_workstream_run_owned(
+                PrepareWorkstreamRun {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    repo_fingerprint: "link-repo".into(),
+                    worktree_fingerprint: "link-worktree".into(),
+                    cwd: "/tmp/scratch".into(),
+                    agent: AgentKind::ClaudeCode,
+                    automatic_harness: false,
+                    available_agents: Vec::new(),
+                    selection: WorkstreamSelection::Current,
+                    lease_owner: "test:link".into(),
+                },
+                owner_user,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn run_native_session(state: &HookState, run_id: ManagedRunId) -> Option<String> {
+        state
+            .reader
+            .managed_run_status(run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_session_id
+    }
+
+    /// #1082: a later hook event carrying a managed-run id links its native
+    /// session only from the run's own operator and project — the SessionStart
+    /// boundary. A run id obtained out of band must not let another operator
+    /// repoint the run, while that operator's own event is still captured.
+    #[tokio::test]
+    async fn hook_event_links_a_managed_run_only_from_its_operator() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = IdentityKey::User("alice".into());
+        let bob = IdentityKey::User("bob".into());
+        let run = prepare_link_test_run(&state, Some(&alice)).await;
+
+        // Before the owner's session has linked, a foreign event must not
+        // claim the run.
+        let mut foreign = session_envelope("user-prompt-submit", "bob-native", "/tmp/scratch");
+        foreign.managed_run = Some(run.run_id.to_string());
+        process(&state, foreign.clone(), Some(bob), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            run_native_session(&state, run.run_id).await,
+            None,
+            "another operator's event linked the run"
+        );
+        let bob_session = resolve_session_id(&foreign).unwrap();
+        assert!(
+            !state
+                .reader
+                .observations_for_session(bob_session)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the refused link must not drop the event itself"
+        );
+
+        let mut owned = session_envelope("user-prompt-submit", "alice-native", "/tmp/scratch");
+        owned.managed_run = Some(run.run_id.to_string());
+        process(&state, owned, Some(alice), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("alice-native"),
+            "the run's own operator links its session"
+        );
+    }
+
+    /// #1082: an event admitted to a different project than the run's never
+    /// links, even from the run's own operator.
+    #[tokio::test]
+    async fn hook_event_in_another_project_does_not_link_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let run = prepare_link_test_run(&state, None).await;
+
+        let mut elsewhere = session_envelope("user-prompt-submit", "elsewhere", "/tmp/elsewhere");
+        elsewhere.project_override = Some("elsewhere".into());
+        elsewhere.managed_run = Some(run.run_id.to_string());
+        process(&state, elsewhere, None, Vec::new()).await.unwrap();
+        assert_eq!(run_native_session(&state, run.run_id).await, None);
+    }
+
+    /// #1082 control: a single-operator server keeps linking runs from later
+    /// hook events exactly as before.
+    #[tokio::test]
+    async fn hook_event_links_a_shared_run_on_a_single_operator_server() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let run = prepare_link_test_run(&state, None).await;
+
+        let mut event = session_envelope("user-prompt-submit", "shared-native", "/tmp/scratch");
+        event.managed_run = Some(run.run_id.to_string());
+        process(&state, event, None, Vec::new()).await.unwrap();
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("shared-native")
         );
     }
 

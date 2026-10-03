@@ -98,10 +98,10 @@ pub use users::{
 };
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun,
-    RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
-    WorkstreamSelection, WorkstreamSelector,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
+    LinkOrAdoptManagedRunSession, ManagedRunAuthority, ManagedRunContext, ManagedRunSessionLink,
+    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 

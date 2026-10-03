@@ -234,6 +234,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored history; the CLI also protected reads from older servers. (#1079)
 
 ### Fixed
+- Fixed a later hook event carrying a managed-run id linking its native session
+  to that run without the checks SessionStart applies. It now links only from
+  the run's own project and operator; an event from elsewhere is still captured
+  but no longer repoints the run. (#1082)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
