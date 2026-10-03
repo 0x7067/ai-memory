@@ -16,10 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens on strict-JSON calls. The Gemini provider now sends
   `thinkingBudget = 0` to 3.8 Flash as it already did for 2.5 and 3.5 Flash
   (verified live: 0 thought tokens, about half the latency); 3.8 Flash-Lite
-  keeps the field omitted until verified.
+  keeps the field omitted until verified. (#1077)
 - Fixed the secret scrubber missing Gemini authorization keys. AI Studio has
   issued `AQ.Ab…` keys instead of `AIza…` since 2026-05-28, so a bare new key
-  reached capture unredacted; it is now redacted as `google_api_key`.
+  reached capture unredacted; it is now redacted as `google_api_key`. (#1077)
 - Fixed watcher reindexing racing with writes and batches to the same page by
   sharing their per-page mutex from disk read through SQLite upsert. Both
   mutation guards are released before embedding; external editors remain
