@@ -419,14 +419,10 @@ impl AgentKind {
     /// model (verified live against the embedded engine v0.16.5, capture logs
     /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
     ///
-    /// GitHub Copilot CLI documents `SessionStart` context injection, but
-    /// through a top-level `additionalContext` key — not Claude Code's
-    /// `hookSpecificOutput` envelope, which is what the native hook emits —
-    /// even in its PascalCase/VS-Code-compatible payload mode, and no live
-    /// capture proves the model sees it. Fails safe like Pool/Hermes until a
-    /// Copilot-specific envelope is wired and verified: the handoff stays
-    /// available on demand via `memory_handoff_accept` rather than risking a
-    /// destructive fetch-and-discard.
+    /// GitHub Copilot CLI injects `SessionStart` context from a top-level
+    /// `additionalContext` key (GitHub's hooks reference), not Claude Code's
+    /// `hookSpecificOutput` envelope, even in its PascalCase payload mode; the
+    /// native hook prints that top-level envelope for it.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -437,7 +433,6 @@ impl AgentKind {
                 | Self::KimiCode
                 | Self::Hermes
                 | Self::Pool
-                | Self::CopilotCli
                 | Self::Other
         )
     }
@@ -659,11 +654,9 @@ mod tests {
         assert_eq!(AgentKind::from_wire("copilot"), AgentKind::Other);
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("copilot-cli-2"), AgentKind::Other);
-        // Copilot CLI reads a top-level `additionalContext`, not the
-        // `hookSpecificOutput` envelope the native hook prints, so the
-        // destructive handoff fetch must not happen from its native hook yet
-        // (see the doc comment on `session_start_injects_handoff`).
-        assert!(!AgentKind::CopilotCli.session_start_injects_handoff());
+        // Copilot CLI reads a top-level `additionalContext` at SessionStart,
+        // which the native hook prints for it.
+        assert!(AgentKind::CopilotCli.session_start_injects_handoff());
         assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
     }
 

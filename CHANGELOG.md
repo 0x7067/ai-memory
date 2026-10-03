@@ -15,9 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload. Ten events — Claude Code's nine plus `PostToolUseFailure` — with
   native commands enforcing capture exclusions; tool output is read from
   `tool_result.text_result_for_llm` and the outcome from
-  `tool_result.result_type`. Copilot reads a top-level `additionalContext` on
-  `SessionStart` rather than Claude Code's envelope, so handoffs are not
-  injected yet: recover them with `memory_handoff_accept`. The bare
+  `tool_result.result_type`. The `SessionStart` hook delivers the prior
+  session's handoff through Copilot's top-level `additionalContext` (ported
+  from #1069). There is deliberately no `--scope project`. The bare
   `install-mcp --client copilot` alias keeps meaning VS Code Copilot;
   `install-mcp --client copilot-cli` and `ai-memory run copilot` follow
   separately. (#1040)
