@@ -221,11 +221,12 @@ impl std::fmt::Debug for HookEnvelope {
 
 /// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
 /// (a nested/spawned agent session) rather than the top-level session. Grok
-/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_type`
-/// and `agent_id` (on its `SubagentStart`/`SubagentStop` and subagent tool
-/// events). The set is a union so one check covers every harness that signals
-/// subagent-ness; a harness that does not signal it simply never matches.
-const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_type", "agent_id"];
+/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_id`
+/// on subagent events. `agent_type` alone is not a subagent marker: Claude
+/// Code also sets it on top-level sessions launched with `--agent`. The set
+/// is a union so one check covers every harness that signals subagent-ness;
+/// a harness that does not signal it simply never matches.
+const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_id"];
 
 /// True when the raw hook payload carries a non-empty subagent marker — i.e.
 /// the event originates from a spawned subagent session. The ingest router
@@ -726,6 +727,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Pool
             | AgentKind::Zcode
             | AgentKind::CopilotCli
+            | AgentKind::Grizzybot
     )
 }
 
@@ -1377,13 +1379,33 @@ mod tests {
         assert!(body_is_subagent(
             &serde_json::json!({ "sessionId": "s", "subagentType": "general-purpose" })
         ));
-        // Claude Code tags its subagent events with `agent_type` / `agent_id`.
+        // Claude Code identifies spawned agents with `agent_id`.
         assert!(body_is_subagent(
-            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent" })
+            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent", "agent_id": "agent-abc123" })
         ));
         assert!(body_is_subagent(
             &serde_json::json!({ "agent_id": "agent-abc123" })
         ));
+    }
+
+    #[test]
+    fn body_is_subagent_keeps_top_level_claude_agent_sessions() {
+        // `claude --agent <name>` also sets agent_type on the main session.
+        let mut raw = serde_json::json!({
+            "session_id": "main-session",
+            "agent_type": "regulus:regulus",
+        });
+        assert!(!body_is_subagent(&raw), "agent_id absent");
+        for agent_id in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!(42),
+            serde_json::json!(false),
+        ] {
+            raw["agent_id"] = agent_id;
+            assert!(!body_is_subagent(&raw), "{raw}");
+        }
     }
 
     #[test]
@@ -2099,6 +2121,30 @@ mod tests {
         assert_eq!(env.session_id.as_deref(), Some("sess_4fc06da3"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/zcode-capture"));
         assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+    }
+
+    #[test]
+    fn grizzybot_tool_title_is_a_closed_family() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write_file",
+            "tool_input": {"path": "notes.md", "content": "untrusted"},
+            "tool_response": "ok",
+            "session_id": "gb-session",
+            "cwd": "/bot/home"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("grizzybot".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Grizzybot);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("gb-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
     }
 
     /// Body is well-formed JSON but the expected `session_id` /

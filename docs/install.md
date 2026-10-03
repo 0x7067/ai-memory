@@ -1332,14 +1332,18 @@ rejects `matcher` on `SessionStart`, `Stop`, `SessionEnd`, and the subagent
 events, and omitting it elsewhere means "every invocation". Tool output is
 read from `tool_result.text_result_for_llm`.
 
-Copilot reads a top-level `additionalContext` from `SessionStart` stdout, not
-Claude Code's `hookSpecificOutput` envelope, so the prior session's handoff is
-not injected yet; recover it via MCP `memory_handoff_list` then
-`memory_handoff_accept` with that `handoff_id`. There is no `--scope project`:
-Copilot's repository hook files (`.github/hooks/*.json`) are shared with the
-team and loaded by the Copilot cloud agent, so they cannot carry per-machine
-script paths. `ai-memory run copilot` is not shipped yet;
-`install-mcp --client copilot` remains the VS Code Copilot client.
+The `SessionStart` hook delivers the prior session's handoff: Copilot reads a
+top-level `additionalContext` from `SessionStart` stdout (not Claude Code's
+`hookSpecificOutput` envelope), and the hook prints exactly that, or `{}` when
+nothing is pending.
+
+`--scope project` is intentionally unsupported for Copilot CLI. Copilot's
+repository hook files (`.github/hooks/*.json`) are versioned, shared with the
+team and loaded by the Copilot cloud agent, while ai-memory's hook entries
+carry this machine's absolute executable and data-dir paths; committing them
+would point every teammate at one person's install and server.
+`ai-memory run copilot` is not shipped yet; `install-mcp --client copilot`
+remains the VS Code Copilot client.
 
 ### Hermes Agent (Nous Research)
 

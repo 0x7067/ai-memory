@@ -283,6 +283,8 @@ pub enum AgentKind {
     /// GitHub Copilot CLI (`copilot`), configured with PascalCase hook event
     /// names for a Claude Code/VS-Code-compatible payload shape (#1040).
     CopilotCli,
+    /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
+    Grizzybot,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -293,7 +295,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -315,6 +317,7 @@ impl AgentKind {
         Self::Pool,
         Self::Zcode,
         Self::CopilotCli,
+        Self::Grizzybot,
         Self::Other,
     ];
 
@@ -343,6 +346,7 @@ impl AgentKind {
             Self::Pool => "pool",
             Self::Zcode => "zcode",
             Self::CopilotCli => "copilot-cli",
+            Self::Grizzybot => "grizzybot",
             Self::Other => "other",
         }
     }
@@ -374,6 +378,7 @@ impl AgentKind {
             "pool" | "poolside" => Self::Pool,
             "zcode" | "zai" => Self::Zcode,
             "copilot-cli" | "copilot_cli" => Self::CopilotCli,
+            "grizzybot" | "grizzy-bot" => Self::Grizzybot,
             _ => Self::Other,
         }
     }
@@ -414,14 +419,10 @@ impl AgentKind {
     /// model (verified live against the embedded engine v0.16.5, capture logs
     /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
     ///
-    /// GitHub Copilot CLI documents `SessionStart` context injection, but
-    /// through a top-level `additionalContext` key — not Claude Code's
-    /// `hookSpecificOutput` envelope, which is what the native hook emits —
-    /// even in its PascalCase/VS-Code-compatible payload mode, and no live
-    /// capture proves the model sees it. Fails safe like Pool/Hermes until a
-    /// Copilot-specific envelope is wired and verified: the handoff stays
-    /// available on demand via `memory_handoff_accept` rather than risking a
-    /// destructive fetch-and-discard.
+    /// GitHub Copilot CLI injects `SessionStart` context from a top-level
+    /// `additionalContext` key (GitHub's hooks reference), not Claude Code's
+    /// `hookSpecificOutput` envelope, even in its PascalCase payload mode; the
+    /// native hook prints that top-level envelope for it.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -432,7 +433,6 @@ impl AgentKind {
                 | Self::KimiCode
                 | Self::Hermes
                 | Self::Pool
-                | Self::CopilotCli
                 | Self::Other
         )
     }
@@ -654,12 +654,26 @@ mod tests {
         assert_eq!(AgentKind::from_wire("copilot"), AgentKind::Other);
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("copilot-cli-2"), AgentKind::Other);
-        // Copilot CLI reads a top-level `additionalContext`, not the
-        // `hookSpecificOutput` envelope the native hook prints, so the
-        // destructive handoff fetch must not happen from its native hook yet
-        // (see the doc comment on `session_start_injects_handoff`).
-        assert!(!AgentKind::CopilotCli.session_start_injects_handoff());
+        // Copilot CLI reads a top-level `additionalContext` at SessionStart,
+        // which the native hook prints for it.
+        assert!(AgentKind::CopilotCli.session_start_injects_handoff());
         assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_grizzybot_round_trips() {
+        assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
+        assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
+        assert_eq!(AgentKind::from_wire("grizzy-bot"), AgentKind::Grizzybot);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Grizzybot).unwrap(),
+            "\"grizzybot\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"grizzybot\"").unwrap(),
+            AgentKind::Grizzybot
+        );
+        assert_eq!(AgentKind::from_wire("grizzybot-2"), AgentKind::Other);
     }
 
     #[test]

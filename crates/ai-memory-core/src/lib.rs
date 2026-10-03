@@ -103,4 +103,5 @@ pub use workstream::{
     ManagedRunStatus, ManagedWorkstreamSummary, NewWorkstreamEvent, PrepareManagedRunRequest,
     PrepareManagedRunResponse, RenameManagedWorkstreamRequest, RenamedManagedWorkstream,
     UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+    scrub_workstream_provenance,
 };

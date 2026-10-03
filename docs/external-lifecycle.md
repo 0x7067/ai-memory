@@ -163,13 +163,15 @@ Use the tuple recipe when event IDs have narrower scope.
 - `results` contains one `{index, outcome}` for each acknowledged index, in
   index order, including an empty array when nothing was acknowledged. Outcomes
   are `stored`, `replayed`, `resumed`, `ignored_end`, `dropped_policy`,
-  `dropped_subagent`, `dropped_unauthorized` and `dropped_collision`. A drop is a
+  `dropped_subagent`, `dropped_unauthorized`, `dropped_collision` and
+  `dropped_invalid` (no session id outside a SessionStart). A drop is a
   terminal acknowledgement. Older servers omit `results`; the relay records
   those receipts as `unknown`.
 - A rate-limited source can be skipped while other sources advance. Inspect
   acknowledgements even on HTTP 429 or a partial failure; `failed_index` identifies
   a processing failure after earlier skips. An acknowledgement can also mean a
-  deliberate policy drop, not a new observation.
+  deliberate policy drop, or an event that can never be stored (no session id
+  on anything but a session start), not a new observation.
 - On a timeout or lost response, retry unchanged items and keys. Back off on
   saturation rather than opening an unbounded number of requests.
 
