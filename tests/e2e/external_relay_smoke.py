@@ -246,7 +246,8 @@ def parse_status(stdout: str, label: str) -> dict[str, Any]:
     outcomes = parsed.get("receipt_outcomes")
     expected = {
         "stored", "replayed", "resumed", "ignored_end", "dropped_policy",
-        "dropped_subagent", "dropped_unauthorized", "dropped_collision", "unknown",
+        "dropped_subagent", "dropped_unauthorized", "dropped_collision", "dropped_invalid",
+        "unknown",
     }
     if not isinstance(outcomes, dict) or set(outcomes) != expected:
         raise SmokeFailure(f"{label} status JSON has incomplete receipt outcomes")
