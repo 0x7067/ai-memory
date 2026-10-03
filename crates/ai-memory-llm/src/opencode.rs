@@ -38,7 +38,7 @@ pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 pub const OPENCODE_ZEN_BASE_URL: &str = OPENCODE_GO_BASE_URL;
 
 /// Default model when `AI_MEMORY_LLM_MODEL` is not set.
-pub const OPENCODE_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+pub const OPENCODE_DEFAULT_MODEL: &str = "mimo-v2.6-flash";
 
 /// Session-correlation header OpenCode asks callers to send, on Zen and Go alike.
 pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
@@ -679,13 +679,15 @@ mod tests {
     }
 
     #[test]
-    fn default_model_selects_anthropic_messages_transport() {
+    fn default_model_selects_go_chat_completions_transport() {
         let provider =
             OpenCodeProvider::new(SecretString::from("sk-test"), OPENCODE_DEFAULT_MODEL).unwrap();
         assert!(matches!(
             provider.transport,
-            OpenCodeTransport::AnthropicMessages(_)
+            OpenCodeTransport::ChatCompletions(_)
         ));
+        assert_eq!(provider.model(), "mimo-v2.6-flash");
+        assert_eq!(provider.base_url(), OPENCODE_GO_BASE_URL);
     }
 
     #[test]
@@ -776,7 +778,7 @@ mod tests {
 
         let provider = OpenCodeProvider::new_with_base_url(
             SecretString::from("sk-test"),
-            "claude-sonnet-4-6",
+            "claude-sonnet-5",
             format!("{}/zen/v1", server.uri()),
         )
         .unwrap();
@@ -789,6 +791,8 @@ mod tests {
         assert_eq!(response.text, "ok");
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "claude-sonnet-5");
         assert_eq!(header_value(&requests[0], "x-api-key"), Some("sk-test"));
         assert_eq!(
             header_value(&requests[0], "user-agent"),
@@ -798,6 +802,29 @@ mod tests {
             header_value(&requests[0], OPENCODE_SESSION_HEADER),
             Some(operation_id.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn default_model_completion_preserves_the_go_catalogue() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/zen/go/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_with_content("ok")))
+            .mount(&server)
+            .await;
+
+        let provider = OpenCodeProvider::new(SecretString::from("sk-test"), OPENCODE_DEFAULT_MODEL)
+            .unwrap()
+            .with_base_url(format!("{}/zen/go/v1", server.uri()));
+        provider
+            .complete(ChatRequest::user_prompt("hello"))
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "mimo-v2.6-flash");
     }
 
     #[tokio::test]
