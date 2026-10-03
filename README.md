@@ -370,6 +370,9 @@ ai-memory continue           # resume the newest managed checkout
 ai-memory run --force-unlock codex
 ai-memory resume             # pick from ALL workstreams in this checkout only
 ai-memory resume --search auth # find a workstream by name (case-insensitive)
+ai-memory                     # same picker, when run in a terminal
+ai-jail ai-memory             # picker + selected harness inside ai-jail
+ai-jail --ssh ai-memory       # also share SSH access
 ```
 
 `--force-unlock` immediately expires the selected workstream's active lease;
@@ -385,6 +388,12 @@ The list scrolls and loads every checkout-local page;
 there is no default workstream cutoff. Use `--limit N` only when you want to
 cap the matching results. Workstreams from other repositories or worktrees
 never appear; `continue` still resumes the newest linked checkout from anywhere.
+
+Running `ai-memory` without a subcommand in a terminal opens the same picker.
+`ai-jail ai-memory` keeps both the picker and the selected harness inside
+ai-jail; add ai-jail options before `ai-memory`, such as `--ssh` above.
+This works with native installs and the Linux/macOS shell wrapper. Scripts
+still require an explicit CLI subcommand, and `ai-memory --help` shows help.
 
 Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with

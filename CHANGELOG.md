@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a default checkout-local workstream picker for commandless terminal
+  launches, including `ai-jail ai-memory`. The Linux/macOS shell wrapper now
+  routes a bare interactive launch to its native host client. Scripted CLI
+  calls still require a subcommand; help/version behavior is unchanged. (#1039)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
@@ -122,7 +126,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project, removed its default result cutoff with bounded server pagination,
   and added `--search` plus immediate type-to-filter name search while preserving
   Left/Right harness selection. Explicit limits now apply after the initial
-  search; `continue` retained its cross-directory behavior. (#534)
+  search; `continue` retained its cross-directory behavior. (#1039)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-

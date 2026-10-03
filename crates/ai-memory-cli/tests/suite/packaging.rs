@@ -442,6 +442,11 @@ fn run_wrapper_with_piped_stdin(args: &[&str], stdin_payload: &str) -> String {
     let mut child = shell_script_command(&repo_root().join("bin/ai-memory"))
         .args(args)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        .env(
+            "AI_MEMORY_NATIVE_BIN",
+            tmp.path().join("must-not-launch-native"),
+        )
+        .env("AI_MEMORY_IMAGE", "docker.io/akitaonrails/ai-memory:latest")
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
@@ -2384,6 +2389,20 @@ mod slow {
         assert!(
             flags.iter().any(|arg| arg.ends_with(":/scope:ro")),
             "the marker scope mount must be read-only; got {args}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_wrapper_with_piped_stdin_does_not_open_the_host_picker() {
+        let args = run_wrapper_with_piped_stdin(&[], "");
+        let flags = args.lines().collect::<Vec<_>>();
+        assert!(flags.contains(&"-i"));
+        assert!(!flags.contains(&"-t"));
+        assert!(!flags.contains(&"resume"), "{args}");
+        assert_eq!(
+            flags.last().copied(),
+            Some("docker.io/akitaonrails/ai-memory:latest")
         );
     }
 

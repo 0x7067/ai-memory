@@ -561,6 +561,11 @@ native_host_binary() {
 
 # ---- intercept wrapper-only subcommands ----------------------------------
 
+if [ "$#" -eq 0 ] && [ -z "${AI_MEMORY_NO_TTY:-}" ] && [ -t 0 ] && [ -t 1 ]; then
+  # The picker must inspect the host checkout and launch host harnesses.
+  set -- resume
+fi
+
 case "${1:-}" in
   upgrade)
     shift
