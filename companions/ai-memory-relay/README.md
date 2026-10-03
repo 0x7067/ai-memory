@@ -226,9 +226,9 @@ events to `unknown`; future outcome strings also map to `unknown`.
 
 Receipts persist `stored`, `replayed`, `resumed`, `ignored_end`,
 `dropped_policy`, `dropped_subagent`, `dropped_unauthorized`,
-`dropped_collision` or `unknown`. All acknowledged outcomes release events,
+`dropped_collision`, `dropped_invalid` or `unknown`. All acknowledged outcomes release events,
 including drops. Flush reports `acknowledged_outcomes` for that invocation.
-Status adds `receipt_outcomes`, with all nine fixed keys, including zero counts,
+Status adds `receipt_outcomes`, with all ten fixed keys, including zero counts,
 for receipts within the retained 30-day window measured from first attempt.
 These are bounded delivery counts, not lifetime observation totals.
 
@@ -242,6 +242,17 @@ adding nullable receipt outcomes and updating schema metadata together. Pending
 order, binding, hashes, pins and existing receipt metadata survive; old NULL
 outcomes count as `unknown`. Concurrent opens recheck the version under the write
 lock. An interrupted migration rolls back and can be retried on reopen.
+After the transaction commits, journal configuration retries only SQLite
+BUSY/LOCKED errors within one 10-second budget. Each attempt rechecks the
+identity and schema version metadata on the same connection; a changed identity
+or schema version stops the open without retrying or adopting that database. The
+checks cover the presence of user objects and the `identity`/`schema_version`
+metadata; they do not validate the complete table structure. This wait
+budget covers journal configuration, separately from the existing SQLite busy
+timeout on transactions. Concurrent processes use SQLite's file locks.
+When the budget expires, the queue reports that it is busy and asks you to
+retry opening the same queue. A committed migration and pending events remain
+in that directory; do not switch queues or restore a backup to clear contention.
 Unknown schemas are refused. Older relay binaries refuse version 2 queues:
 downgrading requires restoring a pre-upgrade backup while all queue users are
 stopped. Do not recreate a queue to bypass its delivery history.

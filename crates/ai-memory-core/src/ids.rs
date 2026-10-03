@@ -283,6 +283,8 @@ pub enum AgentKind {
     /// GitHub Copilot CLI (`copilot`), configured with PascalCase hook event
     /// names for a Claude Code/VS-Code-compatible payload shape (#1040).
     CopilotCli,
+    /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
+    Grizzybot,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -315,6 +317,7 @@ impl AgentKind {
         Self::Pool,
         Self::Zcode,
         Self::CopilotCli,
+        Self::Grizzybot,
         Self::Other,
     ];
 
@@ -343,6 +346,7 @@ impl AgentKind {
             Self::Pool => "pool",
             Self::Zcode => "zcode",
             Self::CopilotCli => "copilot-cli",
+            Self::Grizzybot => "grizzybot",
             Self::Other => "other",
         }
     }
@@ -374,6 +378,7 @@ impl AgentKind {
             "pool" | "poolside" => Self::Pool,
             "zcode" | "zai" => Self::Zcode,
             "copilot-cli" | "copilot_cli" => Self::CopilotCli,
+            "grizzybot" | "grizzy-bot" => Self::Grizzybot,
             _ => Self::Other,
         }
     }
@@ -660,6 +665,22 @@ mod tests {
         // (see the doc comment on `session_start_injects_handoff`).
         assert!(!AgentKind::CopilotCli.session_start_injects_handoff());
         assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_grizzybot_round_trips() {
+        assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
+        assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
+        assert_eq!(AgentKind::from_wire("grizzy-bot"), AgentKind::Grizzybot);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Grizzybot).unwrap(),
+            "\"grizzybot\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"grizzybot\"").unwrap(),
+            AgentKind::Grizzybot
+        );
+        assert_eq!(AgentKind::from_wire("grizzybot-2"), AgentKind::Other);
     }
 
     #[test]

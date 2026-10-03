@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn v71_to_v72_preserves_session_state_and_accepts_copilot_cli() {
+    fn v71_to_v72_preserves_session_state_and_accepts_grizzybot() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 71).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -918,10 +918,43 @@ mod tests {
             ],
         )
         .unwrap();
+        // V64 mail points at sessions with ON DELETE SET NULL; the rebuild
+        // must neither null the sender nor leave a dangling reference.
+        let message_id = uuid::Uuid::now_v7();
+        conn.execute(
+            "INSERT INTO agent_messages \
+             (id, from_workspace_id, from_project_id, from_agent, from_session_id, \
+              to_workspace_id, to_project_id, body, created_at) \
+             VALUES (?1, ?2, ?3, 'zcode', ?4, ?2, ?3, 'hello', 1)",
+            params![
+                message_id.as_bytes().as_slice(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                existing.as_bytes(),
+            ],
+        )
+        .unwrap();
 
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         run(&mut conn).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let sender: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT from_session_id FROM agent_messages WHERE id = ?1",
+                params![message_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sender.as_deref(), Some(existing.as_bytes().as_slice()));
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('agent_messages')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0, "agent_messages must still reference sessions");
 
         let preserved: (String, String, i64, Option<String>) = conn
             .query_row(
@@ -943,7 +976,7 @@ mod tests {
                 id: SessionId::new(),
                 workspace_id,
                 project_id,
-                agent_kind: AgentKind::CopilotCli,
+                agent_kind: AgentKind::Grizzybot,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
             },
