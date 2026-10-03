@@ -36,9 +36,9 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession,
-    ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
+    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun,
+    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -735,6 +735,10 @@ pub(crate) enum WriteCmd {
     },
     LinkOrAdoptManagedRunSession {
         input: LinkOrAdoptManagedRunSession,
+        reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
+    },
+    LinkManagedRunSessionInScope {
+        input: LinkManagedRunSessionInScope,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     AcceptManagedRunContext {
@@ -3088,6 +3092,18 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Link the native session a later hook event of a managed run reported,
+    /// within the run's own project and operator boundary.
+    pub async fn link_managed_run_session_in_scope(
+        &self,
+        input: LinkManagedRunSessionInScope,
+    ) -> StoreResult<ManagedRunSessionLink> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkManagedRunSessionInScope { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Acknowledge successful SessionStart delivery for a managed run.
     pub async fn accept_managed_run_context(&self, run_id: ManagedRunId) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
@@ -4331,6 +4347,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::LinkOrAdoptManagedRunSession { input, reply } => {
                 let result = crate::workstream::link_or_adopt_native_session(&mut conn, &input);
                 send_or_warn(reply, result, "link_or_adopt_managed_run_session");
+            }
+            WriteCmd::LinkManagedRunSessionInScope { input, reply } => {
+                let result = crate::workstream::link_native_session_in_scope(&mut conn, &input);
+                send_or_warn(reply, result, "link_managed_run_session_in_scope");
             }
             WriteCmd::AcceptManagedRunContext { run_id, reply } => {
                 let result = crate::workstream::accept_context(&mut conn, run_id);

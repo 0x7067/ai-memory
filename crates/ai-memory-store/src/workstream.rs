@@ -221,6 +221,27 @@ pub struct LinkOrAdoptManagedRunSession {
     pub owner_user: Option<String>,
 }
 
+/// Scope a later hook event of a managed run resolved to.
+///
+/// The SessionStart binding goes through [`LinkOrAdoptManagedRunSession`];
+/// every later event carrying the run id goes through this, and both enforce
+/// the same run boundary.
+#[derive(Debug, Clone)]
+pub struct LinkManagedRunSessionInScope {
+    /// Run id the hook event carried.
+    pub run_id: ManagedRunId,
+    /// Workspace the event was admitted to.
+    pub workspace_id: WorkspaceId,
+    /// Project the event was admitted to.
+    pub project_id: ProjectId,
+    /// Harness reporting the native session.
+    pub agent: AgentKind,
+    /// Harness-native session id to bind.
+    pub native_session_id: String,
+    /// Topology-aware qualified operator identity, or shared `None`.
+    pub owner_user: Option<String>,
+}
+
 /// Store-level finish input after the raw segment has been made durable.
 #[derive(Debug, Clone)]
 pub struct FinishWorkstreamRun {
@@ -379,6 +400,48 @@ struct ManagedRunBoundaryRow {
     cwd: String,
     agent: String,
     owner_user: Option<String>,
+    native_session: Option<String>,
+}
+
+impl ManagedRunBoundaryRow {
+    const SELECT: &str = "SELECT mr.state, w.workspace_id, w.project_id, w.cwd, mr.agent_kind, \
+                mr.owner_user, mr.native_session_id \
+         FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
+         WHERE mr.id = ?1";
+
+    fn read(tx: &Transaction<'_>, run_id: ManagedRunId) -> StoreResult<Option<Self>> {
+        Ok(tx
+            .query_row(Self::SELECT, params![run_id.as_bytes()], |row| {
+                Ok(Self {
+                    state: row.get(0)?,
+                    workspace: row.get(1)?,
+                    project: row.get(2)?,
+                    cwd: row.get(3)?,
+                    agent: row.get(4)?,
+                    owner_user: row.get(5)?,
+                    native_session: row.get(6)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// The scope and operator a native session may join this run from: the
+    /// run's own project and its launching operator (a shared run admits only
+    /// shared callers). SessionStart also pins the checkout `cwd`; a later
+    /// event's `cwd` follows the agent around the checkout, so it is not
+    /// compared there.
+    fn admits(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cwd: Option<&str>,
+        owner_user: Option<&str>,
+    ) -> bool {
+        self.workspace.as_slice() == workspace_id.as_bytes()
+            && self.project.as_slice() == project_id.as_bytes()
+            && cwd.is_none_or(|cwd| self.cwd == cwd)
+            && self.owner_user.as_deref() == owner_user
+    }
 }
 
 /// Atomically select a workstream, expire stale leases, and open one run.
@@ -801,32 +864,16 @@ pub(crate) fn link_or_adopt_native_session(
         };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let supplied: Option<ManagedRunBoundaryRow> = tx
-        .query_row(
-            "SELECT mr.state, w.workspace_id, w.project_id, w.cwd, mr.agent_kind, mr.owner_user \
-             FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
-             WHERE mr.id = ?1",
-            params![input.supplied_run_id.as_bytes()],
-            |row| {
-                Ok(ManagedRunBoundaryRow {
-                    state: row.get(0)?,
-                    workspace: row.get(1)?,
-                    project: row.get(2)?,
-                    cwd: row.get(3)?,
-                    agent: row.get(4)?,
-                    owner_user: row.get(5)?,
-                })
-            },
-        )
-        .optional()?;
+    let supplied = ManagedRunBoundaryRow::read(&tx, input.supplied_run_id)?;
 
     let selected = match supplied {
         Some(run) if run.state == "active" => {
-            let boundary_matches = run.workspace.as_slice() == input.workspace_id.as_bytes()
-                && run.project.as_slice() == input.project_id.as_bytes()
-                && run.cwd == input.cwd
-                && run.agent == input.agent.as_str()
-                && run.owner_user == input.owner_user;
+            let boundary_matches = run.admits(
+                input.workspace_id,
+                input.project_id,
+                Some(&input.cwd),
+                input.owner_user.as_deref(),
+            ) && run.agent == input.agent.as_str();
             if !boundary_matches {
                 tx.commit()?;
                 return Ok(ManagedRunSessionLink::Refused);
@@ -883,6 +930,62 @@ pub(crate) fn link_or_adopt_native_session(
         ManagedRunSessionLink::Adopted(selected.0)
     } else {
         ManagedRunSessionLink::Exact(selected.0)
+    })
+}
+
+/// Bind the native session a later hook event of a managed run reported.
+///
+/// The event's admitted scope and operator must match the run's boundary, as
+/// at SessionStart: a run id alone, obtained out of band, must not let another
+/// operator or another project repoint the run's current session. A boundary
+/// mismatch that would change nothing (the run already holds this session) is
+/// a quiet no-op rather than a refusal.
+pub(crate) fn link_native_session_in_scope(
+    conn: &mut Connection,
+    input: &LinkManagedRunSessionInScope,
+) -> StoreResult<ManagedRunSessionLink> {
+    if input
+        .owner_user
+        .as_deref()
+        .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
+    {
+        return Ok(ManagedRunSessionLink::Refused);
+    }
+    let native_identity =
+        match NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(ManagedRunSessionLink::NoMatch),
+        };
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let Some(run) =
+        ManagedRunBoundaryRow::read(&tx, input.run_id)?.filter(|run| run.state == "active")
+    else {
+        tx.commit()?;
+        return Ok(ManagedRunSessionLink::NoMatch);
+    };
+    if !run.admits(
+        input.workspace_id,
+        input.project_id,
+        None,
+        input.owner_user.as_deref(),
+    ) {
+        tx.commit()?;
+        return Ok(
+            if run.native_session.as_deref() == Some(native_identity.as_str()) {
+                ManagedRunSessionLink::NoMatch
+            } else {
+                ManagedRunSessionLink::Refused
+            },
+        );
+    }
+    let linked =
+        link_native_session_in_transaction(&tx, input.run_id, input.agent, &native_identity, now)?;
+    tx.commit()?;
+    Ok(if linked {
+        ManagedRunSessionLink::Exact(input.run_id)
+    } else {
+        ManagedRunSessionLink::NoMatch
     })
 }
 
