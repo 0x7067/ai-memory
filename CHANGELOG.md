@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`complete_with_operation_id`, `complete_structured_raw_with_operation_id`).
   They fell to the trait defaults, which drop the caller's id, so every retry
   of one logical operation got a fresh id and, for OpenCode, a new session
-  header on every call.
+  header on every call. (#1085)
 - Fixed interrupted launchers blocking an immediate managed-workstream restart
   by adding explicit `ai-memory run --force-unlock` recovery. The server
   atomically expires and replaces only a lease attributed to the same
