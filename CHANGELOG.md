@@ -8,9 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Added bounded, sanitized native-record and adapter correlation provenance to
-  managed-workstream search/tail results and the CLI's text/JSON output, with
-  compatible optional fields and sanitization of legacy provenance on reads. (#1057)
+- Added shared capture privacy checks to the relay and the conversation importer,
+  run before an event is hashed, persisted, previewed or delivered: they refuse
+  credential-shaped native identities, scrub nested credentials while keeping
+  numeric token counts, and drop locally a relay item queued before them that
+  fails them, so it no longer holds its session. (#1072)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
@@ -126,6 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or distinct extensions, including backfill).
   Mixed-source counts preserve scope, session ownership and time-window filters;
   older servers leave unsupported fields unknown. (#1016)
+- Added bounded, sanitized native-record and adapter correlation provenance to
+  managed-workstream search/tail results and the CLI's text/JSON output, with
+  compatible optional fields and sanitization of legacy provenance on reads. (#1057)
 - Added Portuguese history phrases to the existing opt-in session-recall
   router (`[retrieval] query_intent`), including accented and unaccented spellings of
   "última sessão", "onde paramos ontem", and "decisão anterior". Word
@@ -150,12 +155,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `sessions.agent_kind` CHECK constraint. (#1036)
 
 ### Changed
-- Restricted managed-workstream provenance to scrubbed source labels and an
-  explicit scalar metadata allowlist, with 512-byte string bounds. Client event
-  ids beginning with `managed-run:` are reserved for server checkpoints and
-  extraction-loss annotations. Active-run retries reject changes to an existing
-  event's agent, native session or kind, and retain its first indexed content
-  and provenance across sanitizer changes. (#1057)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
@@ -163,12 +162,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sandbox-parity). The `aarch64-darwin` package smoke and the privileged
   NixOS container smoke run only on schedule, `workflow_dispatch`, or a PR
   labelled `nix` / `full-ci`. (#989)
+- Restricted managed-workstream provenance to scrubbed source labels and an
+  explicit scalar metadata allowlist, with 512-byte string bounds. Client event
+  ids beginning with `managed-run:` are reserved for server checkpoints and
+  extraction-loss annotations. Active-run retries reject changes to an existing
+  event's agent, native session or kind, and retain its first indexed content
+  and provenance across sanitizer changes. (#1057)
 
 ### Fixed
-- Concurrent relay queue opens no longer report a locked queue as foreign:
-  journal setup now retries SQLite BUSY/LOCKED within one 10-second budget,
-  rechecking the queue's identity and schema version before each attempt.
-  (#1060)
 - Fixed completed retries and no-op session endings advancing
   `last_persisted_ms` without a durable write. Recovery still advances the
   timestamp when it commits a new page or terminal effect. (#1015)
@@ -233,6 +234,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+- Concurrent relay queue opens no longer report a locked queue as foreign:
+  journal setup now retries SQLite BUSY/LOCKED within one 10-second budget,
+  rechecking the queue's identity and schema version before each attempt.
+  (#1060)
 - Fixed watcher reindexing racing with writes and batches to the same page by
   sharing their per-page mutex from disk read through SQLite upsert. Both
   mutation guards are released before embedding; external editors remain

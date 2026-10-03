@@ -81,8 +81,10 @@ ai-memory-relay status --queue-dir "$HOME/.ai-memory-relay"
 
 `enqueue` validates the whole array and commits it in one transaction. Each body
 must be an object with explicit `session_id` and `cwd` strings. Use the harness's
-native identity and canonical hook event names. Other body fields keep their
-values, including an `_ai_memory_capture` block. The relay does not translate
+native identity and canonical hook event names. Sensitive identities are refused
+without renaming them. Shared private capture helpers scrub new body text and
+credential values before serialization, hashing and enqueueing. An
+`_ai_memory_capture` block remains untrusted provenance. The relay does not translate
 provider transcripts or infer parent agents and workflows.
 
 For authenticated servers, supply `AI_MEMORY_AUTH_TOKEN` through the flush
@@ -151,7 +153,15 @@ print event bodies. Receipts count acknowledgements, including policy drops.
 
 ## Local data and recovery
 
-The queue contains producer-supplied event bodies before server sanitization.
+New queue bodies receive local credential sanitation before persistence, then
+cross the normal server sanitizer on delivery. Legacy pending bytes, digest,
+native identity, ingest key and attempt state remain exact. A stored item that
+fails the privacy check (only possible for one queued before local sanitation)
+is never sent: the flush drops it locally as `dropped_policy`, keeps a receipt
+so its key stays replay-protected, and reports the count without payload. Its
+session's later events continue instead of waiting behind it. See the [shared
+privacy helpers](../ai-memory-client).
+
 The producer must apply its capture exclusions before enqueueing. The relay
 does not load the project's `[capture] ignore_paths` settings or inspect tool
 payloads for sensitive paths. Server sanitization cannot protect a local queue
