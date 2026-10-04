@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed `memory_handoff_list` MCP tool calls being counted under writes in
+  `client_activity`: the read-only inspection tool is now classified as a read
+  in `tool_call_is_write`. (#1088)
 - Fixed a store write sent while the writer was shutting down occasionally
   waiting forever instead of failing with `WriterClosed`: the writer now
   closes its queue and drains in-flight commands before it stops.
