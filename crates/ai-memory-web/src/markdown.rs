@@ -639,7 +639,9 @@ mod tests {
             "scratch",
         );
         assert!(
-            html.contains(r#"href="w/default/scratch/p/notes/foo.md#section-1">notes/foo#section-1</a>"#),
+            html.contains(
+                r#"href="w/default/scratch/p/notes/foo.md#section-1">notes/foo#section-1</a>"#
+            ),
             "bare anchor: {html}"
         );
         assert!(
@@ -653,7 +655,9 @@ mod tests {
             "scratch",
         );
         assert!(
-            cross.contains(r#"href="w/default/otherproj/p/notes/x.md#heading">otherproj:notes/x#heading</a>"#),
+            cross.contains(
+                r#"href="w/default/otherproj/p/notes/x.md#heading">otherproj:notes/x#heading</a>"#
+            ),
             "cross-project anchor: {cross}"
         );
         assert!(
