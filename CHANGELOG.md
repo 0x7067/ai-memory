@@ -198,6 +198,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   personal slot namespace instead of removing the shared project-wide slot, and
   deleting directly inside another operator's slot namespace is rejected with an
   invalid request error. (#1083)
+- Fixed the web page view showing a `[[wikilink]]` inside a raw HTML block
+  (an HTML comment, a `<div>` block) as generated link markup such as
+  `[notes/foo](w/default/scratch/p/notes/foo.md)`. HTML blocks render as
+  escaped source text, so the wikilink now stays as the page wrote it. (#1087)
 
 ### Security
 - Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a

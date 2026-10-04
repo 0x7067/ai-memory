@@ -104,8 +104,8 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
 }
 
 /// Convert `[[target]]` / `[[target|label]]` spans into `[label](href)`
-/// markdown links, skipping code: fenced and indented code blocks and
-/// inline-code spans. Targets that aren't internal pages (external
+/// markdown links, skipping code (fenced and indented code blocks and
+/// inline-code spans) and raw HTML blocks. Targets that aren't internal pages (external
 /// schemes, traversal, empty) are left as literal `[[…]]`.
 ///
 /// What counts as code is what the renderer's own parser reads as code,
@@ -113,10 +113,14 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
 /// CommonMark says they do, so a nested list item or a paragraph's
 /// continuation line indented four spaces is text, and its wikilink is
 /// rewritten like any other (the engine's link extractor indexes it).
+///
+/// An HTML block is shown as escaped source text, so markdown inside it
+/// is never parsed: a rewritten wikilink would surface as its generated
+/// `[label](w/…/p/….md)` markup instead of the `[[…]]` the page holds.
 fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
     let mut out = String::with_capacity(body.len() + 64);
     let mut pos = 0;
-    for code in code_ranges(body) {
+    for code in literal_ranges(body) {
         rewrite_wikilinks_in_lines(&body[pos..code.start], workspace, project, &mut out);
         out.push_str(&body[code.clone()]);
         pos = code.end;
@@ -125,14 +129,16 @@ fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
     out
 }
 
-/// Byte ranges of the code in `body` (fenced and indented code blocks,
-/// inline-code spans) as the renderer's parser reads it, in document
-/// order and without overlap.
-fn code_ranges(body: &str) -> Vec<Range<usize>> {
+/// Byte ranges of `body` the renderer shows verbatim (fenced and indented
+/// code blocks, inline-code spans, raw HTML blocks) as its parser reads
+/// them, in document order and without overlap.
+fn literal_ranges(body: &str) -> Vec<Range<usize>> {
     let mut ranges: Vec<Range<usize>> = Vec::new();
     for (event, range) in Parser::new_ext(body, options()).into_offset_iter() {
-        if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_))
-            && ranges.last().is_none_or(|last| range.start >= last.end)
+        if matches!(
+            event,
+            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) | Event::Code(_)
+        ) && ranges.last().is_none_or(|last| range.start >= last.end)
         {
             ranges.push(range);
         }
@@ -667,6 +673,30 @@ mod tests {
 
         let inline = render("use `[[notes/foo]]` literally", "default", "scratch");
         assert!(!inline.contains("<a href"), "inline code: {inline}");
+    }
+
+    /// An HTML block renders as its escaped source, so a wikilink in it
+    /// has to stay as written rather than turn into rewritten link markup.
+    #[test]
+    fn wikilink_kept_as_written_in_html_block() {
+        let comment = render("<!-- see [[notes/foo]] -->", "default", "scratch");
+        assert!(comment.contains("see [[notes/foo]]"), "comment: {comment}");
+        assert!(!comment.contains("/p/notes/foo.md"), "comment: {comment}");
+
+        let div = render("<div>\n[[notes/foo|Foo]]\n</div>", "default", "scratch");
+        assert!(div.contains("[[notes/foo|Foo]]"), "div: {div}");
+
+        // Inline HTML is only the tag itself; the text around it is still
+        // a paragraph, and so is the paragraph after the block.
+        let inline = render(
+            "<div>x</div>\n\ntext <span>[[notes/foo]]</span>",
+            "default",
+            "scratch",
+        );
+        assert!(
+            inline.contains(r#"<a href="w/default/scratch/p/notes/foo.md">notes/foo</a>"#),
+            "inline: {inline}"
+        );
     }
 
     #[test]
