@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the web page view showing a `[[wikilink]]` inside a raw HTML block
   (an HTML comment, a `<div>` block) as generated link markup such as
   `[notes/foo](w/default/scratch/p/notes/foo.md)`. HTML blocks render as
-  escaped source text, so the wikilink now stays as the page wrote it.
+  escaped source text, so the wikilink now stays as the page wrote it. (#1087)
 - Fixed a store write sent while the writer was shutting down occasionally
   waiting forever instead of failing with `WriterClosed`: the writer now
   closes its queue and drains in-flight commands before it stops.
