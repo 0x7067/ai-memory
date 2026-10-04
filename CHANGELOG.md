@@ -202,6 +202,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (an HTML comment, a `<div>` block) as generated link markup such as
   `[notes/foo](w/default/scratch/p/notes/foo.md)`. HTML blocks render as
   escaped source text, so the wikilink now stays as the page wrote it. (#1087)
+- Fixed wikilinks dropping `#anchor` and `?query` suffixes. `[[page#section]]`
+  and `[[page#section|label]]` lost the fragment when rewritten to standard
+  Markdown links (for example on OKF export), leaving the link pointed at the
+  page root. The rewriters now keep the suffix, percent-encoded where needed so
+  a space or parenthesis in it cannot break the link. In `/web` the suffix is
+  kept on the href; the page view does not emit heading ids. (#1089)
 
 ### Security
 - Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
