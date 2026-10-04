@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generic slot path (`_slots/current-focus.md`) are now redirected to their
   personal slot namespace instead of removing the shared project-wide slot, and
   deleting directly inside another operator's slot namespace is rejected with an
-  invalid request error.
+  invalid request error. (#1083)
 - Fixed `resume` and `workstreams` running `git status` on every linked checkout
   before listing anything: listing now reads only the checkout's stable
   fingerprints, so a large working tree or a slow filesystem-monitor hook no
