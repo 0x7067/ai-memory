@@ -341,7 +341,12 @@ them on the project, so they apply to every harness. Removing the key from the
 marker turns the setting back on at the next session start. A session start
 that sends no value at all (no marker found, an older hook bundle, a client not
 yet regenerated) leaves the recorded setting as it is: an opt-out is never
-undone by a client that did not say anything. A marker that sets only `[profile]` keys is a settings boundary, like one
+undone by a client that did not say anything. The recorded value follows the
+marker of the most recent session start, so keep the setting in the marker every
+checkout of the project shares (two checkouts whose markers disagree flip it
+back and forth).
+
+A marker that sets only `[profile]` keys is a settings boundary, like one
 that sets `[briefing]` keys: an outer marker's `workspace`/`project` do not
 apply through it. `ai-memory profile status` lists the projects that opted out
 of contributing.

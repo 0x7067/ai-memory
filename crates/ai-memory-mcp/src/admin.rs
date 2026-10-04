@@ -3444,6 +3444,11 @@ async fn build_reorg_plan(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| "unknown".to_string());
+        // Capture never attributes to a reserved scope; a reorg must not
+        // either, or a directory named like one would create or fill it.
+        if ai_memory_core::profile::is_reserved_scope_project(&project_name) {
+            continue;
+        }
         let proj = state
             .writer
             .get_or_create_project(ws, project_name.clone(), repo_path_from_reorg_cwd(cwd))
@@ -3455,7 +3460,9 @@ async fn build_reorg_plan(
     let mut plan_entries: Vec<ReorgPlanEntry> = Vec::new();
     let mut writer_plan: Vec<(SessionId, ProjectId)> = Vec::new();
     for (session_id, old_project_id, cwd) in &sessions {
-        let (_, new_project_id, project_name) = &cwd_to_proj[cwd.as_str()];
+        let Some((_, new_project_id, project_name)) = cwd_to_proj.get(cwd.as_str()) else {
+            continue;
+        };
         if *new_project_id == *old_project_id {
             continue;
         }
