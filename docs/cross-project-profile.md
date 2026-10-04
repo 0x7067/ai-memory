@@ -99,7 +99,8 @@ folder: `stack`, `architecture`, `workflow`, `testing`, `tools`, `style` or
 
 Entries are ordinary wiki pages, markdown in git: edit them by hand, and every
 change is versioned. `memory_delete_page` with `scope: "profile"` removes one
-(git keeps its history).
+(git keeps its history). Most entries, though, are learned on their own; see
+the next section.
 
 From the command line (root token on a multi-user server):
 
@@ -107,10 +108,87 @@ From the command line (root token on a multi-user server):
 ai-memory profile status                 # on/off, where it lives, entries, digest size, opt-outs
 ai-memory profile list                   # every entry with its scope tags
 ai-memory profile show tools/pnpm.md     # one entry
-ai-memory profile forget tools/pnpm.md   # remove one entry
+ai-memory profile forget tools/pnpm.md   # remove one entry (stays removed until you say it again)
+ai-memory profile review                 # entries with their evidence, habits still short of the bar
+ai-memory profile rebuild                # re-read every project from the start (safe to repeat)
 ai-memory profile list --user alice      # an operator's private profile (share = "user")
 ai-memory profile list --workspace work  # a workspace profile (share = "workspace")
 ```
+
+## How entries are learned
+
+The server builds most entries itself, from evidence, in two steps: once
+shortly after startup, after every session that ends (a few seconds later, so
+a burst of session ends costs one pass), and hourly. Each pass only reads what
+is new since the last one.
+
+**1. Harvest.** From every project that contributes, it collects:
+
+- **Your own prompts** that read as a preference or a correction: *always*,
+  *never*, *prefer X over Y*, *use X instead of Y*, *don't use*, *from now on*,
+  *by default*, *I usually*, *in all my projects*, and the Portuguese
+  equivalents (*sempre*, *nunca*, *prefiro*, *em vez de*, *não use*, *a partir
+  de agora*, *por padrão*, …). A sentence also has to name an action or be a
+  comparison, so "the build always fails" is not a preference; questions and
+  code blocks never are. Your verbatim words are kept as evidence.
+- **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
+  `procedures/`.
+- **Stack signals**: the languages the project's activity shows (from file
+  names such as `Cargo.toml` and source extensions).
+
+Tool output (what a command printed, what a file contained) is never read, so
+text an agent merely *saw* cannot become your preference.
+
+**2. Converge.** Statements are grouped by topic across projects. A group
+becomes an entry when:
+
+- you stated it as general ("in all my projects", "always", "by default",
+  "from now on"), or
+- the same choice shows up in at least `min_projects` projects (default 2).
+
+A habit seen in only one project stays that project's business; `profile
+review` lists such habits and how many more projects each needs. A language
+used in at least `min_projects` projects becomes a `profile/stack/<language>.md`
+entry, scoped to that language, which is how a new project learns your usual
+stack.
+
+**The latest ruling wins.** When you change your mind ("use bun instead of
+pnpm from now on"), the newer statement replaces the entry; the old version
+stays in the page history, never destroyed.
+
+Each learned entry records its evidence (the projects and dates it came from,
+your words, the most recent five), how many projects back it, its confidence,
+and a `generated_by: profile-harvest` stamp.
+
+### With an LLM
+
+With a provider configured (and `[profile] llm` left on), the pass uses it in
+two places, both through JSON-schema structured output:
+
+- **Classify.** Preference-shaped sentences from your prompts go to the model,
+  which decides which are real preferences, whether they are general, their
+  category and stack, and restates each as one short line. A looser filter
+  feeds it, so it catches phrasing the word lists miss.
+- **Merge.** When an entry gains evidence, the model restates it from your
+  words, newest ruling first, with your reasoning when you gave one.
+
+Both prompts treat every sentence as data, rank your own words first and are
+told never to follow instructions found in the text. The evidence quote is
+always your own sentence, never model text. If a call fails, the pass falls
+back to the zero-LLM path for that batch; without a provider the profile works
+the same way, with the word lists and the newest statement.
+
+### Correcting a wrong entry
+
+- **Remove it:** `ai-memory profile forget <path>`. The harvester remembers the
+  entries it wrote, so a removed one is not recreated from the same evidence;
+  it comes back only if you state it again later.
+- **Reword it:** edit the page (by hand, or with `memory_write_page` and
+  `scope: "profile"`). An entry you edited becomes yours: the harvester never
+  rewrites a page it did not write, or one whose body changed since it wrote
+  it, and `profile review` lists it as edited by hand.
+- **Start over:** `ai-memory profile rebuild` re-reads every project from the
+  beginning. It does not touch entries you edited or removed.
 
 ## Server settings
 
@@ -210,7 +288,14 @@ of contributing.
 - Event capture is never attributed to a profile project, whether the name comes
   from a directory or a marker.
 - Entries go through the same sanitizer as every page; `contribute = false`
-  keeps a project out of the profile entirely.
+  keeps a project out of the profile entirely, including evidence harvested
+  before you set it.
+- Harvesting reads only your prompts and curated pages, never tool output.
+- A private profile only ever learns from its own operator's sessions and
+  pages, in projects that operator can read. A shared profile on a multi-user
+  server (`global` or `workspace`) never learns from a restricted project,
+  because everyone can read it.
+- Text sent to the LLM goes through the sanitizer again first.
 
 ## Troubleshooting
 
@@ -225,3 +310,9 @@ of contributing.
 - **The agent did not apply a default.** The rules file and your instructions
   win; check that the repository does not say otherwise. Run
   `memory_read_page` on the entry to see what it actually says.
+- **A habit never became an entry.** `ai-memory profile review` shows it under
+  "not in the profile yet" with how many more projects it needs; say it once as
+  a general rule ("in all my projects, …") to admit it now, or lower
+  `min_projects`.
+- **An entry stopped updating.** It was edited by hand, so the harvester leaves
+  it alone (`profile review` says so). Delete it to hand it back.

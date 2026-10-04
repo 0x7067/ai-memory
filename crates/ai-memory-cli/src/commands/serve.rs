@@ -768,6 +768,100 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
 }
 
+/// Delay before the first profile pass, so it never competes with migration
+/// and first-request work on boot.
+const PROFILE_PASS_STARTUP_DELAY: Duration = Duration::from_secs(120);
+/// Wait after a SessionEnd wake-up before the pass runs, so a burst of
+/// session ends costs one pass.
+const PROFILE_PASS_DEBOUNCE: Duration = Duration::from_secs(30);
+/// Cadence of the profile pass when no session ends wake it.
+const PROFILE_PASS_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// What the cross-project profile worker needs.
+struct ProfileWorker {
+    reader: ai_memory_store::ReaderPool,
+    writer: WriterHandle,
+    wiki: Wiki,
+    llm: Option<Arc<dyn LlmProvider>>,
+    settings: ai_memory_core::profile::ProfileSettings,
+    trusted_proxy_identity: bool,
+}
+
+/// Harvest and converge the cross-project profile
+/// (`docs/design-cross-project-profile.md`): once shortly after startup, then
+/// after every SessionEnd (debounced) and hourly. Each pass reads only what is
+/// new past the per-project marks. The deployment's operator topology is read
+/// per pass, so adding the first database user turns an `auto` profile off
+/// without a restart.
+async fn run_profile_worker(
+    worker: ProfileWorker,
+    notify: Arc<tokio::sync::Notify>,
+    cancel: CancellationToken,
+) {
+    tokio::select! {
+        () = cancel.cancelled() => return,
+        () = tokio::time::sleep(PROFILE_PASS_STARTUP_DELAY) => {},
+    }
+    loop {
+        let distinguishes = match worker
+            .reader
+            .distinguishes_operators(worker.trusted_proxy_identity)
+            .await
+        {
+            Ok(distinguishes) => distinguishes,
+            Err(error) => {
+                tracing::warn!(%error, "profile pass could not read the operator topology");
+                true
+            }
+        };
+        if worker.settings.effective_share(distinguishes).is_some() {
+            let config = ai_memory_consolidate::profile::ProfilePassConfig {
+                settings: worker.settings.clone(),
+                distinguishes_operators: distinguishes,
+            };
+            let started = std::time::Instant::now();
+            match ai_memory_consolidate::profile::run_profile_pass(
+                &worker.reader,
+                &worker.writer,
+                &worker.wiki,
+                worker.llm.as_ref(),
+                &config,
+            )
+            .await
+            {
+                Ok(report) if report.candidates_added > 0 || report.entries_written > 0 => info!(
+                    share = report.share,
+                    projects = report.projects_harvested,
+                    candidates = report.candidates_added,
+                    written = report.entries_written,
+                    skipped_manual = report.skipped_manual.len(),
+                    llm_calls = report.llm_calls,
+                    llm_fallbacks = report.llm_fallbacks,
+                    errors = report.errors.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "profile pass updated the cross-project profile"
+                ),
+                Ok(report) if !report.errors.is_empty() => tracing::warn!(
+                    errors = ?report.errors,
+                    "profile pass finished with errors"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "profile pass failed"),
+            }
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = notify.notified() => {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(PROFILE_PASS_DEBOUNCE) => {},
+                }
+            }
+            () = tokio::time::sleep(PROFILE_PASS_INTERVAL) => {},
+        }
+    }
+}
+
 async fn run_session_consolidation_worker(
     writer: WriterHandle,
     consolidator: Arc<Consolidator>,
@@ -1218,6 +1312,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
+    let profile_llm = admin_llm.clone();
     // Share the tool router's last-activity clock with the B3 dream scheduler so
     // it can tell an idle box from a busy one and cancel a run on the operator's
     // return.
@@ -1290,6 +1385,19 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             seed_active_project_fallback(&store.reader, &active_project).await;
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
+            let profile_notify = Arc::new(tokio::sync::Notify::new());
+            let profile_task = tokio::spawn(run_profile_worker(
+                ProfileWorker {
+                    reader: store.reader.clone(),
+                    writer: store.writer.clone(),
+                    wiki: wiki.clone(),
+                    llm: profile_llm.clone(),
+                    settings: config.profile.clone(),
+                    trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                },
+                profile_notify.clone(),
+                cancel.child_token(),
+            ));
             let (session_consolidation_notify, session_consolidation_task) =
                 if config.consolidate_on_session_end {
                     if let Some(consolidator) = consolidator.clone() {
@@ -1388,6 +1496,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
+                profile_notify: Some(profile_notify.clone()),
                 capture_assistant_enabled: config.capture_assistant,
                 claim_handoff_on_session_start: config.handoff.claim_on_session_start,
                 create_handoff_on_session_end: config.handoff.create_on_session_end,
@@ -1557,6 +1666,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 .merge(ai_memory_mcp::admin_profile::profile_admin_router(
                     ai_memory_mcp::admin_profile::ProfileAdminState {
                         reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        wiki: wiki.clone(),
+                        llm: profile_llm.clone(),
                         profile: config.profile.clone(),
                         trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                     },
@@ -1744,6 +1856,17 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 }
             };
             cancel.cancel();
+            // The profile pass checks no cancellation mid-pass; a pass that
+            // is mid-write finishes its current page within the grace period
+            // or is abandoned, and the next start resumes from its marks.
+            match tokio::time::timeout(SHUTDOWN_GRACE, profile_task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "profile worker join failed"),
+                Err(_) => tracing::warn!(
+                    grace_secs = SHUTDOWN_GRACE.as_secs(),
+                    "profile worker did not stop within the shutdown grace period; exiting anyway"
+                ),
+            }
             if let Some(task) = session_consolidation_task {
                 // Bounded like the drain above. The worker can be parked in
                 // `claim_session_consolidation` or `release_session_consolidation`,

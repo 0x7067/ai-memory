@@ -187,6 +187,24 @@ fenced, byte-budgeted, byte-stable digest of the user's usual choices from other
 projects (`docs/cross-project-profile.md`), filtered by the stack the project's
 activity shows, with a larger baseline for a project that has no pages yet. It
 is on by default for a single-operator server and off for a multi-user one.
+Entries are learned by the profile pass (`ai_memory_consolidate::profile`), run
+by a server worker shortly after startup, a debounced moment after every
+SessionEnd (`HookState::profile_notify`), hourly, and on
+`POST /admin/profile/rebuild`. It **harvests** each contributing project past
+its marks (`profile_harvest_marks`): preference-shaped sentences of
+`user-prompt` observations (never tool output), the project's `_rules/`,
+`decisions/`, `gotchas/` and `procedures/` pages, and its stack signals, into
+`profile_candidates`. It then **converges** per profile scope: candidates group
+by topic-token overlap across projects; a group stated as general or seen in
+`min_projects` projects becomes a `profile/<category>/<slug>.md` page written
+through `Wiki::write_page`, the newest statement winning (the replaced version
+stays in the supersession chain). Pages it did not write, or whose body changed
+since it wrote them, are never rewritten; `profile_entry_ledger` keeps a removed
+entry removed until newer evidence arrives. With an LLM provider and
+`[profile] llm`, classification and the per-entry merge use JSON-schema
+structured calls and fall back to the zero-LLM path on any error. A private
+profile converges only its operator's own candidates from projects they can
+read; a shared profile on a multi-user server skips restricted projects.
 
 **Optional managed-workstream loop:** `ai-memory run` opens a lease for the
 current repository/worktree workstream, resolves an explicit harness or the
@@ -351,7 +369,7 @@ prunable rather than only after it ages in place.
 
 | Table | What |
 |---|---|
-| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. A marker's `identity_style = "path"` (#1033, forwarded as the `identity_style` hook query param alongside a git-remote identity; default `host_path`) names a project that resolution *creates* from the repository path without the host (`acme-api`), falling back to the usual name when another project already holds it; it never renames or re-keys an existing project. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` — `docs/users.md#per-project-access`. `projects.profile_contribute` / `profile_consume` (V74) record the marker's `[profile]` opt-outs, forwarded at session start. Reserved projects: `scratch`, `_global` (shared preferences; holds the single-user profile under `profile/`), `_profile` (a workspace profile) and `_profile.<user id>` (a private profile, always `restricted`); capture is never attributed to any of them — `docs/cross-project-profile.md`. |
+| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. A marker's `identity_style = "path"` (#1033, forwarded as the `identity_style` hook query param alongside a git-remote identity; default `host_path`) names a project that resolution *creates* from the repository path without the host (`acme-api`), falling back to the usual name when another project already holds it; it never renames or re-keys an existing project. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` — `docs/users.md#per-project-access`. `projects.profile_contribute` / `profile_consume` (V74) record the marker's `[profile]` opt-outs, forwarded at session start; `profile_candidates`, `profile_harvest_marks` and `profile_entry_ledger` (V75) hold the profile pass's evidence, per-project read position and the entries it wrote. Reserved projects: `scratch`, `_global` (shared preferences; holds the single-user profile under `profile/`), `_profile` (a workspace profile) and `_profile.<user id>` (a private profile, always `restricted`); capture is never attributed to any of them — `docs/cross-project-profile.md`. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |

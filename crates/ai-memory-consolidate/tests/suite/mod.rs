@@ -18,6 +18,7 @@ mod lifecycle;
 mod local_embeddings;
 mod multi_machine;
 mod observation_retention;
+mod profile_harvest;
 mod recall_eval;
 mod search_quality;
 mod typed_edges;

@@ -9823,6 +9823,84 @@ impl ReaderPool {
         .await
     }
 
+    /// Every project the profile harvester may read, with its marks.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_harvest_projects(&self) -> StoreResult<Vec<crate::ProfileHarvestProject>> {
+        self.with_conn(crate::profile::profile_harvest_projects)
+            .await
+    }
+
+    /// What the harvester reads next from one project: user prompts and
+    /// curated pages past its marks, at most `limit` of each.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_harvest_inputs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        mark: crate::ProfileHarvestMark,
+        limit: usize,
+    ) -> StoreResult<(
+        Vec<crate::ProfilePromptRow>,
+        Vec<crate::ProfilePageRow>,
+        std::collections::BTreeSet<String>,
+    )> {
+        self.with_conn(move |conn| {
+            Ok((
+                crate::profile::profile_prompts_since(
+                    conn,
+                    workspace_id,
+                    project_id,
+                    mark.observations_until,
+                    limit,
+                )?,
+                crate::profile::profile_pages_since(
+                    conn,
+                    workspace_id,
+                    project_id,
+                    mark.pages_until,
+                    limit,
+                )?,
+                crate::profile::project_stack_tags(conn, workspace_id, project_id)?,
+            ))
+        })
+        .await
+    }
+
+    /// The newest recorded profile candidates of contributing projects.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_candidates(
+        &self,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::ProfileCandidateRow>> {
+        self.with_conn(move |conn| crate::profile::profile_candidates(conn, limit))
+            .await
+    }
+
+    /// Every current `profile/` page of a scope, raw, and the harvester's
+    /// ledger of the entries it wrote there, from one connection checkout.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_scope_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<(Vec<crate::ProfileScopePage>, Vec<crate::ProfileLedgerEntry>)> {
+        self.with_conn(move |conn| {
+            Ok((
+                crate::profile::profile_scope_pages(conn, workspace_id, project_id)?,
+                crate::profile::profile_entry_ledger(conn, workspace_id, project_id)?,
+            ))
+        })
+        .await
+    }
+
     /// The digest inputs for a session in `project` reading the profile held
     /// in `profile_scope`, from one connection checkout.
     ///

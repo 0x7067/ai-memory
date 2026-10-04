@@ -163,6 +163,71 @@ impl EffectiveProfileShare {
     }
 }
 
+/// Where a profile candidate came from. Tool output is never a source: only
+/// what the user wrote and what was curated into pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProfileCandidateSource {
+    /// A user-prompt observation.
+    Prompt,
+    /// A curated page (`_rules/`, `decisions/`, `gotchas/`, `procedures/`).
+    Page,
+    /// A stack signal derived from the project's observed file paths.
+    Stack,
+}
+
+impl ProfileCandidateSource {
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Page => "page",
+            Self::Stack => "stack",
+        }
+    }
+
+    /// Parse the stored spelling.
+    #[must_use]
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "prompt" => Some(Self::Prompt),
+            "page" => Some(Self::Page),
+            "stack" => Some(Self::Stack),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the user stated a candidate as holding everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProfileGenerality {
+    /// Said in, and about, one project.
+    Project,
+    /// Said as a general rule ("in all my projects", "always", "by default").
+    General,
+}
+
+impl ProfileGenerality {
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::General => "general",
+        }
+    }
+
+    /// Parse the stored spelling; anything unknown is project-scoped.
+    #[must_use]
+    pub fn from_db(value: &str) -> Self {
+        if value == "general" {
+            Self::General
+        } else {
+            Self::Project
+        }
+    }
+}
+
 /// Default number of distinct projects a choice must appear in before it
 /// becomes a profile entry.
 pub const DEFAULT_MIN_PROJECTS: u32 = 2;

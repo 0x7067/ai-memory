@@ -496,6 +496,10 @@ pub struct HookState {
     /// Coalescing wake-up for the durable SessionEnd consolidation worker.
     /// The database is the queue; notifications only reduce pickup latency.
     pub session_consolidation_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Coalescing wake-up for the cross-project profile pass: a session that
+    /// ended may have taught the profile something. The pass reads only what
+    /// is new past its marks, so a wake-up with nothing new is cheap.
+    pub profile_notify: Option<Arc<tokio::sync::Notify>>,
     /// Opt-in (`AI_MEMORY_CAPTURE_ASSISTANT`): when true, the server honors the
     /// client's `_ai_memory_assistant` protocol on a `Stop` event and persists
     /// the sanitized excerpt as the Stop body. Off by default; when off the
@@ -3801,6 +3805,9 @@ async fn process_authorized(
             info!(session = %session_id, page = %new_page.path, "turn checkpoint written; native session remains open");
         } else {
             enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+            if let Some(notify) = state.profile_notify.as_ref() {
+                notify.notify_one();
+            }
             if let Some(handoff_id) = handoff_id {
                 info!(
                     session = %session_id,
@@ -5277,6 +5284,7 @@ mod tests {
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
+            profile_notify: None,
             capture_assistant_enabled: false,
             claim_handoff_on_session_start: true,
             create_handoff_on_session_end: true,

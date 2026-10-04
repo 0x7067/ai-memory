@@ -1,21 +1,24 @@
 //! `/admin/profile/*`: operator view of the cross-project profile
-//! (`docs/cross-project-profile.md`). Read-only; `ai-memory profile show`
-//! and `forget` reuse `/admin/read-page` and `/admin/delete-page` against the
-//! scope `status` reports. Root-only on a multi-user server, like every
-//! `/admin/*` route.
+//! (`docs/cross-project-profile.md`). `status`, `list` and `review` read;
+//! `rebuild` re-harvests every contributing project and converges the
+//! profile. `ai-memory profile show` and `forget` reuse `/admin/read-page` and
+//! `/admin/delete-page` against the scope `status` reports. Root-only on a
+//! multi-user server, like every `/admin/*` route.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ai_memory_core::profile::{EffectiveProfileShare, ProfileSettings, render_digest};
 use ai_memory_core::{AuthLevel, Capability};
-use ai_memory_store::{ReaderPool, ResolvedScope, ScopeResolutionError};
+use ai_memory_llm::LlmProvider;
+use ai_memory_store::{ReaderPool, ResolvedScope, ScopeResolutionError, WriterHandle};
+use ai_memory_wiki::Wiki;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +27,13 @@ use serde::{Deserialize, Serialize};
 pub struct ProfileAdminState {
     /// Reader pool.
     pub reader: ReaderPool,
+    /// Writer actor (`rebuild` records candidates and marks).
+    pub writer: WriterHandle,
+    /// Wiki (`rebuild` writes profile entries through it).
+    pub wiki: Wiki,
+    /// The configured LLM provider, if any (`rebuild` classifies and merges
+    /// with it when `[profile] llm` allows).
+    pub llm: Option<Arc<dyn LlmProvider>>,
     /// `[profile]` settings.
     pub profile: ProfileSettings,
     /// `[auth].actor_proxy_bearer_token` is configured; see
@@ -37,6 +47,8 @@ pub fn profile_admin_router(state: ProfileAdminState) -> Router {
     Router::new()
         .route("/admin/profile/status", get(handle_status))
         .route("/admin/profile/list", get(handle_list))
+        .route("/admin/profile/review", get(handle_review))
+        .route("/admin/profile/rebuild", post(handle_rebuild))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_root_for_multiuser_admin,
@@ -270,4 +282,96 @@ async fn handle_list(
         })
         .collect();
     Json(serde_json::json!({ "scope": names, "entries": entries })).into_response()
+}
+
+async fn pass_config(
+    state: &ProfileAdminState,
+) -> Result<ai_memory_consolidate::profile::ProfilePassConfig, Response> {
+    let distinguishes = state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+        .map_err(internal)?;
+    Ok(ai_memory_consolidate::profile::ProfilePassConfig {
+        settings: state.profile.clone(),
+        distinguishes_operators: distinguishes,
+    })
+}
+
+/// `GET /admin/profile/review`: the inspected profile's entries with their
+/// evidence, the groups still below the bar, and the entries a pass would
+/// update, leaves alone (hand-edited) or keeps removed (forgotten).
+async fn handle_review(
+    State(state): State<Arc<ProfileAdminState>>,
+    Query(query): Query<ProfileQuery>,
+) -> Response {
+    let config = match pass_config(&state).await {
+        Ok(config) => config,
+        Err(response) => return response,
+    };
+    let workspace_id = match state.reader.find_workspace(query.workspace.clone()).await {
+        Ok(ws) => ws,
+        Err(e) => return internal(e),
+    };
+    let user = match query
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        Some(name) => match state.reader.find_user_by_username(name.to_owned()).await {
+            Ok(Some(user)) => Some(user.id),
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": format!("no user named {name}") })),
+                )
+                    .into_response();
+            }
+            Err(e) => return internal(e),
+        },
+        None => None,
+    };
+    match ai_memory_consolidate::profile::profile_review(&state.reader, &config, workspace_id, user)
+        .await
+    {
+        Ok(review) => Json(review).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// `POST /admin/profile/rebuild`: forget the harvest marks, re-read every
+/// contributing project from the start and converge every profile scope.
+/// Recording a candidate twice is a no-op, so this is safe to repeat.
+async fn handle_rebuild(State(state): State<Arc<ProfileAdminState>>) -> Response {
+    let config = match pass_config(&state).await {
+        Ok(config) => config,
+        Err(response) => return response,
+    };
+    if config
+        .settings
+        .effective_share(config.distinguishes_operators)
+        .is_none()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "the profile is off on this server" })),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.writer.clear_profile_harvest_marks().await {
+        return internal(e);
+    }
+    match ai_memory_consolidate::profile::run_profile_pass(
+        &state.reader,
+        &state.writer,
+        &state.wiki,
+        state.llm.as_ref(),
+        &config,
+    )
+    .await
+    {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => internal(e),
+    }
 }

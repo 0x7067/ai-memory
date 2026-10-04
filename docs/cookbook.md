@@ -69,8 +69,12 @@ the agent applies those choices whenever the repository's rules file and you
 say nothing. A brand-new repository gets the whole baseline, plus a pointer to
 `ai-memory profile apply` for writing it into that repository's rules file.
 
+- You don't have to ask: habits you state in your prompts ("always…", "prefer
+  X over Y", "from now on…") are learned on their own once you say them as a
+  general rule or in two projects. `ai-memory profile review` shows what was
+  learned, from which words, and what is still one project short.
 - See what it holds: `ai-memory profile list`; drop one: `ai-memory profile
-  forget tools/pnpm.md`.
+  forget tools/pnpm.md` (it stays dropped until you say it again).
 - Keep a client project out of it: `[profile] contribute = false` in that
   repository's `.ai-memory.toml`; keep the digest out of one: `consume = false`.
 - Scope an entry to a stack with frontmatter `applies_to: [rust]`.

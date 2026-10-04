@@ -68,7 +68,12 @@ pub use ops::{
     StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
-pub use profile::{PROFILE_ENTRIES_LIMIT, ProfileDigestInputs, ProfileOptOut, ProjectProfileFlags};
+pub use profile::{
+    NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
+    ProfileCandidateRow, ProfileDigestInputs, ProfileHarvestMark, ProfileHarvestProject,
+    ProfileLedgerEntry, ProfileOptOut, ProfilePageRow, ProfilePromptRow, ProfileScopePage,
+    ProjectProfileFlags,
+};
 pub use project_authz::{
     AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
     RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,

@@ -1,10 +1,11 @@
 //! `ai-memory profile` — inspect and curate the cross-project profile
 //! (`docs/cross-project-profile.md`).
 //!
-//! Thin HTTP client: `status` and `list` read `/admin/profile/*`; `show` and
-//! `forget` resolve the profile's scope through `status` and then use the
-//! ordinary `/admin/read-page` and `/admin/delete-page`, so a profile entry is
-//! read and removed exactly like any other page.
+//! Thin HTTP client: `status`, `list` and `review` read `/admin/profile/*`
+//! and `rebuild` posts to it; `show` and `forget` resolve the profile's scope
+//! through `status` and then use the ordinary `/admin/read-page` and
+//! `/admin/delete-page`, so a profile entry is read and removed exactly like
+//! any other page.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -25,6 +26,8 @@ pub async fn run(config: &Config, args: ProfileArgs) -> Result<()> {
         ProfileCommand::List(scope) => list(&ep, &scope).await,
         ProfileCommand::Show { path, scope } => show(&ep, &scope, &path).await,
         ProfileCommand::Forget { path, scope } => forget(&ep, &scope, &path).await,
+        ProfileCommand::Review(scope) => review(&ep, &scope).await,
+        ProfileCommand::Rebuild => rebuild(&ep).await,
     }
 }
 
@@ -231,6 +234,156 @@ async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Re
         println!("Forgot {} (the git history keeps it).", resp.path);
     } else {
         println!("{} was not in the profile; nothing changed.", resp.path);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewEntry {
+    path: String,
+    statement: String,
+    projects: Option<u64>,
+    confidence: Option<f64>,
+    last_seen: Option<String>,
+    managed: bool,
+    #[serde(default)]
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitingGroup {
+    statement: String,
+    projects: usize,
+    needs: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewResponse {
+    share: Option<String>,
+    entries: Vec<ReviewEntry>,
+    waiting: Vec<WaitingGroup>,
+    pending_updates: Vec<String>,
+    hand_edited: Vec<String>,
+    forgotten: Vec<String>,
+}
+
+async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
+    let r: ReviewResponse = get_json(ep, "/admin/profile/review", &scope_query(scope))
+        .await
+        .context("reviewing the profile")?;
+    let Some(share) = r.share else {
+        println!("The profile is off on this server.");
+        return Ok(());
+    };
+    println!(
+        "Profile ({share}): {} entr{}",
+        r.entries.len(),
+        if r.entries.len() == 1 { "y" } else { "ies" }
+    );
+    for entry in &r.entries {
+        let mut facts = Vec::new();
+        if let Some(n) = entry.projects {
+            facts.push(format!("{n} project{}", if n == 1 { "" } else { "s" }));
+        }
+        if let Some(c) = entry.confidence {
+            facts.push(format!("confidence {c:.2}"));
+        }
+        if let Some(seen) = &entry.last_seen {
+            facts.push(format!("last seen {seen}"));
+        }
+        facts.push(if entry.managed {
+            "harvested".into()
+        } else {
+            "yours (never rewritten)".into()
+        });
+        println!("  {}  [{}]", entry.path, facts.join(", "));
+        println!("      {}", entry.statement);
+        if let Some(items) = entry.evidence.as_array() {
+            for item in items.iter().take(3) {
+                let quote = item
+                    .get("quote")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let project = item
+                    .get("project")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                println!("        \"{quote}\" ({project})");
+            }
+        }
+    }
+    if !r.pending_updates.is_empty() {
+        println!("Next pass will update: {}", r.pending_updates.join(", "));
+    }
+    if !r.waiting.is_empty() {
+        println!("Not in the profile yet (needs more projects, or say it as a general rule):");
+        for group in &r.waiting {
+            println!(
+                "  {} ({} project{}, {} more needed)",
+                group.statement,
+                group.projects,
+                if group.projects == 1 { "" } else { "s" },
+                group.needs
+            );
+        }
+    }
+    if !r.hand_edited.is_empty() {
+        println!("Edited by hand, left alone: {}", r.hand_edited.join(", "));
+    }
+    if !r.forgotten.is_empty() {
+        println!(
+            "Forgotten, stays out until you say it again: {}",
+            r.forgotten.join(", ")
+        );
+    }
+    println!(
+        "Fix a wrong entry: `ai-memory profile forget <path>`; reword it by editing the page (it then stays yours)."
+    );
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct RebuildReport {
+    share: Option<String>,
+    projects_harvested: usize,
+    candidates_added: usize,
+    entries_written: usize,
+    entries_unchanged: usize,
+    skipped_manual: Vec<String>,
+    llm_calls: usize,
+    llm_fallbacks: usize,
+    errors: Vec<String>,
+}
+
+async fn rebuild(ep: &ServerEndpoint) -> Result<()> {
+    let r: RebuildReport = post_json(ep, "/admin/profile/rebuild", &serde_json::json!({}))
+        .await
+        .context("rebuilding the profile")?;
+    println!(
+        "Rebuilt the {} profile: read {} project{}, {} new candidate{}, {} entr{} written, {} unchanged.",
+        r.share.as_deref().unwrap_or("?"),
+        r.projects_harvested,
+        if r.projects_harvested == 1 { "" } else { "s" },
+        r.candidates_added,
+        if r.candidates_added == 1 { "" } else { "s" },
+        r.entries_written,
+        if r.entries_written == 1 { "y" } else { "ies" },
+        r.entries_unchanged
+    );
+    if r.llm_calls > 0 || r.llm_fallbacks > 0 {
+        println!(
+            "  LLM calls: {} ({} fell back to the zero-LLM path)",
+            r.llm_calls, r.llm_fallbacks
+        );
+    }
+    if !r.skipped_manual.is_empty() {
+        println!(
+            "  left alone (edited by hand): {}",
+            r.skipped_manual.join(", ")
+        );
+    }
+    for error in &r.errors {
+        println!("  error: {error}");
     }
     Ok(())
 }

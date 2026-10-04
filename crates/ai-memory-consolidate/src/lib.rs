@@ -23,6 +23,7 @@ pub mod experience;
 pub mod keep_tokens;
 pub mod lint;
 mod path_sanitize;
+pub mod profile;
 pub mod projection;
 pub mod sweep;
 pub mod types;

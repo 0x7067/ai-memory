@@ -163,6 +163,7 @@ impl Harness {
             ingest_gates: ai_memory_hooks::IngestGates::default(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
+            profile_notify: None,
             capture_assistant_enabled: false,
             claim_handoff_on_session_start: true,
             create_handoff_on_session_end: true,

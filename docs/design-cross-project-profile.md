@@ -169,6 +169,14 @@ imperative line, then the user's own reasoning when there is some.
 All writes go through `Wiki::write_page` (sanitization, admission,
 attribution, rollback, index in the same transaction).
 
+A harvested page carries `generated_by: profile-harvest` and the sha256 of
+the body it wrote (`generated_sha`). The harvester rewrites only such a page,
+and only while its body still matches: a page written or edited by hand is
+never rewritten, and the group it would have updated is reported as skipped.
+`profile_entry_ledger` records the entries it wrote; a ledger row whose page
+is gone was removed by the user, and that topic is not recreated until a
+candidate newer than the entry's last write arrives.
+
 ### 5.4 Deliver
 
 - **SessionStart digest.** A fenced section after the project brief:
@@ -238,8 +246,10 @@ consume = false      # no digest or union in this project
 `ai-memory profile status | list | show <path> | forget <path> | review |
 rebuild | apply [--target FILE] [--dry-run]`.
 
-`status` and `list` read `/admin/profile/*`; `show` and `forget` reuse
-`/admin/read-page` and `/admin/delete-page` against the profile's scope. All
+`status`, `list` and `review` read `/admin/profile/*` and `rebuild` posts
+to it (forget the harvest marks, re-read every project, converge); `show` and
+`forget` reuse `/admin/read-page` and `/admin/delete-page` against the
+profile's scope. All
 are root-only on a multi-user server, like every `/admin/*` route; there, each
 operator manages their own private profile through MCP.
 

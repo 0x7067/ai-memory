@@ -23,8 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `memory_delete_page` accept `scope: "profile"`, `memory_query` returns
   profile entries in `global_scope_hits`, a marker's `[profile] contribute` /
   `consume` keys opt a project out of contributing or receiving, and
-  `ai-memory profile status | list | show | forget` inspects and curates it.
-  (cross-project profile)
+  `ai-memory profile status | list | show | forget | review | rebuild`
+  inspects and curates it. Entries are learned on their own: a server pass,
+  run after each session ends and hourly, harvests the user's own
+  preference-shaped prompts (never tool output), the project's curated pages
+  and its stack signals, and converges them across projects into entries once
+  the user states a choice as general or it appears in `min_projects`
+  projects, the newest ruling winning. With an LLM provider the pass
+  classifies and restates entries through JSON-schema calls and falls back to
+  the zero-LLM path on any error. It never rewrites an entry edited by hand,
+  and an entry removed with `profile forget` stays removed until the user
+  states it again. (cross-project profile)
 - Added `ai-memory resume --search` with immediate type-to-filter name search,
   and `resume --all`, which keeps the previous cross-checkout picker: every
   linked checkout, the current one first, each listed with its own fully

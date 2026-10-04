@@ -83,6 +83,22 @@ pub(crate) enum WriteCmd {
         flags: crate::ProjectProfileFlags,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    RecordProfileHarvest {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<crate::NewProfileCandidate>,
+        mark: crate::ProfileHarvestMark,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    ClearProfileHarvestMarks {
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    RecordProfileEntries {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        entries: Vec<crate::ProfileLedgerEntry>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     ResolveProjectByIdentity {
         workspace_id: WorkspaceId,
         identity: ai_memory_core::repository_identity::RepositoryIdentity,
@@ -960,6 +976,67 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one project's profile candidates and advance its harvest marks
+    /// in one transaction. Re-recording a candidate is a no-op; returns how
+    /// many were new.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn record_profile_harvest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<crate::NewProfileCandidate>,
+        mark: crate::ProfileHarvestMark,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordProfileHarvest {
+            workspace_id,
+            project_id,
+            candidates,
+            mark,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record the profile entries the harvester wrote into a profile scope,
+    /// in one transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn record_profile_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        entries: Vec<crate::ProfileLedgerEntry>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordProfileEntries {
+            workspace_id,
+            project_id,
+            entries,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Forget every profile harvest mark (`ai-memory profile rebuild`).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn clear_profile_harvest_marks(&self) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearProfileHarvestMarks { reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -3254,6 +3331,40 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = crate::profile::set_project_profile_flags(&conn, project_id, flags);
                 send_or_warn(reply, result, "set_project_profile_flags");
+            }
+            WriteCmd::RecordProfileHarvest {
+                workspace_id,
+                project_id,
+                candidates,
+                mark,
+                reply,
+            } => {
+                let result = crate::profile::record_profile_harvest(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &candidates,
+                    mark,
+                );
+                send_or_warn(reply, result, "record_profile_harvest");
+            }
+            WriteCmd::RecordProfileEntries {
+                workspace_id,
+                project_id,
+                entries,
+                reply,
+            } => {
+                let result = crate::profile::record_profile_entries(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &entries,
+                );
+                send_or_warn(reply, result, "record_profile_entries");
+            }
+            WriteCmd::ClearProfileHarvestMarks { reply } => {
+                let result = crate::profile::clear_profile_harvest_marks(&conn);
+                send_or_warn(reply, result, "clear_profile_harvest_marks");
             }
             WriteCmd::Shutdown => break,
             WriteCmd::AuthorizeProject {

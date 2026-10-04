@@ -938,13 +938,20 @@ pub enum ProfileCommand {
         #[command(flatten)]
         scope: ProfileScopeArgs,
     },
-    /// Remove one entry (`profile/` prefix optional). Git keeps its history.
+    /// Remove one entry (`profile/` prefix optional). Git keeps its history,
+    /// and the harvester leaves the topic alone until you state it again.
     Forget {
         /// Entry path, e.g. `tools/pnpm.md`.
         path: String,
         #[command(flatten)]
         scope: ProfileScopeArgs,
     },
+    /// Show each entry with its evidence, plus the habits still short of the
+    /// bar and the entries the harvester leaves alone.
+    Review(ProfileScopeArgs),
+    /// Re-read every contributing project from the start and rebuild the
+    /// profile from what it finds (safe to repeat).
+    Rebuild,
 }
 
 /// Which profile a `profile` subcommand inspects.
