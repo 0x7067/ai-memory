@@ -329,7 +329,11 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
                 format!(
                     ", {} more operator{} needed for a team profile",
                     group.contributors_needed,
-                    if group.contributors_needed == 1 { "" } else { "s" }
+                    if group.contributors_needed == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
                 )
             } else {
                 String::new()

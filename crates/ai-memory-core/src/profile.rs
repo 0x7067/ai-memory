@@ -569,7 +569,8 @@ const DIGEST_PRECEDENCE: &str = "> Your usual choices from other projects. Use t
      this project's rules and the user say nothing; say which default you applied. The user's \
      instructions, then this repository's rules file (`AGENTS.md`, `CLAUDE.md`), then this \
      project's memory all take precedence.\n";
-const TEAM_DIGEST_TITLE: &str = "> 🧭 **ai-memory: team defaults** (shared cross-project profile)\n";
+const TEAM_DIGEST_TITLE: &str =
+    "> 🧭 **ai-memory: team defaults** (shared cross-project profile)\n";
 const TEAM_DIGEST_PRECEDENCE: &str = "> Team defaults: choices several operators on this server \
      made across projects, not necessarily this user's own. Use them when this project's rules and \
      the user say nothing; say which default you applied. The user's instructions, then this \
@@ -618,7 +619,11 @@ pub fn render_digest(
     }
 
     let mut head = String::new();
-    head.push_str(if team { TEAM_DIGEST_TITLE } else { DIGEST_TITLE });
+    head.push_str(if team {
+        TEAM_DIGEST_TITLE
+    } else {
+        DIGEST_TITLE
+    });
     head.push_str(if team {
         TEAM_DIGEST_PRECEDENCE
     } else {

@@ -2169,7 +2169,13 @@ pub fn review_plan(
     min_contributors: usize,
 ) -> ConvergePlan {
     let rows: Vec<&ProfileCandidateRow> = candidates.iter().collect();
-    converge(&rows, existing_pages, ledger, min_projects, min_contributors)
+    converge(
+        &rows,
+        existing_pages,
+        ledger,
+        min_projects,
+        min_contributors,
+    )
 }
 
 /// Distinct operators a statement needs evidence from before it enters
