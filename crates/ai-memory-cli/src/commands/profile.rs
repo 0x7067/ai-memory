@@ -260,6 +260,8 @@ struct WaitingGroup {
     statement: String,
     projects: usize,
     needs: usize,
+    #[serde(default)]
+    contributors_needed: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,8 +325,17 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
     if !r.waiting.is_empty() {
         println!("Not in the profile yet (needs more projects, or say it as a general rule):");
         for group in &r.waiting {
+            let people = if group.contributors_needed > 0 {
+                format!(
+                    ", {} more operator{} needed for a team profile",
+                    group.contributors_needed,
+                    if group.contributors_needed == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "  {} ({} project{}, {} more needed)",
+                "  {} ({} project{}, {} more needed{people})",
                 group.statement,
                 group.projects,
                 if group.projects == 1 { "" } else { "s" },

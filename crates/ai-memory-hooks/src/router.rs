@@ -2055,7 +2055,13 @@ async fn render_requested_profile_digest(
     } else {
         state.profile.digest_budget()
     };
-    ai_memory_core::profile::render_digest(&inputs.entries, &inputs.project_tags, budget, baseline)
+    ai_memory_core::profile::render_digest(
+        &inputs.entries,
+        &inputs.project_tags,
+        budget,
+        baseline,
+        ai_memory_core::profile::is_team_profile(share, distinguishes),
+    )
 }
 
 fn combine_handoff_and_brief(

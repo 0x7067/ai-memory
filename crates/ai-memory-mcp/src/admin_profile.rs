@@ -206,8 +206,13 @@ async fn handle_status(
                     Ok(entries) => entries,
                     Err(e) => return internal(e),
                 };
-                let digest =
-                    render_digest(&entries, &BTreeSet::new(), settings.digest_budget(), false);
+                let digest = render_digest(
+                    &entries,
+                    &BTreeSet::new(),
+                    settings.digest_budget(),
+                    false,
+                    ai_memory_core::profile::is_team_profile(share, distinguishes),
+                );
                 (Some(names), entries.len(), digest.map_or(0, |d| d.len()))
             }
             Err(e) => return internal(e),

@@ -828,6 +828,9 @@ pub struct WaitingGroup {
     pub projects: usize,
     /// Projects still needed.
     pub needs: usize,
+    /// Distinct contributors still needed (a team profile admits a statement
+    /// only on evidence from more than one operator; 0 otherwise).
+    pub contributors_needed: usize,
 }
 
 /// What a convergence decided.
@@ -992,12 +995,19 @@ fn unique_path(base: &str, taken: &BTreeSet<String>) -> String {
 /// `ledger` lists the entries the harvester wrote before; one whose page is
 /// gone was removed by the user, and its topic is not recreated until a
 /// candidate newer than its last write arrives.
+///
+/// `min_contributors` is how many distinct operators a statement needs
+/// evidence from: 1 for a personal profile, more for a team profile, so one
+/// operator cannot plant a "default" in everyone's session start by repeating
+/// it in two projects. Stack entries describe file names, not instructions,
+/// and keep the project threshold only.
 #[must_use]
 pub fn converge(
     candidates: &[&ProfileCandidateRow],
     existing_pages: &[ProfileScopePage],
     ledger: &[ProfileLedgerEntry],
     min_projects: u32,
+    min_contributors: usize,
 ) -> ConvergePlan {
     let min_projects = usize::try_from(min_projects.max(1)).unwrap_or(1);
     let existing: Vec<ExistingEntry> = existing_pages
@@ -1034,6 +1044,7 @@ pub fn converge(
                 statement: format!("Usual stack: {tag}"),
                 projects: projects.len(),
                 needs: min_projects - projects.len(),
+                contributors_needed: 0,
             });
             continue;
         }
@@ -1104,11 +1115,28 @@ pub fn converge(
         }) else {
             continue;
         };
-        if !general && projects.len() < min_projects {
+        let contributors: BTreeSet<&str> = group
+            .iter()
+            .filter_map(|m| m.row.candidate.contributor.as_deref())
+            .collect();
+        let projects_short = if general {
+            0
+        } else {
+            min_projects.saturating_sub(projects.len())
+        };
+        // Only a team profile counts people; a personal one (or a single-user
+        // server, where evidence carries no contributor) needs none.
+        let contributors_short = if min_contributors > 1 {
+            min_contributors.saturating_sub(contributors.len())
+        } else {
+            0
+        };
+        if projects_short > 0 || contributors_short > 0 {
             plan.waiting.push(WaitingGroup {
                 statement: newest.row.candidate.statement.clone(),
                 projects: projects.len(),
-                needs: min_projects - projects.len(),
+                needs: projects_short,
+                contributors_needed: contributors_short,
             });
             continue;
         }
@@ -1900,6 +1928,7 @@ async fn converge_target(
         &existing_pages,
         &ledger,
         config.settings.min_projects,
+        min_contributors(target.share, config.distinguishes_operators),
     );
     report.entries_unchanged += plan.unchanged;
     report
@@ -2086,6 +2115,7 @@ pub async fn profile_review(
         &pages,
         &ledger,
         config.settings.min_projects,
+        min_contributors(share, config.distinguishes_operators),
     );
     review.waiting = plan.waiting;
     review.pending_updates = plan.writes.into_iter().map(|w| w.path).collect();
@@ -2136,10 +2166,25 @@ pub fn review_plan(
     existing_pages: &[ProfileScopePage],
     ledger: &[ProfileLedgerEntry],
     min_projects: u32,
+    min_contributors: usize,
 ) -> ConvergePlan {
     let rows: Vec<&ProfileCandidateRow> = candidates.iter().collect();
-    converge(&rows, existing_pages, ledger, min_projects)
+    converge(&rows, existing_pages, ledger, min_projects, min_contributors)
 }
+
+/// Distinct operators a statement needs evidence from before it enters
+/// `share`'s profile: two for a team profile, one otherwise.
+#[must_use]
+pub fn min_contributors(share: EffectiveProfileShare, distinguishes_operators: bool) -> usize {
+    if ai_memory_core::profile::is_team_profile(share, distinguishes_operators) {
+        TEAM_MIN_CONTRIBUTORS
+    } else {
+        1
+    }
+}
+
+/// Distinct operators a team-profile statement needs evidence from.
+pub const TEAM_MIN_CONTRIBUTORS: usize = 2;
 
 #[cfg(test)]
 mod tests {
@@ -2240,7 +2285,7 @@ mod tests {
             day(1),
             ProfileGenerality::Project,
         );
-        let plan = converge(&[&one], &[], &[], 2);
+        let plan = converge(&[&one], &[], &[], 2, 1);
         assert!(plan.writes.is_empty());
         assert_eq!(plan.waiting.len(), 1);
         assert_eq!(plan.waiting[0].needs, 1);
@@ -2251,7 +2296,7 @@ mod tests {
             day(2),
             ProfileGenerality::Project,
         );
-        let plan = converge(&[&one, &two], &[], &[], 2);
+        let plan = converge(&[&one, &two], &[], &[], 2, 1);
         assert_eq!(plan.writes.len(), 1);
         assert_eq!(plan.writes[0].projects, 2);
 
@@ -2261,7 +2306,7 @@ mod tests {
             day(3),
             ProfileGenerality::General,
         );
-        let plan = converge(&[&general], &[], &[], 2);
+        let plan = converge(&[&general], &[], &[], 2, 1);
         assert_eq!(
             plan.writes.len(),
             1,
@@ -2289,7 +2334,7 @@ mod tests {
             day(9),
             ProfileGenerality::General,
         );
-        let plan = converge(&[&old_a, &old_b, &new_c], &[], &[], 2);
+        let plan = converge(&[&old_a, &old_b, &new_c], &[], &[], 2, 1);
         assert_eq!(plan.writes.len(), 1);
         assert_eq!(
             plan.writes[0].statement,
@@ -2306,7 +2351,7 @@ mod tests {
             day(1),
             ProfileGenerality::General,
         );
-        let plan = converge(&[&a], &[], &[], 2);
+        let plan = converge(&[&a], &[], &[], 2, 1);
         let (fm1, body1) = render_entry(&plan.writes[0]);
         let (fm2, body2) = render_entry(&plan.writes[0]);
         assert_eq!((fm1.clone(), body1.clone()), (fm2, body2));
@@ -2316,7 +2361,7 @@ mod tests {
             body: body1,
             frontmatter: fm1,
         };
-        let again = converge(&[&a], &[page], &[], 2);
+        let again = converge(&[&a], &[page], &[], 2, 1);
         assert!(again.writes.is_empty());
         assert_eq!(again.unchanged, 1);
     }
@@ -2329,7 +2374,7 @@ mod tests {
             day(1),
             ProfileGenerality::General,
         );
-        let plan = converge(&[&a], &[], &[], 2);
+        let plan = converge(&[&a], &[], &[], 2, 1);
         let (fm, body) = render_entry(&plan.writes[0]);
         let edited = ProfileScopePage {
             path: plan.writes[0].path.clone(),
@@ -2343,7 +2388,7 @@ mod tests {
             day(5),
             ProfileGenerality::General,
         );
-        let plan = converge(&[&a, &newer], std::slice::from_ref(&edited), &[], 2);
+        let plan = converge(&[&a, &newer], std::slice::from_ref(&edited), &[], 2, 1);
         assert!(plan.writes.is_empty());
         assert_eq!(plan.skipped_manual, std::slice::from_ref(&edited.path));
 
@@ -2353,7 +2398,7 @@ mod tests {
             body: "Always use pnpm.".into(),
             frontmatter: serde_json::json!({}),
         };
-        let plan = converge(&[&a], &[handwritten], &[], 2);
+        let plan = converge(&[&a], &[handwritten], &[], 2, 1);
         assert!(plan.writes.is_empty());
         assert_eq!(plan.skipped_manual, ["profile/tools/pnpm.md"]);
     }
@@ -2366,14 +2411,14 @@ mod tests {
             day(1),
             ProfileGenerality::General,
         );
-        let path = converge(&[&a], &[], &[], 2).writes[0].path.clone();
+        let path = converge(&[&a], &[], &[], 2, 1).writes[0].path.clone();
         let ledger = [ProfileLedgerEntry {
             path: path.clone(),
             topic_key: a.candidate.topic_key.clone(),
             written_at: day(3),
         }];
         // The page is gone and nothing newer was said: it stays gone.
-        let plan = converge(&[&a], &[], &ledger, 2);
+        let plan = converge(&[&a], &[], &ledger, 2, 1);
         assert!(plan.writes.is_empty());
         assert_eq!(plan.forgotten, std::slice::from_ref(&path));
         // Said again after the removal: it comes back.
@@ -2383,7 +2428,7 @@ mod tests {
             day(7),
             ProfileGenerality::General,
         );
-        let plan = converge(&[&a, &again], &[], &ledger, 2);
+        let plan = converge(&[&a, &again], &[], &ledger, 2, 1);
         assert_eq!(plan.writes.len(), 1);
         assert!(plan.forgotten.is_empty());
     }
@@ -2394,11 +2439,11 @@ mod tests {
         a.candidate.source = ProfileCandidateSource::Stack;
         let mut b = row("beta", "rust", day(2), ProfileGenerality::Project);
         b.candidate.source = ProfileCandidateSource::Stack;
-        let plan = converge(&[&a, &b], &[], &[], 2);
+        let plan = converge(&[&a, &b], &[], &[], 2, 1);
         assert_eq!(plan.writes.len(), 1);
         assert_eq!(plan.writes[0].path, "profile/stack/rust.md");
         assert_eq!(plan.writes[0].applies_to, ["rust"]);
-        let plan = converge(&[&a], &[], &[], 2);
+        let plan = converge(&[&a], &[], &[], 2, 1);
         assert!(plan.writes.is_empty());
     }
 
@@ -2415,7 +2460,7 @@ mod tests {
             })
             .collect();
         let refs: Vec<&ProfileCandidateRow> = rows.iter().collect();
-        let plan = converge(&refs, &[], &[], 2);
+        let plan = converge(&refs, &[], &[], 2, 1);
         assert_eq!(plan.writes[0].evidence.len(), EVIDENCE_CAP);
         assert_eq!(plan.writes[0].evidence[0].project, "default/p7");
     }
