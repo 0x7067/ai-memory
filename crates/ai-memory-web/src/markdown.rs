@@ -222,10 +222,17 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     // Optional `[workspace/]project:` scope qualifier.
     let (ws, proj, path_part) = split_scope(target, workspace, project);
 
-    // Strip anchor/query, reject non-page extensions, normalise the `.md`
-    // suffix, then rely on the canonical page-path validator for traversal,
-    // absolute paths, Windows prefixes, backslashes, and empty segments.
-    let path = path_part.split(['#', '?']).next().unwrap_or("").trim();
+    // Split off a trailing #anchor/?query so it survives the rewrite,
+    // matching scope_relative_link.
+    let (path_part, suffix) = match path_part.find(['#', '?']) {
+        Some(i) => (&path_part[..i], &path_part[i..]),
+        None => (path_part, ""),
+    };
+
+    // Reject non-page extensions, normalise the `.md` suffix, then rely on
+    // the canonical page-path validator for traversal, absolute paths,
+    // Windows prefixes, backslashes, and empty segments.
+    let path = path_part.trim();
     if path.is_empty() {
         return None;
     }
@@ -240,7 +247,10 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     };
     let path = PagePath::new(path).ok()?;
 
-    let href = crate::templates::page_href(ws, proj, path.as_str());
+    let href = format!(
+        "{}{suffix}",
+        crate::templates::page_href(ws, proj, path.as_str())
+    );
     let display = label
         .filter(|l| !l.is_empty())
         .unwrap_or(target)
@@ -618,6 +628,37 @@ mod tests {
         assert!(
             html.contains(r#"href="w/default/scratch/p/bar.md""#),
             "suffix keep: {html}"
+        );
+    }
+
+    #[test]
+    fn wikilink_preserves_anchor_and_query_suffix() {
+        let html = render(
+            "see [[notes/foo#section-1]] and [[notes/bar.md#section-2|Bar Section]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#section-1">notes/foo#section-1</a>"#),
+            "bare anchor: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/bar.md#section-2">Bar Section</a>"#),
+            "anchor with label: {html}"
+        );
+
+        let cross = render(
+            "[[otherproj:notes/x#heading]] [[_global:python-env?v=1#setup|Setup]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            cross.contains(r#"href="w/default/otherproj/p/notes/x.md#heading">otherproj:notes/x#heading</a>"#),
+            "cross-project anchor: {cross}"
+        );
+        assert!(
+            cross.contains(r#"href="w/default/_global/p/python-env.md?v=1#setup">Setup</a>"#),
+            "global scope query and anchor: {cross}"
         );
     }
 
