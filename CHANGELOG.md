@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `[hook_spool] max_attempts` and
+  `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` to configure failed drain passes before
+  dropping an event; zero disables attempt-based drops while age and spool
+  size limits remain.
+
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
