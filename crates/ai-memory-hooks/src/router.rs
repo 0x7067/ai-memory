@@ -17477,6 +17477,78 @@ mod tests {
         );
     }
 
+    /// The feature's core scenario, end to end on the zero-LLM path: the user
+    /// states a habit in two projects, a profile pass converges it, and the
+    /// first session start of a brand-new third project carries it as the
+    /// baseline, without the user repeating it there.
+    #[tokio::test]
+    async fn a_habit_from_two_projects_reaches_a_new_projects_first_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        for (index, project) in ["alpha", "beta"].into_iter().enumerate() {
+            let proj = state
+                .writer
+                .get_or_create_project(state.workspace_id, project, None)
+                .await
+                .unwrap();
+            let session_id = SessionId::from_native(&format!("habit-{index}"));
+            state
+                .writer
+                .begin_session(ai_memory_core::NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id: state.workspace_id,
+                    project_id: proj,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            state
+                .writer
+                .insert_observation(ai_memory_core::Sanitized::new(
+                    ai_memory_core::NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: state.workspace_id,
+                        project_id: proj,
+                        kind: ai_memory_core::ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: "prompt".into(),
+                        body: "I prefer tabs over spaces.".into(),
+                        importance: 5,
+                    },
+                    &ai_memory_core::Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        let config = ai_memory_consolidate::profile::ProfilePassConfig {
+            settings: state.profile.clone(),
+            distinguishes_operators: false,
+        };
+        ai_memory_consolidate::profile::run_profile_pass(
+            &state.reader,
+            &state.writer,
+            &state.wiki,
+            None,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let digest = session_start_text(&state, profile_query("/home/u/gamma", "codex"))
+            .await
+            .expect("the new project receives the profile");
+        assert!(digest.contains("tabs over spaces"), "{digest}");
+        assert!(
+            digest.contains("ai-memory profile apply"),
+            "a project with no memory gets the baseline: {digest}"
+        );
+    }
+
     /// Adversarial: event capture must never be attributed to a profile
     /// project, whether the name comes from a directory or a marker override.
     /// Capture into `_profile.<id>` would file one operator's events in

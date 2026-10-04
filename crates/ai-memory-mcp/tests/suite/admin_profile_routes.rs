@@ -215,6 +215,114 @@ async fn review_and_rebuild_are_root_only_on_a_multi_user_server() {
     }
 }
 
+/// `apply` returns what `ai-memory profile apply` writes: the converged
+/// entries, capped at `apply_max_lines`, including for a project the server
+/// has never seen; a project that set `[profile] consume = false` gets none.
+#[tokio::test]
+async fn apply_lists_the_lines_for_a_project_and_honours_consume() {
+    let fx = fixture().await;
+    prompt(&fx, "alpha", "Always use pnpm.").await;
+    prompt(&fx, "alpha", "Always keep tests beside the code.").await;
+    let (status, report) = call(
+        router(&fx, ProfileSettings::default()),
+        "POST",
+        "/admin/profile/rebuild",
+        AuthLevel::Anonymous,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+
+    let (status, body) = call(
+        router(&fx, ProfileSettings::default()),
+        "GET",
+        "/admin/profile/apply?workspace=default&project=brand-new",
+        AuthLevel::Anonymous,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["consume"], true);
+    let lines: Vec<&str> = body["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{body}");
+    assert!(lines.iter().any(|l| l.contains("pnpm")), "{body}");
+    assert!(lines.iter().all(|l| l.contains("(`profile/")), "{body}");
+
+    let capped = ProfileSettings {
+        apply_max_lines: 1,
+        ..ProfileSettings::default()
+    };
+    let (_, body) = call(
+        router(&fx, capped),
+        "GET",
+        "/admin/profile/apply?workspace=default&project=brand-new",
+        AuthLevel::Anonymous,
+    )
+    .await;
+    assert_eq!(body["lines"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["omitted"], 1, "{body}");
+
+    let alpha = fx
+        .store
+        .writer
+        .get_or_create_project(fx.ws, "alpha", None)
+        .await
+        .unwrap();
+    fx.store
+        .writer
+        .set_project_profile_flags(
+            alpha,
+            ai_memory_store::ProjectProfileFlags {
+                contribute: true,
+                consume: false,
+            },
+        )
+        .await
+        .unwrap();
+    let (_, body) = call(
+        router(&fx, ProfileSettings::default()),
+        "GET",
+        "/admin/profile/apply?workspace=default&project=alpha",
+        AuthLevel::Anonymous,
+    )
+    .await;
+    assert_eq!(body["consume"], false, "{body}");
+    assert!(body["lines"].as_array().unwrap().is_empty(), "{body}");
+}
+
+/// Multi-user: `apply` is root-only like the other profile routes.
+#[tokio::test]
+async fn apply_is_root_only_on_a_multi_user_server() {
+    let fx = fixture().await;
+    fx.store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "alice".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let settings = ProfileSettings {
+        enabled: ProfileEnabled::On,
+        share: ProfileShare::Global,
+        ..ProfileSettings::default()
+    };
+    let uri = "/admin/profile/apply?workspace=default&project=app";
+    let (status, _) = call(router(&fx, settings.clone()), "GET", uri, AuthLevel::User).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = call(router(&fx, settings), "GET", uri, AuthLevel::Root).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// A rebuild on a server whose profile is off says so instead of doing work.
 #[tokio::test]
 async fn rebuild_refuses_when_the_profile_is_off() {

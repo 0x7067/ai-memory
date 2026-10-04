@@ -433,6 +433,15 @@ pub(crate) fn is_truthy(value: &str) -> bool {
     )
 }
 
+/// An explicitly falsy marker flag, for settings that stay on unless turned
+/// off (`[profile] contribute` / `consume`), matching the server's reading.
+pub(crate) fn is_falsy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

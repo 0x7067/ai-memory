@@ -952,6 +952,31 @@ pub enum ProfileCommand {
     /// Re-read every contributing project from the start and rebuild the
     /// profile from what it finds (safe to repeat).
     Rebuild,
+    /// Write the profile entries that fit this repository into a managed
+    /// block of its rules file, turning your usual choices into hard rules
+    /// here. Only the block between the `ai-memory:profile` delimiters is
+    /// ever touched; re-running replaces it.
+    Apply(ProfileApplyArgs),
+}
+
+/// Arguments for `profile apply`.
+#[derive(Debug, Args)]
+pub struct ProfileApplyArgs {
+    /// Rules file to write, relative to the repository root unless absolute.
+    /// Default: `AGENTS.md` when it exists, else `CLAUDE.md` unless it only
+    /// imports `AGENTS.md`, else a new `AGENTS.md`.
+    #[arg(long)]
+    pub target: Option<PathBuf>,
+    /// Print the block and the target instead of writing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Remove the managed block instead of writing it.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub remove: bool,
+    /// Operator whose private profile to use when the profile is per user
+    /// (`share = "user"`).
+    #[arg(long)]
+    pub user: Option<String>,
 }
 
 /// Which profile a `profile` subcommand inspects.

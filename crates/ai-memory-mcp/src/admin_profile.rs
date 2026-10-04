@@ -1,9 +1,10 @@
 //! `/admin/profile/*`: operator view of the cross-project profile
-//! (`docs/cross-project-profile.md`). `status`, `list` and `review` read;
-//! `rebuild` re-harvests every contributing project and converges the
-//! profile. `ai-memory profile show` and `forget` reuse `/admin/read-page` and
-//! `/admin/delete-page` against the scope `status` reports. Root-only on a
-//! multi-user server, like every `/admin/*` route.
+//! (`docs/cross-project-profile.md`). `status`, `list`, `review` and `apply`
+//! read (`apply` returns the lines `ai-memory profile apply` writes into a
+//! repository's rules file); `rebuild` re-harvests every contributing project
+//! and converges the profile. `ai-memory profile show` and `forget` reuse
+//! `/admin/read-page` and `/admin/delete-page` against the scope `status`
+//! reports. Root-only on a multi-user server, like every `/admin/*` route.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ pub fn profile_admin_router(state: ProfileAdminState) -> Router {
         .route("/admin/profile/status", get(handle_status))
         .route("/admin/profile/list", get(handle_list))
         .route("/admin/profile/review", get(handle_review))
+        .route("/admin/profile/apply", get(handle_apply))
         .route("/admin/profile/rebuild", post(handle_rebuild))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -282,6 +284,114 @@ async fn handle_list(
         })
         .collect();
     Json(serde_json::json!({ "scope": names, "entries": entries })).into_response()
+}
+
+/// Query of `GET /admin/profile/apply`: the project whose rules file is being
+/// written, and the operator whose private profile to use when it is per user.
+#[derive(Debug, Deserialize)]
+struct ApplyQuery {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+/// `GET /admin/profile/apply`: the lines `ai-memory profile apply` writes for
+/// one project. Selection matches the digest (stack scope, entries enforced
+/// elsewhere skipped) and is capped at `apply_max_lines`. A project that set
+/// `[profile] consume = false` receives nothing. A project the server has not
+/// seen yet gets every entry, like the baseline digest of a new project.
+async fn handle_apply(
+    State(state): State<Arc<ProfileAdminState>>,
+    Query(query): Query<ApplyQuery>,
+) -> Response {
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(distinguishes) => distinguishes,
+        Err(e) => return internal(e),
+    };
+    let Some(share) = state.profile.effective_share(distinguishes) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "the profile is off on this server" })),
+        )
+            .into_response();
+    };
+    let profile_query = ProfileQuery {
+        workspace: query.workspace.clone(),
+        user: query.user.clone(),
+    };
+    let (profile_scope, names) = match resolve_scope(&state.reader, share, &profile_query).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return Json(serde_json::json!({
+                "scope": null, "consume": true, "lines": [], "omitted": 0,
+            }))
+            .into_response();
+        }
+        Err(e) => return internal(e),
+    };
+    let project = match ai_memory_store::lookup_existing_scope(
+        &state.reader,
+        &query.workspace,
+        &query.project,
+    )
+    .await
+    {
+        Ok(scope) => Some(scope),
+        Err(
+            ScopeResolutionError::WorkspaceNotFound { .. }
+            | ScopeResolutionError::ProjectNotFoundInWorkspace { .. },
+        ) => None,
+        Err(e) => return internal(e),
+    };
+    let (entries, tags) = match project {
+        Some(project) => {
+            match state
+                .reader
+                .project_profile_flags(project.workspace_id, project.project_id)
+                .await
+            {
+                Ok(flags) if !flags.consume => {
+                    return Json(serde_json::json!({
+                        "scope": names, "consume": false, "lines": [], "omitted": 0,
+                    }))
+                    .into_response();
+                }
+                Ok(_) => {}
+                Err(e) => return internal(e),
+            }
+            match state
+                .reader
+                .profile_digest_inputs(profile_scope.as_tuple(), project.as_tuple())
+                .await
+            {
+                Ok(inputs) => (inputs.entries, inputs.project_tags),
+                Err(e) => return internal(e),
+            }
+        }
+        None => match state
+            .reader
+            .profile_entries(
+                profile_scope.workspace_id,
+                profile_scope.project_id,
+                ai_memory_store::PROFILE_ENTRIES_LIMIT,
+            )
+            .await
+        {
+            Ok(entries) => (entries, BTreeSet::new()),
+            Err(e) => return internal(e),
+        },
+    };
+    let (lines, omitted) =
+        ai_memory_core::profile::apply_lines(&entries, &tags, state.profile.apply_max_lines);
+    Json(serde_json::json!({
+        "scope": names, "consume": true, "lines": lines, "omitted": omitted,
+    }))
+    .into_response()
 }
 
 async fn pass_config(

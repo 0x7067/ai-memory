@@ -1,16 +1,20 @@
 //! `ai-memory profile` — inspect and curate the cross-project profile
 //! (`docs/cross-project-profile.md`).
 //!
-//! Thin HTTP client: `status`, `list` and `review` read `/admin/profile/*`
-//! and `rebuild` posts to it; `show` and `forget` resolve the profile's scope
-//! through `status` and then use the ordinary `/admin/read-page` and
-//! `/admin/delete-page`, so a profile entry is read and removed exactly like
-//! any other page.
+//! Thin HTTP client: `status`, `list`, `review` and `apply` read
+//! `/admin/profile/*` and `rebuild` posts to it; `show` and `forget` resolve
+//! the profile's scope through `status` and then use the ordinary
+//! `/admin/read-page` and `/admin/delete-page`, so a profile entry is read and
+//! removed exactly like any other page. `apply` is the only command that
+//! writes a local file: the managed block of the repository's rules file.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::cli::{ProfileArgs, ProfileCommand, ProfileScopeArgs};
+use super::apply_shared::{PrivateBackup, apply_atomic_with_backup, checkout_backup_stem};
+use crate::cli::{ProfileApplyArgs, ProfileArgs, ProfileCommand, ProfileScopeArgs};
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json};
 
@@ -28,6 +32,7 @@ pub async fn run(config: &Config, args: ProfileArgs) -> Result<()> {
         ProfileCommand::Forget { path, scope } => forget(&ep, &scope, &path).await,
         ProfileCommand::Review(scope) => review(&ep, &scope).await,
         ProfileCommand::Rebuild => rebuild(&ep).await,
+        ProfileCommand::Apply(args) => apply(&ep, config, &args).await,
     }
 }
 
@@ -388,9 +393,157 @@ async fn rebuild(ep: &ServerEndpoint) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct ApplyResponse {
+    consume: bool,
+    lines: Vec<String>,
+    omitted: usize,
+}
+
+/// `profile apply`: write (or `--remove`) the managed profile block in the
+/// current repository's rules file.
+async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) -> Result<()> {
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let root = repository_root(&cwd);
+    let target = choose_target(&root, args.target.as_deref());
+    let backup = PrivateBackup {
+        dir: config.data_dir.join("backups").join("profile-apply"),
+        stem: checkout_backup_stem(&root),
+    };
+    if args.remove {
+        return remove_block(&target, &backup);
+    }
+    if let Some(marker) = crate::marker::find_settings_marker(&cwd.to_string_lossy())
+        && crate::marker::parse_toml_flag(&marker, "consume")
+            .is_some_and(|v| crate::marker::is_falsy(&v))
+    {
+        bail!(
+            "{} sets `[profile] consume = false`, so this project does not take the profile",
+            marker.display()
+        );
+    }
+    let (workspace, project) = super::resolve_scope(config, None, None)?;
+    let mut query = vec![
+        ("workspace", workspace.as_str()),
+        ("project", project.as_str()),
+    ];
+    if let Some(user) = args.user.as_deref() {
+        query.push(("user", user));
+    }
+    let resp: ApplyResponse = get_json(ep, "/admin/profile/apply", &query)
+        .await
+        .context("reading the profile entries for this project")?;
+    if !resp.consume {
+        bail!(
+            "{workspace}/{project} sets `[profile] consume = false`, so it does not take the profile"
+        );
+    }
+    if resp.lines.is_empty() {
+        println!("No profile entries apply to {workspace}/{project}; nothing written.");
+        return Ok(());
+    }
+    let block = ai_memory_core::profile::render_profile_block(&resp.lines, resp.omitted);
+    if args.dry_run {
+        println!("Would write to {}:\n\n{block}", target.display());
+        return Ok(());
+    }
+    let outcome = apply_atomic_with_backup(&target, Some(&backup), |existing| {
+        Ok(ai_memory_core::profile::merge_profile_block(
+            existing, &block,
+        ))
+    })?;
+    println!(
+        "{}: {} ({} entr{}{})",
+        target.display(),
+        outcome.verb(),
+        resp.lines.len(),
+        if resp.lines.len() == 1 { "y" } else { "ies" },
+        if resp.omitted > 0 {
+            format!(", {} more over apply_max_lines", resp.omitted)
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+fn remove_block(target: &Path, backup: &PrivateBackup) -> Result<()> {
+    let existing = match std::fs::read_to_string(target) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("{} does not exist; nothing to remove.", target.display());
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", target.display()));
+        }
+    };
+    let Some(remaining) = ai_memory_core::profile::remove_profile_block(&existing) else {
+        println!(
+            "{} has no profile block; nothing to remove.",
+            target.display()
+        );
+        return Ok(());
+    };
+    if remaining.is_empty() {
+        // The file held nothing but the block `apply` created it for.
+        std::fs::remove_file(target).with_context(|| format!("removing {}", target.display()))?;
+        println!(
+            "{}: removed (it held only the profile block)",
+            target.display()
+        );
+        return Ok(());
+    }
+    let outcome = apply_atomic_with_backup(target, Some(backup), |_| Ok(remaining))?;
+    println!(
+        "{}: profile block removed ({})",
+        target.display(),
+        outcome.verb()
+    );
+    Ok(())
+}
+
+/// The checkout `cwd` is in: the nearest ancestor holding `.git` (a directory,
+/// or the file a linked worktree has), else `cwd` itself.
+fn repository_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+/// The rules file `apply` writes: `--target` (relative to `root`), else an
+/// existing `AGENTS.md`, else an existing `CLAUDE.md` unless it only imports
+/// `AGENTS.md` (writing there would be a no-op for every other harness), else
+/// a new `AGENTS.md`.
+fn choose_target(root: &Path, explicit: Option<&Path>) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return if explicit.is_absolute() {
+            explicit.to_path_buf()
+        } else {
+            root.join(explicit)
+        };
+    }
+    let agents = root.join("AGENTS.md");
+    if agents.exists() {
+        return agents;
+    }
+    let claude = root.join("CLAUDE.md");
+    match std::fs::read_to_string(&claude) {
+        Ok(text) if !only_imports_agents(&text) => claude,
+        _ => agents,
+    }
+}
+
+/// A `CLAUDE.md` whose every non-blank line is an `@AGENTS.md` import.
+fn only_imports_agents(text: &str) -> bool {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines.clone().next().is_some() && lines.all(|line| line == "@AGENTS.md")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::profile_path;
+    use super::{choose_target, only_imports_agents, profile_path, repository_root};
 
     #[test]
     fn profile_paths_gain_the_prefix_once() {
@@ -400,5 +553,53 @@ mod tests {
             "profile/tools/pnpm.md"
         );
         assert_eq!(profile_path(" /tools/pnpm.md "), "profile/tools/pnpm.md");
+    }
+
+    #[test]
+    fn the_target_prefers_agents_then_a_real_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            choose_target(root, None),
+            root.join("AGENTS.md"),
+            "new AGENTS.md"
+        );
+
+        std::fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+        assert_eq!(
+            choose_target(root, None),
+            root.join("AGENTS.md"),
+            "an import-only CLAUDE.md points at AGENTS.md"
+        );
+        std::fs::write(root.join("CLAUDE.md"), "# Rules\nUse tabs.\n").unwrap();
+        assert_eq!(choose_target(root, None), root.join("CLAUDE.md"));
+
+        std::fs::write(root.join("AGENTS.md"), "# Agents\n").unwrap();
+        assert_eq!(choose_target(root, None), root.join("AGENTS.md"));
+        assert_eq!(
+            choose_target(root, Some(std::path::Path::new("docs/RULES.md"))),
+            root.join("docs/RULES.md")
+        );
+    }
+
+    #[test]
+    fn import_only_detection() {
+        assert!(only_imports_agents("@AGENTS.md\n"));
+        assert!(only_imports_agents("\n  @AGENTS.md  \n\n"));
+        assert!(!only_imports_agents(""));
+        assert!(!only_imports_agents("@AGENTS.md\nAlso: use tabs.\n"));
+    }
+
+    #[test]
+    fn the_root_is_the_nearest_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let nested = repo.join("crates").join("x");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        assert_eq!(repository_root(&nested), repo);
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        assert_eq!(repository_root(&loose), loose);
     }
 }

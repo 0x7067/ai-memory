@@ -22,6 +22,7 @@ mod jail_toggles_e2e;
 mod marker_scope;
 mod message_e2e;
 mod packaging;
+mod profile_e2e;
 mod removal;
 mod repo_layout;
 mod routing_instructions;

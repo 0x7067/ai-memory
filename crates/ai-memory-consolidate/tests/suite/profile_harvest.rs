@@ -758,6 +758,62 @@ async fn a_provider_failure_falls_back_to_the_zero_llm_path() {
     assert!(pages[0].1.contains("Always use pnpm for installs."));
 }
 
+/// The core scenario on the LLM path: a habit said loosely in one project is
+/// classified as general, merged into an entry, and lands in the baseline
+/// digest of a brand-new project, scoped to the stack it applies to. A project
+/// that set `[profile] consume = false` is recorded as such, which is what the
+/// session start and the query union read to leave it out.
+#[tokio::test]
+async fn the_llm_path_reaches_a_new_projects_baseline_digest() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(&fx, alpha, "always pnpm pls, never npm in here", 1).await;
+    let llm = FakeProfileLlm {
+        merge_statement: "Use pnpm for every JavaScript project.".into(),
+        ..FakeProfileLlm::default()
+    };
+    pass_with(&fx, &single_user(), Arc::new(llm)).await;
+
+    let global = ai_memory_store::lookup_global_scope(&fx.store.reader)
+        .await
+        .unwrap()
+        .unwrap();
+    let gamma = project(&fx, "gamma").await;
+    let inputs = fx
+        .store
+        .reader
+        .profile_digest_inputs(global.as_tuple(), (fx.ws, gamma))
+        .await
+        .unwrap();
+    assert!(!inputs.project_has_pages, "gamma is brand new");
+    let digest = render_digest(&inputs.entries, &inputs.project_tags, 6_000, true).unwrap();
+    assert!(
+        digest.contains("[javascript] Use pnpm for every JavaScript project."),
+        "{digest}"
+    );
+    assert!(digest.contains("ai-memory profile apply"), "{digest}");
+
+    let opted_out = project(&fx, "client-work").await;
+    fx.store
+        .writer
+        .set_project_profile_flags(
+            opted_out,
+            ProjectProfileFlags {
+                contribute: true,
+                consume: false,
+            },
+        )
+        .await
+        .unwrap();
+    let flags = fx
+        .store
+        .reader
+        .project_profile_flags(fx.ws, opted_out)
+        .await
+        .unwrap();
+    assert!(!flags.consume);
+}
+
 /// A profile that is off harvests nothing (multi-user default).
 #[tokio::test]
 async fn a_multi_user_server_harvests_nothing_by_default() {

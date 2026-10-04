@@ -111,9 +111,46 @@ ai-memory profile show tools/pnpm.md     # one entry
 ai-memory profile forget tools/pnpm.md   # remove one entry (stays removed until you say it again)
 ai-memory profile review                 # entries with their evidence, habits still short of the bar
 ai-memory profile rebuild                # re-read every project from the start (safe to repeat)
+ai-memory profile apply                  # write the entries that fit this repo into its rules file
 ai-memory profile list --user alice      # an operator's private profile (share = "user")
 ai-memory profile list --workspace work  # a workspace profile (share = "workspace")
 ```
+
+## Turning the profile into hard rules for one repository
+
+The digest is a default the agent applies when nothing more specific speaks.
+When you want your usual choices to be **rules** in a repository, written down
+where every harness and every collaborator sees them, run this from inside it:
+
+```bash
+ai-memory profile apply --dry-run   # show the block and the file it would go to
+ai-memory profile apply             # write it
+ai-memory profile apply --remove    # take it out again
+```
+
+- **Which file.** `--target FILE` (relative to the repository root) wins.
+  Otherwise an existing `AGENTS.md`; else an existing `CLAUDE.md`, unless it
+  only imports `@AGENTS.md`; else a new `AGENTS.md`. The repository root is the
+  nearest directory holding `.git` (a linked worktree writes its own checkout).
+- **What it writes.** The entries that fit this repository, selected like the
+  digest (scoped to the stacks the project's activity shows, entries enforced
+  elsewhere skipped, a new project gets them all), at most `apply_max_lines`
+  (default 40), each with the page it came from, between
+  `<!-- ai-memory:profile:start -->` and `<!-- ai-memory:profile:end -->`.
+- **What it never touches.** Anything outside those delimiters, including the
+  `<!-- ai-memory:start -->` routing block and your own rules. Re-running
+  replaces only the block, and leaves the file byte-identical when the profile
+  has not changed. `--remove` takes the block out and restores the file; a file
+  `apply` created for the block alone is deleted.
+- **Backups.** The previous version of the file goes to
+  `<data dir>/backups/profile-apply/`, never next to the file, so nothing extra
+  shows up in `git status`.
+- **Opt-outs.** A project with `[profile] consume = false` refuses `apply`.
+
+It is the only command that writes a file in your repository, and it only runs
+when you run it: ai-memory never edits a rules file on its own. Because the
+block then sits in the rules file, it outranks the digest for that repository
+(step 2 of the order above).
 
 ## How entries are learned
 
@@ -241,6 +278,18 @@ llm = true
   merge entries; `false` keeps the profile fully zero-LLM.
 
 `ai-memory profile status` prints the effective values.
+
+### Common customizations
+
+| You want | Set |
+|---|---|
+| Keep work and personal (or two clients) apart | `share = "workspace"` |
+| No LLM involvement in the profile, even with a provider configured | `llm = false` |
+| Only admit habits you repeat in more projects | `min_projects = 3` (or more) |
+| A smaller digest at every session start | `digest_max_bytes = 1500` |
+| The profile in retrieval only, no digest | `inject_on_session_start = false` |
+| No profile at all on a single-user server | `enabled = false` (or `share = "off"`) |
+| One project neither teaches nor receives it | `[profile] contribute = false` and `consume = false` in its marker |
 
 ### Enabling it on a multi-user server
 

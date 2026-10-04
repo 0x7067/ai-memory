@@ -519,6 +519,115 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
     assert!(raw_hits[0].snippet.contains("<mark>capybara</mark>"));
 }
 
+/// Cross-project profile recall (`docs/cross-project-profile.md`): a habit the
+/// user stated in two projects becomes a profile entry that a task-level
+/// query finds in the profile scope, where every other project's
+/// `memory_query` unions it. A choice only one project made stays out.
+#[tokio::test]
+async fn profile_recall_across_projects() {
+    use ai_memory_consolidate::profile::{ProfilePassConfig, run_profile_pass};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
+    for (project, prompt) in [
+        ("alpha", "I prefer tabs over spaces."),
+        ("beta", "I prefer tabs over spaces."),
+        (
+            "alpha",
+            "Use the legacy webpack builder instead of vite in this repo.",
+        ),
+    ] {
+        let proj = store
+            .writer
+            .get_or_create_project(ws, project, None)
+            .await
+            .expect("proj");
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .expect("begin session");
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: prompt.into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .expect("insert observation");
+    }
+    let config = ProfilePassConfig {
+        settings: ai_memory_core::profile::ProfileSettings::default(),
+        distinguishes_operators: false,
+    };
+    run_profile_pass(&store.reader, &store.writer, &wiki, None, &config)
+        .await
+        .expect("profile pass");
+
+    let global = ai_memory_store::lookup_global_scope(&store.reader)
+        .await
+        .expect("lookup")
+        .expect("the profile scope exists");
+    let hits = store
+        .reader
+        .search_pages_for_project(
+            global.workspace_id,
+            global.project_id,
+            "tabs spaces".into(),
+            5,
+            None,
+        )
+        .await
+        .expect("profile search");
+    assert!(
+        hits.iter().any(|h| h.path.as_str().starts_with("profile/")),
+        "the converged habit is recallable from the profile: {hits:?}"
+    );
+    let local = store
+        .reader
+        .search_pages_for_project(
+            global.workspace_id,
+            global.project_id,
+            "webpack builder".into(),
+            5,
+            None,
+        )
+        .await
+        .expect("profile search");
+    assert!(
+        local.is_empty(),
+        "a one-project exception never reaches the profile: {local:?}"
+    );
+}
+
 async fn measure_recall(
     store: &Store,
     ws: ai_memory_core::WorkspaceId,

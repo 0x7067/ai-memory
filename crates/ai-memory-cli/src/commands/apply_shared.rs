@@ -79,6 +79,29 @@ pub struct PrivateBackup {
     pub stem: String,
 }
 
+/// A [`PrivateBackup::stem`] naming a checkout: its directory flattened to
+/// safe characters and bounded to the tail (the repository-name end), plus a
+/// short hash of the full path so checkouts that flatten alike stay apart.
+pub(crate) fn checkout_backup_stem(checkout: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    let checkout = checkout.to_string_lossy();
+    let mut flat = String::with_capacity(checkout.len());
+    for c in checkout.chars() {
+        let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+            c
+        } else {
+            '-'
+        };
+        if !(c == '-' && flat.ends_with('-')) {
+            flat.push(c);
+        }
+    }
+    let flat = flat.trim_matches('-');
+    let tail = &flat[flat.len().saturating_sub(64)..];
+    let digest = format!("{:x}", Sha256::digest(checkout.as_bytes()));
+    format!("{}-{}", tail.trim_start_matches('-'), &digest[..12])
+}
+
 /// [`apply_atomic`], writing the backup to `private_backup` instead of next
 /// to `path` when one is given.
 ///

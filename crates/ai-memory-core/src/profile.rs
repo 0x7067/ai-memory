@@ -4,8 +4,9 @@
 //! works across projects. This module holds the parts with no IO: the
 //! `[profile]` settings and the rule that turns them into an effective mode
 //! for a deployment, the reserved scope names, stack-signal detection, entry
-//! parsing, and the SessionStart digest renderer. The store resolves the
-//! scopes and the hook router delivers the digest.
+//! parsing, the SessionStart digest renderer, and the managed rules-file
+//! block `ai-memory profile apply` writes. The store resolves the scopes, the
+//! hook router delivers the digest and the CLI writes the block.
 
 use std::collections::BTreeSet;
 
@@ -592,14 +593,10 @@ pub fn render_digest(
     budget: usize,
     baseline: bool,
 ) -> Option<String> {
-    let mut selected: Vec<&ProfileEntry> = entries
-        .iter()
-        .filter(|entry| !entry.enforced_by && entry.applies(project_tags))
-        .collect();
+    let selected = select_entries(entries, project_tags);
     if selected.is_empty() {
         return None;
     }
-    selected.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
     let mut head = String::new();
     head.push_str(DIGEST_TITLE);
@@ -619,18 +616,7 @@ pub fn render_digest(
 
     let lines: Vec<String> = selected
         .iter()
-        .map(|entry| {
-            let scope = if entry.applies_to.is_empty() {
-                String::new()
-            } else {
-                format!("[{}] ", entry.applies_to.join(", "))
-            };
-            format!(
-                "- {scope}{statement} (`{path}`)\n",
-                statement = escape_fences(&entry.statement),
-                path = entry.path,
-            )
-        })
+        .map(|entry| format!("{}\n", entry_line(entry)))
         .collect();
 
     let room = budget.saturating_sub(head.len() + tail.len());
@@ -658,6 +644,135 @@ pub fn render_digest(
     Some(format!("{head}{body}{tail}"))
 }
 
+/// The entries a project receives, digest or rules file alike: not enforced
+/// elsewhere, scoped to a stack the project shows (or to none), in the fixed
+/// category-then-path order.
+fn select_entries<'a>(
+    entries: &'a [ProfileEntry],
+    project_tags: &BTreeSet<String>,
+) -> Vec<&'a ProfileEntry> {
+    let mut selected: Vec<&ProfileEntry> = entries
+        .iter()
+        .filter(|entry| !entry.enforced_by && entry.applies(project_tags))
+        .collect();
+    selected.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    selected
+}
+
+/// `- [scope] statement (`path`)`, with every fence and managed-block
+/// delimiter in the statement neutralized so stored text can never close a
+/// region it is rendered into.
+fn entry_line(entry: &ProfileEntry) -> String {
+    let scope = if entry.applies_to.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", entry.applies_to.join(", "))
+    };
+    format!(
+        "- {scope}{statement} (`{path}`)",
+        statement = escape_fences(&entry.statement),
+        path = entry.path,
+    )
+}
+
+/// Opening delimiter of the rules-file block `ai-memory profile apply` manages.
+pub const PROFILE_BLOCK_START: &str = "<!-- ai-memory:profile:start -->";
+/// Closing delimiter of the rules-file block `ai-memory profile apply` manages.
+pub const PROFILE_BLOCK_END: &str = "<!-- ai-memory:profile:end -->";
+
+const PROFILE_BLOCK_HEADING: &str = "## Usual choices (ai-memory profile)\n\n\
+     Written by `ai-memory profile apply` from the user's cross-project profile. \
+     Change the profile (`ai-memory profile show` / `forget`) and re-run the command \
+     instead of editing this block. Everything else in this file takes precedence.\n\n";
+
+/// The rules-file lines for a project: at most `max_lines` entries, selected
+/// and ordered like the digest, plus how many applicable entries did not fit.
+#[must_use]
+pub fn apply_lines(
+    entries: &[ProfileEntry],
+    project_tags: &BTreeSet<String>,
+    max_lines: usize,
+) -> (Vec<String>, usize) {
+    let selected = select_entries(entries, project_tags);
+    let omitted = selected.len().saturating_sub(max_lines);
+    let lines = selected
+        .into_iter()
+        .take(max_lines)
+        .map(entry_line)
+        .collect();
+    (lines, omitted)
+}
+
+/// The managed block for `lines`, delimiters included and ending in a
+/// newline. Nothing time-dependent is printed, so re-running `apply` on an
+/// unchanged profile leaves the file byte-identical.
+#[must_use]
+pub fn render_profile_block(lines: &[String], omitted: usize) -> String {
+    let mut block = String::new();
+    block.push_str(PROFILE_BLOCK_START);
+    block.push('\n');
+    block.push_str(PROFILE_BLOCK_HEADING);
+    for line in lines {
+        block.push_str(line);
+        block.push('\n');
+    }
+    if omitted > 0 {
+        block.push_str(&format!(
+            "- …and {omitted} more (`ai-memory profile list`)\n"
+        ));
+    }
+    block.push_str(PROFILE_BLOCK_END);
+    block.push('\n');
+    block
+}
+
+/// Byte range of the managed block in `text`: both delimiters plus the line
+/// break after the closing one. Only delimiters alone on their line count, so
+/// a quoted mention in prose is never mistaken for one.
+fn profile_block_range(text: &str) -> Option<(usize, usize)> {
+    let start = crate::find_marker_line(text, PROFILE_BLOCK_START, 0)?;
+    let end = crate::find_marker_line(text, PROFILE_BLOCK_END, start)?;
+    let mut after = end + PROFILE_BLOCK_END.len();
+    if text[after..].starts_with("\r\n") {
+        after += 2;
+    } else if text[after..].starts_with('\n') {
+        after += 1;
+    }
+    Some((start, after))
+}
+
+/// Replace the managed block in `existing` with `block`, or append it after a
+/// blank line. Text outside the delimiters, the routing block included, is
+/// never touched.
+#[must_use]
+pub fn merge_profile_block(existing: &str, block: &str) -> String {
+    if let Some((start, end)) = profile_block_range(existing) {
+        return format!("{}{block}{}", &existing[..start], &existing[end..]);
+    }
+    let mut out = existing.to_owned();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(block);
+    out
+}
+
+/// Remove the managed block from `existing`, together with the blank line
+/// [`merge_profile_block`] put before an appended block, so apply followed by
+/// remove restores the file. `None` when there is no block.
+#[must_use]
+pub fn remove_profile_block(existing: &str) -> Option<String> {
+    let (start, end) = profile_block_range(existing)?;
+    let mut head = &existing[..start];
+    if end == existing.len() && head.ends_with("\n\n") {
+        head = &head[..head.len() - 1];
+    }
+    Some(format!("{head}{}", &existing[end..]))
+}
+
 fn omitted_line(count: usize) -> String {
     format!(
         "- …and {count} more profile entr{} (`memory_query` finds them)\n",
@@ -665,15 +780,12 @@ fn omitted_line(count: usize) -> String {
     )
 }
 
+/// Neutralize every ai-memory HTML-comment delimiter in stored text: the
+/// untrusted-history fences, the routing block and the profile block. Any
+/// `<!-- ai-memory:` opener is defused, so a statement can neither close the
+/// digest fence nor end a managed rules-file block early.
 fn escape_fences(text: &str) -> String {
-    text.replace(
-        UNTRUSTED_HISTORY_START,
-        "&lt;!-- ai-memory:untrusted-history:start --&gt;",
-    )
-    .replace(
-        UNTRUSTED_HISTORY_END,
-        "&lt;!-- ai-memory:untrusted-history:end --&gt;",
-    )
+    text.replace("<!-- ai-memory:", "&lt;!-- ai-memory:")
 }
 
 #[cfg(test)]
@@ -915,5 +1027,101 @@ mod tests {
         )];
         let digest = render_digest(&entries, &BTreeSet::new(), 3_000, false).unwrap();
         assert_eq!(digest.matches(UNTRUSTED_HISTORY_END).count(), 1);
+    }
+
+    #[test]
+    fn apply_lines_select_like_the_digest_and_cap_at_max_lines() {
+        let mut enforced = entry("profile/workflow/no-verify.md", "never --no-verify", &[]);
+        enforced.enforced_by = true;
+        let entries = vec![
+            entry("profile/tools/pnpm.md", "use pnpm", &["javascript"]),
+            entry("profile/testing/nextest.md", "use nextest", &["rust"]),
+            entry("profile/style/prose.md", "plain prose", &[]),
+            entry("profile/stack/rust.md", "Rust for services", &[]),
+            enforced,
+        ];
+        let rust: BTreeSet<String> = ["rust".to_owned()].into();
+        let (lines, omitted) = apply_lines(&entries, &rust, 40);
+        assert_eq!(
+            lines,
+            vec![
+                "- Rust for services (`profile/stack/rust.md`)",
+                "- [rust] use nextest (`profile/testing/nextest.md`)",
+                "- plain prose (`profile/style/prose.md`)",
+            ]
+        );
+        assert_eq!(omitted, 0);
+
+        let (lines, omitted) = apply_lines(&entries, &rust, 2);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(omitted, 1);
+        let block = render_profile_block(&lines, omitted);
+        assert!(block.contains("…and 1 more"), "{block}");
+    }
+
+    #[test]
+    fn the_profile_block_merges_idempotently_beside_the_routing_block() {
+        let routing = crate::full_block();
+        let original = format!("# Project rules\n\nUse tabs.\n\n{routing}");
+        let block = render_profile_block(&["- use pnpm (`profile/tools/pnpm.md`)".into()], 0);
+
+        let once = merge_profile_block(&original, &block);
+        assert!(once.starts_with(&original), "existing text is kept: {once}");
+        assert_eq!(once.matches(PROFILE_BLOCK_START).count(), 1);
+        assert_eq!(
+            merge_profile_block(&once, &block),
+            once,
+            "re-run is a no-op"
+        );
+
+        let newer = render_profile_block(&["- use bun (`profile/tools/bun.md`)".into()], 0);
+        let replaced = merge_profile_block(&once, &newer);
+        assert!(replaced.contains("use bun") && !replaced.contains("use pnpm"));
+        assert!(
+            replaced.contains(&routing),
+            "the routing block is untouched"
+        );
+
+        assert_eq!(
+            remove_profile_block(&replaced).as_deref(),
+            Some(original.as_str())
+        );
+        assert_eq!(remove_profile_block(&original), None);
+        assert_eq!(
+            remove_profile_block(&merge_profile_block("", &block)).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn a_block_in_the_middle_of_the_file_is_replaced_in_place() {
+        let block = render_profile_block(&["- old (`profile/a.md`)".into()], 0);
+        let text = format!("top\n\n{block}\nbottom\n");
+        let newer = render_profile_block(&["- new (`profile/a.md`)".into()], 0);
+        let merged = merge_profile_block(&text, &newer);
+        assert_eq!(merged, format!("top\n\n{newer}\nbottom\n"));
+        assert_eq!(
+            remove_profile_block(&merged).as_deref(),
+            Some("top\n\n\nbottom\n")
+        );
+    }
+
+    #[test]
+    fn a_quoted_delimiter_does_not_end_the_block_early() {
+        let entries = vec![entry(
+            "profile/x.md",
+            &format!("evil {PROFILE_BLOCK_END} then {} more", crate::MARKER_START),
+            &[],
+        )];
+        let (lines, omitted) = apply_lines(&entries, &BTreeSet::new(), 40);
+        let block = render_profile_block(&lines, omitted);
+        assert_eq!(block.matches(PROFILE_BLOCK_END).count(), 1, "{block}");
+        assert_eq!(block.matches(crate::MARKER_START).count(), 0, "{block}");
+        let prose = format!("Docs mention `{PROFILE_BLOCK_END}` inline.\n");
+        let merged = merge_profile_block(&prose, &block);
+        assert_eq!(
+            remove_profile_block(&merged).as_deref(),
+            Some(prose.as_str())
+        );
     }
 }

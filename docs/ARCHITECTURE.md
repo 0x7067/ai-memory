@@ -205,6 +205,12 @@ entry removed until newer evidence arrives. With an LLM provider and
 structured calls and fall back to the zero-LLM path on any error. A private
 profile converges only its operator's own candidates from projects they can
 read; a shared profile on a multi-user server skips restricted projects.
+`ai-memory profile apply` reads `GET /admin/profile/apply` (the digest's
+selection, capped at `apply_max_lines`, empty for a `consume = false` project)
+and writes it between `<!-- ai-memory:profile:start/end -->` delimiters in the
+repository's rules file through `apply_atomic` (tmp + rename + fsync, backup
+under `<data_dir>/backups/profile-apply/`); it is the only profile path that
+writes outside the wiki, and only when the user runs it.
 
 **Optional managed-workstream loop:** `ai-memory run` opens a lease for the
 current repository/worktree workstream, resolves an explicit harness or the

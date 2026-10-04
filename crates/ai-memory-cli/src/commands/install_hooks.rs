@@ -133,32 +133,12 @@ pub(crate) fn project_settings_backup(data_dir: &Path, settings: &Path) -> Priva
     }
 }
 
-/// A file-name stem naming the checkout `settings` sits in: its directory
-/// flattened to safe characters and bounded to the tail (the repository name
-/// end), plus a short hash of the full path so checkouts that flatten alike
-/// stay apart.
+/// A file-name stem naming the checkout `settings` sits in (see
+/// [`super::apply_shared::checkout_backup_stem`]).
 fn project_settings_backup_stem(settings: &Path) -> String {
-    use sha2::{Digest as _, Sha256};
-    let checkout = settings
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or(settings)
-        .to_string_lossy();
-    let mut flat = String::with_capacity(checkout.len());
-    for c in checkout.chars() {
-        let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
-            c
-        } else {
-            '-'
-        };
-        if !(c == '-' && flat.ends_with('-')) {
-            flat.push(c);
-        }
-    }
-    let flat = flat.trim_matches('-');
-    let tail = &flat[flat.len().saturating_sub(64)..];
-    let digest = format!("{:x}", Sha256::digest(checkout.as_bytes()));
-    format!("{}-{}", tail.trim_start_matches('-'), &digest[..12])
+    super::apply_shared::checkout_backup_stem(
+        settings.parent().and_then(Path::parent).unwrap_or(settings),
+    )
 }
 
 /// The `hooks` table of a Claude-shaped settings document (`hooks` → event →

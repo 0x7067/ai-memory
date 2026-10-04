@@ -1,6 +1,7 @@
 # Design: the cross-project profile
 
-*Status: accepted (2026-10-04), implementing for 2.6.*
+*Status: accepted (2026-10-04), implemented for 2.6. User guide:
+[`cross-project-profile.md`](cross-project-profile.md).*
 
 ## 1. The problem
 
@@ -195,7 +196,11 @@ candidate newer than the entry's last write arrives.
 - **`ai-memory profile apply`.** Writes the top entries into a managed
   sub-block (`<!-- ai-memory:profile:start -->` … `end`) of the rules file in
   the current repository, capped at `apply_max_lines` (default 40), never
-  touching text outside the markers. Command-driven only, with `--dry-run`.
+  touching text outside the markers. Command-driven only, with `--dry-run`
+  and `--remove`. The entries come from `GET /admin/profile/apply` with the
+  digest's selection; the target is `--target`, else an existing `AGENTS.md`,
+  else a `CLAUDE.md` that does more than import `AGENTS.md`, else a new
+  `AGENTS.md`. The write is atomic with its backup kept under the data dir.
   This is how a profile entry becomes a hard rule, when the user wants one.
 
 ## 6. Using an LLM when one is configured
@@ -244,12 +249,12 @@ consume = false      # no digest or union in this project
 ## 8. Commands
 
 `ai-memory profile status | list | show <path> | forget <path> | review |
-rebuild | apply [--target FILE] [--dry-run]`.
+rebuild | apply [--target FILE] [--dry-run | --remove]`.
 
-`status`, `list` and `review` read `/admin/profile/*` and `rebuild` posts
-to it (forget the harvest marks, re-read every project, converge); `show` and
-`forget` reuse `/admin/read-page` and `/admin/delete-page` against the
-profile's scope. All
+`status`, `list`, `review` and `apply` read `/admin/profile/*` and `rebuild`
+posts to it (forget the harvest marks, re-read every project, converge);
+`show` and `forget` reuse `/admin/read-page` and `/admin/delete-page` against
+the profile's scope. All
 are root-only on a multi-user server, like every `/admin/*` route; there, each
 operator manages their own private profile through MCP.
 
