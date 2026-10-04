@@ -8719,6 +8719,14 @@ async fn handle_project_access(
             "{project} is the shared preferences scope, read by every user; it cannot be restricted"
         )));
     }
+    // A profile project's mode is fixed by its kind: a private profile stays
+    // restricted to its owner, a workspace profile stays readable by the
+    // workspace. Changing either would expose or hide a profile wholesale.
+    if ai_memory_core::profile::is_profile_project(project) {
+        return Err(validation_error(format!(
+            "{project} is a cross-project profile; its access mode is fixed"
+        )));
+    }
     let (_, project_id) = lookup_ws_proj_no_create(&state, workspace, project).await?;
     let previous = state
         .writer
@@ -14491,7 +14499,8 @@ mod tests {
     }
 
     /// `POST /admin/projects/access` (#708): a mode is required and never
-    /// guessed, the shared preferences scope cannot be restricted, an unknown
+    /// guessed, the shared preferences scope cannot be restricted, a profile
+    /// project's mode is fixed (a private one is never opened), an unknown
     /// project creates nothing, repeating a mode reports no change, and only
     /// root may call it.
     #[tokio::test]
@@ -14507,6 +14516,8 @@ mod tests {
             serde_json::json!({"workspace": "default", "project": "client-work"}),
             serde_json::json!({"workspace": "default", "project": "client-work", "mode": "members"}),
             serde_json::json!({"workspace": "default", "project": "_global", "mode": "restricted"}),
+            serde_json::json!({"workspace": "default", "project": "_profile", "mode": "restricted"}),
+            serde_json::json!({"workspace": "default", "project": "_profile.00000000000000000000000000000001", "mode": "open"}),
         ] {
             let (status, json) = call("root-token", body.clone()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {json}");

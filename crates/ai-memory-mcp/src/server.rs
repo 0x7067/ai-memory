@@ -13704,6 +13704,67 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Squatting: before joao has a profile, maria names his private profile
+    /// project in an explicit write. Creating it would make her its creator
+    /// and lock joao out for good, so it is refused before anything exists.
+    /// Controls: joao's own profile then works, and joao may also name his
+    /// own private project explicitly.
+    #[tokio::test]
+    async fn a_user_cannot_squat_another_operators_private_profile() {
+        let tmp = TempDir::new().unwrap();
+        let (store, server, joao, maria) = global_gate_fixture(&tmp).await;
+        let server = server.with_profile(profile_on(ai_memory_core::profile::ProfileShare::Auto));
+        let joaos = ai_memory_core::profile::user_profile_project(joao);
+
+        let mut squat = profile_entry("profile/tools/npm.md", None);
+        squat.workspace = Some("default".into());
+        squat.project = Some(joaos.clone());
+        server
+            .memory_write_page(Parameters(squat), OptionalParts(parts_as_user(maria)))
+            .await
+            .expect_err("maria cannot create joao's private profile");
+        let ws = store
+            .reader
+            .find_workspace("default".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .find_project(ws, joaos.clone())
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused write created nothing"
+        );
+        let mut workspace_profile = profile_entry("profile/tools/npm.md", None);
+        workspace_profile.workspace = Some("default".into());
+        workspace_profile.project = Some(ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT.into());
+        server
+            .memory_write_page(
+                Parameters(workspace_profile),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect_err("a workspace profile is only created through the profile path");
+
+        server
+            .memory_write_page(
+                Parameters(profile_entry("tools/pnpm.md", Some("profile"))),
+                OptionalParts(parts_as_user(joao)),
+            )
+            .await
+            .expect("joao's own profile still works");
+        let mut explicit_own = profile_entry("profile/tools/yarn.md", None);
+        explicit_own.workspace = Some("default".into());
+        explicit_own.project = Some(joaos);
+        server
+            .memory_write_page(Parameters(explicit_own), OptionalParts(parts_as_user(joao)))
+            .await
+            .expect("joao may name his own private profile");
+    }
+
     /// Multi-user, profile enabled (`share` auto → one private profile per
     /// operator). Adversarial: maria can neither see joao's profile through
     /// her query union nor read, write or delete it by naming its project.

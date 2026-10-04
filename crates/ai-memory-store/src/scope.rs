@@ -486,8 +486,44 @@ pub async fn create_explicit_scope_guarded(
     project: &str,
     viewer: Option<UserId>,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
+    refuse_foreign_profile_name(Some(workspace), project, viewer)?;
     let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
     create_project_in_workspace_guarded(reader, writer, workspace_id, project, viewer).await
+}
+
+/// Refusal for an explicit write that names a profile project it does not own.
+pub const PROFILE_NAME_RESERVED: &str = "profile projects are reserved: write profile entries \
+     with scope \"profile\", which resolves your own profile";
+
+/// A database user may name exactly one profile project explicitly: their own
+/// private profile, `default/_profile.<their id>`. Any other `_profile` or
+/// `_profile.*` name is refused before anything is created, so a user cannot
+/// create (squat) another operator's private profile and lock its owner out,
+/// nor create a workspace profile outside the profile path. A caller with no
+/// database user (root, or a single-user server) may, for repair.
+///
+/// `workspace` is the name the caller gave; `None` (the workspace inferred
+/// from the active project or the server default) never matches, so a user
+/// names `default` explicitly to reach their own private profile this way.
+fn refuse_foreign_profile_name(
+    workspace: Option<&str>,
+    project: &str,
+    viewer: Option<UserId>,
+) -> Result<(), ScopeResolutionError> {
+    if !ai_memory_core::profile::is_profile_project(project) {
+        return Ok(());
+    }
+    let Some(viewer) = viewer else {
+        return Ok(());
+    };
+    if workspace == Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
+        && project == ai_memory_core::profile::user_profile_project(viewer)
+    {
+        return Ok(());
+    }
+    Err(ScopeResolutionError::Forbidden(
+        PROFILE_NAME_RESERVED.to_owned(),
+    ))
 }
 
 /// [`create_explicit_scope_guarded`] for a workspace already resolved by id.
@@ -1028,6 +1064,7 @@ impl<'a> ScopeResolver<'a> {
         // the choke point below then admits; one that already existed is
         // decided like any other write, so "create" is never a way in.
         let creator = self.authz.as_ref().and_then(|principal| principal.user_id);
+        refuse_foreign_profile_name(trimmed_opt(explicit_workspace), project, creator)?;
         let (project_id, _) = writer
             .get_or_create_project_as(workspace_id, project.to_owned(), None, creator)
             .await?;

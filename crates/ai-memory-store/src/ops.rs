@@ -4888,6 +4888,29 @@ pub fn rename_project(
             "project name must not contain '/' (it appears in URL paths)".into(),
         ));
     }
+    // A profile project is found by its name (and a private one's owner is
+    // its name), so renaming one away orphans it and renaming a project onto
+    // a profile name hands someone else's pages to that profile.
+    if ai_memory_core::profile::is_profile_project(trimmed) {
+        return Err(StoreError::InvalidProjectName(format!(
+            "{trimmed} is reserved for the cross-project profile"
+        )));
+    }
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT name FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![project_id.as_bytes(), workspace_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current
+        .as_deref()
+        .is_some_and(ai_memory_core::profile::is_profile_project)
+    {
+        return Err(StoreError::InvalidProjectName(
+            "a cross-project profile project cannot be renamed".into(),
+        ));
+    }
 
     // Wrap the UPDATE + audit row in one transaction so the trail can never
     // diverge from the rename it records (on any error the tx drops without
@@ -14610,6 +14633,37 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         rename_project(&mut conn, &ws, &proj, "renamed-live", None)
             .expect("rename of live project must succeed");
+    }
+
+    /// A profile project is found by name and a private one's owner is in its
+    /// name: renaming a project onto a profile name, or a profile away, is
+    /// refused, and the refused rename changes nothing.
+    #[test]
+    fn rename_project_refuses_profile_names_both_ways() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for name in ["_profile", "_profile.00000000000000000000000000000001"] {
+            let err = rename_project(&mut conn, &ws, &proj, name, None)
+                .expect_err("renaming onto a profile name must be refused");
+            assert!(matches!(err, StoreError::InvalidProjectName(_)), "{err:?}");
+        }
+        let private = get_or_create_project(
+            &mut conn,
+            &ws,
+            "_profile.00000000000000000000000000000002",
+            None,
+        )
+        .unwrap();
+        let err = rename_project(&mut conn, &ws, &private, "plain", None)
+            .expect_err("renaming a profile away must be refused");
+        assert!(matches!(err, StoreError::InvalidProjectName(_)), "{err:?}");
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM projects WHERE id = ?1",
+                params![private.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "_profile.00000000000000000000000000000002");
     }
 
     fn seed_user(conn: &Connection, username: &str) -> ai_memory_core::UserId {
