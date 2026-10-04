@@ -987,6 +987,7 @@ fn tool_call_is_write(tool: &str) -> bool {
             | "memory_briefing"
             | "memory_explore"
             | "memory_status"
+            | "memory_handoff_list"
             | "memory_message_list"
             | "memory_install_self_routing"
     )
@@ -15641,10 +15642,13 @@ mod tests {
         for read in [
             "memory_query",
             "memory_read_page",
+            "memory_read_session_observations",
             "memory_recent",
             "memory_briefing",
             "memory_explore",
             "memory_status",
+            "memory_handoff_list",
+            "memory_message_list",
             "memory_install_self_routing",
         ] {
             assert!(!tool_call_is_write(read), "{read}");
@@ -15654,14 +15658,37 @@ mod tests {
             "memory_delete_page",
             "memory_feedback",
             "memory_consolidate",
+            "memory_auto_improve",
+            "memory_lint",
             "memory_forget_sweep",
             "memory_handoff_begin",
+            "memory_handoff_accept",
+            "memory_handoff_cancel",
+            "memory_message_send",
+            "memory_message_pop",
+            "memory_message_cancel",
         ] {
             assert!(tool_call_is_write(write), "{write}");
         }
         // The deliberate default: a tool this list has never met counts as
         // a write, so forgetting to classify a future tool is visible.
         assert!(tool_call_is_write("memory_some_future_tool"));
+    }
+
+    #[test]
+    fn memory_handoff_list_is_classified_as_read_activity() {
+        assert!(!tool_call_is_write("memory_handoff_list"));
+        let mut buffer = ClientActivityBuffer::new();
+        buffer.record(
+            "test-client".into(),
+            1,
+            tool_call_is_write("memory_handoff_list"),
+        );
+        assert_eq!(
+            buffer.pending.get(&("test-client".into(), 1)),
+            Some(&(1, 0)),
+            "read-only handoff inspection must increment reads, not writes"
+        );
     }
 
     #[test]
