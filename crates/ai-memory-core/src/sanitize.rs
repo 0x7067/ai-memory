@@ -182,13 +182,19 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         "env_secret",
     ),
     // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
-    // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment, plus the
-    // suffixes one step outside those: `*_KEY_ID` (the other half of an S3
-    // pair, e.g. `LITESTREAM_ACCESS_KEY_ID`), `*_PASSPHRASE`, `*_SIGNING_KEY`,
-    // and `*_PEPPER` / `*_SALT`, which turn a stolen hash table into a usable
-    // one.
+    // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
     (
-        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|KEY_ID|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|CREDENTIALS|PRIVATE_KEY|SIGNING_KEY|PEPPER|SALT)"?\s*[=:]\s*\S+"#,
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)"?\s*[=:]\s*\S+"#,
+        "env_secret",
+    ),
+    // The suffixes one step outside those: `*_KEY_ID` (the other half of an
+    // S3 pair, e.g. `LITESTREAM_ACCESS_KEY_ID`), `*_PASSPHRASE`,
+    // `*_SIGNING_KEY`, and `*_PEPPER` / `*_SALT`, which turn a stolen hash
+    // table into a usable one. Uppercase only, the environment-variable
+    // convention: as code identifiers (`api_key_id`, `password_salt`) they are
+    // ordinary column and field names, and redaction is irreversible.
+    (
+        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)"?\s*[=:]\s*\S+"#,
         "env_secret",
     ),
     // Filesystem paths that commonly contain credentials. The separator
@@ -516,6 +522,19 @@ mod tests {
             let out = s().scrub(input);
             assert!(!out.contains(secret), "{input} -> {out}");
             assert!(out.contains("[REDACTED:env_secret]"), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn lowercase_identifiers_with_the_new_suffixes_survive() {
+        // Code, not environment: the new suffixes are uppercase-only.
+        for keep in [
+            "let api_key_id = row.get(0);",
+            "pub password_salt: String,",
+            "struct Row { user_key_id: u64 }",
+            "cache_key_id: abc123",
+        ] {
+            assert_eq!(s().scrub(keep), keep);
         }
     }
 
