@@ -187,6 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check used the root-only `/admin/sessions/by-agent` route, so every
   developer's own key got 403; on a 403 it now asks the grant-checked
   `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` instead. (#1086)
+- The sanitizer now redacts `*_KEY_ID`, `*_PASSPHRASE`, `*_SIGNING_KEY`,
+  `*_PEPPER` and `*_SALT` assignments (e.g. an S3 `…_ACCESS_KEY_ID`, an auth
+  token pepper) and dotless base64 JSON tokens such as Cloudflare tunnel
+  tokens (`eyJ…`, 40+ characters); SHAs, UUIDs and short `eyJ` fragments are
+  left alone. (#1084)
 
 ### Security
 - Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
