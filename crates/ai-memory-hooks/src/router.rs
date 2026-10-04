@@ -539,6 +539,10 @@ pub struct HookState {
     /// default and historical behavior) or inherits the session's project
     /// (`sticky`). Held here because the hooks crate makes no config reads.
     pub mid_session_routing: ai_memory_core::MidSessionRouting,
+    /// `[profile]`: the cross-project profile and its SessionStart digest
+    /// (`docs/design-cross-project-profile.md`). Held here because the hooks
+    /// crate makes no config reads.
+    pub profile: ai_memory_core::profile::ProfileSettings,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -1376,6 +1380,16 @@ pub struct HandoffQuery {
     /// Naming style for a project this request creates; see
     /// [`crate::payload::HookQuery::identity_style`].
     pub identity_style: Option<String>,
+    /// The marker's `[profile] contribute`. An explicit falsy value keeps the
+    /// project out of profile harvesting; absent or anything else keeps it in.
+    pub profile_contribute: Option<String>,
+    /// The marker's `[profile] consume`. An explicit falsy value keeps the
+    /// profile digest out of this session and the profile out of the
+    /// project's query union.
+    pub profile_consume: Option<String>,
+    /// Set falsy by a client that re-fetches on every prompt (Kimi Code) once
+    /// the session already received the digest, so it is delivered once.
+    pub profile_digest: Option<String>,
 }
 
 impl HandoffQuery {
@@ -1532,6 +1546,8 @@ async fn fetch_and_accept_handoff_at(
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
     let brief_md = render_requested_session_brief(state, &query, ws, proj, actor.as_ref()).await?;
+    persist_profile_flags(state, &query, proj).await;
+    let profile_md = render_requested_profile_digest(state, &query, ws, proj, viewer).await;
     // Handoff first: it is a short curated pointer and must not be buried
     // under a ledger that can run tens of KB. The existing ledger-then-brief
     // order is preserved. Claim both single-use inputs only after every
@@ -1681,7 +1697,10 @@ async fn fetch_and_accept_handoff_at(
             handoff_notice,
             combine_handoff_and_brief(
                 managed_md,
-                combine_handoff_and_brief(brief_md, inbox_notice),
+                combine_handoff_and_brief(
+                    brief_md,
+                    combine_handoff_and_brief(profile_md, inbox_notice),
+                ),
             ),
         ),
     ))
@@ -1906,6 +1925,93 @@ async fn render_requested_session_brief(
         )
         .await?;
     Ok(render_session_brief(&core, &recent, budget))
+}
+
+/// The marker's `[profile]` flags, as forwarded on the session-start fetch.
+fn profile_flags_from_query(query: &HandoffQuery) -> ai_memory_store::ProjectProfileFlags {
+    ai_memory_store::ProjectProfileFlags {
+        contribute: !crate::payload::query_flag_falsy(query.profile_contribute.as_deref()),
+        consume: !crate::payload::query_flag_falsy(query.profile_consume.as_deref()),
+    }
+}
+
+/// Persist the marker's `[profile]` flags on the project, so the harvester
+/// and the MCP query union honour them. A conditional no-op in the common
+/// case, and never allowed to fail the session start.
+async fn persist_profile_flags(state: &HookState, query: &HandoffQuery, project_id: ProjectId) {
+    if let Err(e) = state
+        .writer
+        .set_project_profile_flags(project_id, profile_flags_from_query(query))
+        .await
+    {
+        warn!(error = %e, "could not record the project's [profile] flags");
+    }
+}
+
+/// Render the cross-project profile digest for a session in `(workspace_id,
+/// project_id)`, or `None` when the profile is off, the project opted out with
+/// `[profile] consume = false`, the client already delivered it this session,
+/// or no entry applies. Every failure degrades to no digest: it is context, not
+/// something a session start may fail on.
+async fn render_requested_profile_digest(
+    state: &HookState,
+    query: &HandoffQuery,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    viewer: Option<ai_memory_core::UserId>,
+) -> Option<String> {
+    if !state.profile.inject_on_session_start
+        || !profile_flags_from_query(query).consume
+        || crate::payload::query_flag_falsy(query.profile_digest.as_deref())
+    {
+        return None;
+    }
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(distinguishes) => distinguishes,
+        Err(e) => {
+            warn!(error = %e, "operator-topology lookup failed; skipping the profile digest");
+            return None;
+        }
+    };
+    let share = state.profile.effective_share(distinguishes)?;
+    let scope =
+        match ai_memory_store::lookup_profile_scope(&state.reader, share, workspace_id, viewer)
+            .await
+        {
+            Ok(Some(scope)) => scope,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(error = %e, "could not resolve the profile scope; skipping the digest");
+                return None;
+            }
+        };
+    // A session opened in the profile's own scope already reads it as its
+    // project memory; repeating it as a digest would double it.
+    if scope.as_tuple() == (workspace_id, project_id) {
+        return None;
+    }
+    let inputs = match state
+        .reader
+        .profile_digest_inputs(scope.as_tuple(), (workspace_id, project_id))
+        .await
+    {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            warn!(error = %e, "could not read the profile; skipping the digest");
+            return None;
+        }
+    };
+    let baseline = !inputs.project_has_pages;
+    let budget = if baseline {
+        state.profile.baseline_budget()
+    } else {
+        state.profile.digest_budget()
+    };
+    ai_memory_core::profile::render_digest(&inputs.entries, &inputs.project_tags, budget, baseline)
 }
 
 fn combine_handoff_and_brief(
@@ -2467,17 +2573,18 @@ async fn resolve_project_ids_inner(
         }
     };
 
-    // The reserved global preferences scope (issue #154) is written only
-    // through explicit MCP `scope: "global"` requests — event capture must
-    // never create it or leak observations into it, whether the name came
-    // from a directory literally called `_global` or a marker-file
-    // override. Fall back to the server-default project, same as a
-    // cwd-less event.
-    if project_name == ai_memory_core::GLOBAL_SCOPE_PROJECT {
+    // The reserved global preferences scope (issue #154) and the profile
+    // scopes are written only through explicit MCP `scope` requests — event
+    // capture must never create them or leak observations into them, whether
+    // the name came from a directory literally called `_global` / `_profile`
+    // or a marker-file override. A private `_profile.<user id>` matters most:
+    // capture into it would land one operator's events in another's profile.
+    // Fall back to the server-default project, same as a cwd-less event.
+    if ai_memory_core::profile::is_reserved_scope_project(&project_name) {
         debug!(
             cwd = ?cwd_norm,
-            "hook router: refusing to attribute event capture to the reserved \
-             global scope; using the server-default project"
+            "hook router: refusing to attribute event capture to a reserved \
+             scope; using the server-default project"
         );
         return Ok((state.workspace_id, state.project_id));
     }
@@ -4345,6 +4452,9 @@ mod tests {
 
     fn session_start_query(cwd: &str) -> HandoffQuery {
         HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
@@ -4823,6 +4933,9 @@ mod tests {
     #[test]
     fn handoff_query_accepts_identity_on_the_same_terms_as_a_capture() {
         let query = |identity: &str, source: &str| HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
             ..Default::default()
@@ -5177,6 +5290,7 @@ mod tests {
             ingest_gates: IngestGates::default(),
             per_user_slots: false,
             mid_session_routing: MidSessionRouting::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
         }
     }
 
@@ -11004,6 +11118,9 @@ mod tests {
             jiff::Timestamp::now() + LIVE_BATON_QUIET_PERIOD + jiff::SignedDuration::from_secs(1);
         for (project, other) in [("alpha", "beta"), ("beta", "alpha")] {
             let query = HandoffQuery {
+                profile_contribute: None,
+                profile_consume: None,
+                profile_digest: None,
                 workspace: Some("checkpoint-workspace".into()),
                 project: Some(project.into()),
                 agent: Some("codex".into()),
@@ -11079,6 +11196,9 @@ mod tests {
         .await
         .unwrap();
         let receiver = || HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("opencode2".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -11791,6 +11911,9 @@ mod tests {
             handle_handoff(
                 State(state.clone()),
                 Query(HandoffQuery {
+                    profile_contribute: None,
+                    profile_consume: None,
+                    profile_digest: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
@@ -12404,6 +12527,9 @@ mod tests {
             .await
             .unwrap();
         let query = || HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -12488,6 +12614,9 @@ mod tests {
             .await
             .unwrap();
         let query = || HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -12591,6 +12720,9 @@ mod tests {
             .id;
         let state = Arc::new(state);
         let query = HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -12772,6 +12904,9 @@ mod tests {
             handle_handoff(
                 State(state.clone()),
                 Query(HandoffQuery {
+                    profile_contribute: None,
+                    profile_consume: None,
+                    profile_digest: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
@@ -13660,6 +13795,9 @@ mod tests {
         let rendered = fetch_and_accept_handoff(
             &state,
             HandoffQuery {
+                profile_contribute: None,
+                profile_consume: None,
+                profile_digest: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
@@ -13738,6 +13876,9 @@ mod tests {
         let rendered = fetch_and_accept_handoff(
             &state,
             HandoffQuery {
+                profile_contribute: None,
+                profile_consume: None,
+                profile_digest: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
@@ -13808,6 +13949,9 @@ mod tests {
             .await
             .unwrap();
         let query = |session_id: &str| HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -13958,6 +14102,9 @@ mod tests {
             .unwrap();
 
         let query = HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -14075,6 +14222,9 @@ mod tests {
             .unwrap();
 
         let query = HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -14154,6 +14304,9 @@ mod tests {
         }
 
         let query = HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -14217,6 +14370,9 @@ mod tests {
             .unwrap();
 
         let query = |briefing: Option<&str>| HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -14376,6 +14532,9 @@ mod tests {
             .await
             .unwrap();
         let query = |briefing: Option<&str>| HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
@@ -14591,6 +14750,9 @@ mod tests {
         let rendered = fetch_and_accept_handoff(
             &state,
             HandoffQuery {
+                profile_contribute: None,
+                profile_consume: None,
+                profile_digest: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
@@ -17043,6 +17205,9 @@ mod tests {
                 .unwrap();
             if start_path {
                 let query = HandoffQuery {
+                    profile_contribute: None,
+                    profile_consume: None,
+                    profile_digest: None,
                     managed_run: Some(run.run_id.to_string()),
                     session_id: Some("private-vendor".into()),
                     cwd: Some(cwd.clone()),
@@ -17104,5 +17269,259 @@ mod tests {
                 Some("vendor-界-01")
             );
         }
+    }
+
+    // ---- cross-project profile (docs/design-cross-project-profile.md) ----
+
+    fn profile_query(cwd: &str, agent: &str) -> HandoffQuery {
+        HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
+            agent: Some(agent.into()),
+            cwd: Some(cwd.into()),
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
+            managed_run: None,
+            session_id: None,
+            identity: None,
+            identity_src: None,
+            identity_style: None,
+        }
+    }
+
+    /// Seed two profile entries into the global scope, the single-user default.
+    async fn seed_global_profile(state: &HookState) {
+        let global = ai_memory_store::create_global_scope(&state.writer)
+            .await
+            .unwrap();
+        for (path, body) in [
+            ("profile/tools/pnpm.md", "# Pnpm\n\nUse pnpm, not npm."),
+            (
+                "profile/testing/layout.md",
+                "# Layout\n\nKeep tests beside the code.",
+            ),
+        ] {
+            state
+                .writer
+                .upsert_page(brief_page(
+                    global.workspace_id,
+                    global.project_id,
+                    path,
+                    body,
+                    false,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn session_start_text(state: &HookState, query: HandoffQuery) -> Option<String> {
+        fetch_and_accept_handoff(state, query, None, Vec::new(), None)
+            .await
+            .unwrap()
+    }
+
+    /// Single-user default: a new project's session start carries the profile
+    /// as a baseline, and the text is byte-identical on the next start, from
+    /// any harness, so it stays in a cached prompt prefix. Once the project has
+    /// memory of its own the baseline hint goes away.
+    #[tokio::test]
+    async fn session_start_delivers_a_stable_profile_digest() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_global_profile(&state).await;
+        let cwd = "/home/u/new-app";
+
+        let first = session_start_text(&state, profile_query(cwd, "claude-code"))
+            .await
+            .expect("the profile must be delivered");
+        assert!(first.contains("ai-memory: your usual choices"), "{first}");
+        assert!(first.contains("Use pnpm, not npm."), "{first}");
+        assert!(first.contains("profile/tools/pnpm.md"), "{first}");
+        assert!(
+            first.contains("ai-memory profile apply"),
+            "a new project gets the baseline: {first}"
+        );
+        let codex = session_start_text(&state, profile_query(cwd, "codex"))
+            .await
+            .unwrap();
+        assert_eq!(first, codex, "two harnesses see the same digest");
+        let again = session_start_text(&state, profile_query(cwd, "claude-code"))
+            .await
+            .unwrap();
+        assert_eq!(first, again, "the digest must be byte-stable");
+
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(ws, proj, "notes/own.md", "own memory", false))
+            .await
+            .unwrap();
+        let settled = session_start_text(&state, profile_query(cwd, "claude-code"))
+            .await
+            .unwrap();
+        assert!(settled.contains("Use pnpm, not npm."), "{settled}");
+        assert!(!settled.contains("ai-memory profile apply"), "{settled}");
+    }
+
+    /// `[profile] consume = false`, a client that already delivered the digest
+    /// this session, and `inject_on_session_start = false` each suppress it.
+    #[tokio::test]
+    async fn profile_digest_honours_consume_once_per_session_and_the_server_switch() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        seed_global_profile(&state).await;
+        let cwd = "/home/u/app";
+
+        let mut opted_out = profile_query(cwd, "claude-code");
+        opted_out.profile_consume = Some("false".into());
+        assert_eq!(session_start_text(&state, opted_out).await, None);
+
+        let mut delivered = profile_query(cwd, "kimi-code");
+        delivered.profile_digest = Some("0".into());
+        assert_eq!(session_start_text(&state, delivered).await, None);
+
+        let mut truthy = profile_query(cwd, "claude-code");
+        truthy.profile_consume = Some("yes".into());
+        assert!(session_start_text(&state, truthy).await.is_some());
+
+        state.profile.inject_on_session_start = false;
+        assert_eq!(
+            session_start_text(&state, profile_query(cwd, "claude-code")).await,
+            None
+        );
+    }
+
+    /// The marker's flags are recorded on the project at session start, and
+    /// removing them from the marker turns them back on.
+    #[tokio::test]
+    async fn session_start_records_the_marker_profile_flags() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/u/client-work";
+        let mut query = profile_query(cwd, "claude-code");
+        query.profile_contribute = Some("false".into());
+        query.profile_consume = Some("off".into());
+        session_start_text(&state, query).await;
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let flags = state.reader.project_profile_flags(ws, proj).await.unwrap();
+        assert!(!flags.contribute && !flags.consume, "{flags:?}");
+
+        session_start_text(&state, profile_query(cwd, "claude-code")).await;
+        let flags = state.reader.project_profile_flags(ws, proj).await.unwrap();
+        assert_eq!(flags, ai_memory_store::ProjectProfileFlags::default());
+    }
+
+    /// A multi-user server leaves the profile off unless the operator enables
+    /// it: entries in `_global` must not start reaching every operator's
+    /// session start the moment a first database user exists.
+    #[tokio::test]
+    async fn a_multi_user_server_has_no_profile_digest_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_global_profile(&state).await;
+        let cwd = "/home/u/app";
+        assert!(
+            session_start_text(&state, profile_query(cwd, "claude-code"))
+                .await
+                .is_some()
+        );
+
+        state
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session_start_text(&state, profile_query(cwd, "claude-code")).await,
+            None
+        );
+    }
+
+    /// Adversarial: event capture must never be attributed to a profile
+    /// project, whether the name comes from a directory or a marker override.
+    /// Capture into `_profile.<id>` would file one operator's events in
+    /// another's private profile. Control: an ordinary name resolves to its
+    /// own project.
+    #[tokio::test]
+    async fn capture_is_never_attributed_to_a_profile_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let actor = ai_memory_core::ActorKey::default();
+        let private = ai_memory_core::profile::user_profile_project(ai_memory_core::UserId::new());
+        for name in ["_profile", private.as_str()] {
+            let by_override = resolve_project_ids(
+                &state,
+                Some("/home/u/anything"),
+                None,
+                Some(name),
+                ProjectStrategy::Basename,
+                &actor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                by_override,
+                (state.workspace_id, state.project_id),
+                "{name}"
+            );
+            let by_directory = resolve_project_ids(
+                &state,
+                Some(&format!("/home/u/{name}")),
+                None,
+                None,
+                ProjectStrategy::Basename,
+                &actor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                by_directory,
+                (state.workspace_id, state.project_id),
+                "{name}"
+            );
+        }
+        let ordinary = resolve_project_ids(
+            &state,
+            Some("/home/u/my_profile"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &actor,
+        )
+        .await
+        .unwrap();
+        assert_ne!(ordinary, (state.workspace_id, state.project_id));
     }
 }

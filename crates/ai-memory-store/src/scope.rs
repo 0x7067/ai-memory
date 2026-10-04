@@ -487,6 +487,17 @@ pub async fn create_explicit_scope_guarded(
     viewer: Option<UserId>,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
     let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
+    create_project_in_workspace_guarded(reader, writer, workspace_id, project, viewer).await
+}
+
+/// [`create_explicit_scope_guarded`] for a workspace already resolved by id.
+async fn create_project_in_workspace_guarded(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    workspace_id: WorkspaceId,
+    project: &str,
+    viewer: Option<UserId>,
+) -> Result<ResolvedScope, ScopeResolutionError> {
     let (project_id, _) = writer
         .get_or_create_project_as(workspace_id, project.to_owned(), None, viewer)
         .await?;
@@ -495,6 +506,127 @@ pub async fn create_explicit_scope_guarded(
         project_id,
     };
     authorize_scope_for(reader, Some(writer), scope, viewer, ProjectAccess::Write).await
+}
+
+/// Refusal for a private-profile request that carries no database user: a
+/// `user` profile belongs to one, and an anonymous or root caller has none.
+pub const PRIVATE_PROFILE_NEEDS_USER: &str = "this server keeps a private profile per database \
+     user; authenticate with your own API key to read or write yours";
+
+/// Where the cross-project profile lives for a caller, without creating it
+/// (`docs/design-cross-project-profile.md`). `workspace_id` is the workspace of
+/// the project the caller is in; `viewer` the database user the request
+/// authenticated as. `Ok(None)` means there is no profile to read yet, or
+/// none for this caller (a private profile with no database user).
+///
+/// A private profile is read through the per-project choke point, so only its
+/// creator (and root, as with every restricted project) is admitted.
+///
+/// # Errors
+/// Store failures, and [`ScopeResolutionError::Forbidden`] if a private
+/// profile refuses the viewer.
+pub async fn lookup_profile_scope(
+    reader: &ReaderPool,
+    share: ai_memory_core::profile::EffectiveProfileShare,
+    workspace_id: WorkspaceId,
+    viewer: Option<UserId>,
+) -> Result<Option<ResolvedScope>, ScopeResolutionError> {
+    use ai_memory_core::profile::{EffectiveProfileShare, WORKSPACE_PROFILE_PROJECT};
+    match share {
+        EffectiveProfileShare::Global => lookup_global_scope(reader).await,
+        EffectiveProfileShare::Workspace => Ok(reader
+            .find_project(workspace_id, WORKSPACE_PROFILE_PROJECT.to_owned())
+            .await?
+            .map(|project_id| ResolvedScope {
+                workspace_id,
+                project_id,
+            })),
+        EffectiveProfileShare::User => {
+            let Some(viewer) = viewer else {
+                return Ok(None);
+            };
+            let Some(default_workspace) = reader
+                .find_workspace(ai_memory_core::DEFAULT_WORKSPACE_NAME.to_owned())
+                .await?
+            else {
+                return Ok(None);
+            };
+            let Some(project_id) = reader
+                .find_project(
+                    default_workspace,
+                    ai_memory_core::profile::user_profile_project(viewer),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let scope = ResolvedScope {
+                workspace_id: default_workspace,
+                project_id,
+            };
+            authorize_scope_for(reader, None, scope, Some(viewer), ProjectAccess::Read)
+                .await
+                .map(Some)
+        }
+    }
+}
+
+/// Create or fetch the caller's profile scope for a write, authorized.
+///
+/// The shared scopes (`global`, `workspace`) go through the reserved-scope
+/// write gate: on a server with database users only root or a `write` grant
+/// on that scope may write it. A private profile is created restricted, with
+/// the caller as its creator, so only they (and root) can use it.
+///
+/// # Errors
+/// [`ScopeResolutionError::Forbidden`] when the gate refuses the caller or a
+/// private profile is requested without a database user; store failures
+/// otherwise.
+pub async fn create_profile_scope(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    share: ai_memory_core::profile::EffectiveProfileShare,
+    workspace_id: WorkspaceId,
+    viewer: Option<UserId>,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    use ai_memory_core::profile::{EffectiveProfileShare, WORKSPACE_PROFILE_PROJECT};
+    match share {
+        EffectiveProfileShare::Global => {
+            create_explicit_scope_guarded(
+                reader,
+                writer,
+                ai_memory_core::DEFAULT_WORKSPACE_NAME,
+                ai_memory_core::GLOBAL_SCOPE_PROJECT,
+                viewer,
+            )
+            .await
+        }
+        EffectiveProfileShare::Workspace => {
+            create_project_in_workspace_guarded(
+                reader,
+                writer,
+                workspace_id,
+                WORKSPACE_PROFILE_PROJECT,
+                viewer,
+            )
+            .await
+        }
+        EffectiveProfileShare::User => {
+            let Some(viewer) = viewer else {
+                return Err(ScopeResolutionError::Forbidden(
+                    PRIVATE_PROFILE_NEEDS_USER.to_owned(),
+                ));
+            };
+            create_explicit_scope_guarded(
+                reader,
+                writer,
+                ai_memory_core::DEFAULT_WORKSPACE_NAME,
+                &ai_memory_core::profile::user_profile_project(viewer),
+                Some(viewer),
+            )
+            .await
+        }
+    }
 }
 
 /// [`resolve_many_existing_scopes`], every scope authorized for `viewer`.

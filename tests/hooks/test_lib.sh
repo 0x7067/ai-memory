@@ -316,6 +316,42 @@ assert_eq "marker_qs stops at the briefing-only boundary" \
     "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
 
+# A marker that only sets `[profile]` keys is a settings boundary too, and
+# marker_qs forwards both flags (quoted or bare) for the server to interpret.
+mkdir -p "$TMP/profile-only/inner"
+printf 'workspace = "outer"\n' >"$TMP/profile-only/.ai-memory.toml"
+printf '[profile]\ncontribute = false\nconsume = "no"\n' >"$TMP/profile-only/inner/.ai-memory.toml"
+assert_eq "profile-only marker is a settings boundary" \
+    "$TMP/profile-only/inner/.ai-memory.toml" "$(ai_memory_find_settings_marker "$TMP/profile-only/inner")"
+assert_eq "marker_qs forwards [profile] contribute and consume" \
+    "&cwd=$(ai_memory_url_encode "$TMP/profile-only/inner")&profile_contribute=false&profile_consume=no" \
+    "$(ai_memory_marker_qs "$TMP/profile-only/inner")"
+assert_eq "marker_qs omits [profile] keys a marker does not set" \
+    "&cwd=$(ai_memory_url_encode "$TMP/profile-only")&workspace=outer" \
+    "$(ai_memory_marker_qs "$TMP/profile-only")"
+PSH=""
+if command -v pwsh >/dev/null 2>&1; then
+    PSH=$(command -v pwsh)
+elif command -v powershell >/dev/null 2>&1; then
+    PSH=$(command -v powershell)
+fi
+if [ -n "$PSH" ]; then
+    PS_LIB=$(host_path "$PWD/hooks/lib/ai-memory-hook.ps1")
+    PS_CWD=$(host_path "$TMP/profile-only/inner")
+    PS_QS=$(HOME="$TMP" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+        ". '$PS_LIB'; Get-AiMemoryMarkerQuery -Cwd '$PS_CWD'")
+    case "$PS_QS" in
+        *"&profile_contribute=false&profile_consume=no"*) PS_PROFILE="ok" ;;
+        *) PS_PROFILE="got: $PS_QS" ;;
+    esac
+    assert_eq "powershell marker query forwards [profile] flags" "ok" "$PS_PROFILE"
+else
+    PS_PROFILE=$(grep -q '&profile_contribute=' hooks/lib/ai-memory-hook.ps1 \
+        && grep -q '&profile_consume=' hooks/lib/ai-memory-hook.ps1 \
+        && printf 'ok' || printf 'missing')
+    assert_eq "powershell marker query forwards [profile] flags (static)" "ok" "$PS_PROFILE"
+fi
+
 # A capture-only marker with no scope-declaring ancestor: still transparent,
 # and resolution falls back exactly as it does with no marker at all.
 mkdir -p "$TMP/no-outer-scope/inner"

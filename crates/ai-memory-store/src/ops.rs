@@ -291,11 +291,17 @@ pub fn get_or_create_project(
 /// The access mode a newly created project starts in.
 ///
 /// `default` is the server's `[auth] new_projects_restricted` setting. The
-/// two reserved projects are always open whatever it says: `scratch` is where
-/// every cwd-less event lands, and the global preferences scope is shared by
-/// construction and unioned into everybody's reads.
+/// shared reserved projects are always open whatever it says: `scratch` is
+/// where every cwd-less event lands, and the global preferences scope and a
+/// workspace profile are shared by construction and unioned into everybody's
+/// reads. A private profile (`_profile.<user id>`) is always restricted: it
+/// exists to be readable by its creator alone.
 pub(crate) fn initial_access_mode(name: &str, default: crate::AccessMode) -> crate::AccessMode {
-    if name == ai_memory_core::DEFAULT_PROJECT_NAME || name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+    if name.starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX) {
+        crate::AccessMode::Restricted
+    } else if name == ai_memory_core::DEFAULT_PROJECT_NAME
+        || name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+        || name == ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT
     {
         crate::AccessMode::Open
     } else {
@@ -625,7 +631,8 @@ fn insert_project_with_identity(
 /// which is what makes this safe to run on a schedule (the operator-driven
 /// `purge-project` covers everything that actually holds data). Reserved
 /// projects (`scratch`, the cwd-less fallback; `_global`, the preferences
-/// scope) are exempt even when empty. Returns the deleted names for logging.
+/// scope; `_profile` and `_profile.<user id>`, the profile scopes) are exempt
+/// even when empty. Returns the deleted names for logging.
 ///
 /// # Errors
 /// Propagates SQLite failures.
@@ -636,7 +643,8 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
     let names: Vec<String> = {
         let mut stmt = tx.prepare(
             "SELECT name FROM projects
-             WHERE name NOT IN ('scratch', ?1)
+             WHERE name NOT IN ('scratch', ?1, '_profile')
+               AND name NOT LIKE '\\_profile.%' ESCAPE '\\'
                AND created_at < ?2
                AND NOT EXISTS (SELECT 1 FROM pages        WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)
@@ -656,7 +664,8 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
     if !names.is_empty() {
         tx.execute(
             "DELETE FROM projects
-             WHERE name NOT IN ('scratch', ?1)
+             WHERE name NOT IN ('scratch', ?1, '_profile')
+               AND name NOT LIKE '\\_profile.%' ESCAPE '\\'
                AND created_at < ?2
                AND NOT EXISTS (SELECT 1 FROM pages        WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)

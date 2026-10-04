@@ -25,6 +25,7 @@ mod maintenance;
 mod migrations;
 mod ops;
 pub mod password;
+mod profile;
 mod project_authz;
 mod reader;
 mod retrieval_tuning;
@@ -67,6 +68,7 @@ pub use ops::{
     StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
+pub use profile::{PROFILE_ENTRIES_LIMIT, ProfileDigestInputs, ProfileOptOut, ProjectProfileFlags};
 pub use project_authz::{
     AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
     RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
@@ -86,11 +88,12 @@ pub use reader::{
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
-    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, ScopeSource,
-    WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for, create_explicit_scope,
-    create_explicit_scope_guarded, create_global_scope, lookup_existing_scope,
-    lookup_existing_scope_guarded, lookup_existing_workspace, lookup_global_scope,
-    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
+    PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver,
+    ScopeSource, WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for, create_explicit_scope,
+    create_explicit_scope_guarded, create_global_scope, create_profile_scope,
+    lookup_existing_scope, lookup_existing_scope_guarded, lookup_existing_workspace,
+    lookup_global_scope, lookup_profile_scope, resolve_many_existing_scopes,
+    resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{

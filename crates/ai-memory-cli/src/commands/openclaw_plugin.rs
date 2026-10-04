@@ -241,6 +241,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     const defaultGlobal = tomlFlag(body, "default_global");
     const briefing = tomlFlag(body, "inject_on_session_start");
     const briefingBudget = tomlFlag(body, "max_chars");
+    const profileContribute = tomlFlag(body, "contribute");
+    const profileConsume = tomlFlag(body, "consume");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     // `project_src` tells the server a marker rescope from a host-derived
@@ -251,6 +253,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
     if (briefing) url.searchParams.set("briefing", briefing);
     if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+    if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
+    if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
       if (repoProject) {
@@ -273,6 +277,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
+  let profileContribute: string | undefined;
+  let profileConsume: string | undefined;
   const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
@@ -284,6 +290,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
       defaultGlobal = tomlFlag(body, "default_global");
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
+      profileContribute = tomlFlag(body, "contribute");
+      profileConsume = tomlFlag(body, "consume");
     } catch (_e) {
     }
   }
@@ -306,6 +314,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
   if (briefing) url.searchParams.set("briefing", briefing);
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+  if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
+  if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
 }"#;
     format!(
         "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{find_settings_marker}\n{body}",
@@ -658,6 +668,8 @@ mod tests {
         assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
+        assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));

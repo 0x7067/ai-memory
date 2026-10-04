@@ -325,6 +325,8 @@ function Get-AiMemoryMarkerQuery {
     $projSrc = $null
     $explicitIdentity = $null
     $identityStyle = $null
+    $profileContribute = $null
+    $profileConsume = $null
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
@@ -333,6 +335,10 @@ function Get-AiMemoryMarkerQuery {
         $dropSubagent = Get-AiMemoryTomlKey -File $marker -Key "drop_subagent_captures"
         $explicitIdentity = Get-AiMemoryTomlKey -File $marker -Key "identity"
         $identityStyle = Get-AiMemoryTomlKey -File $marker -Key "identity_style"
+        # `[profile] contribute` / `consume`, quoted or bare; the server
+        # decides truthiness and keeps both on unless explicitly falsy.
+        $profileContribute = Get-AiMemoryTomlFlag -File $marker -Key "contribute"
+        $profileConsume = Get-AiMemoryTomlFlag -File $marker -Key "consume"
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
@@ -358,6 +364,8 @@ function Get-AiMemoryMarkerQuery {
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     if ($dropSubagent) { $qs += "&drop_subagent=$([uri]::EscapeDataString($dropSubagent))" }
+    if ($profileContribute) { $qs += "&profile_contribute=$([uri]::EscapeDataString($profileContribute))" }
+    if ($profileConsume) { $qs += "&profile_consume=$([uri]::EscapeDataString($profileConsume))" }
     return $qs
 }
 
@@ -594,7 +602,21 @@ function Invoke-AiMemoryHook {
         # supplies one; otherwise use a stable hash of agent+cwd.
         $BriefQS = ""
         $BriefFile = $null
+        $ProfileFile = $null
+        $ProfileQS = ""
         if ($BriefingOncePerSession) {
+            # The cross-project profile digest rides the first prompt only,
+            # like the brief, but is not tied to the [briefing] opt-in.
+            $ProfileKey = [string]$NativeSessionId
+            if (-not $ProfileKey) {
+                $ProfileSha = [System.Security.Cryptography.SHA256]::Create()
+                $ProfileBytes = $ProfileSha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$Agent`n$Cwd"))
+                $ProfileKey = (($ProfileBytes | ForEach-Object { $_.ToString("x2") }) -join "")
+            }
+            $ProfileFile = Get-AiMemoryBriefedFile -Key "profile-$ProfileKey"
+            if (Test-Path $ProfileFile -PathType Leaf) {
+                $ProfileQS = "&profile_digest=0"
+            }
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
             if ($BriefQS) {
                 $BriefKey = [string]$NativeSessionId
@@ -621,7 +643,7 @@ function Invoke-AiMemoryHook {
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
                 if ($GrokPostTool) {
@@ -660,6 +682,9 @@ function Invoke-AiMemoryHook {
         # anyway, and the one lost brief returns on the next session).
         if ($BriefFile) {
             Set-AiMemoryBriefed -Path $BriefFile
+        }
+        if ($ProfileFile) {
+            Set-AiMemoryBriefed -Path $ProfileFile
         }
     } elseif ($AntigravityPreInvocationOutput) {
         [Console]::Out.Write("{}")

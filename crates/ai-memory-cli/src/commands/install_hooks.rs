@@ -3879,7 +3879,7 @@ pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(te
     if (tomlKey(text, key) !== undefined) return true;
   }
   if (/^\s*server\s*=/m.test(text)) return true;
-  for (const key of ["default_global", "inject_on_session_start", "max_chars"]) {
+  for (const key of ["default_global", "inject_on_session_start", "max_chars", "contribute", "consume"]) {
     if (tomlFlag(text, key) !== undefined) return true;
   }
   return false;
@@ -3953,6 +3953,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const defaultGlobal = tomlFlag(body, "default_global");
     const briefing = tomlFlag(body, "inject_on_session_start");
     const briefingBudget = tomlFlag(body, "max_chars");
+    const profileContribute = tomlFlag(body, "contribute");
+    const profileConsume = tomlFlag(body, "consume");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
@@ -3960,6 +3962,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
     if (briefing) url.searchParams.set("briefing", briefing);
     if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+    if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
+    if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
       if (repoProject) url.searchParams.set("project", repoProject);
@@ -3981,6 +3985,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
+  let profileContribute: string | undefined;
+  let profileConsume: string | undefined;
   let explicitIdentity: string | undefined;
   let identityStyle: string | undefined;
   const marker = findSettingsMarker(cwd);
@@ -3994,6 +4000,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       defaultGlobal = tomlFlag(body, "default_global");
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
+      profileContribute = tomlFlag(body, "contribute");
+      profileConsume = tomlFlag(body, "consume");
       explicitIdentity = tomlKey(body, "identity");
       identityStyle = tomlKey(body, "identity_style");
     } catch (_e) {
@@ -4013,6 +4021,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
   if (briefing) url.searchParams.set("briefing", briefing);
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
+  if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
+  if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
 }"#;
     format!(
         "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{TS_IDENTITY}\n{body}",
@@ -9529,6 +9539,9 @@ model = "gpt-5"
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        assert!(plugin.contains("tomlFlag(body, \"contribute\")"));
+        assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
+        assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         // #668: applyMarkerParams resolves scope/settings via the
         // settings-walk, not the nearest-marker findMarker, so a nested
         // capture-only marker does not shadow an outer marker's scope.
@@ -9539,7 +9552,7 @@ model = "gpt-5"
             "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\", \"identity\", \"identity_style\"])"
         ));
         assert!(plugin.contains(
-            "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\"])"
+            "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\", \"contribute\", \"consume\"])"
         ));
         assert!(
             plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")

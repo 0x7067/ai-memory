@@ -189,7 +189,8 @@ fn find_marker_matching<T>(
 /// section: any root-level scope key (`workspace`/`project`/
 /// `project_strategy`), or any of the other settings
 /// `hook_capture::marker_query_suffix_impl` forwards (`[recall]
-/// default_global`, `[briefing]` keys, top-level `drop_subagent_captures`).
+/// default_global`, `[briefing]` and `[profile]` keys, top-level
+/// `drop_subagent_captures`).
 /// A marker with any of these is a resolution boundary; only a marker whose
 /// only content is `[capture]` (e.g. `ignore_paths`) is transparent (#668).
 ///
@@ -206,7 +207,13 @@ fn declares_more_than_capture(text: &str) -> bool {
         "identity",
         "identity_style",
     ];
-    const FLAG_KEYS: [&str; 3] = ["default_global", "inject_on_session_start", "max_chars"];
+    const FLAG_KEYS: [&str; 5] = [
+        "default_global",
+        "inject_on_session_start",
+        "max_chars",
+        "contribute",
+        "consume",
+    ];
     QUOTED_KEYS
         .iter()
         .any(|key| parse_key_in(text, key).is_some())

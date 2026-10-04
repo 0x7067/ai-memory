@@ -557,6 +557,14 @@ pub struct Config {
     /// Session-start handoff delivery (design: #959). Default keeps today's
     /// automatic-claim behavior unchanged.
     pub handoff: HandoffSettings,
+    /// `[profile]` — the cross-project profile: how this user usually works,
+    /// delivered to every project as defaults below the repository's rules
+    /// file (`docs/design-cross-project-profile.md`,
+    /// `docs/cross-project-profile.md`). `enabled = "auto"` (the default)
+    /// turns it on for a single-operator server, shared across every
+    /// workspace, and leaves it off for a multi-user one. Settable via
+    /// `AI_MEMORY_PROFILE__<KEY>` (for example `AI_MEMORY_PROFILE__SHARE`).
+    pub profile: ai_memory_core::profile::ProfileSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
     pub sanitize: ai_memory_core::SanitizeConfig,
@@ -1001,6 +1009,7 @@ impl Default for Config {
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             handoff: HandoffSettings::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
@@ -3941,6 +3950,51 @@ mod tests {
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    #[test]
+    fn profile_defaults_are_auto_and_parse_from_file_and_env() {
+        use ai_memory_core::profile::{EffectiveProfileShare, ProfileEnabled, ProfileShare};
+        let defaults = Config::default().profile;
+        assert_eq!(defaults.enabled, ProfileEnabled::Auto);
+        assert_eq!(defaults.share, ProfileShare::Auto);
+        assert!(defaults.inject_on_session_start);
+        assert_eq!(
+            defaults.effective_share(false),
+            Some(EffectiveProfileShare::Global)
+        );
+        assert_eq!(defaults.effective_share(true), None);
+
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[profile]\nenabled = true\nshare = \"workspace\"\nmin_projects = 3\n\
+             inject_on_session_start = false\ndigest_max_bytes = 4000\n\
+             baseline_max_bytes = 8000\napply_max_lines = 20\nllm = false\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.profile.enabled, ProfileEnabled::On);
+        assert_eq!(cfg.profile.share, ProfileShare::Workspace);
+        assert_eq!(cfg.profile.min_projects, 3);
+        assert!(!cfg.profile.inject_on_session_start);
+        assert_eq!(cfg.profile.digest_max_bytes, 4_000);
+        assert_eq!(cfg.profile.baseline_max_bytes, 8_000);
+        assert_eq!(cfg.profile.apply_max_lines, 20);
+        assert!(!cfg.profile.llm);
+        assert_eq!(
+            cfg.profile.effective_share(true),
+            Some(EffectiveProfileShare::Workspace)
+        );
+
+        std::fs::write(
+            &cfg_path,
+            "[profile]\nenabled = \"auto\"\nshare = \"off\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.profile.effective_share(false), None);
     }
 
     #[test]

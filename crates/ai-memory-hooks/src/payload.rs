@@ -257,6 +257,16 @@ pub(crate) fn query_flag_truthy(value: Option<&str>) -> bool {
     )
 }
 
+/// Whether a forwarded flag was explicitly turned off (`0` / `false` / `no` /
+/// `off`, any case). An absent flag is not falsy: settings that default on,
+/// like `[profile] contribute`, stay on unless a marker says otherwise.
+pub(crate) fn query_flag_falsy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
 /// How the hook router derives a project name when no explicit
 /// `project` override is present.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]

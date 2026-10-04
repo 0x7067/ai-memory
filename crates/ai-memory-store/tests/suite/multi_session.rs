@@ -2327,3 +2327,128 @@ async fn native_identity_store_history_projects_unknown_without_rewriting() {
         "vendor-界-01"
     );
 }
+
+/// The cross-project profile under invariant #16: two harnesses of one
+/// operator (or that operator's two machines) resolving the private profile
+/// at the same moment converge on one project, never two, and an entry either
+/// writes is the other's to read. A second operator resolves elsewhere and
+/// cannot open the first one's profile, while knowledge in an ordinary shared
+/// project stays shared between them.
+#[tokio::test]
+async fn two_harnesses_of_one_operator_share_one_private_profile() {
+    use ai_memory_core::profile::{EffectiveProfileShare, user_profile_project};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let new_user = |name: &str| NewUser {
+        username: name.into(),
+        name: None,
+        email: None,
+    };
+    let alice = store
+        .writer
+        .create_human_user(new_user("alice"), UserRole::User, None, false)
+        .await
+        .unwrap();
+    let bob = store
+        .writer
+        .create_human_user(new_user("bob"), UserRole::User, None, false)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+
+    let resolve = || {
+        ai_memory_store::create_profile_scope(
+            &store.reader,
+            &store.writer,
+            EffectiveProfileShare::User,
+            ws,
+            Some(alice),
+        )
+    };
+    let (claude, codex) = tokio::join!(resolve(), resolve());
+    let (claude, codex) = (claude.unwrap(), codex.unwrap());
+    assert_eq!(claude, codex, "two harnesses must not split one profile");
+
+    store
+        .writer
+        .upsert_page(page(
+            claude.workspace_id,
+            claude.project_id,
+            "profile/tools/pnpm.md",
+            "Pnpm",
+            "Use pnpm, not npm.",
+        ))
+        .await
+        .unwrap();
+    let seen_by_codex = ai_memory_store::lookup_profile_scope(
+        &store.reader,
+        EffectiveProfileShare::User,
+        ws,
+        Some(alice),
+    )
+    .await
+    .unwrap()
+    .expect("the other harness finds the same profile");
+    let entries = store
+        .reader
+        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].statement, "Use pnpm, not npm.");
+
+    assert_eq!(
+        ai_memory_store::lookup_profile_scope(
+            &store.reader,
+            EffectiveProfileShare::User,
+            ws,
+            Some(bob),
+        )
+        .await
+        .unwrap(),
+        None,
+        "bob resolves to his own profile, not alice's"
+    );
+    let refused = ai_memory_store::lookup_existing_scope_guarded(
+        &store.reader,
+        "default",
+        &user_profile_project(alice),
+        Some(bob),
+        ai_memory_store::ProjectAccess::Read,
+    )
+    .await;
+    assert!(refused.is_err(), "bob cannot open alice's private profile");
+
+    // Control: the profile being private changes nothing about shared pages.
+    let (shared_ws, shared_proj) = scope(&store).await;
+    store
+        .writer
+        .upsert_page(page(
+            shared_ws,
+            shared_proj,
+            "notes/db.md",
+            "Db",
+            "Postgres 17.",
+        ))
+        .await
+        .unwrap();
+    for viewer in [alice, bob] {
+        let read = store
+            .reader
+            .authorize_project(
+                shared_ws,
+                shared_proj,
+                ai_memory_store::ProjectPrincipal::user(viewer),
+                true,
+                ai_memory_store::ProjectAccess::Read,
+            )
+            .await
+            .unwrap();
+        assert!(read.is_ok(), "an open project stays shared");
+    }
+}

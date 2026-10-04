@@ -78,6 +78,11 @@ pub(crate) enum WriteCmd {
         mode: crate::AccessMode,
         reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
     },
+    SetProjectProfileFlags {
+        project_id: ProjectId,
+        flags: crate::ProjectProfileFlags,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     ResolveProjectByIdentity {
         workspace_id: WorkspaceId,
         identity: ai_memory_core::repository_identity::RepositoryIdentity,
@@ -931,6 +936,27 @@ impl WriterHandle {
         self.send(WriteCmd::SetAccessMode {
             project_id,
             mode,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Persist a project's `[profile]` flags (forwarded from its marker at
+    /// session start). A no-op when they already match.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_project_profile_flags(
+        &self,
+        project_id: ProjectId,
+        flags: crate::ProjectProfileFlags,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetProjectProfileFlags {
+            project_id,
+            flags,
             reply: tx,
         })
         .await?;
@@ -3220,6 +3246,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = crate::grants::set_access_mode(&conn, project_id, mode);
                 send_or_warn(reply, result, "set_access_mode");
+            }
+            WriteCmd::SetProjectProfileFlags {
+                project_id,
+                flags,
+                reply,
+            } => {
+                let result = crate::profile::set_project_profile_flags(&conn, project_id, flags);
+                send_or_warn(reply, result, "set_project_profile_flags");
             }
             WriteCmd::Shutdown => break,
             WriteCmd::AuthorizeProject {

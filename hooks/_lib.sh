@@ -83,7 +83,8 @@ ai_memory_parse_toml_flag() {
 # Whether "$1" (a marker file) declares anything beyond a `[capture]`
 # section: any root-level scope key (workspace/project/project_strategy), or
 # any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
-# forward (drop_subagent_captures, default_global, [briefing] keys). Mirrors
+# forward (drop_subagent_captures, default_global, [briefing] and [profile]
+# keys). Mirrors
 # `declares_more_than_capture` in marker.rs. A marker with any of these is a
 # resolution boundary; only a marker whose only content is `[capture]` (e.g.
 # ignore_paths) is scope/settings-transparent (#668).
@@ -94,7 +95,7 @@ ai_memory_marker_declares_settings() {
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
     ai_memory_marker_declares_server "$file" && return 0
-    for key in default_global inject_on_session_start max_chars; do
+    for key in default_global inject_on_session_start max_chars contribute consume; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
     done
     return 1
@@ -472,6 +473,8 @@ ai_memory_marker_qs() {
     ps=""
     idn=""
     isty=""
+    pcon=""
+    pcons=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
     # capture-only marker (e.g. one that only sets ignore_paths) must not
     # shadow an outer marker's workspace/project/etc.
@@ -483,6 +486,10 @@ ai_memory_marker_qs() {
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
         idn=$(ai_memory_parse_toml_key "$marker" identity)
         isty=$(ai_memory_parse_toml_key "$marker" identity_style)
+        # `[profile] contribute` / `consume`, quoted or bare; the server
+        # decides truthiness and keeps both on unless explicitly falsy.
+        pcon=$(ai_memory_parse_toml_flag "$marker" contribute)
+        pcons=$(ai_memory_parse_toml_flag "$marker" consume)
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
@@ -516,6 +523,8 @@ ai_memory_marker_qs() {
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     [ -n "$ds" ] && qs="${qs}&drop_subagent=$(ai_memory_url_encode "$ds")"
+    [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
+    [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
     qs="${qs}$(ai_memory_managed_qs)"
     printf '%s' "$qs"
 }

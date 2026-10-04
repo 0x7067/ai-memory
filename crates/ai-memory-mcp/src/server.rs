@@ -541,6 +541,10 @@ pub struct AiMemoryServer {
     /// default, and every deployment that never sets the flag — means a nested
     /// slot path is an ordinary shared page, so both stay exactly as they were.
     per_user_slots: bool,
+    /// `[profile]`: the cross-project profile. Decides which scope
+    /// `scope: "profile"` writes and deletes target and whether a query unions
+    /// a workspace or private profile (`docs/design-cross-project-profile.md`).
+    profile: ai_memory_core::profile::ProfileSettings,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -1562,6 +1566,11 @@ struct DeletePageArgs {
     /// Missing explicit sibling scope fails closed instead of falling back.
     #[serde(default)]
     workspace: Option<String>,
+    /// Set to `"profile"` to delete an entry of your cross-project profile
+    /// (`path` is taken under `profile/`). Cannot be combined with
+    /// `workspace`/`project`.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Write one durable wiki page. Optional metadata (`kind`, `entities`,
@@ -1730,6 +1739,7 @@ impl AiMemoryServer {
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxy_identity: false,
             per_user_slots: false,
+            profile: ai_memory_core::profile::ProfileSettings::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -1749,6 +1759,13 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_trusted_proxy_identity(mut self, enabled: bool) -> Self {
         self.trusted_proxy_identity = enabled;
+        self
+    }
+
+    /// Configure the cross-project profile (`[profile]`).
+    #[must_use]
+    pub fn with_profile(mut self, profile: ai_memory_core::profile::ProfileSettings) -> Self {
+        self.profile = profile;
         self
     }
 
@@ -2858,6 +2875,76 @@ impl AiMemoryServer {
         } else {
             Vec::new()
         };
+        // The cross-project profile rides the same union. A `global` profile
+        // already lives in `_global` (its `profile/` pages are in the hits
+        // above); a workspace or private profile is one more scoped search.
+        // `[profile] consume = false` in the project's marker keeps the
+        // profile out entirely. The profile is context, so a failure to
+        // resolve it degrades to no profile hits rather than failing the query.
+        let mut global_scope_hits = global_scope_hits;
+        if single_project_scoped {
+            let viewer = Self::viewer_from_parts(Some(&parts));
+            let current = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                    viewer,
+                )
+                .await?;
+            let consume = self
+                .reader
+                .project_profile_flags(current.0, current.1)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                .consume;
+            if !consume {
+                global_scope_hits.retain(|hit| {
+                    !hit.hit
+                        .path
+                        .as_str()
+                        .starts_with(ai_memory_core::profile::PROFILE_PATH_PREFIX)
+                });
+            } else if let Some(
+                share @ (ai_memory_core::profile::EffectiveProfileShare::Workspace
+                | ai_memory_core::profile::EffectiveProfileShare::User),
+            ) = self.profile_share().await?
+            {
+                match ai_memory_store::lookup_profile_scope(&self.reader, share, current.0, viewer)
+                    .await
+                {
+                    Ok(Some(scope)) if scope.as_tuple() != current => {
+                        let hits = self
+                            .search_project(
+                                scope.workspace_id,
+                                scope.project_id,
+                                ProjectSearchOptions {
+                                    query: &args.query,
+                                    query_vec: query_vec.as_deref(),
+                                    limit,
+                                    include_expired,
+                                    explain,
+                                    include_superseded,
+                                },
+                            )
+                            .await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        self.spawn_access_bump(
+                            hits.iter().map(|(h, _)| h.id).collect(),
+                            bump_actor.as_ref(),
+                        );
+                        global_scope_hits.extend(
+                            hits.into_iter()
+                                .map(|(hit, score_details)| QueryHit { hit, score_details }),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not resolve the profile scope; skipping its hits");
+                    }
+                }
+            }
+        }
         let streams_active = explain.then(|| {
             let mut streams = vec!["fts", "entity"];
             if query_vec.is_some() {
@@ -3168,6 +3255,69 @@ impl AiMemoryServer {
         self.reader
             .distinguishes_operators(self.trusted_proxy_identity)
             .await
+    }
+
+    /// Where the cross-project profile lives on this deployment, if it is on.
+    async fn profile_share(
+        &self,
+    ) -> Result<Option<ai_memory_core::profile::EffectiveProfileShare>, McpError> {
+        let distinguishes = self
+            .deployment_distinguishes_operators()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(self.profile.effective_share(distinguishes))
+    }
+
+    /// The profile scope a `scope: "profile"` write or delete targets: the
+    /// caller's profile for the project they are in. `create` makes it on first
+    /// use (a write); a delete only looks it up and then needs write access.
+    async fn profile_target_ids(
+        &self,
+        parts: &axum::http::request::Parts,
+        actor: &ai_memory_core::ActorKey,
+        create: bool,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        let Some(share) = self.profile_share().await? else {
+            return Err(McpError::invalid_params(
+                "the cross-project profile is off on this server: set [profile] enabled \
+                 (and share) in the server config — see docs/cross-project-profile.md",
+                None,
+            ));
+        };
+        let viewer = Self::viewer_from_parts(Some(parts));
+        // Only a workspace profile depends on where the caller is, and only on
+        // the workspace: resolving it needs no access to the caller's current
+        // project, which is not what this request touches.
+        let (current_workspace, _) = self
+            .effective_ids_for_read_args_with_actor(None, None, actor, None)
+            .await?;
+        if create {
+            return ai_memory_store::create_profile_scope(
+                &self.reader,
+                &self.writer,
+                share,
+                current_workspace,
+                viewer,
+            )
+            .await
+            .map(ai_memory_store::ResolvedScope::as_tuple)
+            .map_err(Self::scope_error);
+        }
+        let scope =
+            ai_memory_store::lookup_profile_scope(&self.reader, share, current_workspace, viewer)
+                .await
+                .map_err(Self::scope_error)?
+                .ok_or_else(|| McpError::invalid_params("this caller has no profile yet", None))?;
+        ai_memory_store::authorize_scope_for(
+            &self.reader,
+            Some(&self.writer),
+            scope,
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await
+        .map(ai_memory_store::ResolvedScope::as_tuple)
+        .map_err(Self::scope_error)
     }
 
     /// Which slots this request may see, per `[slots] per_user`.
@@ -4044,6 +4194,11 @@ impl AiMemoryServer {
         path.ensure_portable()
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
+        let path = if args.scope.as_deref().map(str::trim) == Some("profile") {
+            profile_page_path(path)?
+        } else {
+            path
+        };
         let session_page =
             session_id.is_some_and(|id| path.as_str() == format!("sessions/{id}.md"));
         // Consolidation writes the session page as episodic; keep that
@@ -4057,7 +4212,7 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         if session_id.is_some() && args.scope.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             return Err(McpError::invalid_params(
-                "session_id cannot be combined with scope: \"global\"; a session belongs to one project",
+                "session_id cannot be combined with scope; a session belongs to one project",
                 None,
             ));
         }
@@ -4096,9 +4251,28 @@ impl AiMemoryServer {
                 )
                 .await?
             }
+            Some("profile") => {
+                if args
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || args
+                        .project
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                {
+                    return Err(McpError::internal_error(
+                        "scope: \"profile\" cannot be combined with workspace/project",
+                        None,
+                    ));
+                }
+                self.profile_target_ids(&parts, &aps_actor, true).await?
+            }
             Some(other) => {
                 return Err(McpError::internal_error(
-                    format!("unknown scope '{other}': the only supported value is \"global\""),
+                    format!(
+                        "unknown scope '{other}': the supported values are \"global\" and \"profile\""
+                    ),
                     None,
                 ));
             }
@@ -4663,14 +4837,44 @@ impl AiMemoryServer {
         };
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
-        let (ws, proj) = self
-            .effective_ids_for_mutation_args_with_actor(
-                args.workspace.as_deref(),
-                args.project.as_deref(),
-                &aps_actor,
-                Self::viewer_from_parts(Some(&parts)),
-            )
-            .await?;
+        let (path, (ws, proj)) = match args.scope.as_deref().map(str::trim) {
+            None | Some("") => (
+                path,
+                self.effective_ids_for_mutation_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
+                )
+                .await?,
+            ),
+            Some("profile") => {
+                if args
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || args
+                        .project
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                {
+                    return Err(McpError::invalid_params(
+                        "scope: \"profile\" cannot be combined with workspace/project",
+                        None,
+                    ));
+                }
+                (
+                    profile_page_path(path)?,
+                    self.profile_target_ids(&parts, &aps_actor, false).await?,
+                )
+            }
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("unknown scope '{other}': the only supported value is \"profile\""),
+                    None,
+                ));
+            }
+        };
 
         // Carry actor identity + loop-prevention skip list (same as write_page).
         // `Wiki::delete_page` stamps `op = Delete` regardless of what we pass.
@@ -6197,6 +6401,22 @@ impl AiMemoryServer {
 /// its `scopes` list on top of this.
 fn named_scope_args_present(workspace: Option<&str>, project: Option<&str>) -> bool {
     workspace.is_some_and(|s| !s.trim().is_empty()) || project.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// A profile entry's path: under `profile/`, whatever the caller passed.
+fn profile_page_path(path: PagePath) -> Result<PagePath, McpError> {
+    if path
+        .as_str()
+        .starts_with(ai_memory_core::profile::PROFILE_PATH_PREFIX)
+    {
+        return Ok(path);
+    }
+    PagePath::new(format!(
+        "{}{}",
+        ai_memory_core::profile::PROFILE_PATH_PREFIX,
+        path.as_str()
+    ))
+    .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))
 }
 
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
@@ -13054,6 +13274,7 @@ mod tests {
         let err = server
             .memory_delete_page(
                 Parameters(DeletePageArgs {
+                    scope: None,
                     path: "notes/keep.md".into(),
                     project: None,
                     workspace: None,
@@ -13174,6 +13395,7 @@ mod tests {
         server
             .memory_delete_page(
                 Parameters(DeletePageArgs {
+                    scope: None,
                     path: "notes/mine.md".into(),
                     project: None,
                     workspace: None,
@@ -13327,6 +13549,7 @@ mod tests {
         server
             .memory_delete_page(
                 Parameters(DeletePageArgs {
+                    scope: None,
                     path: "preferences.md".into(),
                     project: Some("_global".into()),
                     workspace: Some("default".into()),
@@ -13412,6 +13635,333 @@ mod tests {
             .filter_map(|hit| hit["path"].as_str())
             .collect();
         assert!(paths.contains(&"preferences.md"), "{value}");
+    }
+
+    // ---- cross-project profile (docs/design-cross-project-profile.md) ----
+
+    fn profile_on(
+        share: ai_memory_core::profile::ProfileShare,
+    ) -> ai_memory_core::profile::ProfileSettings {
+        ai_memory_core::profile::ProfileSettings {
+            enabled: ai_memory_core::profile::ProfileEnabled::On,
+            share,
+            ..ai_memory_core::profile::ProfileSettings::default()
+        }
+    }
+
+    fn profile_entry(path: &str, scope: Option<&str>) -> WritePageArgs {
+        WritePageArgs {
+            path: path.into(),
+            body: "# Pnpm\n\nprofileverify use pnpm, not npm.".into(),
+            title: None,
+            tier: Some("semantic".into()),
+            tags: vec![],
+            pinned: false,
+            project: None,
+            workspace: None,
+            scope: scope.map(str::to_owned),
+            expires_at: None,
+            session_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    fn query_in(project: &str, query: &str) -> QueryArgs {
+        QueryArgs {
+            query: query.into(),
+            limit: Some(10),
+            project: Some(project.into()),
+            scopes: Vec::new(),
+            workspace: Some("default".into()),
+            global: None,
+            include_expired: None,
+            include_superseded: None,
+            pin_first: None,
+            explain: None,
+            as_of: None,
+            answer: None,
+            reasoning: None,
+        }
+    }
+
+    fn global_hit_paths(result: &CallToolResult) -> Vec<String> {
+        tool_json(result)["global_scope_hits"]
+            .as_array()
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|hit| hit["path"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Multi-user, profile enabled (`share` auto → one private profile per
+    /// operator). Adversarial: maria can neither see joao's profile through
+    /// her query union nor read, write or delete it by naming its project.
+    /// Controls: joao's entry reaches joao's own queries, maria gets a profile
+    /// of her own, and root (no database user) has none to write into.
+    #[tokio::test]
+    async fn a_private_profile_is_private_to_its_operator() {
+        let tmp = TempDir::new().unwrap();
+        let (store, server, joao, maria) = global_gate_fixture(&tmp).await;
+        let server = server.with_profile(profile_on(ai_memory_core::profile::ProfileShare::Auto));
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+        let joaos = ai_memory_core::profile::user_profile_project(joao);
+
+        let written = server
+            .memory_write_page(
+                Parameters(profile_entry("tools/pnpm.md", Some("profile"))),
+                OptionalParts(parts_as_user(joao)),
+            )
+            .await
+            .expect("joao writes his profile");
+        assert_eq!(tool_json(&written)["path"], "profile/tools/pnpm.md");
+
+        let joao_view = server
+            .memory_query(
+                Parameters(query_in("acme-app", "profileverify")),
+                OptionalParts(parts_as_user(joao)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            global_hit_paths(&joao_view).contains(&"profile/tools/pnpm.md".to_owned()),
+            "joao's own profile reaches his queries"
+        );
+
+        let maria_view = server
+            .memory_query(
+                Parameters(query_in("shared", "profileverify")),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            global_hit_paths(&maria_view).is_empty(),
+            "joao's profile must not reach maria's union: {:?}",
+            global_hit_paths(&maria_view)
+        );
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("profile/tools/pnpm.md".into()),
+                    query: None,
+                    project: Some(joaos.clone()),
+                    workspace: Some("default".into()),
+                }),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect_err("maria cannot read joao's profile by name");
+        let mut forged = profile_entry("profile/tools/npm.md", None);
+        forged.workspace = Some("default".into());
+        forged.project = Some(joaos.clone());
+        server
+            .memory_write_page(Parameters(forged), OptionalParts(parts_as_user(maria)))
+            .await
+            .expect_err("maria cannot write into joao's profile");
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "profile/tools/pnpm.md".into(),
+                    project: Some(joaos.clone()),
+                    workspace: Some("default".into()),
+                }),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect_err("maria cannot delete from joao's profile");
+
+        let hers = server
+            .memory_write_page(
+                Parameters(profile_entry("tools/bun.md", Some("profile"))),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect("maria writes a profile of her own");
+        assert_eq!(tool_json(&hers)["path"], "profile/tools/bun.md");
+        server
+            .memory_write_page(
+                Parameters(profile_entry("tools/root.md", Some("profile"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("root has no private profile to write into");
+
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: Some("profile".into()),
+                    path: "tools/pnpm.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_user(joao)),
+            )
+            .await
+            .expect("joao deletes his own entry");
+    }
+
+    /// Multi-user with a workspace profile: it is unioned into everybody's
+    /// reads, so it is write-gated like `_global` — refused without a grant,
+    /// admitted for root and for a write grant — and stays readable.
+    #[tokio::test]
+    async fn a_workspace_profile_is_write_gated_and_read_open() {
+        let tmp = TempDir::new().unwrap();
+        let (store, server, joao, maria) = global_gate_fixture(&tmp).await;
+        let server =
+            server.with_profile(profile_on(ai_memory_core::profile::ProfileShare::Workspace));
+
+        let err = server
+            .memory_write_page(
+                Parameters(profile_entry("tools/pnpm.md", Some("profile"))),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect_err("maria holds no grant on the workspace profile");
+        assert!(
+            err.message.contains("not authorized for _profile"),
+            "{}",
+            err.message
+        );
+
+        server
+            .memory_write_page(
+                Parameters(profile_entry("tools/pnpm.md", Some("profile"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("root writes the workspace profile");
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let profile = store
+            .writer
+            .get_or_create_project(ws, "_profile", None)
+            .await
+            .unwrap();
+        grant_writer(store.db_path(), maria, profile);
+        server
+            .memory_write_page(
+                Parameters(profile_entry("tools/bun.md", Some("profile"))),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect("a write grant on _profile admits maria");
+
+        let view = server
+            .memory_query(
+                Parameters(query_in("acme-app", "profileverify")),
+                OptionalParts(parts_as_user(joao)),
+            )
+            .await
+            .unwrap();
+        let paths = global_hit_paths(&view);
+        assert!(
+            paths.contains(&"profile/tools/pnpm.md".to_owned()),
+            "{paths:?}"
+        );
+    }
+
+    /// Single-user default: `scope: "profile"` writes under `profile/` in
+    /// `_global`, every project's query sees it, and a project whose marker
+    /// set `[profile] consume = false` gets the rest of `_global` without the
+    /// profile. With the profile off, `scope: "profile"` is refused.
+    #[tokio::test]
+    async fn the_single_user_profile_lives_in_global_and_honours_consume() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let app = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, app)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(
+                Parameters(profile_entry("tools/pnpm.md", Some("profile"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("the default profile is on for a single operator");
+        let mut other = profile_entry("notes/standing.md", Some("global"));
+        other.body = "# Standing\n\nprofileverify a global note".into();
+        server
+            .memory_write_page(Parameters(other), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+
+        let view = server
+            .memory_query(
+                Parameters(query_in("app", "profileverify")),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let paths = global_hit_paths(&view);
+        assert!(
+            paths.contains(&"profile/tools/pnpm.md".to_owned()),
+            "{paths:?}"
+        );
+        assert!(paths.contains(&"notes/standing.md".to_owned()), "{paths:?}");
+
+        store
+            .writer
+            .set_project_profile_flags(
+                app,
+                ai_memory_store::ProjectProfileFlags {
+                    contribute: true,
+                    consume: false,
+                },
+            )
+            .await
+            .unwrap();
+        let view = server
+            .memory_query(
+                Parameters(query_in("app", "profileverify")),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let paths = global_hit_paths(&view);
+        assert!(
+            !paths.contains(&"profile/tools/pnpm.md".to_owned()),
+            "{paths:?}"
+        );
+        assert!(paths.contains(&"notes/standing.md".to_owned()), "{paths:?}");
+
+        let off = server.with_profile(ai_memory_core::profile::ProfileSettings {
+            enabled: ai_memory_core::profile::ProfileEnabled::Off,
+            ..ai_memory_core::profile::ProfileSettings::default()
+        });
+        off.memory_write_page(
+            Parameters(profile_entry("tools/x.md", Some("profile"))),
+            OptionalParts(test_parts_default()),
+        )
+        .await
+        .expect_err("scope: profile is refused while the profile is off");
     }
 
     /// The finding that started #708, as a test.
@@ -14170,6 +14720,7 @@ mod tests {
         server
             .memory_delete_page(
                 Parameters(DeletePageArgs {
+                    scope: None,
                     path: "notes/temp.md".into(),
                     project: None,
                     workspace: None,
@@ -14263,6 +14814,7 @@ mod tests {
         let err = server
             .memory_delete_page(
                 Parameters(DeletePageArgs {
+                    scope: None,
                     path: "notes/keep.md".into(),
                     project: Some("typo".into()),
                     workspace: None,
@@ -14381,6 +14933,7 @@ mod tests {
         server
             .memory_delete_page(
                 Parameters(DeletePageArgs {
+                    scope: None,
                     path: "notes/twin.md".into(),
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),

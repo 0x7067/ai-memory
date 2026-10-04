@@ -17,10 +17,10 @@
 //!   where there is no notion of "another user" to gate against, and
 //! - any `open` project.
 //!
-//! ## The reserved global scope is read-open, write-gated
+//! ## The reserved shared scopes are read-open, write-gated
 //!
-//! `default/_global` stays `open` because its pages are unioned into every
-//! project's reads. Writing it therefore reaches every other user's results,
+//! `default/_global` and a workspace's `_profile` stay `open` because their
+//! pages are unioned into every project's reads. Writing it therefore reaches every other user's results,
 //! so on a deployment that distinguishes operators a write needs root or an
 //! explicit `write` grant on it, whatever its access mode. Creating it first
 //! grants nothing: the first writer must not become a permanent one.
@@ -187,7 +187,8 @@ pub struct ProjectAuthz {
     pub is_creator: bool,
     /// The caller's grant on the project, if any.
     pub grant: Option<GrantLevel>,
-    /// The project is the reserved global scope (`default/_global`).
+    /// The project is a shared reserved scope: the global preferences scope
+    /// (`default/_global`) or a workspace profile (`<workspace>/_profile`).
     pub reserved_global: bool,
 }
 
@@ -331,9 +332,13 @@ fn read_project_row_strict(
     })
 }
 
+/// The shared reserved scopes every project's reads union in: the global
+/// preferences scope, and a workspace's `_profile`. A private profile is not
+/// one of them; it is restricted to its creator instead.
 fn is_reserved_global(workspace: &str, project: &str) -> bool {
-    workspace == ai_memory_core::DEFAULT_WORKSPACE_NAME
-        && project == ai_memory_core::GLOBAL_SCOPE_PROJECT
+    (workspace == ai_memory_core::DEFAULT_WORKSPACE_NAME
+        && project == ai_memory_core::GLOBAL_SCOPE_PROJECT)
+        || project == ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT
 }
 
 /// Look up a caller's grant on a project. Returns the failure so the caller can

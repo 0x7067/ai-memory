@@ -187,6 +187,17 @@ fn briefed_marker_path(
     data_dir.join("briefed").join(key)
 }
 
+/// The once-per-session profile-digest marker beside a brief marker: same
+/// key, `profile-` prefix, so the two gates never share a file. The shell and
+/// PowerShell hooks name it the same way.
+fn profile_digest_marker_path(brief_marker: PathBuf) -> PathBuf {
+    let name = brief_marker
+        .file_name()
+        .map(|name| format!("profile-{}", name.to_string_lossy()))
+        .unwrap_or_else(|| "profile-".to_owned());
+    brief_marker.with_file_name(name)
+}
+
 fn sanitize_briefed_key(raw: &str) -> String {
     raw.chars()
         .map(|c| {
@@ -990,6 +1001,19 @@ where
                     policy_cwd.as_deref(),
                 )
             });
+        // The profile digest rides the first prompt the same way, gated on its
+        // own marker because it is on by default rather than an opt-in.
+        let profile_path = profile_digest_marker_path(briefed_marker_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        ));
+        let profile_qs = if profile_path.is_file() {
+            "&profile_digest=0"
+        } else {
+            ""
+        };
         let handoff_qs = if briefed_path.as_ref().is_some_and(|path| path.is_file()) {
             policy_cwd
                 .as_deref()
@@ -1004,7 +1028,7 @@ where
             qs.clone()
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
             args.agent
         );
         let handoff =
@@ -1017,6 +1041,7 @@ where
         if let Some(path) = briefed_path.as_deref() {
             mark_briefed(path);
         }
+        mark_briefed(&profile_path);
         if let Some(handoff) = handoff {
             writeln!(stdout, "{handoff}")?;
         }
@@ -4197,7 +4222,42 @@ mod tests {
         let request = first_request(&mut requests).await.unwrap();
         assert!(request.starts_with("GET /handoff?"), "{request}");
         assert!(!request.contains("briefing"), "{request}");
-        assert!(!data_dir.join("briefed").exists());
+        // Only the profile digest's own gate is written; no brief marker.
+        let markers: Vec<String> = std::fs::read_dir(data_dir.join("briefed"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(markers, vec!["profile-session_abc".to_owned()]);
+    }
+
+    /// Kimi re-fetches on every prompt, so the profile digest rides the first
+    /// prompt only: later prompts of the session send `profile_digest=0`.
+    #[tokio::test]
+    async fn kimi_delivers_the_profile_digest_on_the_first_prompt_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let prompt = || {
+            serde_json::json!({ "session_id": "session_k", "cwd": cwd, "prompt": "hi" }).to_string()
+        };
+        for _ in 0..2 {
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                kimi_hook_args("user-prompt-submit", &base),
+                prompt(),
+                &mut stdout,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        }
+        let first = first_request(&mut requests).await.unwrap();
+        let second = first_request(&mut requests).await.unwrap();
+        assert!(!first.contains("profile_digest"), "{first}");
+        assert!(second.contains("&profile_digest=0"), "{second}");
     }
 
     #[tokio::test]

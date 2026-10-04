@@ -461,6 +461,7 @@ fn marker_query_suffix_impl(
     let scope = hook_scope_from_marker(cwd, default_strategy, marker.as_deref());
     let (mut drop_subagent, mut default_global) = (None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
+    let (mut profile_contribute, mut profile_consume) = (None, None);
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
@@ -474,6 +475,10 @@ fn marker_query_suffix_impl(
         // appended to the session-start handoff fetch (#176).
         briefing = parse_toml_flag(&marker, "inject_on_session_start");
         briefing_budget = parse_toml_flag(&marker, "max_chars");
+        // `[profile] contribute` / `consume` (quoted or bare). The server
+        // keeps both on unless the value is explicitly falsy.
+        profile_contribute = parse_toml_flag(&marker, "contribute");
+        profile_consume = parse_toml_flag(&marker, "consume");
     }
     if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
@@ -508,6 +513,15 @@ fn marker_query_suffix_impl(
     // tools search globally. Truthiness is decided server-side.
     if let Some(val) = default_global.filter(|v| !v.is_empty()) {
         qs.push_str(&format!("&default_global={}", url_encode(&val)));
+    }
+    // Per-project `[profile]` settings: the server records `contribute` on the
+    // project for harvesting, and `consume = false` suppresses the digest and
+    // the profile union for this project.
+    if let Some(val) = profile_contribute.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&profile_contribute={}", url_encode(&val)));
+    }
+    if let Some(val) = profile_consume.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&profile_consume={}", url_encode(&val)));
     }
     // Per-repo session-start brief opt-in: forwarded on every request for
     // simplicity (the capture path ignores it); only the `/handoff` GET at
@@ -1267,6 +1281,35 @@ drop_subagent_captures = "true"
         assert!(qs.contains("&project=infra"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
         assert!(qs.contains("&drop_subagent=true"), "{qs}");
+    }
+
+    /// `[profile] contribute` / `consume` are forwarded as written (quoted or
+    /// bare) for the server to interpret, and a marker that sets only them is
+    /// a settings boundary; a marker without them forwards nothing.
+    #[test]
+    fn marker_query_suffix_forwards_the_profile_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"outer\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join(".ai-memory.toml"),
+            "[profile]\ncontribute = false\nconsume = \"no\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(qs.contains("&profile_contribute=false"), "{qs}");
+        assert!(qs.contains("&profile_consume=no"), "{qs}");
+        assert!(
+            !qs.contains("workspace=outer"),
+            "a [profile] marker is a boundary: {qs}"
+        );
+        let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!outer.contains("profile_"), "{outer}");
     }
 
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so

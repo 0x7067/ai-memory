@@ -625,7 +625,7 @@ purge-session               compact              api-key
 export-okf                  message              doctor
 backfill                    project              reclaim-ledger-versions
 repair-backfill-timestamps  server               backup-agents
-restore-agents
+restore-agents              profile
 ```
 
 Run `ai-memory --help` for the full tree.

@@ -346,6 +346,10 @@ pub enum Command {
     /// or `restricted` (root and grant holders) (#708). Requires the root
     /// bearer token.
     Project(ProjectArgs),
+    /// Inspect and curate the cross-project profile: how you usually work,
+    /// delivered to every project as defaults below the repository's rules
+    /// file. Requires the root bearer token on a multi-user server.
+    Profile(ProfileArgs),
     /// Manage local server profiles, which a repository's `.ai-memory.toml`
     /// selects with `server = "<name>"` to route its hook capture to a
     /// different ai-memory server.
@@ -910,6 +914,49 @@ pub enum ProjectCommand {
     Access(ProjectAccessArgs),
     /// List who holds a grant on one project.
     Grants(ProjectGrantsArgs),
+}
+
+/// Arguments for `profile`.
+#[derive(Debug, Args)]
+pub struct ProfileArgs {
+    /// Profile action to run.
+    #[command(subcommand)]
+    pub command: ProfileCommand,
+}
+
+/// `profile` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommand {
+    /// Show whether the profile is on, where it lives, and its settings.
+    Status(ProfileScopeArgs),
+    /// List the profile's entries.
+    List(ProfileScopeArgs),
+    /// Print one entry (`profile/` prefix optional).
+    Show {
+        /// Entry path, e.g. `tools/pnpm.md`.
+        path: String,
+        #[command(flatten)]
+        scope: ProfileScopeArgs,
+    },
+    /// Remove one entry (`profile/` prefix optional). Git keeps its history.
+    Forget {
+        /// Entry path, e.g. `tools/pnpm.md`.
+        path: String,
+        #[command(flatten)]
+        scope: ProfileScopeArgs,
+    },
+}
+
+/// Which profile a `profile` subcommand inspects.
+#[derive(Debug, Args)]
+pub struct ProfileScopeArgs {
+    /// Workspace whose profile to inspect when `[profile] share = "workspace"`.
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// Operator whose private profile to inspect when the profile is per
+    /// user (`share = "user"`).
+    #[arg(long)]
+    pub user: Option<String>,
 }
 
 /// Arguments for `project grants`.

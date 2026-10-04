@@ -10,6 +10,7 @@
 
 pub mod actor;
 pub mod admin;
+pub mod admin_profile;
 pub mod auth;
 pub mod human_auth;
 pub mod identity;

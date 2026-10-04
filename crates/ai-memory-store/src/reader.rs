@@ -48,7 +48,7 @@ use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstr
 /// the decay-candidate walk deliberately do NOT use this — reads
 /// annotate expiry instead of hiding it, and the sweep must see
 /// expired rows to delete them.
-fn not_expired(table: &str, now_param: &str) -> String {
+pub(crate) fn not_expired(table: &str, now_param: &str) -> String {
     format!(" AND ({table}.expires_at IS NULL OR {table}.expires_at > {now_param})")
 }
 
@@ -71,7 +71,7 @@ fn latest_only(table: &str, include_superseded: bool) -> String {
 
 /// Current wall-clock in microseconds, for binding against
 /// [`not_expired`] fragments.
-fn now_us() -> i64 {
+pub(crate) fn now_us() -> i64 {
     Timestamp::now().as_microsecond()
 }
 
@@ -195,6 +195,7 @@ fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
                 WHEN {path_column} LIKE 'concepts/%' THEN 'concept' \
                 WHEN {path_column} LIKE 'procedures/%' THEN 'procedure' \
                 WHEN {path_column} LIKE 'notes/%' THEN 'note' \
+                WHEN {path_column} LIKE 'profile/%' THEN 'preference' \
                 ELSE 'fact' \
             END \
         )"
@@ -350,7 +351,7 @@ impl PageAuthority {
 
         let kind_adjust = match kind {
             "rule" | "decision" => 0.15,
-            "procedure" | "gotcha" => 0.12,
+            "procedure" | "gotcha" | "preference" => 0.12,
             "concept" | "slot" => 0.07,
             "session" => -0.15,
             _ => 0.0,
@@ -9780,6 +9781,71 @@ impl ReaderPool {
             return Ok(true);
         }
         self.users_exist().await
+    }
+
+    /// The `[profile]` flags stored on a project (both on when it has none).
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn project_profile_flags(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<crate::ProjectProfileFlags> {
+        self.with_conn(move |conn| {
+            crate::profile::project_profile_flags(conn, workspace_id, project_id)
+        })
+        .await
+    }
+
+    /// Projects whose marker keeps them out of the profile.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_contribute_opt_outs(&self) -> StoreResult<Vec<crate::ProfileOptOut>> {
+        self.with_conn(crate::profile::contribute_opt_outs).await
+    }
+
+    /// The current entries of a profile scope, at most `limit`
+    /// ([`crate::PROFILE_ENTRIES_LIMIT`] caps it).
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<ai_memory_core::profile::ProfileEntry>> {
+        self.with_conn(move |conn| {
+            crate::profile::profile_entries(conn, workspace_id, project_id, limit)
+        })
+        .await
+    }
+
+    /// The digest inputs for a session in `project` reading the profile held
+    /// in `profile_scope`, from one connection checkout.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn profile_digest_inputs(
+        &self,
+        profile_scope: (WorkspaceId, ProjectId),
+        project: (WorkspaceId, ProjectId),
+    ) -> StoreResult<crate::ProfileDigestInputs> {
+        self.with_conn(move |conn| {
+            Ok(crate::ProfileDigestInputs {
+                entries: crate::profile::profile_entries(
+                    conn,
+                    profile_scope.0,
+                    profile_scope.1,
+                    crate::PROFILE_ENTRIES_LIMIT,
+                )?,
+                project_tags: crate::profile::project_stack_tags(conn, project.0, project.1)?,
+                project_has_pages: crate::profile::project_has_pages(conn, project.0, project.1)?,
+            })
+        })
+        .await
     }
 
     /// Return the last successful global maintenance completion for `job`.

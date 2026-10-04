@@ -18,6 +18,7 @@ pub mod message;
 pub mod observation;
 pub mod okf;
 pub mod page;
+pub mod profile;
 pub mod repository_identity;
 pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;

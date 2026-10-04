@@ -1207,6 +1207,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_sanitizer(sanitizer.clone())
         .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
         .with_per_user_slots(config.slots.per_user)
+        .with_profile(config.profile.clone())
         .with_strip_root_combinators(config.strip_root_combinators)
         .with_gemini_safe_schemas(config.gemini_safe_schemas);
     if let Some(e) = embedder.clone() {
@@ -1407,6 +1408,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 home_dir: config.home_dir.clone(),
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 mid_session_routing: config.routing.mid_session,
+                profile: config.profile.clone(),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -1552,6 +1554,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 auth_state.clone(),
             );
             let admin = admin
+                .merge(ai_memory_mcp::admin_profile::profile_admin_router(
+                    ai_memory_mcp::admin_profile::ProfileAdminState {
+                        reader: store.reader.clone(),
+                        profile: config.profile.clone(),
+                        trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                    },
+                ))
                 .layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES))
                 .layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),

@@ -180,6 +180,7 @@ impl MultiUserHarness {
             create_handoff_on_session_end: true,
             per_user_slots: false,
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),
