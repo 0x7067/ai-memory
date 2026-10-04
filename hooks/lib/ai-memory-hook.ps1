@@ -151,6 +151,15 @@ function Get-AiMemoryTomlFlag {
     return $null
 }
 
+# A resolved marker's `[profile]` flag as the explicit value the hook sends:
+# "0" for a falsy value, "1" for anything else, an absent key included.
+# Parity with `profile_flag_value` in hook_capture.rs.
+function ConvertTo-AiMemoryProfileFlag {
+    param([string] $Value)
+    if ($Value -and (@("0", "false", "no", "off") -contains $Value.Trim().ToLowerInvariant())) { return "0" }
+    return "1"
+}
+
 function Test-AiMemoryTruthy {
     param([string] $Value)
     if (-not $Value) { return $false }
@@ -337,8 +346,11 @@ function Get-AiMemoryMarkerQuery {
         $identityStyle = Get-AiMemoryTomlKey -File $marker -Key "identity_style"
         # `[profile] contribute` / `consume`, quoted or bare; the server
         # decides truthiness and keeps both on unless explicitly falsy.
-        $profileContribute = Get-AiMemoryTomlFlag -File $marker -Key "contribute"
-        $profileConsume = Get-AiMemoryTomlFlag -File $marker -Key "consume"
+        # Always explicit once a marker resolved (0 when falsy, else 1): removing
+        # the key re-enables; no marker sends nothing and the server keeps
+        # what it stored.
+        $profileContribute = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "contribute")
+        $profileConsume = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "consume")
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while

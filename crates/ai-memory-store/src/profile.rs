@@ -59,9 +59,9 @@ pub struct ProfileOptOut {
     pub project: String,
 }
 
-/// Persist `flags` on `project_id`, writing only when they differ from the
-/// stored values, so the session-start path that calls this on every fetch
-/// costs one indexed no-op statement in the common case.
+/// Persist `flags` on `project_id`. The session-start path calls this only
+/// when an explicit forwarded flag differs from the stored value; the
+/// conditional `WHERE` keeps a racing duplicate write a no-op.
 pub(crate) fn set_project_profile_flags(
     conn: &Connection,
     project_id: ProjectId,

@@ -244,11 +244,11 @@ assert_eq "json_string escapes a control byte as a \u escape" "yes" "$CTRL_ESCAP
 
 # --- marker_qs --------------------------------------------------------
 QS=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "marker_qs single key" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=deep" "$QS"
+assert_eq "marker_qs single key" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=deep&profile_contribute=1&profile_consume=1" "$QS"
 
 printf 'workspace = "ws1"\nproject = "p1"\nproject_strategy = "repo-root"\n' >"$TMP/a/b/.ai-memory.toml"
 QS2=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=ws1&project=p1&project_src=marker&project_strategy=repo-root" "$QS2"
+assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=ws1&project=p1&project_src=marker&project_strategy=repo-root&profile_contribute=1&profile_consume=1" "$QS2"
 
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> cwd only" "&cwd=$(ai_memory_url_encode "$TMP/nonexistent")" "$QS3"
@@ -269,7 +269,7 @@ assert_eq "capture-only marker: find_settings_marker skips it for the outer" \
     "$TMP/scope/.ai-memory.toml" \
     "$(ai_memory_find_settings_marker "$TMP/scope/inner")"
 assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
-    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
 
 # --- repository identity (#708) ----------------------------------------
@@ -288,20 +288,20 @@ if command -v git >/dev/null 2>&1; then
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     printf 'project = "mine"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: a declared project routes by name" \
-        "&cwd=$ID_CWD&project=mine&project_src=marker" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     printf 'project = "mine"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: an explicit identity outranks the project" \
-        "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     # #1033: the path style rides along with a remote identity only.
     printf 'identity_style = "path"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: the path style rides along with the remote" \
-        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=path" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=path&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     printf 'identity_style = "path"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: a declared identity sends no style" \
-        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     rm -rf "$TMP/idrepo"
 fi
@@ -313,21 +313,21 @@ printf '[briefing]\ninject_on_session_start = true\n' >"$TMP/scope/inner/.ai-mem
 assert_eq "briefing-only marker is a settings boundary, not transparent" \
     "" "$(ai_memory_parse_toml_key "$(ai_memory_find_settings_marker "$TMP/scope/inner")" workspace)"
 assert_eq "marker_qs stops at the briefing-only boundary" \
-    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
 
 # A marker that only sets `[profile]` keys is a settings boundary too, and
-# marker_qs forwards both flags (quoted or bare) for the server to interpret.
+# marker_qs forwards both flags (quoted or bare) as explicit 0/1 values.
 mkdir -p "$TMP/profile-only/inner"
 printf 'workspace = "outer"\n' >"$TMP/profile-only/.ai-memory.toml"
 printf '[profile]\ncontribute = false\nconsume = "no"\n' >"$TMP/profile-only/inner/.ai-memory.toml"
 assert_eq "profile-only marker is a settings boundary" \
     "$TMP/profile-only/inner/.ai-memory.toml" "$(ai_memory_find_settings_marker "$TMP/profile-only/inner")"
 assert_eq "marker_qs forwards [profile] contribute and consume" \
-    "&cwd=$(ai_memory_url_encode "$TMP/profile-only/inner")&profile_contribute=false&profile_consume=no" \
+    "&cwd=$(ai_memory_url_encode "$TMP/profile-only/inner")&profile_contribute=0&profile_consume=0" \
     "$(ai_memory_marker_qs "$TMP/profile-only/inner")"
-assert_eq "marker_qs omits [profile] keys a marker does not set" \
-    "&cwd=$(ai_memory_url_encode "$TMP/profile-only")&workspace=outer" \
+assert_eq "marker_qs sends explicit [profile] defaults when a marker omits the keys" \
+    "&cwd=$(ai_memory_url_encode "$TMP/profile-only")&workspace=outer&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/profile-only")"
 PSH=""
 if command -v pwsh >/dev/null 2>&1; then
@@ -381,7 +381,7 @@ if command -v git >/dev/null 2>&1; then
     printf 'workspace = "oss"\nproject_strategy = "repo-root"\n' >"$REPO/.ai-memory.toml"
     QSR=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "repo-root: subdir resolves to repo basename" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root&profile_contribute=1&profile_consume=1" \
         "$QSR"
 
     rm -f "$REPO/.ai-memory.toml"
@@ -396,7 +396,7 @@ if command -v git >/dev/null 2>&1; then
         >"$REPO/.ai-memory.toml"
     QSO=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "marker project strategy overrides env default" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=basename" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=basename&profile_contribute=1&profile_consume=1" \
         "$QSO"
     unset AI_MEMORY_PROJECT_STRATEGY
 
@@ -413,7 +413,7 @@ if command -v git >/dev/null 2>&1; then
     if git -C "$REPO" worktree add -q "$WT" >/dev/null 2>&1; then
         QSW=$(ai_memory_marker_qs "$WT")
         assert_eq "repo-root: out-of-tree worktree collapses to main repo" \
-            "&cwd=$(ai_memory_url_encode "$WT")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root" \
+            "&cwd=$(ai_memory_url_encode "$WT")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root&profile_contribute=1&profile_consume=1" \
             "$QSW"
     fi
 
@@ -422,7 +422,7 @@ if command -v git >/dev/null 2>&1; then
         >"$REPO/.ai-memory.toml"
     QSP=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "explicit project pin beats repo-root" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=repo-root" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=repo-root&profile_contribute=1&profile_consume=1" \
         "$QSP"
 
     PSH=""
@@ -813,7 +813,7 @@ assert_eq "a server-only marker is a settings boundary" \
     "$TMP/server-only/inner/.ai-memory.toml" \
     "$(ai_memory_find_settings_marker "$TMP/server-only/inner")"
 assert_eq "an unrouted repository is unchanged" \
-    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
 
 AI_MEMORY_DATA_DIR="$TMP/routed-data"

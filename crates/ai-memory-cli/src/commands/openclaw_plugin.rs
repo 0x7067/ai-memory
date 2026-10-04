@@ -241,8 +241,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     const defaultGlobal = tomlFlag(body, "default_global");
     const briefing = tomlFlag(body, "inject_on_session_start");
     const briefingBudget = tomlFlag(body, "max_chars");
-    const profileContribute = tomlFlag(body, "contribute");
-    const profileConsume = tomlFlag(body, "consume");
+    const profileContribute = profileFlag(tomlFlag(body, "contribute"));
+    const profileConsume = profileFlag(tomlFlag(body, "consume"));
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     // `project_src` tells the server a marker rescope from a host-derived
@@ -290,8 +290,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
       defaultGlobal = tomlFlag(body, "default_global");
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
-      profileContribute = tomlFlag(body, "contribute");
-      profileConsume = tomlFlag(body, "consume");
+      profileContribute = profileFlag(tomlFlag(body, "contribute"));
+      profileConsume = profileFlag(tomlFlag(body, "consume"));
     } catch (_e) {
     }
   }

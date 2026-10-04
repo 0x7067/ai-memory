@@ -451,6 +451,17 @@ fn forwarded_identity_style(raw: Option<&str>) -> Option<&'static str> {
         .map(IdentityStyle::as_str)
 }
 
+/// A resolved marker's `[profile]` flag as the explicit value the hook
+/// forwards: `0` for a falsy value, `1` for anything else, an absent key
+/// included.
+fn profile_flag_value(raw: Option<String>) -> &'static str {
+    if raw.as_deref().is_some_and(crate::marker::is_falsy) {
+        "0"
+    } else {
+        "1"
+    }
+}
+
 fn marker_query_suffix_impl(
     cwd: &str,
     default_strategy: Option<&str>,
@@ -475,10 +486,12 @@ fn marker_query_suffix_impl(
         // appended to the session-start handoff fetch (#176).
         briefing = parse_toml_flag(&marker, "inject_on_session_start");
         briefing_budget = parse_toml_flag(&marker, "max_chars");
-        // `[profile] contribute` / `consume` (quoted or bare). The server
-        // keeps both on unless the value is explicitly falsy.
-        profile_contribute = parse_toml_flag(&marker, "contribute");
-        profile_consume = parse_toml_flag(&marker, "consume");
+        // `[profile] contribute` / `consume` (quoted or bare), always sent
+        // explicitly once a marker resolved: a falsy value sends `0`, anything
+        // else (an absent key included) `1`. Removing the key re-enables; no
+        // marker sends nothing, so the server keeps what it stored.
+        profile_contribute = Some(profile_flag_value(parse_toml_flag(&marker, "contribute")));
+        profile_consume = Some(profile_flag_value(parse_toml_flag(&marker, "consume")));
     }
     if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
@@ -517,11 +530,11 @@ fn marker_query_suffix_impl(
     // Per-project `[profile]` settings: the server records `contribute` on the
     // project for harvesting, and `consume = false` suppresses the digest and
     // the profile union for this project.
-    if let Some(val) = profile_contribute.filter(|v| !v.is_empty()) {
-        qs.push_str(&format!("&profile_contribute={}", url_encode(&val)));
+    if let Some(val) = profile_contribute {
+        qs.push_str(&format!("&profile_contribute={val}"));
     }
-    if let Some(val) = profile_consume.filter(|v| !v.is_empty()) {
-        qs.push_str(&format!("&profile_consume={}", url_encode(&val)));
+    if let Some(val) = profile_consume {
+        qs.push_str(&format!("&profile_consume={val}"));
     }
     // Per-repo session-start brief opt-in: forwarded on every request for
     // simplicity (the capture path ignores it); only the `/handoff` GET at
@@ -1302,14 +1315,23 @@ drop_subagent_captures = "true"
         )
         .unwrap();
         let qs = marker_query_suffix(inner.to_str().unwrap(), None);
-        assert!(qs.contains("&profile_contribute=false"), "{qs}");
-        assert!(qs.contains("&profile_consume=no"), "{qs}");
+        assert!(qs.contains("&profile_contribute=0"), "{qs}");
+        assert!(qs.contains("&profile_consume=0"), "{qs}");
         assert!(
             !qs.contains("workspace=outer"),
             "a [profile] marker is a boundary: {qs}"
         );
+        // A resolved marker without the keys states the defaults explicitly,
+        // so removing an opt-out from the marker turns it back on.
         let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
-        assert!(!outer.contains("profile_"), "{outer}");
+        assert!(
+            outer.contains("&profile_contribute=1&profile_consume=1"),
+            "{outer}"
+        );
+        // No marker at all: nothing is sent, so the server keeps what it stored.
+        let bare = tempfile::TempDir::new().unwrap();
+        let none = marker_query_suffix(bare.path().to_str().unwrap(), None);
+        assert!(!none.contains("profile_"), "{none}");
     }
 
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so

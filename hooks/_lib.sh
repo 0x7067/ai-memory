@@ -80,6 +80,16 @@ ai_memory_parse_toml_flag() {
         "$file" | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
+# A resolved marker's `[profile]` flag as the explicit value the hook sends:
+# 0 for a falsy value (0/false/no/off, any case), 1 for anything else, an
+# absent key included. Parity with `profile_flag_value` in hook_capture.rs.
+ai_memory_profile_flag() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        0 | false | no | off) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
 # Whether "$1" (a marker file) declares anything beyond a `[capture]`
 # section: any root-level scope key (workspace/project/project_strategy), or
 # any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
@@ -486,10 +496,12 @@ ai_memory_marker_qs() {
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
         idn=$(ai_memory_parse_toml_key "$marker" identity)
         isty=$(ai_memory_parse_toml_key "$marker" identity_style)
-        # `[profile] contribute` / `consume`, quoted or bare; the server
-        # decides truthiness and keeps both on unless explicitly falsy.
-        pcon=$(ai_memory_parse_toml_flag "$marker" contribute)
-        pcons=$(ai_memory_parse_toml_flag "$marker" consume)
+        # `[profile] contribute` / `consume`, quoted or bare, always sent
+        # explicitly once a marker resolved (0 when falsy, else 1): removing
+        # the key re-enables; no marker sends nothing and the server keeps
+        # what it stored.
+        pcon=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" contribute)")
+        pcons=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" consume)")
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while

@@ -3933,8 +3933,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const defaultGlobal = tomlFlag(body, "default_global");
     const briefing = tomlFlag(body, "inject_on_session_start");
     const briefingBudget = tomlFlag(body, "max_chars");
-    const profileContribute = tomlFlag(body, "contribute");
-    const profileConsume = tomlFlag(body, "consume");
+    const profileContribute = profileFlag(tomlFlag(body, "contribute"));
+    const profileConsume = profileFlag(tomlFlag(body, "consume"));
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
@@ -3980,8 +3980,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       defaultGlobal = tomlFlag(body, "default_global");
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
-      profileContribute = tomlFlag(body, "contribute");
-      profileConsume = tomlFlag(body, "consume");
+      profileContribute = profileFlag(tomlFlag(body, "contribute"));
+      profileConsume = profileFlag(tomlFlag(body, "consume"));
       explicitIdentity = tomlKey(body, "identity");
       identityStyle = tomlKey(body, "identity_style");
     } catch (_e) {
@@ -4107,6 +4107,12 @@ pub(crate) const TS_TOML_FLAG: &str = r#"function tomlFlag(text: string, key: st
     if (match) return match[1] ?? match[2];
   }
   return undefined;
+}
+// A resolved marker's `[profile]` flag as the explicit value the hook sends:
+// "0" for a falsy value, "1" for anything else, an absent key included.
+// Parity with `profile_flag_value` in hook_capture.rs.
+function profileFlag(value: string | undefined): string {
+  return value !== undefined && ["0", "false", "no", "off"].includes(value.trim().toLowerCase()) ? "0" : "1";
 }"#;
 
 /// `repoRootProject`, shared by every generated TypeScript integration: the

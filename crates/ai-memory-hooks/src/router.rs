@@ -1550,8 +1550,10 @@ async fn fetch_and_accept_handoff_at(
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
     let brief_md = render_requested_session_brief(state, &query, ws, proj, actor.as_ref()).await?;
-    persist_profile_flags(state, &query, proj).await;
-    let profile_md = render_requested_profile_digest(state, &query, ws, proj, viewer).await;
+    let profile_flags = persist_profile_flags(state, &query, ws, proj).await;
+    let profile_md =
+        render_requested_profile_digest(state, &query, ws, proj, viewer, profile_flags.consume)
+            .await;
     // Handoff first: it is a short curated pointer and must not be buried
     // under a ledger that can run tens of KB. The existing ledger-then-brief
     // order is preserved. Claim both single-use inputs only after every
@@ -1931,25 +1933,62 @@ async fn render_requested_session_brief(
     Ok(render_session_brief(&core, &recent, budget))
 }
 
-/// The marker's `[profile]` flags, as forwarded on the session-start fetch.
-fn profile_flags_from_query(query: &HandoffQuery) -> ai_memory_store::ProjectProfileFlags {
-    ai_memory_store::ProjectProfileFlags {
-        contribute: !crate::payload::query_flag_falsy(query.profile_contribute.as_deref()),
-        consume: !crate::payload::query_flag_falsy(query.profile_consume.as_deref()),
+/// An explicit `[profile]` flag forwarded by the client: `Some` when the
+/// resolved marker sent `1`/`0` (or another truthy/falsy spelling), `None` when
+/// the parameter is absent. Absent means "no marker said anything" (no marker,
+/// an older client, a front door that wasn't regenerated), so the stored value
+/// stands: an opt-out must not be undone by a session start that omits it.
+fn explicit_profile_flag(value: Option<&str>) -> Option<bool> {
+    if crate::payload::query_flag_truthy(value) {
+        Some(true)
+    } else if crate::payload::query_flag_falsy(value) {
+        Some(false)
+    } else {
+        None
     }
 }
 
-/// Persist the marker's `[profile]` flags on the project, so the harvester
-/// and the MCP query union honour them. A conditional no-op in the common
-/// case, and never allowed to fail the session start.
-async fn persist_profile_flags(state: &HookState, query: &HandoffQuery, project_id: ProjectId) {
-    if let Err(e) = state
-        .writer
-        .set_project_profile_flags(project_id, profile_flags_from_query(query))
+/// The project's effective `[profile]` flags for this session start: each
+/// explicit forwarded value overrides the stored one, an absent value keeps it.
+/// Writes only when an explicit value changes what is stored, so the common
+/// session start costs one bounded read and no writer command. Never fails the
+/// session start: an unreadable stored value withholds the digest rather than
+/// guessing it was on.
+async fn persist_profile_flags(
+    state: &HookState,
+    query: &HandoffQuery,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> ai_memory_store::ProjectProfileFlags {
+    let contribute = explicit_profile_flag(query.profile_contribute.as_deref());
+    let consume = explicit_profile_flag(query.profile_consume.as_deref());
+    let stored = match state
+        .reader
+        .project_profile_flags(workspace_id, project_id)
         .await
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!(error = %e, "could not read the project's [profile] flags");
+            return ai_memory_store::ProjectProfileFlags {
+                contribute: contribute.unwrap_or(false),
+                consume: consume.unwrap_or(false),
+            };
+        }
+    };
+    let wanted = ai_memory_store::ProjectProfileFlags {
+        contribute: contribute.unwrap_or(stored.contribute),
+        consume: consume.unwrap_or(stored.consume),
+    };
+    if wanted != stored
+        && let Err(e) = state
+            .writer
+            .set_project_profile_flags(project_id, wanted)
+            .await
     {
         warn!(error = %e, "could not record the project's [profile] flags");
     }
+    wanted
 }
 
 /// Render the cross-project profile digest for a session in `(workspace_id,
@@ -1963,9 +2002,10 @@ async fn render_requested_profile_digest(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     viewer: Option<ai_memory_core::UserId>,
+    consume: bool,
 ) -> Option<String> {
     if !state.profile.inject_on_session_start
-        || !profile_flags_from_query(query).consume
+        || !consume
         || crate::payload::query_flag_falsy(query.profile_digest.as_deref())
     {
         return None;
@@ -17413,17 +17453,21 @@ mod tests {
         );
     }
 
-    /// The marker's flags are recorded on the project at session start, and
-    /// removing them from the marker turns them back on.
+    /// The marker's flags are recorded on the project at session start. An
+    /// opt-out is sticky: a later session start that forwards no flags (no
+    /// marker found, an older hook bundle, a front door not regenerated) keeps
+    /// the project out of the harvest and the digest. Only an explicit value
+    /// (a marker without the key now sends `1`) turns it back on.
     #[tokio::test]
     async fn session_start_records_the_marker_profile_flags() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
+        seed_global_profile(&state).await;
         let cwd = "/home/u/client-work";
         let mut query = profile_query(cwd, "claude-code");
         query.profile_contribute = Some("false".into());
         query.profile_consume = Some("off".into());
-        session_start_text(&state, query).await;
+        assert_eq!(session_start_text(&state, query).await, None);
         let (ws, proj) = resolve_project_ids(
             &state,
             Some(cwd),
@@ -17437,7 +17481,18 @@ mod tests {
         let flags = state.reader.project_profile_flags(ws, proj).await.unwrap();
         assert!(!flags.contribute && !flags.consume, "{flags:?}");
 
-        session_start_text(&state, profile_query(cwd, "claude-code")).await;
+        // No flags forwarded: the opt-out stands and the digest stays off.
+        assert_eq!(
+            session_start_text(&state, profile_query(cwd, "claude-code")).await,
+            None
+        );
+        let flags = state.reader.project_profile_flags(ws, proj).await.unwrap();
+        assert!(!flags.contribute && !flags.consume, "{flags:?}");
+
+        let mut query = profile_query(cwd, "claude-code");
+        query.profile_contribute = Some("1".into());
+        query.profile_consume = Some("1".into());
+        assert!(session_start_text(&state, query).await.is_some());
         let flags = state.reader.project_profile_flags(ws, proj).await.unwrap();
         assert_eq!(flags, ai_memory_store::ProjectProfileFlags::default());
     }
