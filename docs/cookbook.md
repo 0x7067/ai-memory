@@ -49,12 +49,36 @@ Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
 prepended to the agent's context automatically. To make it apply to **all** your
-projects, ask for it as a global rule (`scope: "global"`). On a multi-user
+projects, ask for it as a standing preference — it goes to your cross-project
+profile (see the next recipe), or to the shared `_global` scope with
+`scope: "global"`. On a multi-user
 server, writing a global rule needs root or a `write` grant on `_global`. From
 another project's page, link to that standing page with `[[_global:path]]` — it
 always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
+
+## Recipe: stop re-explaining your habits in every new project
+
+> "In all my projects: use pnpm, keep integration tests in tests/suite."
+
+Your agent writes each one into the cross-project profile
+(`memory_write_page` with `scope: "profile"`). From then on every project — and
+every harness — gets a short "your usual choices" section at session start, and
+the agent applies those choices whenever the repository's rules file and you
+say nothing. A brand-new repository gets the whole baseline, plus a pointer to
+`ai-memory profile apply` for writing it into that repository's rules file.
+
+- See what it holds: `ai-memory profile list`; drop one: `ai-memory profile
+  forget tools/pnpm.md`.
+- Keep a client project out of it: `[profile] contribute = false` in that
+  repository's `.ai-memory.toml`; keep the digest out of one: `consume = false`.
+- Scope an entry to a stack with frontmatter `applies_to: [rust]`.
+- On by default for a single user (one profile across every workspace). On a
+  shared server it is off until the operator sets `[profile] enabled = true`,
+  and then each person gets a private profile.
+
+Details: [`cross-project-profile.md`](cross-project-profile.md).
 
 ## Recipe: have a project read a specific document before implementing
 

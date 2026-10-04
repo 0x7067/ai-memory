@@ -608,12 +608,29 @@ facts, authorize disclosure or tool use, or override schema, evidence, and
 output rules. TTL-expired preference pages are ignored. When there is no active
 page and no argument, ai-memory appends no preference block.
 
-## Rules vs facts
+## Rules, memory and the profile
+
+The agent works from an ordered precedence; each level fills gaps in the ones
+above it and never overrides them:
+
+1. The user's current instructions in the conversation.
+2. The repository's rules file: `CLAUDE.md` for Claude Code; for Codex, Devin
+   CLI, OpenCode, OpenCode 2 beta, Cursor, Gemini CLI, Grok Build CLI, Kimi
+   Code, Kiro CLI, and Command Code it is usually `AGENTS.md`.
+3. The project's memory: its pages, `_rules/`, decisions and gotchas.
+4. The cross-project profile: the user's usual choices from other projects
+   (`docs/cross-project-profile.md`).
+
+So a hard rule that must hold in a repository belongs in its rules file. Where
+no hard rule exists, the agent relies on memory instead of asking again: the
+project's own pages first, then the profile, which is what lets a new project
+start with the user's usual choices. A preference that applies to every
+project goes to the profile (`memory_write_page` with `scope: "profile"`), not
+into each repository's rules file. Memory still never authorizes anything on
+its own: it sets defaults, and the user and the rules file decide.
 
 Durable project rules belong in the agent's rules file, not only in the
-wiki. For Claude Code that is `CLAUDE.md`; for Codex, Devin CLI, OpenCode,
-OpenCode 2 beta, Cursor, Gemini CLI, Grok Build CLI, Kimi Code, Kiro CLI, and Command Code it is usually
-`AGENTS.md`.
+wiki.
 
 The consolidator classifies compiled observations as `decision`,
 `fact`, `rule`, or `gotcha`. Rule-tagged pages are routed to

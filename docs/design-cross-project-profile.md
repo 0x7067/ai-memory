@@ -99,7 +99,8 @@ Explicit values:
   of that workspace. Use it when workspaces separate contexts that must not mix
   (work and personal, or two clients).
 - `user`: one private profile per operator, in a restricted project in the
-  default workspace whose creator is that operator. It harvests only that
+  default workspace, named `_profile.<user id>`, whose creator is that
+  operator. It harvests only that
   operator's own sessions and pages and only from projects the operator can
   read. Other operators cannot read or write it (per-project authorization,
   `docs/design-per-project-authz.md`); root can, as with every restricted
@@ -210,7 +211,7 @@ Both calls fall back to the zero-LLM path on any provider error.
 
 ## 7. Configuration
 
-Server (`config.toml` / `AI_MEMORY_PROFILE_*`):
+Server (`config.toml` / `AI_MEMORY_PROFILE__<KEY>`):
 
 ```toml
 [profile]
@@ -218,8 +219,8 @@ enabled = "auto"            # auto = on for single-user, off for multi-user
 share = "auto"              # auto | global | workspace | user | off
 min_projects = 2
 inject_on_session_start = true
-digest_max_bytes = 3000     # clamped 500..12000
-baseline_max_bytes = 6000   # clamped 1000..20000
+digest_max_bytes = 3000     # clamped 1500..12000
+baseline_max_bytes = 6000   # clamped 2000..20000
 apply_max_lines = 40
 llm = true                  # use the configured provider when there is one
 ```
@@ -237,10 +238,15 @@ consume = false      # no digest or union in this project
 `ai-memory profile status | list | show <path> | forget <path> | review |
 rebuild | apply [--target FILE] [--dry-run]`.
 
+`status` and `list` read `/admin/profile/*`; `show` and `forget` reuse
+`/admin/read-page` and `/admin/delete-page` against the profile's scope. All
+are root-only on a multi-user server, like every `/admin/*` route; there, each
+operator manages their own private profile through MCP.
+
 On the MCP side no tool is added: `memory_write_page` accepts
-`scope: "profile"` (the caller's profile scope), `memory_delete_page` removes
-an entry the same way, and `memory_query` returns profile hits next to the
-global ones.
+`scope: "profile"` (the caller's profile scope; the path is placed under
+`profile/`), `memory_delete_page` removes an entry the same way, and
+`memory_query` returns profile hits in `global_scope_hits`.
 
 ## 9. Security boundaries
 
@@ -253,6 +259,9 @@ global ones.
 - Candidates come only from user prompts and curated pages, after the
   sanitizer; tool output is never a source.
 - The digest and the LLM prompts treat stored text as data.
+- The shared scopes (`_global`, a workspace `_profile`) are read-open and
+  write-gated on a multi-user server: root or a `write` grant.
+- Event capture is never attributed to a reserved profile project.
 
 Each gets an adversarial test and a row in `docs/security-boundaries.md`.
 

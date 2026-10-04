@@ -30,6 +30,13 @@ ai-memory is what's on the other side of those walls.
   off, what failed, what's still open. Handoffs are a protocol here, not a
   convention — typed, owned, claimed exactly once.
 
+- **It follows you across projects.** A small profile of how you usually
+  work — your package manager, test layout, architecture habits — reaches
+  every new repository at session start, so you stop re-explaining yourself.
+  It is a default below each repository's rules file, on by default for a
+  single user and opt-in, private per person, on a shared server.
+  See [`docs/cross-project-profile.md`](docs/cross-project-profile.md).
+
 - **It follows you across machines.** Memory lives in a server you run —
   on the same laptop, a homelab box, or wherever — so the project you left
   on the desktop is the project you resume on the laptop. Same knowledge,
@@ -558,7 +565,8 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/cookbook.md`](docs/cookbook.md) | **Task-oriented cheat sheet.** "I want to do X" → how: recall prior work, keep a project rule, import an existing knowledge base, get two agents/repos working together. Start here. |
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine walkthrough. |
-| [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
+| [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and the rules, memory and profile precedence. |
+| [`docs/cross-project-profile.md`](docs/cross-project-profile.md) | **The cross-project profile.** Your usual choices delivered to every project as defaults: defaults per deployment, every setting, per-project opt-outs, multi-user opt-in and privacy, CLI. |
 | [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across harnesses: auto harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation, plus per-repository server profiles. |

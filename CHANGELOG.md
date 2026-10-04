@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added the cross-project profile (`docs/cross-project-profile.md`, design in
+  `docs/design-cross-project-profile.md`): a small set of `profile/` pages
+  recording how the user usually works, delivered to every project and every
+  harness at session start as a fenced, byte-budgeted digest of defaults that
+  rank below the user's instructions, the repository's rules file and the
+  project's own memory. It is on by default for a single-operator server,
+  shared across every workspace, and off on a multi-user server until
+  `[profile] enabled = true`, which gives each operator a private, restricted
+  profile; `share = "global"` or `"workspace"` makes a team profile that is
+  read-open and write-gated like `_global`. The digest filters entries by the
+  stack the project's activity shows, stays byte-identical between sessions,
+  and gives a project with no memory yet a larger baseline. `memory_write_page`
+  and `memory_delete_page` accept `scope: "profile"`, `memory_query` returns
+  profile entries in `global_scope_hits`, a marker's `[profile] contribute` /
+  `consume` keys opt a project out of contributing or receiving, and
+  `ai-memory profile status | list | show | forget` inspects and curates it.
+  (cross-project profile)
 - Added `ai-memory resume --search` with immediate type-to-filter name search,
   and `resume --all`, which keeps the previous cross-checkout picker: every
   linked checkout, the current one first, each listed with its own fully
@@ -193,6 +210,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the name it would otherwise get. The default stays `host_path`. (#1033)
 
 ### Changed
+- Changed the documented precedence between rules and memory: the user's
+  instructions, then the repository's rules file, then the project's memory,
+  then the cross-project profile. Where no hard rule exists, agents now use
+  what memory already knows instead of asking again; the routing snippet,
+  MCP instructions and durable-pages skill send standing cross-project
+  preferences to the profile (`scope: "profile"`). (cross-project profile)
 - Scoped `ai-memory resume` to the current checkout by default instead of every
   linked project (`--all` restores the old view) and removed its default result
   cutoff with bounded server pagination, preserving Left/Right harness

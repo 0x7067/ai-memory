@@ -142,6 +142,19 @@ inject_on_session_start = "true"
 # never traded for content. Clamped server-side to [1500, 20000];
 # defaults to 4000.
 max_chars = 4000
+
+# Optional. The cross-project profile (docs/cross-project-profile.md): your
+# usual choices from other projects, delivered at session start as defaults
+# below this repository's rules file. Both keys default to on.
+# `contribute = false` keeps this project out of the profile (client or NDA
+# work); `consume = false` keeps the profile digest out of its session starts
+# and the profile out of its queries. Forwarded by every hook client at
+# session start and recorded on the project, so removing a key turns the
+# setting back on. Quoted or bare; only an explicit false / "no" / "off" /
+# "0" turns a key off.
+[profile]
+contribute = false
+consume = false
 ```
 
 **Naming rules** for `workspace` and `project`, validated server-side:
@@ -156,20 +169,25 @@ defensively but the server's regex is the source of truth.
 `project_strategy` accepts `repo-root` (or `repo_root`) only. Unknown
 values are ignored and behave like the default `basename(cwd)` strategy.
 
+`[profile] contribute` and `consume` are on unless the value is explicitly
+falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
+`[profile]` keys is a settings boundary, like one with `[briefing]` keys.
+
 `default_global` and `inject_on_session_start` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
 
 The session-start brief is **project-scoped**: it draws only from the
-session's resolved `(workspace, project)`, and the reserved `_global` scope
-is deliberately *not* unioned into it. A standing rule placed in
-`_global/_rules/` therefore does not reach the brief. It stays reachable on
-demand through `memory_query` (which *does* union `_global`), and a durable
-always-on rule belongs in the agent's own rules file (`CLAUDE.md` /
-`AGENTS.md`) — see the "Rules vs facts" guidance in `docs/usage.md`. The brief
-is compiled as *untrusted history*, so it is deliberately the wrong channel
-for instructions the agent is expected to obey every turn.
+session's resolved `(workspace, project)`. Cross-project knowledge reaches
+the session through the **profile digest** instead, a separate fenced section
+after the brief (see `docs/cross-project-profile.md`): the profile's entries
+are delivered as defaults the agent applies when the user and the
+repository's rules file say nothing. A hard rule that must hold in this
+repository whatever the defaults say still belongs in the agent's own rules
+file (`CLAUDE.md` / `AGENTS.md`), which takes precedence over memory — see the
+"Rules, memory and the profile" guidance in `docs/usage.md`. Other `_global`
+pages stay reachable on demand through `memory_query`, which unions them.
 
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's

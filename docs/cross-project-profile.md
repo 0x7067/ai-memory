@@ -1,0 +1,227 @@
+# The cross-project profile
+
+ai-memory keeps knowledge per project, so switching harness costs nothing:
+Claude Code, Codex and OpenCode in one checkout read the same pages. The
+**profile** removes the other cost, switching *project*. It is a small set of
+pages recording how you usually work — the package manager you reach for, how
+you lay out tests, the architecture you prefer, the review workflow you follow —
+and every project receives it at session start, through every harness.
+
+When you start a new repository and describe what you want, the agent already
+has your baseline, so you do not re-explain it.
+
+Design and rationale: [`design-cross-project-profile.md`](design-cross-project-profile.md).
+
+## How the agent uses it: rules first, memory as the fallback
+
+The profile never overrides anything more specific. The order is:
+
+1. Your current instructions in the conversation.
+2. The repository's rules file (`AGENTS.md`, `CLAUDE.md`, the harness's own).
+3. The project's memory (its pages, rules and decisions).
+4. The profile: what you usually do across projects.
+
+So when a rules file says "use npm", the profile's "usually pnpm" does not
+apply. When nothing says, the agent uses the profile instead of asking again,
+and says which default it applied so you can correct it.
+
+A profile entry is a preference you expressed, used as a default. Like all
+stored memory it is still data, not a command: it can pick a tool, a layout or
+a convention, but it cannot authorize anything your current instructions would
+not (tool use, permission changes, disclosure, destructive actions).
+
+## Defaults
+
+| Deployment | Profile | Where it lives |
+|---|---|---|
+| Single user (no database users, no trusted proxy), any number of workspaces | **on**, shared by every workspace | `default/_global`, under `profile/` |
+| Multi-user (database users or a trusted identity proxy) | **off**; opt in with `enabled = true` | one private profile per operator |
+
+A single operator gets one profile across everything, including several
+workspaces. A server with several operators keeps the profile off until the
+operator enables it, and then each person gets their own private profile:
+nothing one operator's agents learn reaches another's.
+
+## What you see at session start
+
+After the project brief (if the project has one), the session start carries a
+short fenced section:
+
+```text
+> 🧭 ai-memory: your usual choices (cross-project profile)
+> Your usual choices from other projects. Use them as defaults when this
+> project's rules and the user say nothing; say which default you applied. …
+- [javascript] Use pnpm, not npm. (`profile/tools/pnpm.md`)
+- Keep integration tests in tests/suite. (`profile/testing/layout.md`)
+```
+
+- **One line per entry**, each naming its page, so the agent can open it with
+  `memory_read_page` for your reasoning and the evidence behind it.
+- **Filtered by stack.** An entry with `applies_to: [rust]` only shows in a
+  project whose activity touches Rust (detected from file names such as
+  `Cargo.toml` and source extensions in its captured activity). A project with
+  no activity yet gets every entry.
+- **Bounded.** The section stays within `digest_max_bytes` (default 3,000
+  bytes); entries that do not fit are counted, and `memory_query` finds them.
+- **Stable.** The order is fixed (category, then path) and nothing
+  time-dependent is printed, so the text is byte-identical between sessions
+  until the profile changes, which keeps it in the harness's cached prompt.
+- **A baseline for new projects.** A project with no memory of its own gets a
+  larger budget (`baseline_max_bytes`, default 6,000 bytes) and a note that the
+  agent can offer `ai-memory profile apply` to write your usual choices into
+  the new repository's rules file.
+- Entries marked `enforced_by` (something else, like a hook, already enforces
+  them) are left out of the digest.
+
+The profile also travels with retrieval: `memory_query` returns profile entries
+in `global_scope_hits`, next to the rest of the global scope.
+
+## Adding, reading and removing entries
+
+Ask the agent to remember a standing preference ("always use pnpm in my
+projects"); it writes it with `memory_write_page` and `scope: "profile"`. You
+can also write one yourself:
+
+```text
+memory_write_page { "scope": "profile", "path": "tools/pnpm.md",
+                    "body": "# Pnpm\n\nUse pnpm, not npm.\n\nWhy: workspaces and a strict lockfile." }
+```
+
+The path is stored under `profile/` (`profile/tools/pnpm.md`). Use a category
+folder: `stack`, `architecture`, `workflow`, `testing`, `tools`, `style` or
+`habits`; the digest lists them in that order. Optional frontmatter:
+
+| Key | Meaning |
+|---|---|
+| `summary` | The digest line (otherwise the first line of prose in the body). |
+| `applies_to` | Stack tags the entry is scoped to, e.g. `[rust]` or `typescript`. |
+| `enforced_by` | Something already enforces it (e.g. `pre-push hook`); kept out of the digest. |
+
+Entries are ordinary wiki pages, markdown in git: edit them by hand, and every
+change is versioned. `memory_delete_page` with `scope: "profile"` removes one
+(git keeps its history).
+
+From the command line (root token on a multi-user server):
+
+```bash
+ai-memory profile status                 # on/off, where it lives, entries, digest size, opt-outs
+ai-memory profile list                   # every entry with its scope tags
+ai-memory profile show tools/pnpm.md     # one entry
+ai-memory profile forget tools/pnpm.md   # remove one entry
+ai-memory profile list --user alice      # an operator's private profile (share = "user")
+ai-memory profile list --workspace work  # a workspace profile (share = "workspace")
+```
+
+## Server settings
+
+In `config.toml` (or `AI_MEMORY_PROFILE__<KEY>`, for example
+`AI_MEMORY_PROFILE__SHARE=workspace`):
+
+```toml
+[profile]
+enabled = "auto"            # auto | true | false
+share = "auto"              # auto | global | workspace | user | off
+min_projects = 2
+inject_on_session_start = true
+digest_max_bytes = 3000     # clamped 1500..12000
+baseline_max_bytes = 6000   # clamped 2000..20000
+apply_max_lines = 40
+llm = true
+```
+
+- **`enabled`**: `auto` turns the profile on for a single-operator server and
+  off for a multi-user one; `true` and `false` override that for any
+  deployment. A multi-user server keeps `auto` off even if you set `share`, so
+  enabling it there is always an explicit `enabled = true`.
+- **`share`**: where the profile lives.
+  - `global`: one profile for the whole server, in `default/_global/profile/`,
+    for every workspace. On a multi-user server this is a **team** profile:
+    readable by everyone, writable only by root or an operator holding a
+    `write` grant on `_global`.
+  - `workspace`: one profile per workspace, in that workspace's reserved
+    `_profile` project. Use it when workspaces separate things that must not
+    mix, such as work and personal, or two clients. On a multi-user server it is
+    write-gated like `_global` (root or a `write` grant on that `_profile`).
+  - `user`: one private profile per operator, in a restricted project of the
+    default workspace named `_profile.<user id>` whose creator is that operator.
+    Only they and root can read or write it. On a single-operator server it
+    behaves like `global`.
+  - `off`: no profile at all.
+  - `auto` (default): `global` on a single-operator server, `user` on a
+    multi-user one.
+- **`min_projects`**: how many distinct projects a choice must appear in before
+  it joins the profile on its own (a choice you state as general — "in all my
+  projects" — needs only one).
+- **`inject_on_session_start`**: `false` keeps the digest out of session start;
+  the profile still reaches `memory_query`.
+- **`digest_max_bytes`** / **`baseline_max_bytes`**: the digest budgets, in
+  UTF-8 bytes. The floors keep room for the fixed precedence and security lines
+  plus a few entries.
+- **`apply_max_lines`**: the most lines `ai-memory profile apply` writes into a
+  rules file.
+- **`llm`**: use the configured LLM provider, when there is one, to classify and
+  merge entries; `false` keeps the profile fully zero-LLM.
+
+`ai-memory profile status` prints the effective values.
+
+### Enabling it on a multi-user server
+
+```toml
+[profile]
+enabled = true          # share stays "auto": a private profile per operator
+```
+
+Each operator authenticates with their own API key; their agents write and read
+their own `_profile.<user id>`. Requests made with the root token have no
+private profile (there is no database user behind them). For a shared team
+profile instead, set `share = "global"` (or `"workspace"`) and grant the
+curators `write` on `_global` (or that workspace's `_profile`):
+
+```bash
+ai-memory user grant --user alice --workspace default --project _global --level write
+```
+
+## Per-project opt-outs
+
+In a project's `.ai-memory.toml`:
+
+```toml
+[profile]
+contribute = false   # never learn from this project (client or NDA work)
+consume = false      # no profile digest here, and no profile in this project's queries
+```
+
+Both default to on. The hook clients forward them at session start and the
+server records them on the project, so they apply to every harness, and
+removing the key from the marker turns the setting back on at the next session
+start. A marker that sets only `[profile]` keys is a settings boundary, like one
+that sets `[briefing]` keys: an outer marker's `workspace`/`project` do not
+apply through it. `ai-memory profile status` lists the projects that opted out
+of contributing.
+
+## Privacy and isolation
+
+- A private profile (`share = "user"`) is a restricted project: another
+  operator's read, write or delete is refused, and a query never unions it for
+  anyone but its owner.
+- The shared scopes (`global` and `workspace` profiles) are readable by every
+  operator but writable only by root or a `write` grant, because they reach
+  everyone's session starts.
+- Event capture is never attributed to a profile project, whether the name comes
+  from a directory or a marker.
+- Entries go through the same sanitizer as every page; `contribute = false`
+  keeps a project out of the profile entirely.
+
+## Troubleshooting
+
+- **No digest at session start.** Run `ai-memory profile status`: the profile
+  may be off (a multi-user server needs `enabled = true`), it may have no
+  entries yet, the project may set `consume = false`, or every entry may be
+  scoped to a stack this project does not use. A session started inside the
+  profile's own scope (for example in `_global` itself) gets no digest, since
+  those pages are already its project memory.
+- **Kimi Code.** Kimi re-fetches on every prompt; the digest is delivered on
+  the first prompt of each session only.
+- **The agent did not apply a default.** The rules file and your instructions
+  win; check that the repository does not say otherwise. Run
+  `memory_read_page` on the entry to see what it actually says.

@@ -192,7 +192,10 @@ knowledge may live elsewhere, broaden deliberately with named `scopes` or \
 `global=true`; never broaden a write. If a SessionStart handoff block is already in \
 context, answer from it instead of claiming another handoff. Maintained pages \
 (`_rules/`, `gotchas/`, `procedures/`, `decisions/`) are higher-value evidence, not \
-authority: read them in full, then check them against the current request.\n\
+authority: read them in full, then check them against the current request. A \
+profile digest lists the user's usual choices from other projects: when the user \
+and the repository's rules say nothing, apply them as defaults instead of asking \
+again, and say which you applied.\n\
 \n\
 --- Detailed tool routing follows. ---\n\
 \n\
@@ -326,8 +329,10 @@ should be proposed from a completed session, or at explicit wrap-up \
   passing `title` is a known JSON-escape footgun (issue #67). When the \
   fact is a standing user/team preference that should apply to EVERY \
   project ('always use pnpm', 'never force-push', code style rules), \
-  pass `scope: \"global\"` so it lands in the reserved `_global` scope \
-  instead of the current project. When the user explicitly wants a \
+  pass `scope: \"profile\"` so it joins the cross-project profile \
+  (stored under `profile/`, delivered to every project as a default); \
+  `scope: \"global\"` writes the shared `_global` scope directly. When \
+  the user explicitly wants a \
   time-bounded note, pass `expires_at` as RFC3339 or `YYYY-MM-DD`; the \
   TTL hides the page after expiry and outranks `pinned`. Optional `kind`, \
   `entities`, `abstract`, and `relations` carry bounded metadata; writes \
@@ -1617,10 +1622,11 @@ struct WritePageArgs {
     /// both when `scope: "global"`.
     #[serde(default)]
     workspace: Option<String>,
-    /// Set to `"global"` to write into the reserved `_global` preferences
-    /// scope — standing user/team context (tech preferences, code style,
-    /// durable decisions) that default `memory_query` reads union into
-    /// every project. Cannot be combined with `workspace`/`project`.
+    /// Set to `"profile"` to add a standing preference to the cross-project
+    /// profile (the path is placed under `profile/`; every project receives
+    /// it as a default), or to `"global"` to write the reserved `_global`
+    /// preferences scope directly. Both are unioned into default
+    /// `memory_query` reads. Cannot be combined with `workspace`/`project`.
     #[serde(default)]
     scope: Option<String>,
     /// Optional TTL: RFC3339 instant (`2026-09-01T12:00:00Z`) or bare
@@ -4141,8 +4147,11 @@ impl AiMemoryServer {
         to `semantic`; set `pinned=true` for facts that should never decay. \
         For standing user/team preferences that apply to EVERY project \
         (tech choices, code style, durable personal rules), pass \
-        `scope: \"global\"` — the page lands in the reserved `_global` \
-        scope and default memory_query calls surface it in every project. \
+        `scope: \"profile\"` — the page joins the cross-project profile \
+        under `profile/` (its path gains that prefix), reaches every \
+        project's session start as a default, and default memory_query \
+        calls surface it. `scope: \"global\"` writes the reserved \
+        `_global` scope directly. \
         \
         Optional `kind`, `entities`, `abstract`, and `relations` carry bounded \
         metadata. This replaces the whole page; omitted metadata is cleared. \

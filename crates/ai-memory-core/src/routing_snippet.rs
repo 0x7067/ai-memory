@@ -109,9 +109,9 @@ session start and reaches Claude Code only if the agent opens the file.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
-to ai-memory's reserved global scope instead — the durable-pages skill
-covers how. Default memory reads surface global-scope pages in every
-project automatically.
+to ai-memory's cross-project profile instead (`scope: "profile"`) — the
+durable-pages skill covers how. Every project receives the profile as
+defaults at session start, below its own rules file.
 
 ### Refreshing this snippet
 
@@ -173,7 +173,7 @@ The reserved `_prompts/consolidation.md` page may provide bounded advisory prefe
 
 Write durable project rules such as “always X” or “never Y” to the project's canonical agent instruction file, using the filename and discovery mechanism appropriate to that harness. Do not duplicate a project rule into ai-memory merely to make it persistent.
 
-Standing user or team preferences that genuinely apply across projects belong in ai-memory's reserved global scope. Default memory retrieval surfaces global-scope entries alongside project results.
+Standing user or team preferences that genuinely apply across projects belong in ai-memory's cross-project profile (`scope: "profile"`). Every project receives it as defaults at session start, below its own rules file.
 
 ### Refreshing this managed block
 
