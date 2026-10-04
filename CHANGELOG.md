@@ -178,6 +178,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Documented the observed attach-hook behavior, early-exit import boundary and
   fallback validation limits.
   (#1052)
+- Fixed the provider-health wrapper dropping the caller's operation id: its
+  `complete_with_operation_id` and `complete_structured_raw_with_operation_id`
+  fell to the trait defaults, so every retry of one logical operation got a
+  fresh id and, for OpenCode, a new session header on every call. The wrapper
+  now forwards both. (#1085)
 
 ### Security
 - Fixed GHSA-7qj3-7wqw-m5w6: in multi-user mode a database user without a
