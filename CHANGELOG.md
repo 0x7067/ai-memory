@@ -183,15 +183,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fell to the trait defaults, so every retry of one logical operation got a
   fresh id and, for OpenCode, a new session header on every call. The wrapper
   now forwards both. (#1085)
-- `backfill` works with a non-root key on a multi-user server. Its emptiness
-  check used the root-only `/admin/sessions/by-agent` route, so every
+- Fixed `backfill` failing with a non-root key on a multi-user server. Its
+  emptiness check used the root-only `/admin/sessions/by-agent` route, so every
   developer's own key got 403; on a 403 it now asks the grant-checked
   `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` instead. (#1086)
-- The sanitizer now redacts `*_KEY_ID`, `*_PASSPHRASE`, `*_SIGNING_KEY`,
-  `*_PEPPER` and `*_SALT` assignments (e.g. an S3 `…_ACCESS_KEY_ID`, an auth
-  token pepper) and dotless base64 JSON tokens such as Cloudflare tunnel
-  tokens (`eyJ…`, 40+ characters); SHAs, UUIDs and short `eyJ` fragments are
-  left alone. (#1084)
+- Fixed the sanitizer missing uppercase `*_KEY_ID`, `*_PASSPHRASE`,
+  `*_SIGNING_KEY`, `*_PEPPER` and `*_SALT` assignments (e.g. an S3
+  `…_ACCESS_KEY_ID`, an auth token pepper) and dotless base64 JSON tokens such
+  as Cloudflare tunnel tokens (`eyJ…`, 40+ characters); lowercase code
+  identifiers, SHAs, UUIDs and short `eyJ` fragments are left alone. (#1084)
 - Fixed `memory_delete_page` bypassing per-user slot namespace routing and
   access checks when `[slots] per_user` is active. Non-admin callers deleting a
   generic slot path (`_slots/current-focus.md`) are now redirected to their
