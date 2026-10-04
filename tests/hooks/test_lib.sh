@@ -341,7 +341,7 @@ if [ -n "$PSH" ]; then
     PS_QS=$(HOME="$TMP" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
         ". '$PS_LIB'; Get-AiMemoryMarkerQuery -Cwd '$PS_CWD'")
     case "$PS_QS" in
-        *"&profile_contribute=false&profile_consume=no"*) PS_PROFILE="ok" ;;
+        *"&profile_contribute=0&profile_consume=0"*) PS_PROFILE="ok" ;;
         *) PS_PROFILE="got: $PS_QS" ;;
     esac
     assert_eq "powershell marker query forwards [profile] flags" "ok" "$PS_PROFILE"
