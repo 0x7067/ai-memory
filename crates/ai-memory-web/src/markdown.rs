@@ -248,14 +248,54 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     let path = PagePath::new(path).ok()?;
 
     let href = format!(
-        "{}{suffix}",
-        crate::templates::page_href(ws, proj, path.as_str())
+        "{}{}",
+        crate::templates::page_href(ws, proj, path.as_str()),
+        encode_link_suffix(suffix)
     );
     let display = label
         .filter(|l| !l.is_empty())
         .unwrap_or(target)
         .to_string();
     Some((href, display))
+}
+
+/// Percent-encode a wikilink's `#anchor` / `?query` suffix for a Markdown
+/// link destination. A space, parenthesis, angle bracket, quote or backslash
+/// would end or break the bare `[label](href)` destination; the URI delimiters
+/// a fragment or query uses (and existing `%` escapes) stay as written.
+fn encode_link_suffix(suffix: &str) -> String {
+    let mut out = String::with_capacity(suffix.len());
+    for byte in suffix.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@'
+            | b'/'
+            | b'?'
+            | b'#'
+            | b'%' => out.push(byte as char),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{byte:02X}");
+            }
+        }
+    }
+    out
 }
 
 /// Peel an optional `[workspace/]project:` scope off a wikilink target,
@@ -663,6 +703,31 @@ mod tests {
         assert!(
             cross.contains(r#"href="w/default/_global/p/python-env.md?v=1#setup">Setup</a>"#),
             "global scope query and anchor: {cross}"
+        );
+    }
+
+    #[test]
+    fn wikilink_suffix_with_space_or_parenthesis_stays_one_link() {
+        let html = render(
+            "[[notes/foo#my section]] and [[notes/foo#a)b]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#my%20section">"#),
+            "space in anchor: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#a%29b">"#),
+            "parenthesis in anchor: {html}"
+        );
+        assert!(
+            !html.contains("b)"),
+            "a ')' must not close the link early: {html}"
+        );
+        assert!(
+            !html.contains("[["),
+            "both wikilinks render as links: {html}"
         );
     }
 

@@ -12,12 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
-- Fixed local and web wikilinks dropping `#anchor` and `?query` suffixes.
-  Wikilinks like `[[page#section]]` or `[[page#section|label]]` stripped the
-  fragment when rewritten to standard Markdown links or rendered in the web
-  interface, leaving destinations pointed at the page root instead of the
-  specific section. The rewriters now preserve anchor and query suffixes on
-  the generated links.
+- Fixed wikilinks dropping `#anchor` and `?query` suffixes. `[[page#section]]`
+  and `[[page#section|label]]` lost the fragment when rewritten to standard
+  Markdown links (for example on OKF export), leaving the link pointed at the
+  page root. The rewriters now keep the suffix, percent-encoded where needed so
+  a space or parenthesis in it cannot break the link. In `/web` the suffix is
+  kept on the href; the page view does not emit heading ids. (#1089)
 - Fixed a store write sent while the writer was shutting down occasionally
   waiting forever instead of failing with `WriterClosed`: the writer now
   closes its queue and drains in-flight commands before it stops.
