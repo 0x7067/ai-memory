@@ -435,6 +435,28 @@ async fn move_project_same_workspace_rejected() {
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// A private profile (`default/_profile.<user id>`) cannot be moved out of
+/// the default workspace: its owner finds it there, so a move would orphan it.
+/// The refusal comes before any lookup, so nothing is touched.
+#[tokio::test]
+async fn move_project_refuses_a_private_profile() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project": "_profile.00000000000000000000000000000001",
+            "to_workspace": "elsewhere",
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 /// The move carries the source page's existing embedding over instead of
 /// recomputing it. Proven by overwriting the source embedding with a
 /// recognisable marker vector: if the move re-embedded, the destination would

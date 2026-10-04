@@ -300,13 +300,30 @@ enabled = true          # share stays "auto": a private profile per operator
 
 Each operator authenticates with their own API key; their agents write and read
 their own `_profile.<user id>`. Requests made with the root token have no
-private profile (there is no database user behind them). For a shared team
-profile instead, set `share = "global"` (or `"workspace"`) and grant the
-curators `write` on `_global` (or that workspace's `_profile`):
+private profile (there is no database user behind them). The `_profile` and
+`_profile.*` names are reserved: an operator can name only their own private
+profile explicitly (`workspace = "default"`, `project = "_profile.<their id>"`),
+so nobody can create another operator's profile ahead of them. Profile projects
+cannot be renamed and their access mode is fixed.
+
+For a shared team profile instead, set `share = "global"` (or `"workspace"`)
+and grant the curators `write` on `_global` (or that workspace's `_profile`):
 
 ```bash
 ai-memory user grant --user alice --workspace default --project _global --level write
 ```
+
+**Team-profile trust model.** A team profile reaches every operator's session
+start, so the harvester holds it to a higher bar than a personal one: a
+statement is admitted only on evidence from **at least two distinct
+operators**, on top of `min_projects` (or a general statement). One operator
+repeating "always run X before tests" in two open projects is not enough;
+`profile review` lists such an entry as waiting for another operator. The
+digest is headed **"team defaults"** rather than "your usual choices", so the
+agent knows the defaults are shared, not this user's own. Restricted projects
+never feed a team profile. Stack entries (which only describe the languages
+seen in file names) keep the plain project threshold. Entries written directly
+with `scope: "profile"` still need root or a `write` grant on the scope.
 
 ## Per-project opt-outs
 
@@ -318,10 +335,13 @@ contribute = false   # never learn from this project (client or NDA work)
 consume = false      # no profile digest here, and no profile in this project's queries
 ```
 
-Both default to on. The hook clients forward them at session start and the
-server records them on the project, so they apply to every harness, and
-removing the key from the marker turns the setting back on at the next session
-start. A marker that sets only `[profile]` keys is a settings boundary, like one
+Both default to on. Whenever a hook client finds the project's marker it sends
+both values explicitly (`0` or `1`) at session start, and the server records
+them on the project, so they apply to every harness. Removing the key from the
+marker turns the setting back on at the next session start. A session start
+that sends no value at all (no marker found, an older hook bundle, a client not
+yet regenerated) leaves the recorded setting as it is: an opt-out is never
+undone by a client that did not say anything. A marker that sets only `[profile]` keys is a settings boundary, like one
 that sets `[briefing]` keys: an outer marker's `workspace`/`project` do not
 apply through it. `ai-memory profile status` lists the projects that opted out
 of contributing.
@@ -365,3 +385,22 @@ of contributing.
   `min_projects`.
 - **An entry stopped updating.** It was edited by hand, so the harvester leaves
   it alone (`profile review` says so). Delete it to hand it back.
+- **An opt-out came back on.** Only an explicit value changes it: check that the
+  project's marker still says `contribute = false` / `consume = false` and that
+  the agent runs in a directory under that marker (`ai-memory profile status`
+  lists the projects opted out of contributing).
+- **A team entry is "waiting for another operator".** A team profile admits a
+  statement only when at least two operators said it (see the trust model
+  above). Have a second operator confirm it, or write the entry directly with
+  `scope: "profile"` if you hold the grant.
+- **A private profile is unreachable after `ai-memory reindex`.** Reindex
+  rebuilds a clean database from the wiki, and users are database-only state:
+  operators created again get new ids, so an old `_profile.<old id>` project
+  belongs to nobody (only root can read it). Its entries are still markdown in
+  that project's wiki directory, `wiki/<workspace id>/<project id>/profile/`
+  (entries always live in a `profile/` folder, so
+  `find <data_dir>/wiki -type d -name profile` lists them). To carry them over, have the
+  operator write one entry with `scope: "profile"` (which creates their new
+  `_profile.<new id>`), then copy the old `profile/` files into the new
+  project's wiki directory while the server runs; the wiki watcher indexes
+  them into the new profile.

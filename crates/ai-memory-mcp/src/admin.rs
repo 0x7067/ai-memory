@@ -6118,6 +6118,21 @@ async fn move_project_core(
         ));
     }
 
+    // A private profile is found as `default/_profile.<user id>`; moving it to
+    // another workspace would orphan it. (A workspace `_profile` may move with
+    // its workspace: it lands in, or merges into, the target's own profile.)
+    if req
+        .project
+        .starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "a private cross-project profile stays in the default workspace and cannot be moved"
+            })),
+        ));
+    }
+
     // Resolve the SOURCE without auto-creating — 404 on a typo.
     let (src_ws, src_proj) =
         lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;

@@ -17,12 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared across every workspace, and off on a multi-user server until
   `[profile] enabled = true`, which gives each operator a private, restricted
   profile; `share = "global"` or `"workspace"` makes a team profile that is
-  read-open and write-gated like `_global`. The digest filters entries by the
+  read-open and write-gated like `_global`, admits a habit only on evidence
+  from at least two operators, and is presented as team defaults. The digest filters entries by the
   stack the project's activity shows, stays byte-identical between sessions,
   and gives a project with no memory yet a larger baseline. `memory_write_page`
   and `memory_delete_page` accept `scope: "profile"`, `memory_query` returns
   profile entries in `global_scope_hits`, a marker's `[profile] contribute` /
-  `consume` keys opt a project out of contributing or receiving, and
+  `consume` keys opt a project out of contributing or receiving (an opt-out
+  stays recorded until a marker says otherwise), and
   `ai-memory profile status | list | show | forget | review | rebuild`
   inspects and curates it, while `ai-memory profile apply` writes the entries
   that fit a repository into a managed block of its rules file (`--remove`
