@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed a store write sent while the writer was shutting down occasionally
+  waiting forever instead of failing with `WriterClosed`: the writer now
+  closes its queue and drains in-flight commands before it stops.
 - Fixed `resume` and `workstreams` running `git status` on every linked checkout
   before listing anything: listing now reads only the checkout's stable
   fingerprints, so a large working tree or a slow filesystem-monitor hook no
