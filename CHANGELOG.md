@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed Codex on the Kimi coding endpoint failing every model call with
+  "tools.function.parameters is not a valid moonshot flavored json schema
+  (... detected infinite recursion without termination condition ...)".
+  Moonshot's validator never resolves `$ref`, so the `$defs`/`$ref` pairs
+  Codex forwards from MCP input schemas failed the request at any depth —
+  including the `ReasoningTier` reference on `memory_query` and
+  `memory_explore` and the `FeedbackKind` reference on `memory_feedback` —
+  not just at the root. The `?flavor=moonshot` dialect now inlines every
+  `#/$defs/*` reference and drops the emptied `$defs` table; nested
+  combinators (which Moonshot accepts) and runtime validation are unchanged.
+  `?flavor=bedrock` and `?flavor=gemini` keep serving `$defs`/`$ref` as
+  before.
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
   `client_activity`: the read-only inspection tool is now classified as a read
   in `tool_call_is_write`. (#1088)

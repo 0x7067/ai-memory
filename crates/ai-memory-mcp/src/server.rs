@@ -5491,30 +5491,43 @@ impl ServerHandler for AiMemoryServer {
 }
 
 /// Tool input-schema dialect served for one `tools/list`, ordered by
-/// strictness: each variant applies every rewrite of the one before it, plus
-/// its own. That ordering is what lets the operator's configured floor and a
-/// request's `?flavor=` marker combine with a plain `max`.
+/// strictness: the operator's configured floor and a request's `?flavor=`
+/// marker combine with a plain `max`, and the winning dialect's rewrite set
+/// applies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum SchemaDialect {
     /// The schemas `schemars` generated, verbatim.
     #[default]
     Upstream,
-    /// Root-level `anyOf`/`oneOf`/`allOf` stripped (Moonshot, Bedrock).
+    /// Root-level `anyOf`/`oneOf`/`allOf` stripped (Bedrock).
     RootCombinators,
-    /// Also collapses the nullable unions `Option<T>` produces into Google's
-    /// single-`type` plus `nullable` form (Gemini / Vertex).
+    /// [`RootCombinators`], plus every `#/$defs/*` reference inlined and the
+    /// emptied `$defs` table dropped (Moonshot). Moonshot's validator never
+    /// resolves `$ref` and fails the request with "detected infinite
+    /// recursion", so no reference may survive at any depth; nested
+    /// combinators stay inline, which Moonshot accepts.
+    FlatDefs,
+    /// [`RootCombinators`], plus the nullable-union collapses in
+    /// [`gemini_safe_schema`] (Gemini / Vertex). Deliberately *not*
+    /// [`FlatDefs`]: Vertex accepts `$defs`/`$ref`, and the schemas Gemini
+    /// CLI already ships keep them, so reference-flattening is out of
+    /// scope there.
     GeminiSafe,
 }
 
 /// Bedrock and Moonshot reject root-level
 /// `anyOf`/`oneOf`/`allOf` in tool parameter schemas with a 400 at
-/// `tools/list` time. Kimi's legacy `?flavor=moonshot` and Kiro's
-/// `?flavor=bedrock` both get schemas with those root keys stripped;
-/// nested combinators stay, and runtime validation remains unchanged.
-/// [`SchemaDialect::GeminiSafe`] strips the same root keys and additionally
-/// rewrites every subschema through [`gemini_safe_schema`].
+/// `tools/list` time. Kiro's `?flavor=bedrock` gets schemas with those root
+/// keys stripped; Moonshot's `?flavor=moonshot` gets
+/// [`SchemaDialect::FlatDefs`], which additionally inlines every `$ref` (its
+/// validator rejects references at any depth, not just combinators at the
+/// root). Runtime validation remains unchanged in both dialects.
+/// [`SchemaDialect::GeminiSafe`] strips the same root keys — and keeps
+/// `$defs`/`$ref` by design — while additionally rewriting every subschema
+/// through [`gemini_safe_schema`].
 fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<Tool> {
     const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+    let inline_defs = dialect == SchemaDialect::FlatDefs;
     let gemini_safe = dialect >= SchemaDialect::GeminiSafe;
     tools
         .into_iter()
@@ -5522,12 +5535,15 @@ fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<
             let has_root_combinator = ROOT_COMBINATORS
                 .iter()
                 .any(|key| tool.input_schema.contains_key(*key));
-            if !has_root_combinator && !gemini_safe {
+            if !has_root_combinator && !inline_defs && !gemini_safe {
                 return tool;
             }
             let mut schema = (*tool.input_schema).clone();
             for key in ROOT_COMBINATORS {
                 schema.shift_remove(key);
+            }
+            if inline_defs {
+                inline_schema_defs(&mut schema);
             }
             if gemini_safe {
                 gemini_safe_schema(&mut schema);
@@ -5536,6 +5552,97 @@ fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<
             tool
         })
         .collect()
+}
+
+/// Inline every local `#/$defs/*` reference and drop the emptied `$defs`
+/// table, recursively through the whole input schema.
+///
+/// Moonshot's "moonshot flavored json schema" validator never resolves
+/// `$ref`: any reference — at the root or nested five levels deep — fails
+/// the whole request with "detected infinite recursion without termination
+/// condition". Codex forwards MCP input schemas into Responses
+/// `tools.function.parameters` verbatim, so a served `$defs`/`$ref` pair
+/// 400s every model call even though the referenced subschema would be
+/// valid inline. Nested combinators themselves are fine (inline `anyOf` /
+/// `oneOf` pass), so only the references are rewritten. Sibling keys on the
+/// `$ref` object win over the definition's own, mirroring
+/// [`flatten_sibling_combinator`]'s parent-wins rule. Definitions that
+/// reference each other resolve over successive passes; if the pass budget
+/// is exhausted or a name is missing, the schema is left untouched rather
+/// than shipping a dangling reference without its table.
+fn inline_schema_defs(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    const PASS_BUDGET: usize = 32;
+
+    let Some(defs) = schema
+        .get("$defs")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    else {
+        return;
+    };
+    let mut root = serde_json::Value::Object(std::mem::take(schema));
+    let mut all_resolved = false;
+    for _ in 0..PASS_BUDGET {
+        let (replaced, pending) = resolve_def_pass(&mut root, &defs);
+        all_resolved = !pending;
+        if !replaced {
+            break;
+        }
+    }
+    if let serde_json::Value::Object(mut map) = root {
+        if all_resolved {
+            map.shift_remove("$defs");
+        }
+        *schema = map;
+    }
+}
+
+/// One sweep replacing every resolvable `#/$defs/*` reference. Returns
+/// whether any replacement happened and whether any local `$ref` is still
+/// present afterwards (`true` means the inlined payloads may have pulled in
+/// further references, so another sweep is due; a still-pending reference
+/// after the budget keeps the `$defs` table so nothing dangles).
+fn resolve_def_pass(
+    node: &mut serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+) -> (bool, bool) {
+    let mut replaced = false;
+    let mut pending = false;
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(reference) = map.get("$ref").and_then(serde_json::Value::as_str) {
+                if let Some(definition) = reference
+                    .strip_prefix("#/$defs/")
+                    .and_then(|name| defs.get(name))
+                    .and_then(serde_json::Value::as_object)
+                {
+                    let mut overlay = definition.clone();
+                    map.shift_remove("$ref");
+                    for (key, value) in std::mem::take(map) {
+                        overlay.insert(key, value);
+                    }
+                    *map = overlay;
+                    replaced = true;
+                } else {
+                    pending = true;
+                }
+            }
+            for value in map.values_mut() {
+                let (child_replaced, child_pending) = resolve_def_pass(value, defs);
+                replaced |= child_replaced;
+                pending |= child_pending;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                let (child_replaced, child_pending) = resolve_def_pass(item, defs);
+                replaced |= child_replaced;
+                pending |= child_pending;
+            }
+        }
+        _ => {}
+    }
+    (replaced, pending)
 }
 
 /// Rewrite one subschema — and everything below it — into the subset Google's
@@ -5666,7 +5773,8 @@ fn restricted_schema_flavor(query: &str) -> Option<SchemaDialect> {
     query
         .split('&')
         .filter_map(|pair| match pair {
-            "flavor=moonshot" | "flavor=bedrock" => Some(SchemaDialect::RootCombinators),
+            "flavor=moonshot" => Some(SchemaDialect::FlatDefs),
+            "flavor=bedrock" => Some(SchemaDialect::RootCombinators),
             "flavor=gemini" | "flavor=vertex" => Some(SchemaDialect::GeminiSafe),
             _ => None,
         })
@@ -9879,7 +9987,7 @@ mod tests {
     fn restricted_schema_flavor_matches_complete_query_pairs_only() {
         assert_eq!(
             restricted_schema_flavor("flavor=moonshot"),
-            Some(SchemaDialect::RootCombinators)
+            Some(SchemaDialect::FlatDefs)
         );
         assert_eq!(
             restricted_schema_flavor("client=kiro&flavor=bedrock&debug=false"),
@@ -9898,10 +10006,182 @@ mod tests {
             restricted_schema_flavor("flavor=gemini&flavor=moonshot"),
             Some(SchemaDialect::GeminiSafe)
         );
+        assert_eq!(
+            restricted_schema_flavor("flavor=moonshot&flavor=bedrock"),
+            Some(SchemaDialect::FlatDefs)
+        );
         assert_eq!(restricted_schema_flavor("flavor=unknown"), None);
         assert_eq!(
             restricted_schema_flavor("note=flavor=bedrock&client=kiro"),
             None
+        );
+    }
+
+    fn inlined_defs(schema: serde_json::Value) -> serde_json::Value {
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(schema).unwrap();
+        inline_schema_defs(&mut map);
+        serde_json::Value::Object(map)
+    }
+
+    // Codex + the Kimi coding endpoint 400s every call: the Moonshot
+    // validator never resolves `$ref`, so the `ReasoningTier` /
+    // `FeedbackKind` references must be inlined at any depth.
+    #[test]
+    fn inline_schema_defs_replaces_refs_and_drops_the_table() {
+        let out = inlined_defs(serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "ReasoningTier": {
+                    "description": "Operator-facing tier.",
+                    "oneOf": [
+                        { "type": "string", "const": "minimal" },
+                        { "type": "string", "const": "max" }
+                    ]
+                }
+            },
+            "properties": {
+                "reasoning": {
+                    "description": "Field docs.",
+                    "anyOf": [
+                        { "$ref": "#/$defs/ReasoningTier" },
+                        { "type": "null" }
+                    ]
+                },
+                "signal": { "$ref": "#/$defs/ReasoningTier" }
+            }
+        }));
+
+        assert!(
+            out.get("$defs").is_none(),
+            "the emptied table must go: {out}"
+        );
+        assert_eq!(
+            out["properties"]["reasoning"],
+            serde_json::json!({
+                "description": "Field docs.",
+                "anyOf": [
+                    {
+                        "description": "Operator-facing tier.",
+                        "oneOf": [
+                            { "type": "string", "const": "minimal" },
+                            { "type": "string", "const": "max" }
+                        ]
+                    },
+                    { "type": "null" }
+                ]
+            }),
+            "the reference inlines the definition; the sibling description and the null branch stay"
+        );
+        assert_eq!(
+            out["properties"]["signal"],
+            serde_json::json!({
+                "description": "Operator-facing tier.",
+                "oneOf": [
+                    { "type": "string", "const": "minimal" },
+                    { "type": "string", "const": "max" }
+                ]
+            }),
+            "a bare $ref becomes the definition itself"
+        );
+    }
+
+    #[test]
+    fn inline_schema_defs_resolves_chained_definitions() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Inner": { "type": "string", "enum": ["a", "b"] },
+                "Outer": { "type": "object", "properties": { "inner": { "$ref": "#/$defs/Inner" } } }
+            },
+            "type": "object",
+            "properties": { "outer": { "$ref": "#/$defs/Outer" } }
+        }));
+
+        assert!(
+            out.get("$defs").is_none(),
+            "chained definitions must fully resolve: {out}"
+        );
+        assert_eq!(
+            out["properties"]["outer"]["properties"]["inner"],
+            serde_json::json!({ "type": "string", "enum": ["a", "b"] })
+        );
+    }
+
+    #[test]
+    fn inline_schema_defs_keeps_the_table_when_a_reference_dangles() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Known": { "type": "string" }
+            },
+            "type": "object",
+            "properties": {
+                "known": { "$ref": "#/$defs/Known" },
+                "missing": { "$ref": "#/$defs/Missing" }
+            }
+        }));
+
+        assert!(
+            out.get("$defs").is_some(),
+            "an unresolvable reference must keep its table: {out}"
+        );
+        assert_eq!(
+            out["properties"]["known"],
+            serde_json::json!({ "type": "string" })
+        );
+        assert_eq!(
+            out["properties"]["missing"],
+            serde_json::json!({ "$ref": "#/$defs/Missing" })
+        );
+    }
+
+    // The Bedrock dialect is a narrower patch on purpose: it must not start
+    // flattening references just because Moonshot's stricter sibling does.
+    #[test]
+    fn restricted_schema_tool_list_keeps_defs_for_root_combinator_dialect() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "$defs": { "Kind": { "type": "string", "enum": ["a"] } },
+                "properties": { "kind": { "$ref": "#/$defs/Kind" } }
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_feedback", "Feedback", schema);
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
+
+        assert_eq!(
+            patched[0].input_schema["properties"]["kind"],
+            serde_json::json!({ "$ref": "#/$defs/Kind" }),
+            "bedrock schemas keep their $defs/$ref pairs"
+        );
+        assert!(
+            patched[0].input_schema.get("$defs").is_some(),
+            "bedrock schemas keep the $defs table"
+        );
+    }
+
+    #[test]
+    fn restricted_schema_tool_list_inlines_defs_for_flat_dialect() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "$defs": { "Kind": { "type": "string", "enum": ["a"] } },
+                "properties": { "kind": { "$ref": "#/$defs/Kind" } }
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_feedback", "Feedback", schema);
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::FlatDefs);
+
+        let serialized =
+            serde_json::to_string(&patched[0].input_schema).expect("schema serializes");
+        assert!(
+            !serialized.contains("$ref"),
+            "moonshot schemas must not contain a single $ref: {serialized}"
+        );
+        assert_eq!(
+            patched[0].input_schema["properties"]["kind"],
+            serde_json::json!({ "type": "string", "enum": ["a"] })
         );
     }
 
