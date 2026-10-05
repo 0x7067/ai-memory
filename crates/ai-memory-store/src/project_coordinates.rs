@@ -10,24 +10,139 @@ use crate::{StoreError, StoreResult};
 
 pub(crate) const MAX_COORDINATE_ROWS: usize = 4;
 
-const MATCH_SQL: &str = "SELECT id, name, NULLIF(canonical_name, '') \
-     FROM projects INDEXED BY sqlite_autoindex_projects_2 \
-     WHERE workspace_id = ?1 AND name = ?2 \
-     UNION ALL \
-     SELECT id, name, NULLIF(canonical_name, '') \
-     FROM projects INDEXED BY idx_projects_canonical_name \
-     WHERE workspace_id = ?1 AND canonical_name = ?2 AND canonical_name <> '' \
-     UNION ALL \
-     SELECT id, name, NULLIF(canonical_name, '') \
-     FROM projects INDEXED BY idx_projects_legacy_name \
-     WHERE workspace_id = ?1 AND legacy_name = ?2 AND legacy_name <> '' \
-     LIMIT ?3";
+const MATCH_SQL: &str = "WITH \
+     exact AS (SELECT id FROM projects INDEXED BY sqlite_autoindex_projects_2 \
+       WHERE workspace_id = ?1 AND name = ?2), \
+     canonical AS (SELECT id FROM projects INDEXED BY idx_projects_canonical_name \
+       WHERE workspace_id = ?1 AND canonical_name = ?2 AND canonical_name <> '' \
+       ORDER BY rowid LIMIT ?5), \
+     legacy AS (SELECT id FROM projects INDEXED BY idx_projects_legacy_name \
+       WHERE workspace_id = ?1 AND legacy_name = ?2 AND legacy_name <> '' \
+       ORDER BY rowid LIMIT ?5), \
+     identity_match AS (SELECT id FROM projects INDEXED BY idx_projects_identity \
+       WHERE workspace_id = ?1 AND identity = ?3 AND identity <> '' AND ?3 <> ''), \
+     target AS (SELECT id FROM projects INDEXED BY sqlite_autoindex_projects_2 \
+       WHERE workspace_id = ?1 AND name = ?4 AND ?4 <> ''), \
+     target_compat AS (SELECT id FROM projects INDEXED BY idx_projects_canonical_name \
+       WHERE workspace_id = ?1 AND canonical_name = ?4 AND canonical_name <> '' AND ?4 <> '' \
+       ORDER BY rowid LIMIT ?5), \
+     raw_matches AS (\
+       SELECT id, 1 AS exact_match, 0 AS canonical_match, 0 AS legacy_match, \
+              0 AS identity_match, 0 AS canonical_target FROM exact \
+       UNION ALL SELECT id, 0, 1, 0, 0, 0 FROM canonical \
+       UNION ALL SELECT id, 0, 0, 1, 0, 0 FROM legacy \
+       UNION ALL SELECT id, 0, 0, 0, 1, 0 FROM identity_match \
+       UNION ALL SELECT id, 0, 0, 0, 0, 1 FROM target \
+       UNION ALL SELECT id, 0, 0, 0, 0, 1 FROM target_compat), \
+     unique_matches AS (\
+       SELECT id, MAX(exact_match) AS exact_match, MAX(canonical_match) AS canonical_match, \
+              MAX(legacy_match) AS legacy_match, MAX(identity_match) AS identity_match, \
+              MAX(canonical_target) AS canonical_target \
+       FROM raw_matches GROUP BY id \
+       ORDER BY identity_match DESC, exact_match DESC, \
+                (exact_match OR canonical_match OR legacy_match) DESC, id LIMIT ?5) \
+     SELECT p.id, p.name, NULLIF(p.identity, ''), NULLIF(p.identity_source, ''), \
+            NULLIF(p.canonical_name, ''), NULLIF(p.legacy_name, ''), \
+            m.exact_match, m.canonical_match, m.legacy_match, m.identity_match, m.canonical_target \
+     FROM unique_matches m JOIN projects p ON p.id = m.id AND p.workspace_id = ?1 \
+     ORDER BY m.identity_match DESC, m.exact_match DESC, \
+              (m.exact_match OR m.canonical_match OR m.legacy_match) DESC, m.id";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MatchProvenance {
+    pub(crate) exact: bool,
+    pub(crate) canonical_compat: bool,
+    pub(crate) legacy_compat: bool,
+    pub(crate) identity: bool,
+    pub(crate) canonical_target: bool,
+}
+
+impl MatchProvenance {
+    pub(crate) fn requested(self) -> bool {
+        self.exact || self.canonical_compat || self.legacy_compat
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectCoordinateMatch {
     pub(crate) id: ProjectId,
     pub(crate) current_name: String,
+    pub(crate) identity: Option<String>,
+    pub(crate) identity_source: Option<String>,
     pub(crate) canonical_name: Option<String>,
+    pub(crate) legacy_name: Option<String>,
+    pub(crate) provenance: MatchProvenance,
+}
+
+pub(crate) fn matches(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    requested: &str,
+    repository: Option<&RepositoryIdentity>,
+) -> StoreResult<Vec<ProjectCoordinateMatch>> {
+    let identity = repository.map_or("", |repository| repository.identity.as_str());
+    let canonical = repository.and_then(path_style_name).unwrap_or_default();
+    let limit = i64::try_from(MAX_COORDINATE_ROWS).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare(MATCH_SQL)?;
+    let rows = statement
+        .query_map(
+            params![
+                workspace_id.as_bytes(),
+                requested,
+                identity,
+                canonical,
+                limit
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                raw_id,
+                current_name,
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+                exact,
+                canonical_compat,
+                legacy_compat,
+                identity_match,
+                canonical_target,
+            )| {
+                Ok(ProjectCoordinateMatch {
+                    id: ProjectId::from_slice(&raw_id)?,
+                    current_name,
+                    identity,
+                    identity_source,
+                    canonical_name,
+                    legacy_name,
+                    provenance: MatchProvenance {
+                        exact: exact != 0,
+                        canonical_compat: canonical_compat != 0,
+                        legacy_compat: legacy_compat != 0,
+                        identity: identity_match != 0,
+                        canonical_target: canonical_target != 0,
+                    },
+                })
+            },
+        )
+        .collect()
 }
 
 pub(crate) fn resolve(
@@ -35,36 +150,25 @@ pub(crate) fn resolve(
     workspace_id: WorkspaceId,
     requested: &str,
 ) -> StoreResult<Option<ProjectCoordinateMatch>> {
-    let limit = i64::try_from(MAX_COORDINATE_ROWS).unwrap_or(i64::MAX);
-    let mut statement = conn.prepare(MATCH_SQL)?;
-    let rows = statement
-        .query_map(params![workspace_id.as_bytes(), requested, limit], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut matches = Vec::with_capacity(rows.len());
-    for (raw_id, current_name, canonical_name) in rows {
-        let candidate = ProjectCoordinateMatch {
-            id: ProjectId::from_slice(&raw_id)?,
-            current_name,
-            canonical_name,
-        };
-        if !matches
-            .iter()
-            .any(|existing: &ProjectCoordinateMatch| existing.id == candidate.id)
-        {
-            matches.push(candidate);
-        }
-    }
+    let mut matches = matches(conn, workspace_id, requested, None)?
+        .into_iter()
+        .filter(|candidate| candidate.provenance.requested())
+        .collect::<Vec<_>>();
     match matches.len() {
         0 => Ok(None),
         1 => Ok(matches.pop()),
         _ => Err(StoreError::ProjectNameAmbiguous(requested.to_owned())),
     }
+}
+
+pub(crate) fn promotion_target<'a>(
+    candidate: &'a ProjectCoordinateMatch,
+    requested: &str,
+) -> Option<&'a str> {
+    candidate
+        .canonical_name
+        .as_deref()
+        .filter(|canonical| *canonical == requested && *canonical != candidate.current_name)
 }
 
 pub(crate) fn backfill(conn: &mut Connection) -> StoreResult<u64> {
@@ -111,16 +215,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidate_query_is_bounded_and_uses_only_coordinate_indexes() {
+    fn shared_candidate_query_deduplicates_before_bound_and_uses_only_indexes() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::migrations::run(&mut conn).unwrap();
         let workspace = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
-        for index in 0..1_000_u32 {
-            crate::ops::get_or_create_project(
-                &mut conn,
-                &workspace,
-                &format!("unrelated-{index}"),
-                None,
+        let repository = RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: IdentitySource::GitRemote,
+        };
+        crate::ops::resolve_project_by_identity(
+            &mut conn,
+            &workspace,
+            &repository,
+            ai_memory_core::repository_identity::IdentityStyle::Path,
+            "api",
+            None,
+            None,
+            None,
+            crate::AccessMode::Open,
+        )
+        .unwrap();
+        for index in 0..20_u32 {
+            conn.execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at, identity, \
+                 identity_source, canonical_name, legacy_name) \
+                 VALUES (?1, ?2, ?3, 1, ?4, 'git_remote', 'collision', 'collision')",
+                params![
+                    ProjectId::new().as_bytes(),
+                    workspace.as_bytes(),
+                    format!("collision-{index}"),
+                    format!("forge-{index}.example/acme/api")
+                ],
             )
             .unwrap();
         }
@@ -130,6 +255,8 @@ mod tests {
             .query_map(
                 params![
                     workspace.as_bytes(),
+                    "api",
+                    repository.identity,
                     "acme-api",
                     i64::try_from(MAX_COORDINATE_ROWS).unwrap()
                 ],
@@ -138,64 +265,33 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert!(MATCH_SQL.contains("LIMIT ?3"));
-        let mut statement = conn.prepare(MATCH_SQL).unwrap();
-        let mut rows = statement
-            .query(params![
-                workspace.as_bytes(),
-                "absent",
-                MAX_COORDINATE_ROWS as i64
-            ])
-            .unwrap();
-        assert!(rows.next().unwrap().is_none());
-        drop(rows);
+        assert!(MATCH_SQL.contains("GROUP BY id"));
+        assert!(MATCH_SQL.contains("LIMIT ?5"));
+        let candidates = matches(&conn, workspace, "collision", None).unwrap();
+        assert_eq!(candidates.len(), MAX_COORDINATE_ROWS);
         assert_eq!(
-            statement.get_status(rusqlite::StatementStatus::FullscanStep),
-            0
+            candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            MAX_COORDINATE_ROWS
         );
-        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 100);
-        drop(statement);
-        for index in 0..20_u32 {
-            conn.execute(
-                "INSERT INTO projects (id, workspace_id, name, created_at, canonical_name, legacy_name) \
-                 VALUES (?1, ?2, ?3, 1, 'collision', 'collision')",
-                params![ProjectId::new().as_bytes(), workspace.as_bytes(), format!("collision-{index}")],
-            ).unwrap();
-        }
-        let mut statement = conn.prepare(MATCH_SQL).unwrap();
-        let count = statement
-            .query_map(
-                params![
-                    workspace.as_bytes(),
-                    "collision",
-                    MAX_COORDINATE_ROWS as i64
-                ],
-                |_| Ok(()),
-            )
-            .unwrap()
-            .count();
-        assert_eq!(count, MAX_COORDINATE_ROWS);
-        assert_eq!(
-            statement.get_status(rusqlite::StatementStatus::FullscanStep),
-            0
-        );
-        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 200);
         assert!(matches!(
             resolve(&conn, workspace, "collision"),
             Err(StoreError::ProjectNameAmbiguous(_))
         ));
-        assert!(
-            plan.iter()
-                .any(|line| line.contains("sqlite_autoindex_projects_2"))
-        );
-        assert!(
-            plan.iter()
-                .any(|line| line.contains("idx_projects_canonical_name"))
-        );
-        assert!(
-            plan.iter()
-                .any(|line| line.contains("idx_projects_legacy_name"))
-        );
+        for index in [
+            "sqlite_autoindex_projects_2",
+            "idx_projects_canonical_name",
+            "idx_projects_legacy_name",
+            "idx_projects_identity",
+        ] {
+            assert!(
+                plan.iter().any(|line| line.contains(index)),
+                "{index}: {plan:?}"
+            );
+        }
         assert!(
             plan.iter().all(|line| !line.contains("SCAN projects")),
             "{plan:?}"

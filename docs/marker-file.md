@@ -648,6 +648,16 @@ own name.
 - Static CLI/MCP clients still pass only `workspace` + `project`. They may use
   the canonical path name (`acme-api`) or the v2 basename (`api`) while it is
   unambiguous. A hostless key shared by multiple forges fails closed.
+- `ai-memory doctor` combines the effective local marker and normalized
+  repository evidence with the server's read-only coordinate diagnosis. It
+  reports exact/canonical/legacy compatibility, missing or ambiguous status,
+  rename eligibility, and collision reasons. It parses the routing marker once,
+  honours CLI scope flags before marker names, and reports only a safe marker
+  status/source class; invalid marker TOML is ignored without echoing its
+  contents, raw marker paths are never rendered, and remote credentials never
+  leave the client. An ambiguous result can name the preferred identity-backed
+  candidate UUID/current name for context, but is never a unique resolution or
+  rename-eligible result.
 - The UUID-keyed project `_meta.md` persists optional `identity`,
   `identity_source`, `canonical_name`, and `legacy_name` fields. A clean
   `reindex` restores the original UUID/name and recomputes the indexed keys

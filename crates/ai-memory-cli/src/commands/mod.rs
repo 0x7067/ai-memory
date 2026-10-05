@@ -17,6 +17,15 @@ pub(crate) fn is_scope_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|response| response.status() == reqwest::StatusCode::NOT_FOUND)
 }
 
+pub(crate) fn is_scope_ambiguous(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::http_client::ServerResponseError>()
+        .is_some_and(|response| {
+            response.status() == reqwest::StatusCode::BAD_REQUEST
+                && response.body().contains("ambiguous")
+        })
+}
+
 pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;
@@ -150,12 +159,27 @@ pub(crate) fn resolve_scope(
 ) -> Result<(String, String)> {
     let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
     let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
-    // Both halves pinned on the command line: the marker cannot change the
-    // answer, so skip the walk and the file reads entirely.
     if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
         return Ok((workspace.to_string(), project.to_string()));
     }
-    let marker = marker_scope(config);
+    resolve_scope_with_marker(
+        config,
+        explicit_ws,
+        explicit_proj,
+        marker_scope(config),
+        true,
+    )
+}
+
+pub(crate) fn resolve_scope_with_marker(
+    config: &Config,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+    marker: Option<(crate::marker::MarkerScope, String, String)>,
+    announce: bool,
+) -> Result<(String, String)> {
+    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
+    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
 
     let mut decided: Vec<&str> = Vec::with_capacity(2);
     let workspace = match explicit_ws {
@@ -203,7 +227,7 @@ pub(crate) fn resolve_scope(
         }
     };
 
-    if let Some((scope, _, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
+    if announce && let Some((scope, _, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
         // Name only the halves the marker actually decided: an explicit flag
         // that was honoured must not read as if the file overrode it.
         eprintln!(
@@ -285,6 +309,12 @@ pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> S
 
 /// The nearest scope-declaring marker plus the cwd the walk started from.
 fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String, String)> {
+    let (identity_cwd, lookup_cwd) = scope_directories(config)?;
+    let scope = crate::marker::read_scope(&lookup_cwd, &config.runtime_env)?;
+    Some((scope, identity_cwd, lookup_cwd))
+}
+
+pub(crate) fn scope_directories(config: &Config) -> Option<(String, String)> {
     let identity_cwd = scope_cwd(config)?;
     // The Docker wrapper preserves the host cwd for identity but binds the
     // checkout at /work. Check the host path when its bounded root is mounted;
@@ -299,8 +329,7 @@ fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String, 
             .ok()
             .map(|cwd| cwd.to_string_lossy().into_owned())?
     };
-    let scope = crate::marker::read_scope(&lookup_cwd, &config.runtime_env)?;
-    Some((scope, identity_cwd, lookup_cwd))
+    Some((identity_cwd, lookup_cwd))
 }
 
 /// The directory marker discovery walks up from.

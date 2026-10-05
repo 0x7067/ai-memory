@@ -1473,6 +1473,94 @@ pub struct WorkspaceScopeRow {
     pub workspace_name: String,
 }
 
+/// How a requested project coordinate relates to stored projects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCoordinateStatus {
+    /// The requested name is the project's current stored name.
+    Exact,
+    /// The requested name matched the canonical path-style compatibility key.
+    CanonicalCompat,
+    /// The requested name matched the v2 basename compatibility key.
+    LegacyCompat,
+    /// No workspace/project candidate exists.
+    Missing,
+    /// More than one project UUID matched the requested coordinate.
+    Ambiguous,
+}
+
+impl std::fmt::Display for ProjectCoordinateStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Exact => "exact",
+            Self::CanonicalCompat => "canonical_compat",
+            Self::LegacyCompat => "legacy_compat",
+            Self::Missing => "missing",
+            Self::Ambiguous => "ambiguous",
+        })
+    }
+}
+
+/// Why a coordinate cannot be safely promoted or adopted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCoordinateCollisionReason {
+    /// Different remote identities share one hostless path-style key.
+    CrossForgeCollision,
+    /// Different project UUIDs matched exact/canonical/legacy probes.
+    MultipleProjects,
+    /// The canonical target name is held by another project.
+    CanonicalTargetOccupied,
+    /// The requested exact name is held by a different identity-backed project.
+    CrossIdentityOccupied,
+    /// The exact-name holder has no repository identity and cannot be adopted diagnostically.
+    UnclaimedIdentitylessProject,
+}
+
+impl std::fmt::Display for ProjectCoordinateCollisionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CrossForgeCollision => "cross_forge_collision",
+            Self::MultipleProjects => "multiple_projects",
+            Self::CanonicalTargetOccupied => "canonical_target_occupied",
+            Self::CrossIdentityOccupied => "cross_identity_occupied",
+            Self::UnclaimedIdentitylessProject => "unclaimed_identityless_project",
+        })
+    }
+}
+
+/// Read-only diagnostic for one requested workspace/project coordinate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCoordinateDiagnostic {
+    /// Workspace requested by the caller.
+    pub workspace: String,
+    /// Project name requested by the caller.
+    pub requested_name: String,
+    /// Typed resolution status.
+    pub status: ProjectCoordinateStatus,
+    /// Existing project UUID when one candidate is preferred for context.
+    /// An ambiguous status may prefer the supplied identity's project; this
+    /// does not imply unique resolution or rename eligibility.
+    pub project_id: Option<ProjectId>,
+    /// Current name of the preferred contextual candidate, when present.
+    /// Interpret this together with `status`, never as a successful resolution.
+    pub current_name: Option<String>,
+    /// Canonical path-style candidate when known.
+    pub canonical_candidate: Option<String>,
+    /// Legacy basename candidate when known.
+    pub legacy_candidate: Option<String>,
+    /// Safe identity source, never the identity or remote URL.
+    pub identity_source: Option<String>,
+    /// Naming style implied by the current/canonical relationship.
+    pub identity_style: Option<String>,
+    /// Whether an authorized write through this requested name could rename in place.
+    pub rename_eligible: bool,
+    /// Typed reason that safe promotion/adoption is unavailable.
+    pub collision_reason: Option<ProjectCoordinateCollisionReason>,
+    /// Candidate count after project-UUID deduplication.
+    pub candidate_count: usize,
+}
+
 /// One `(workspace, project)` scope with the ids + repo_path needed to write
 /// its self-describing `_meta.md` manifest. Returned by
 /// [`ReaderPool::list_all_scopes`]; consumed by `Wiki::backfill_scope_manifests`.
@@ -8978,6 +9066,152 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| WorkspaceId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Diagnose a requested project coordinate without creating, claiming, or renaming.
+    ///
+    /// The lookup uses the same bounded exact/canonical/legacy indexes as normal
+    /// compatibility resolution, but retains probe provenance and conflicting
+    /// candidates for operator diagnostics.
+    pub async fn diagnose_project_coordinate(
+        &self,
+        workspace: String,
+        requested_name: String,
+        repository: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+        requested_style: ai_memory_core::repository_identity::IdentityStyle,
+    ) -> StoreResult<ProjectCoordinateDiagnostic> {
+        let canonical_candidate = repository
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::path_style_name);
+        let legacy_candidate = repository
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::legacy_basename_name);
+        let local_source = repository.as_ref().map(|identity| identity.source);
+        let requested = requested_name.clone();
+        let workspace_name = workspace.clone();
+        self.with_conn(move |conn| {
+            let workspace_id = conn
+                .query_row(
+                    "SELECT id FROM workspaces WHERE name = ?1",
+                    params![workspace_name],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .map(|bytes| WorkspaceId::from_slice(&bytes))
+                .transpose()?;
+            let Some(workspace_id) = workspace_id else {
+                return Ok(ProjectCoordinateDiagnostic {
+                    workspace,
+                    requested_name,
+                    status: ProjectCoordinateStatus::Missing,
+                    project_id: None,
+                    current_name: None,
+                    canonical_candidate,
+                    legacy_candidate,
+                    identity_source: local_source.map(|source| source.as_str().to_owned()),
+                    identity_style: local_source.map(|_| requested_style.as_str().to_owned()),
+                    rename_eligible: false,
+                    collision_reason: None,
+                    candidate_count: 0,
+                });
+            };
+
+            let matches = crate::project_coordinates::matches(
+                conn,
+                workspace_id,
+                &requested,
+                repository.as_ref(),
+            )?;
+            let requested_matches = matches
+                .iter()
+                .filter(|candidate| candidate.provenance.requested())
+                .collect::<Vec<_>>();
+            let identity_match = matches
+                .iter()
+                .find(|candidate| candidate.provenance.identity);
+            let exact_match = requested_matches
+                .iter()
+                .copied()
+                .find(|candidate| candidate.provenance.exact);
+            let canonical_collision = identity_match.and_then(|identity| {
+                matches.iter().find(|candidate| {
+                    candidate.provenance.canonical_target && candidate.id != identity.id
+                })
+            });
+            let identity_conflict = repository.as_ref().is_some_and(|repository| {
+                exact_match.is_some_and(|candidate| {
+                    candidate
+                        .identity
+                        .as_deref()
+                        .is_some_and(|stored| stored != repository.identity)
+                })
+            });
+            let identityless_collision = repository.is_some()
+                && exact_match.is_some_and(|candidate| candidate.identity.is_none());
+            let ambiguous = requested_matches.len() > 1
+                || identity_conflict
+                || identityless_collision
+                || (identity_match.is_some()
+                    && exact_match
+                        .is_some_and(|exact| Some(exact.id) != identity_match.map(|row| row.id)));
+
+            let primary = identity_match.or_else(|| requested_matches.first().copied());
+            let status = if ambiguous {
+                ProjectCoordinateStatus::Ambiguous
+            } else if let Some(candidate) = requested_matches.first() {
+                if candidate.provenance.exact {
+                    ProjectCoordinateStatus::Exact
+                } else if candidate.provenance.canonical_compat {
+                    ProjectCoordinateStatus::CanonicalCompat
+                } else {
+                    ProjectCoordinateStatus::LegacyCompat
+                }
+            } else {
+                ProjectCoordinateStatus::Missing
+            };
+            let collision_reason = if identityless_collision {
+                Some(ProjectCoordinateCollisionReason::UnclaimedIdentitylessProject)
+            } else if let Some(holder) = canonical_collision {
+                Some(if holder.identity_source.as_deref() == Some("git_remote") {
+                    ProjectCoordinateCollisionReason::CrossForgeCollision
+                } else {
+                    ProjectCoordinateCollisionReason::CanonicalTargetOccupied
+                })
+            } else if identity_conflict {
+                Some(ProjectCoordinateCollisionReason::CrossIdentityOccupied)
+            } else if requested_matches.len() > 1 && identity_match.is_some() {
+                Some(ProjectCoordinateCollisionReason::CrossForgeCollision)
+            } else if ambiguous {
+                Some(ProjectCoordinateCollisionReason::MultipleProjects)
+            } else {
+                None
+            };
+            let rename_eligible = requested_matches.len() == 1
+                && requested_matches.first().is_some_and(|candidate| {
+                    crate::project_coordinates::promotion_target(candidate, &requested).is_some()
+                })
+                && collision_reason.is_none();
+
+            Ok(ProjectCoordinateDiagnostic {
+                workspace,
+                requested_name,
+                status,
+                project_id: primary.map(|candidate| candidate.id),
+                current_name: primary.map(|candidate| candidate.current_name.clone()),
+                canonical_candidate: canonical_candidate
+                    .or_else(|| primary.and_then(|candidate| candidate.canonical_name.clone())),
+                legacy_candidate: legacy_candidate
+                    .or_else(|| primary.and_then(|candidate| candidate.legacy_name.clone())),
+                identity_source: local_source
+                    .map(|source| source.as_str().to_owned())
+                    .or_else(|| primary.and_then(|candidate| candidate.identity_source.clone())),
+                identity_style: local_source.map(|_| requested_style.as_str().to_owned()),
+                rename_eligible,
+                collision_reason,
+                candidate_count: matches.len(),
+            })
         })
         .await
     }

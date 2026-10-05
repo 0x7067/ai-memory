@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added read-only project-coordinate diagnostics to `ai-memory doctor` and the
+  root-gated `GET /admin/project-coordinate` endpoint. The report classifies
+  exact, canonical-compatibility, legacy-compatibility, missing, and ambiguous
+  names; shows safe local marker/repository evidence and rename eligibility;
+  and reports collisions without creating, claiming, renaming, or exposing
+  remote credentials or marker paths. Ambiguous results keep local session
+  evidence and mark server capture counts unavailable; any returned preferred
+  project is contextual only, never a unique resolution. (#1033)
 - Added the cross-project profile (`docs/cross-project-profile.md`, design in
   `docs/design-cross-project-profile.md`): a small set of `profile/` pages
   recording how the user usually works, delivered to every project and every

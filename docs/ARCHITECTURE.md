@@ -319,6 +319,18 @@ web UI. `ai-memory doctor` uses it to show caller identity and capture ownership
 its per-agent counts flag sessions with multiple capture sources (native events
 or distinct extensions, including backfill).
 The mixed-source count is computed in the same scoped, owner-filtered SQL query.
+`GET /admin/project-coordinate` is a root/admin read-only diagnostic over the
+same bounded exact/canonical/legacy indexes used by scope resolution. It returns
+typed status and collision metadata but never creates, claims, renames, audits,
+or writes a scope manifest. An `ambiguous` result may include the preferred
+identity-backed candidate's UUID/current name as context; that is not unique
+resolution and never makes the request rename-eligible. The endpoint omits the
+stored identity value and reports only its safe source/style and derived
+candidate names. `doctor` adds a safe marker
+status/source class and credential-stripped repository evidence from one shared
+local inspection before rendering that response. If compatibility resolution is
+ambiguous, local session rows remain visible while captured counts are marked
+unavailable rather than rendered as zero.
 
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at

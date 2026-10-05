@@ -14,9 +14,10 @@ use ai_memory_core::{
     SessionId, Tier, UserId, WorkspaceId,
 };
 use ai_memory_store::{
-    AccessMode, GrantLevel, IdentityResolution, ProjectAccess, ProjectPrincipal, ScopeName,
-    ScopeResolutionError, Store, create_explicit_scope_guarded, lookup_existing_scope,
-    lookup_existing_scope_guarded, resolve_many_existing_scopes,
+    AccessMode, GrantLevel, IdentityResolution, ProjectAccess, ProjectCoordinateCollisionReason,
+    ProjectCoordinateStatus, ProjectPrincipal, ScopeName, ScopeResolutionError, Store,
+    create_explicit_scope_guarded, lookup_existing_scope, lookup_existing_scope_guarded,
+    resolve_many_existing_scopes,
 };
 
 fn remote(identity: &str) -> RepositoryIdentity {
@@ -534,6 +535,253 @@ fn preserved_page(ws: WorkspaceId, project: ProjectId) -> NewPage {
         entities: Vec::new(),
         evidence: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn coordinate_diagnostic_classifies_exact_canonical_legacy_and_missing_without_mutation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "checkout-blue", None)
+        .await
+        .0;
+    let before: (i64, String, i64) = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM projects), name, \
+             (SELECT COUNT(*) FROM audit_log) FROM projects WHERE id = ?1",
+            [project.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    for (name, status, rename_eligible) in [
+        ("checkout-blue", ProjectCoordinateStatus::Exact, false),
+        ("acme-api", ProjectCoordinateStatus::CanonicalCompat, true),
+        ("api", ProjectCoordinateStatus::LegacyCompat, false),
+    ] {
+        let diagnostic = store
+            .reader
+            .diagnose_project_coordinate(
+                "default".into(),
+                name.into(),
+                Some(repository.clone()),
+                IdentityStyle::Path,
+            )
+            .await
+            .unwrap();
+        assert_eq!(diagnostic.status, status, "{name}");
+        assert_eq!(diagnostic.project_id, Some(project));
+        assert_eq!(diagnostic.current_name.as_deref(), Some("checkout-blue"));
+        assert_eq!(diagnostic.canonical_candidate.as_deref(), Some("acme-api"));
+        assert_eq!(diagnostic.legacy_candidate.as_deref(), Some("api"));
+        assert_eq!(diagnostic.identity_source.as_deref(), Some("git_remote"));
+        assert_eq!(diagnostic.rename_eligible, rename_eligible);
+    }
+    let no_identity = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "acme-api".into(),
+            None,
+            IdentityStyle::HostPath,
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_identity.status, ProjectCoordinateStatus::CanonicalCompat);
+    assert_eq!(no_identity.project_id, Some(project));
+    assert!(no_identity.rename_eligible);
+    assert_eq!(no_identity.identity_style, None);
+
+    let missing = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "unknown".into(),
+            Some(repository),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status, ProjectCoordinateStatus::Missing);
+    assert_eq!(missing.project_id, Some(project));
+    assert_eq!(missing.current_name.as_deref(), Some("checkout-blue"));
+    assert_eq!(missing.canonical_candidate.as_deref(), Some("acme-api"));
+    assert!(!missing.rename_eligible);
+
+    let after: (i64, String, i64) = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM projects), name, \
+             (SELECT COUNT(*) FROM audit_log) FROM projects WHERE id = ?1",
+            [project.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn coordinate_diagnostic_reports_cross_forge_and_identityless_collisions() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let _github = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        "github-api",
+        None,
+    )
+    .await
+    .0;
+    let gitlab = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/api"),
+        "gitlab-api",
+        None,
+    )
+    .await
+    .0;
+    let ambiguous = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "acme-api".into(),
+            Some(remote("gitlab.com/acme/api")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(
+        ambiguous.collision_reason,
+        Some(ProjectCoordinateCollisionReason::CrossForgeCollision)
+    );
+    assert_eq!(ambiguous.candidate_count, 2);
+    assert_eq!(ambiguous.project_id, Some(gitlab));
+
+    let identityless = store
+        .writer
+        .get_or_create_project(ws, "occupied", None)
+        .await
+        .unwrap();
+    let identity_backed = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/occupied"),
+        "elsewhere",
+        None,
+    )
+    .await
+    .0;
+    let occupied = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "occupied".into(),
+            Some(remote("github.com/acme/occupied")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(occupied.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(
+        occupied.collision_reason,
+        Some(ProjectCoordinateCollisionReason::UnclaimedIdentitylessProject)
+    );
+    assert_eq!(occupied.candidate_count, 2);
+    assert_eq!(occupied.project_id, Some(identity_backed));
+    assert_ne!(identityless, identity_backed);
+
+    let unclaimed_only = store
+        .writer
+        .get_or_create_project(ws, "unclaimed-only", None)
+        .await
+        .unwrap();
+    let unclaimed = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "unclaimed-only".into(),
+            Some(remote("github.com/acme/unclaimed-only")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unclaimed.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(unclaimed.project_id, Some(unclaimed_only));
+    assert_eq!(
+        unclaimed.collision_reason,
+        Some(ProjectCoordinateCollisionReason::UnclaimedIdentitylessProject)
+    );
+    assert!(!unclaimed.rename_eligible);
+
+    let holder = resolve(
+        &store,
+        ws,
+        &explicit("another/repository"),
+        "acme-target-taken",
+        None,
+    )
+    .await
+    .0;
+    let intended = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/target-taken"),
+        "legacy-target",
+        None,
+    )
+    .await
+    .0;
+    let occupied = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "acme-target-taken".into(),
+            Some(remote("github.com/acme/target-taken")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(occupied.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(occupied.project_id, Some(intended));
+    assert_eq!(
+        occupied.collision_reason,
+        Some(ProjectCoordinateCollisionReason::CanonicalTargetOccupied)
+    );
+    assert_eq!(occupied.candidate_count, 2);
+    assert_ne!(holder, intended);
+
+    let foreign = resolve(
+        &store,
+        ws,
+        &remote("github.com/other/occupied-name"),
+        "occupied-name",
+        None,
+    )
+    .await
+    .0;
+    let foreign_occupied = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "occupied-name".into(),
+            Some(remote("gitlab.com/acme/unrelated")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign_occupied.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(foreign_occupied.project_id, Some(foreign));
+    assert_eq!(
+        foreign_occupied.collision_reason,
+        Some(ProjectCoordinateCollisionReason::CrossIdentityOccupied)
+    );
+    assert!(!foreign_occupied.rename_eligible);
 }
 
 #[tokio::test]

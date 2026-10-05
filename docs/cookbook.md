@@ -384,6 +384,16 @@ ai-memory serve                      # run the server
   (removed by hand, a failed first wire), install them by hand: `ai-memory
   install-hooks --agent <your-agent> --apply` and `ai-memory install-mcp
   --client <client> --apply`. Then check `ai-memory status` / `ai-memory doctor`.
+- **The current checkout resolves to an unexpected project**: run `ai-memory
+  doctor`. Its project-coordinate block shows the effective local marker,
+  credential-stripped repository identity source/style, canonical and legacy
+  candidate names, the server's exact/compatibility/missing/ambiguous result,
+  and whether an authorized write can promote the existing name in place. The
+  check is read-only: an unknown coordinate is reported, never created. If the
+  server coordinate is ambiguous, a returned UUID/current name is only the
+  preferred identity-backed candidate for context, not a unique resolution or
+  rename permission. Local harness rows remain visible and their captured
+  counts are shown as unavailable rather than zero.
 - **Only *some* agents are being remembered**: run `ai-memory doctor`. It lists
   every harness that has local sessions in this project and whether the server
   captured them — so a harness you rotated in without installing its hook (a
