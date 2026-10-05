@@ -283,7 +283,15 @@ project. #1033 makes a remote-derived key the default name, landing in steps on
    ambiguous result may carry the preferred identity-backed candidate UUID and
    current name for operator context; it still represents no unique resolution
    and is never rename-eligible.
-5. Marker `aliases`, then 6. identity- or path-keyed blocks in `~/.ai-memory.toml`.
+5. **Local marker aliases (landed).** `aliases = ["former-name"]` is bounded,
+   normalized, deduplicated and forwarded identically by native, POSIX shell,
+   PowerShell and generated TypeScript clients on capture and handoff requests.
+   The marker's `project` remains canonical. Alias lookup stays within its
+   selected workspace and requires the checkout's full hostful git-remote
+   identity to match the stored row; reads do not rename, while capture may use
+   only the Phase 1 write-authorized canonical promotion. Alias lists are
+   transient routing hints, not persisted rows, and stay supported after v3.
+6. Identity- or path-keyed blocks in `~/.ai-memory.toml` remain a later phase.
 
 
 Paths stay lexically normalised throughout; nothing canonicalises.

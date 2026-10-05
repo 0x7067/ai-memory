@@ -61,6 +61,10 @@ handoff lookup also sends `cwd` when no marker exists so the default
 `identity` / `identity_src` when the checkout has a repository identity (see
 [Repository identity](#repository-identity)), with or without a marker, and
 `identity_style=path` alongside a remote identity when the marker opts in.
+A marker `project` remains the canonical requested name. Its validated `aliases`
+travel as one percent-encoded JSON-array `aliases` query value on both hook and
+handoff requests, and are ignored unless the checkout supplies a normalized
+hostful git-remote identity.
 
 ## Schema
 
@@ -94,6 +98,17 @@ identity = "acme/platform"
 # promoted in place only by an authorized write through that canonical name.
 # See "Naming new projects by repository path" below.
 identity_style = "path"
+
+# Optional. Former names for this same repository in this workspace. At most
+# 16 entries, each at most 128 UTF-8 bytes and matching
+# ^[A-Za-z0-9][A-Za-z0-9._-]*$. Whitespace is trimmed and duplicates keep their
+# first position. A hostful upstream/origin identity must match the stored
+# project's identity; otherwise the aliases are refused. Reads use the
+# existing UUID without renaming. Hook capture may rename that UUID to the
+# canonical `project` above only after write authorization. Aliases are local
+# routing hints, are not persisted, never select another workspace, and remain
+# supported after the v3 dual-key compatibility window.
+aliases = ["former-name", "old-worktree-name"]
 
 # Optional. Opt this project into drop_subagent_captures: set it to "true"
 # and the server accepts but does NOT store this project's subagent-session
@@ -166,6 +181,20 @@ consume = false
 Anything else is rejected at `get_or_create_workspace` / `_project`
 time, surfacing as a hook warning. The shell helper URL-encodes
 defensively but the server's regex is the source of truth.
+
+`aliases` is all-or-nothing and intentionally uses a portable subset shared by
+native Rust, POSIX shell, PowerShell, and generated TypeScript: exactly one
+root-level declaration on one line, containing a JSON-compatible array of
+unescaped strings. Duplicate declarations, table placement, multiline arrays,
+comments/trailing junk, trailing commas, path-like/control-bearing values,
+non-strings, oversized values, and over-count lists make hook and handoff
+routing fail closed without echoing their contents. An absent or empty list is
+inert. The canonical `project` still wins when it already resolves. Otherwise
+every local alias hit must deduplicate to one project carrying the checkout's
+exact hostful remote identity; a different identity or more than one project
+fails closed. Alias lookup never searches another workspace, and capture may
+rename only when `project` equals the canonical path-style name derived from
+that exact remote identity.
 
 `project_strategy` accepts `repo-root` (or `repo_root`) only. Unknown
 values are ignored and behave like the default `basename(cwd)` strategy.
@@ -643,8 +672,10 @@ own name.
   a different repository — typically the same path on another forge
   (`gitlab.com/acme/api` after `github.com/acme/api`) — the newcomer falls
   back to the name it would get without the style.
-- Put it in `~/.ai-memory.toml` to apply it to every checkout under `$HOME`
-  that has no nearer marker, like any other marker key.
+- `aliases` in this phase are supported only by a local marker reachable from
+  the checkout. Identity/path-keyed home configuration is a later rollout
+  phase; a single inherited `~/.ai-memory.toml` can still supply ordinary
+  settings, but it cannot yet map several repository identities independently.
 - Static CLI/MCP clients still pass only `workspace` + `project`. They may use
   the canonical path name (`acme-api`) or the v2 basename (`api`) while it is
   unambiguous. A hostless key shared by multiple forges fails closed.

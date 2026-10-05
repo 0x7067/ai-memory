@@ -91,7 +91,8 @@ pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
 const SUBAGENT_SESSIONS_MAX: usize = 4096;
 
 /// Resolved-project cache key:
-/// `(cwd, workspace_override, project_override, project_strategy, identity)`.
+/// `(cwd, workspace_override, project_override, project_strategy,
+/// identity/aliases/provenance/mode)`.
 pub type ProjectCacheKey = (String, String, String, String, String);
 
 /// Shared bounded resolved-project cache.
@@ -464,7 +465,7 @@ pub struct HookState {
     /// the store. Same handle is also held by the wiki and consolidator
     /// so scrubbing happens at every write boundary.
     pub sanitizer: Sanitizer,
-    /// Cache of `(cwd, workspace_override, project_override, project_strategy) → ids`.
+    /// Cache of `(cwd, workspace_override, project_override, project_strategy, identity+aliases) → ids`.
     /// The composite key avoids poisoning between callers that resolve
     /// the same `cwd` with and without an override during a hook-script
     /// upgrade window. Each tuple element defaults to the empty string
@@ -655,6 +656,10 @@ async fn handle_hook(
     // on for a supported Stop, populate the Stop body with the sanitized excerpt.
     // Any gate failure leaves an empty Stop with the same 202 "queued" response.
     crate::assistant_capture::apply_assistant_backstop(&mut env, state.capture_assistant_enabled);
+    if env.aliases_invalid {
+        HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
+        return (StatusCode::ACCEPTED, "invalid marker aliases");
+    }
     let Some(env) = inspect_capture_envelope(env) else {
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "capture policy dropped");
@@ -906,6 +911,15 @@ async fn handle_hook_batch(
             &mut env,
             state.capture_assistant_enabled,
         );
+        if env.aliases_invalid {
+            HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedInvalid,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
         let Some(env) = inspect_capture_envelope(env) else {
             // A protocol-directed drop is committed from the spool's point of
             // view, but intentionally spends neither ingress capacity nor a
@@ -1297,6 +1311,9 @@ async fn should_drop_subagent(
         env.project_strategy,
         env.identity.as_ref(),
         env.identity_style,
+        &env.aliases,
+        env.project_source,
+        true,
         viewer,
     )
     .await
@@ -1355,6 +1372,8 @@ pub struct HandoffQuery {
     pub workspace: Option<String>,
     /// Project override (mirror of `HookQuery.project`).
     pub project: Option<String>,
+    /// Provenance of the project override (mirror of `HookQuery.project_src`).
+    pub project_src: Option<String>,
     /// Project strategy (mirror of `HookQuery.project_strategy`).
     pub project_strategy: Option<String>,
     /// Per-repo opt-in for the session-start project brief, forwarded by
@@ -1384,6 +1403,8 @@ pub struct HandoffQuery {
     /// Naming style for a project this request creates; see
     /// [`crate::payload::HookQuery::identity_style`].
     pub identity_style: Option<String>,
+    /// Compact JSON array of former project names from the local marker.
+    pub aliases: Option<String>,
     /// The marker's `[profile] contribute`. An explicit falsy value keeps the
     /// project out of profile harvesting; absent or anything else keeps it in.
     pub profile_contribute: Option<String>,
@@ -1479,6 +1500,14 @@ async fn fetch_and_accept_handoff_at(
     now: jiff::Timestamp,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
+    let repository = query.repository_identity();
+    let aliases = crate::payload::marker_aliases_from_wire(
+        query.project.as_deref(),
+        ProjectSource::parse(query.project_src.as_deref()),
+        repository.as_ref(),
+        query.aliases.as_deref(),
+    )
+    .map_err(|_| anyhow::anyhow!("invalid marker aliases"))?;
     // Keep the active-project key compatible with MCP transports: the native
     // session id is carried separately below to bind a destructive handoff
     // claim to its exact receiver.
@@ -1492,8 +1521,11 @@ async fn fetch_and_accept_handoff_at(
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
-        query.repository_identity().as_ref(),
+        repository.as_ref(),
         query.identity_style(),
+        &aliases,
+        ProjectSource::parse(query.project_src.as_deref()),
+        false,
         viewer,
     )
     .await?;
@@ -2491,12 +2523,16 @@ pub(crate) fn render_managed_context(
 /// project strategy. Shared by `resolve_project_ids` (insert/lookup) and
 /// `process` (eviction on the stale-cache retry) so the two always agree on
 /// the slot.
+#[allow(clippy::too_many_arguments)]
 fn cache_key_for(
     cwd_norm: Option<&str>,
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
     identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+    aliases: &ai_memory_core::repository_identity::MarkerAliases,
+    project_source: ProjectSource,
+    promote_alias: bool,
 ) -> ProjectCacheKey {
     (
         cwd_norm.unwrap_or_default().to_string(),
@@ -2506,9 +2542,14 @@ fn cache_key_for(
         // Two repositories can sit at the same path on two machines. Without
         // the identity in the key, whichever resolved first would answer for
         // both.
-        identity
-            .map(|i| format!("{}:{}", i.source.as_str(), i.identity))
-            .unwrap_or_default(),
+        format!(
+            "{}:{}:{}:{}:{}",
+            identity.map(|i| i.source.as_str()).unwrap_or_default(),
+            identity.map(|i| i.identity.as_str()).unwrap_or_default(),
+            aliases.cache_key(),
+            project_source.as_str(),
+            if promote_alias { "write" } else { "read" }
+        ),
     )
 }
 
@@ -2543,14 +2584,15 @@ fn has_publishable_scope_hint(cwd: Option<&str>, project_override: Option<&str>)
 /// Precedence:
 /// 1. `workspace_override` (typically declared by the agent's host-side
 ///    hook via a `.ai-memory.toml` walk-up) OR `DEFAULT_WORKSPACE_NAME`.
-/// 2. `project_override` OR marker-selected project strategy OR
-///    `basename(cwd)` OR fallback to `state.project_id` (when `cwd` is
-///    also unavailable).
+/// 2. A canonical marker `project` may resolve through one of its aliases only
+///    when the checkout's full git-remote identity matches the stored row.
+/// 3. Otherwise `project_override` OR marker-selected project strategy OR
+///    `basename(cwd)` OR fallback to `state.project_id` (when `cwd` is also
+///    unavailable).
 ///
-/// Cache key is `(cwd, workspace_override, project_override,
-/// project_strategy)` so the same `cwd` resolved with and without an
-/// override (e.g. during a hook-script upgrade window) doesn't poison each
-/// other's slot.
+/// Cache identity includes cwd, overrides, strategy, repository identity,
+/// normalized aliases, and read/write alias mode so a SessionStart lookup
+/// cannot suppress a later capture promotion.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_project_ids_inner(
     state: &HookState,
@@ -2560,6 +2602,9 @@ async fn resolve_project_ids_inner(
     project_strategy: ProjectStrategy,
     identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
     identity_style: ai_memory_core::repository_identity::IdentityStyle,
+    aliases: &ai_memory_core::repository_identity::MarkerAliases,
+    project_source: ProjectSource,
+    promote_alias: bool,
     creator: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_raw = cwd.filter(|s| !s.is_empty());
@@ -2572,14 +2617,22 @@ async fn resolve_project_ids_inner(
     }
 
     // Only the rungs that carry something a name does not route by identity:
-    // a declared `project` and a folder name keep routing by name.
-    let identity = identity.filter(|i| i.source.routes_by_identity());
+    // a declared `project` and a folder name keep routing by name. Marker
+    // projects opt into identity routing only when they carry effective aliases;
+    // an accepted empty alias list is inert and preserves marker precedence.
+    let identity = identity.filter(|i| {
+        i.source.routes_by_identity()
+            && !(project_source == ProjectSource::Marker && aliases.is_empty())
+    });
     let cache_key = cache_key_for(
         cwd_norm.as_deref(),
         workspace_override,
         project_override,
         project_strategy,
         identity,
+        aliases,
+        project_source,
+        promote_alias,
     );
 
     {
@@ -2771,7 +2824,67 @@ async fn resolve_project_ids_inner(
             .map_err(|e| anyhow::anyhow!("find_project_by_cwd_prefix: {e}"))?,
         _ => None,
     };
-    let proj = if let Some(identity) = identity {
+    let alias_match = if aliases.is_empty() {
+        None
+    } else {
+        let identity = identity
+            .ok_or_else(|| anyhow::anyhow!("marker aliases require repository identity"))?;
+        let resolved = if promote_alias {
+            let principal = creator.map(ai_memory_store::ProjectPrincipal::user);
+            match state
+                .writer
+                .resolve_project_aliases_for_write(
+                    ws,
+                    project_name.clone(),
+                    aliases.clone(),
+                    identity.clone(),
+                    principal,
+                    creator.is_some(),
+                )
+                .await
+            {
+                Ok(Some(resolved)) => {
+                    if resolved.promoted_from.is_some()
+                        && let Err(error) = state
+                            .wiki
+                            .refresh_renamed_scope(ws, resolved.project_id)
+                            .await
+                    {
+                        warn!(error = %error, "marker alias promotion committed but manifest refresh failed");
+                    }
+                    Ok(Some(resolved.project_id))
+                }
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            }
+        } else {
+            state
+                .reader
+                .resolve_existing_project_aliases(
+                    ws,
+                    project_name.clone(),
+                    aliases.clone(),
+                    identity.clone(),
+                )
+                .await
+        };
+        match resolved {
+            Ok(Some(project)) => Some(project),
+            Ok(None) => {
+                return Err(anyhow::anyhow!(
+                    "marker aliases did not match requested project {project_name}"
+                ));
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "marker aliases refused for requested project {project_name}: {error}"
+                ));
+            }
+        }
+    };
+    let proj = if let Some(project) = alias_match {
+        project
+    } else if let Some(identity) = identity {
         // A repository identity decides the project before any name does: the
         // project already carrying it wins, whatever it is called, and the
         // name (or the cwd-prefix parent) is only the candidate for a project
@@ -2846,6 +2959,9 @@ async fn resolve_project_ids(
         project_strategy,
         None,
         Default::default(),
+        &ai_memory_core::repository_identity::MarkerAliases::default(),
+        ProjectSource::Unspecified,
+        true,
         None,
     )
     .await?;
@@ -3161,6 +3277,9 @@ async fn process_authorized(
     skip_webhooks: Vec<String>,
     viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<HookProcessingOutcome> {
+    if env.aliases_invalid {
+        return Err(anyhow::anyhow!("invalid marker aliases"));
+    }
     let session_id = resolve_session_id(&env)?;
     // An OpenCode `session.moved` relocation, forwarded by the plugin as a
     // SessionStart naming the directory the session left. Admission rebinds
@@ -3267,6 +3386,9 @@ async fn process_authorized(
                 env.project_strategy,
                 env.identity.as_ref(),
                 env.identity_style,
+                &env.aliases,
+                env.project_source,
+                true,
                 viewer,
             )
             .await?
@@ -3354,6 +3476,9 @@ async fn process_authorized(
         env.project_override.as_deref(),
         env.project_strategy,
         env.identity.as_ref(),
+        &env.aliases,
+        env.project_source,
+        true,
     );
     let mut attempts = 0;
     // Keep the successful keyed-ingest gate until every downstream effect has
@@ -3421,6 +3546,9 @@ async fn process_authorized(
                     env.project_strategy,
                     env.identity.as_ref(),
                     env.identity_style,
+                    &env.aliases,
+                    env.project_source,
+                    true,
                     viewer,
                 )
                 .await?;
@@ -4512,6 +4640,7 @@ mod tests {
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
             project: Some("scratch".into()),
+            project_src: None,
             project_strategy: None,
             briefing: None,
             briefing_budget: None,
@@ -4520,6 +4649,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         }
     }
 
@@ -4991,6 +5121,7 @@ mod tests {
             profile_digest: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
+            aliases: None,
             ..Default::default()
         };
         let got = query("github.com/orga/api", "git_remote")
@@ -5008,6 +5139,300 @@ mod tests {
                 .is_none()
         );
         assert!(HandoffQuery::default().repository_identity().is_none());
+    }
+
+    #[test]
+    fn hook_and_handoff_queries_validate_aliases_identically() {
+        let raw = Some("[\" former-name \",\"legacy_name\",\"former-name\"]".to_owned());
+        let hook = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                identity: Some("github.com/acme/api".into()),
+                project: Some("acme-api".into()),
+                project_src: Some("marker".into()),
+                identity_src: Some("git_remote".into()),
+                aliases: raw.clone(),
+                ..Default::default()
+            },
+            serde_json::json!({}),
+        );
+        let handoff = HandoffQuery {
+            project: Some("acme-api".into()),
+            project_src: Some("marker".into()),
+            identity: Some("github.com/acme/api".into()),
+            identity_src: Some("git_remote".into()),
+            aliases: raw,
+            ..Default::default()
+        };
+        assert_eq!(
+            hook.aliases,
+            crate::payload::marker_aliases_from_wire(
+                handoff.project.as_deref(),
+                ProjectSource::parse(handoff.project_src.as_deref()),
+                handoff.repository_identity().as_ref(),
+                handoff.aliases.as_deref(),
+            )
+            .unwrap()
+        );
+        assert_eq!(hook.aliases.as_slice(), ["former-name", "legacy_name"]);
+
+        let invalid = Some("[\"../foreign\"]".to_owned());
+        let hook = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                project: Some("acme-api".into()),
+                project_src: Some("marker".into()),
+                identity: Some("github.com/acme/api".into()),
+                identity_src: Some("git_remote".into()),
+                aliases: invalid.clone(),
+                ..Default::default()
+            },
+            serde_json::json!({}),
+        );
+        let handoff = HandoffQuery {
+            project: Some("acme-api".into()),
+            project_src: Some("marker".into()),
+            identity: Some("github.com/acme/api".into()),
+            identity_src: Some("git_remote".into()),
+            aliases: invalid,
+            ..Default::default()
+        };
+        assert!(hook.aliases.is_empty());
+        assert!(hook.aliases_invalid);
+        assert!(
+            crate::payload::marker_aliases_from_wire(
+                handoff.project.as_deref(),
+                ProjectSource::parse(handoff.project_src.as_deref()),
+                handoff.repository_identity().as_ref(),
+                handoff.aliases.as_deref(),
+            )
+            .is_err()
+        );
+
+        for project_src in [None, Some("repo-root".to_owned())] {
+            let raw = Some("[\"former-name\"]".to_owned());
+            let hook = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "session-start".into(),
+                    project: Some("acme-api".into()),
+                    project_src: project_src.clone(),
+                    identity: Some("github.com/acme/api".into()),
+                    identity_src: Some("git_remote".into()),
+                    aliases: raw.clone(),
+                    ..Default::default()
+                },
+                serde_json::json!({}),
+            );
+            let handoff = crate::payload::marker_aliases_from_wire(
+                Some("acme-api"),
+                ProjectSource::parse(project_src.as_deref()),
+                Some(&ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                }),
+                raw.as_deref(),
+            );
+            assert!(hook.aliases_invalid);
+            assert!(handoff.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_promotes_an_alias_but_handoff_only_reads_it() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let repository = ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        };
+        let project = state
+            .writer
+            .resolve_project_by_identity(
+                state.workspace_id,
+                repository.clone(),
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "former-name",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .0;
+        let aliases =
+            ai_memory_core::repository_identity::MarkerAliases::new(["former-name"]).unwrap();
+        let handoff = resolve_project_ids_inner(
+            &state,
+            Some("/repo"),
+            Some("default"),
+            Some("acme-api"),
+            ProjectStrategy::Basename,
+            Some(&repository),
+            Default::default(),
+            &aliases,
+            ProjectSource::Marker,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handoff.1, project);
+        assert_eq!(
+            state
+                .reader
+                .project_name_by_id(state.workspace_id, project)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("former-name")
+        );
+        let capture = resolve_project_ids_inner(
+            &state,
+            Some("/repo"),
+            Some("default"),
+            Some("acme-api"),
+            ProjectStrategy::Basename,
+            Some(&repository),
+            Default::default(),
+            &aliases,
+            ProjectSource::Marker,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.1, project);
+        assert_eq!(
+            state
+                .reader
+                .project_name_by_id(state.workspace_id, project)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-api")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_aliases_preserve_marker_project_precedence() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let repository = ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        };
+        let identity_project = state
+            .writer
+            .resolve_project_by_identity(
+                state.workspace_id,
+                repository.clone(),
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "identity-project",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .0;
+        let marker_project = state
+            .writer
+            .get_or_create_project(state.workspace_id, "marker-project", None)
+            .await
+            .unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                project: Some("marker-project".into()),
+                project_src: Some("marker".into()),
+                identity: Some(repository.identity.clone()),
+                identity_src: Some("git_remote".into()),
+                aliases: Some("[]".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "cwd": "/repo" }),
+        );
+        assert!(!env.aliases_invalid);
+        assert!(env.aliases.is_empty());
+        let resolved = resolve_project_ids_inner(
+            &state,
+            env.cwd.as_deref(),
+            Some("default"),
+            env.project_override.as_deref(),
+            env.project_strategy,
+            env.identity.as_ref(),
+            env.identity_style,
+            &env.aliases,
+            env.project_source,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.1, marker_project);
+        assert_ne!(resolved.1, identity_project);
+        assert_eq!(
+            state
+                .reader
+                .project_name_by_id(state.workspace_id, identity_project)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("identity-project")
+        );
+    }
+
+    #[test]
+    fn project_cache_separates_alias_sets() {
+        let identity = ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        };
+        let first = cache_key_for(
+            Some("/repo"),
+            Some("default"),
+            Some("acme-api"),
+            ProjectStrategy::Basename,
+            Some(&identity),
+            &ai_memory_core::repository_identity::MarkerAliases::new(["old-a"]).unwrap(),
+            ProjectSource::Marker,
+            true,
+        );
+        let second = cache_key_for(
+            Some("/repo"),
+            Some("default"),
+            Some("acme-api"),
+            ProjectStrategy::Basename,
+            Some(&identity),
+            &ai_memory_core::repository_identity::MarkerAliases::new(["old-b"]).unwrap(),
+            ProjectSource::Marker,
+            true,
+        );
+        assert_ne!(first, second);
+        let different_provenance = cache_key_for(
+            Some("/repo"),
+            Some("default"),
+            Some("acme-api"),
+            ProjectStrategy::Basename,
+            Some(&identity),
+            &ai_memory_core::repository_identity::MarkerAliases::new(["old-a"]).unwrap(),
+            ProjectSource::RepoRoot,
+            true,
+        );
+        let read_mode = cache_key_for(
+            Some("/repo"),
+            Some("default"),
+            Some("acme-api"),
+            ProjectStrategy::Basename,
+            Some(&identity),
+            &ai_memory_core::repository_identity::MarkerAliases::new(["old-a"]).unwrap(),
+            ProjectSource::Marker,
+            false,
+        );
+        assert_ne!(first, different_provenance);
+        assert_ne!(first, read_mode);
     }
 
     /// A capture that carries the repository identity its client resolved.
@@ -5064,6 +5489,7 @@ mod tests {
                 identity: Some(identity.to_owned()),
                 identity_src: Some("git_remote".into()),
                 identity_style: style.map(str::to_owned),
+                aliases: None,
                 ..Default::default()
             },
             serde_json::json!({
@@ -8086,6 +8512,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_aliases_are_rejected_before_subagent_scope_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let malformed = HookQuery {
+            event: "pre-tool-use".into(),
+            agent: Some("grok".into()),
+            project: Some("must-not-exist".into()),
+            project_src: Some("marker".into()),
+            identity: Some("github.com/acme/api".into()),
+            identity_src: Some("git_remote".into()),
+            aliases: Some("[\"../foreign\"]".into()),
+            drop_subagent: Some("1".into()),
+            ..Default::default()
+        };
+        let body = serde_json::json!({
+            "sessionId": "malformed-alias-session",
+            "subagentType": "general-purpose",
+            "toolName": "x"
+        });
+
+        let response = handle_hook(
+            State(state.clone()),
+            Query(malformed),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let projects = state
+            .reader
+            .list_projects_with_stats_for_workspace("default".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.project_name.as_str())
+                .collect::<Vec<_>>(),
+            ["scratch"]
+        );
+        assert_eq!(state.project_cache.lock().await.len(), 0);
+
+        let response = handle_hook(
+            State(state.clone()),
+            Query(HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("grok".into()),
+                project: Some("legitimate-project".into()),
+                drop_subagent: Some("1".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(serde_json::json!({
+                "sessionId": "valid-subagent-session",
+                "subagentType": "general-purpose",
+                "toolName": "x"
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let permit = state
+            .ingest_semaphore
+            .clone()
+            .acquire_many_owned(DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT as u32)
+            .await
+            .unwrap();
+        drop(permit);
+        let projects = state
+            .reader
+            .list_projects_with_stats_for_workspace("default".into(), None)
+            .await
+            .unwrap();
+        assert!(
+            projects
+                .iter()
+                .any(|project| project.project_name == "legitimate-project")
+        );
+        assert_eq!(state.project_cache.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn handle_hook_batch_keeps_subagent_events_when_disabled() {
         let tmp = TempDir::new().unwrap();
         let state = Arc::new(make_state(&tmp).await);
@@ -9380,11 +9895,11 @@ mod tests {
                 String::new(),
                 String::new(),
                 ProjectStrategy::Basename.as_str().to_string(),
-                String::new(),
+                ":::unspecified:write".to_string(),
             );
             assert!(
                 cache.contains_key(&key),
-                "cache keyed by (cwd, ws_override, proj_override, project_strategy, identity)"
+                "cache keyed by cwd, overrides, strategy, identity, aliases, provenance, and mode"
             );
         }
 
@@ -9727,6 +10242,9 @@ mod tests {
             Some("scratch"),
             ProjectStrategy::Basename,
             None,
+            &ai_memory_core::repository_identity::MarkerAliases::default(),
+            ProjectSource::Unspecified,
+            true,
         );
         let mut cache = state.project_cache.lock().await;
         assert_eq!(cache.get(&cache_key), Some((cached_ws, cached_proj)));
@@ -11972,6 +12490,7 @@ mod tests {
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
                     project: Some("scratch".into()),
+                    project_src: None,
                     project_strategy: None,
                     briefing: None,
                     briefing_budget: None,
@@ -11980,6 +12499,7 @@ mod tests {
                     identity: None,
                     identity_src: None,
                     identity_style: None,
+                    aliases: None,
                 }),
                 Some(axum::Extension(ai_memory_core::ActorContext {
                     issuer: Some("https://idp.example".into()),
@@ -12588,6 +13108,7 @@ mod tests {
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
             project: Some("scratch".into()),
+            project_src: None,
             project_strategy: None,
             briefing: Some("1".into()),
             briefing_budget: None,
@@ -12596,6 +13117,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
         let state = Arc::new(state);
         let session_start = |viewer: Option<ai_memory_core::UserId>| {
@@ -12675,6 +13197,7 @@ mod tests {
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
             project: Some("scratch".into()),
+            project_src: None,
             project_strategy: None,
             briefing: None,
             briefing_budget: None,
@@ -12683,6 +13206,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
 
         let state = Arc::new(state);
@@ -12781,6 +13305,7 @@ mod tests {
             cwd: Some(cwd),
             workspace: Some("default".into()),
             project: Some("scratch".into()),
+            project_src: None,
             project_strategy: None,
             briefing: None,
             briefing_budget: None,
@@ -12789,6 +13314,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
         let (status, body) = read_handoff_response(
             handle_handoff(
@@ -12965,6 +13491,7 @@ mod tests {
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
                     project: Some("scratch".into()),
+                    project_src: None,
                     project_strategy: None,
                     briefing: None,
                     briefing_budget: None,
@@ -12973,6 +13500,7 @@ mod tests {
                     identity: None,
                     identity_src: None,
                     identity_style: None,
+                    aliases: None,
                 }),
                 None,
                 None,
@@ -13856,6 +14384,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
                 project: None,
+                project_src: None,
                 project_strategy: None,
                 briefing: None,
                 briefing_budget: None,
@@ -13864,6 +14393,7 @@ mod tests {
                 identity: None,
                 identity_src: None,
                 identity_style: None,
+                aliases: None,
             },
             None,
             Vec::new(),
@@ -13937,6 +14467,7 @@ mod tests {
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
                 project: Some("scratch".into()),
+                project_src: None,
                 project_strategy: None,
                 briefing: None,
                 briefing_budget: None,
@@ -13945,6 +14476,7 @@ mod tests {
                 identity: None,
                 identity_src: None,
                 identity_style: None,
+                aliases: None,
             },
             None,
             Vec::new(),
@@ -14010,6 +14542,7 @@ mod tests {
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
             project: Some("scratch".into()),
+            project_src: None,
             project_strategy: None,
             briefing: None,
             briefing_budget: None,
@@ -14018,6 +14551,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
         let empty_sid = "empty-native-session";
         let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new(), None)
@@ -14163,6 +14697,7 @@ mod tests {
             cwd: Some(cwd),
             workspace: Some("default".into()),
             project: Some("scratch".into()),
+            project_src: None,
             project_strategy: None,
             briefing: None,
             briefing_budget: None,
@@ -14173,6 +14708,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
         let rendered = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new(), None)
             .await
@@ -14283,6 +14819,7 @@ mod tests {
             cwd: Some(cwd.into()),
             workspace: None,
             project: None,
+            project_src: None,
             project_strategy: None,
             briefing: Some("true".into()),
             briefing_budget: None,
@@ -14291,6 +14828,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
 
         let named = ai_memory_core::ActorContext {
@@ -14365,6 +14903,7 @@ mod tests {
             cwd: Some(cwd.into()),
             workspace: None,
             project: None,
+            project_src: None,
             project_strategy: None,
             briefing: Some("true".into()),
             briefing_budget: None,
@@ -14373,6 +14912,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
 
         let rendered =
@@ -14431,6 +14971,7 @@ mod tests {
             cwd: Some(cwd.into()),
             workspace: None,
             project: None,
+            project_src: None,
             project_strategy: None,
             briefing: briefing.map(str::to_owned),
             briefing_budget: None,
@@ -14439,6 +14980,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
@@ -14593,6 +15135,7 @@ mod tests {
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
             project: Some("scratch".into()),
+            project_src: None,
             project_strategy: None,
             briefing: briefing.map(str::to_owned),
             briefing_budget: None,
@@ -14601,6 +15144,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         };
 
         let rendered =
@@ -14811,6 +15355,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 workspace: None,
                 project: None,
+                project_src: None,
                 project_strategy: None,
                 briefing: None,
                 briefing_budget: None,
@@ -14819,6 +15364,7 @@ mod tests {
                 identity: None,
                 identity_src: None,
                 identity_style: None,
+                aliases: None,
             },
             None,
             Vec::new(),
@@ -14943,7 +15489,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 strat.clone(),
-                String::new(),
+                ":::unspecified:write".to_string(),
             )),
             "cache key must remain case-folded for #806 stickiness"
         );
@@ -14953,7 +15499,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 strat,
-                String::new(),
+                ":::unspecified:write".to_string(),
             )),
             "cache key must not carry the original-case basename"
         );
@@ -17336,6 +17882,7 @@ mod tests {
             cwd: Some(cwd.into()),
             workspace: None,
             project: None,
+            project_src: None,
             project_strategy: None,
             briefing: None,
             briefing_budget: None,
@@ -17344,6 +17891,7 @@ mod tests {
             identity: None,
             identity_src: None,
             identity_style: None,
+            aliases: None,
         }
     }
 
