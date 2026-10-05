@@ -18,6 +18,7 @@ use ai_memory_store::{
     StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle,
     create_explicit_scope_guarded, lookup_existing_scope_guarded,
 };
+use ai_memory_wiki::Wiki;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -43,6 +44,8 @@ pub struct WorkstreamState {
     pub reader: ReaderPool,
     /// Privacy scrubber applied before raw or indexed persistence.
     pub sanitizer: Sanitizer,
+    /// Wiki handle for refreshing a scope manifest after name promotion.
+    pub wiki: Wiki,
     /// ai-memory data root containing `raw/workstreams`.
     pub data_dir: PathBuf,
     /// Whether a trusted proxy can distinguish operators without DB users.
@@ -89,15 +92,28 @@ pub fn workstream_router(state: WorkstreamState) -> Router {
 #[derive(Debug, Serialize)]
 struct ApiError {
     error: String,
+    #[serde(flatten)]
+    warning: ai_memory_core::repository_identity::ManifestWarningContext,
 }
 
 type ApiFailure = (StatusCode, Json<ApiError>);
 
 fn api_failure(status: StatusCode, message: impl Into<String>) -> ApiFailure {
+    api_failure_with_manifest_warning(status, message, None)
+}
+
+fn api_failure_with_manifest_warning(
+    status: StatusCode,
+    message: impl Into<String>,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+) -> ApiFailure {
     (
         status,
         Json(ApiError {
             error: message.into(),
+            warning: ai_memory_core::repository_identity::ManifestWarningContext {
+                manifest_warning,
+            },
         }),
     )
 }
@@ -281,7 +297,21 @@ async fn prepare_run(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
-    let scope = match create_explicit_scope_guarded(
+    let selection = match (&request.workstream, &request.new_workstream) {
+        (Some(name), None) => WorkstreamSelection::Named(name.trim().to_string()),
+        (None, Some(name)) => WorkstreamSelection::New(name.trim().to_string()),
+        (None, None) => WorkstreamSelection::Current,
+        (Some(_), Some(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "workstream and new_workstream are mutually exclusive",
+            );
+        }
+    };
+    if let Err(failure) = selection.validate() {
+        return store_error_response(failure);
+    }
+    let resolved_scope = match create_explicit_scope_guarded(
         &state.reader,
         &state.writer,
         request.workspace.trim(),
@@ -296,17 +326,34 @@ async fn prepare_run(
         }
         Err(failure) => return error(StatusCode::BAD_REQUEST, failure.to_string()),
     };
-    let selection = match (request.workstream, request.new_workstream) {
-        (Some(name), None) => WorkstreamSelection::Named(name.trim().to_string()),
-        (None, Some(name)) => WorkstreamSelection::New(name.trim().to_string()),
-        (None, None) => WorkstreamSelection::Current,
-        (Some(_), Some(_)) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "workstream and new_workstream are mutually exclusive",
-            );
+    let manifest_warning = if resolved_scope.promoted_from.is_some() {
+        match state
+            .wiki
+            .refresh_renamed_scope(
+                resolved_scope.scope.workspace_id,
+                resolved_scope.scope.project_id,
+            )
+            .await
+        {
+            Ok(_) => None,
+            Err(failure) => {
+                warn!(
+                    error = %failure,
+                    workspace_id = %resolved_scope.scope.workspace_id,
+                    project_id = %resolved_scope.scope.project_id,
+                    "project name promotion committed; manifest refresh/checkpoint failed; startup backfill can repair"
+                );
+                Some(
+                    ai_memory_core::repository_identity::ManifestWarning::promotion_refresh_failed(
+                        failure,
+                    ),
+                )
+            }
         }
+    } else {
+        None
     };
+    let scope = resolved_scope.scope;
     let identity = actor.and_then(|Extension(actor)| actor.identity_key());
     let owner_user = match managed_run_owner_stamp(
         &state.reader,
@@ -316,7 +363,14 @@ async fn prepare_run(
     .await
     {
         Ok(owner) => owner,
-        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        Err(failure) => {
+            return api_failure_with_manifest_warning(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                failure.to_string(),
+                manifest_warning,
+            )
+            .into_response();
+        }
     };
     let force_unlock = request.force_unlock;
     let prepared = state
@@ -349,9 +403,10 @@ async fn prepare_run(
             sync_after: prepared.sync_after,
             sync_through: prepared.sync_through,
             may_adopt_existing_session: prepared.may_adopt_existing_session,
+            manifest_warning,
         })
         .into_response(),
-        Err(failure) => store_error_response(failure),
+        Err(failure) => store_error_response_with_manifest_warning(failure, manifest_warning),
     }
 }
 
@@ -990,6 +1045,13 @@ fn parse_run_id(raw: &str) -> Result<ManagedRunId, ApiFailure> {
 }
 
 fn store_error_response(failure: StoreError) -> Response {
+    store_error_response_with_manifest_warning(failure, None)
+}
+
+fn store_error_response_with_manifest_warning(
+    failure: StoreError,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+) -> Response {
     let status = match failure {
         StoreError::Forbidden(_) => StatusCode::FORBIDDEN,
         StoreError::WorkstreamBusy(_)
@@ -999,7 +1061,7 @@ fn store_error_response(failure: StoreError) -> Response {
         StoreError::InvalidState(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    error(status, failure.to_string())
+    api_failure_with_manifest_warning(status, failure.to_string(), manifest_warning).into_response()
 }
 
 fn sanitize_events(
@@ -1187,6 +1249,9 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             sanitizer: Sanitizer::default(),
+            wiki: Wiki::new(data_dir, store.writer.clone())
+                .unwrap()
+                .with_store_reader(store.reader.clone()),
             data_dir: data_dir.to_path_buf(),
             trusted_proxy_identity: false,
             finish_barrier: None,
@@ -1225,6 +1290,452 @@ mod tests {
             .await
             .unwrap();
         (workspace_id, project_id)
+    }
+
+    #[tokio::test]
+    async fn managed_run_promotion_refreshes_the_scope_manifest() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (project_id, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state.wiki.backfill_scope_manifests().await.unwrap();
+        state.wiki.commit_all("fixture baseline").unwrap();
+        let reader = store
+            .writer
+            .create_user(
+                ai_memory_core::NewUser {
+                    username: "promotion-reader".into(),
+                    name: None,
+                    email: None,
+                },
+                [7; ai_memory_store::TOKEN_HASH_LEN],
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        store
+            .writer
+            .grant_memory(reader, project_id, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+        let request = || PrepareManagedRunRequest {
+            workspace: "default".into(),
+            project: "acme-api".into(),
+            cwd: "/repo".into(),
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            workstream: None,
+            new_workstream: None,
+            force_unlock: false,
+            lease_owner: "launcher".into(),
+        };
+        let refused = prepare_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(ai_memory_core::AuthorizedViewer(reader))),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("api")
+        );
+        let manifest_path = temp
+            .path()
+            .join("wiki")
+            .join(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join("_meta.md");
+        assert!(
+            std::fs::read_to_string(&manifest_path)
+                .unwrap()
+                .contains("project: api")
+        );
+        let response = prepare_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::Root)),
+            None,
+            None,
+            Json(request()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert!(prepared.manifest_warning.is_none());
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-api")
+        );
+        let manifest = std::fs::read_to_string(
+            temp.path()
+                .join("wiki")
+                .join(workspace_id.to_string())
+                .join(project_id.to_string())
+                .join("_meta.md"),
+        )
+        .unwrap();
+        assert!(manifest.contains("project: acme-api"), "{manifest}");
+    }
+
+    #[tokio::test]
+    async fn managed_run_rejects_mutually_exclusive_selection_before_promotion() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (project_id, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let response = prepare_run(
+            State(state),
+            None,
+            None,
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "acme-api".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: Some("existing".into()),
+                new_workstream: Some("new".into()),
+                force_unlock: false,
+                lease_owner: "launcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("api")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_run_discloses_manifest_failure_after_committed_promotion() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (project_id, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state.wiki.backfill_scope_manifests().await.unwrap();
+        let manifest = temp
+            .path()
+            .join("wiki")
+            .join(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join("_meta.md");
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+
+        let response = prepare_run(
+            State(state),
+            None,
+            None,
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "acme-api".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                force_unlock: false,
+                lease_owner: "launcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            prepared
+                .manifest_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("committed"))
+        );
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-api")
+        );
+        assert!(manifest.is_dir());
+        std::fs::remove_dir(&manifest).unwrap();
+        let restarted = Wiki::new(temp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        assert_eq!(restarted.backfill_scope_manifests().await.unwrap(), 1);
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("project: acme-api")
+        );
+        assert_eq!(restarted.backfill_scope_manifests().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn managed_run_store_failure_after_promotion_preserves_manifest_warning() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (project_id, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state.wiki.backfill_scope_manifests().await.unwrap();
+        let manifest = temp
+            .path()
+            .join("wiki")
+            .join(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join("_meta.md");
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_managed_run_insert BEFORE INSERT ON managed_runs \
+             BEGIN SELECT RAISE(ABORT, 'injected managed-run failure'); END;",
+        )
+        .unwrap();
+
+        let response = prepare_run(
+            State(state),
+            None,
+            None,
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "acme-api".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                force_unlock: false,
+                lease_owner: "launcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("injected managed-run failure")),
+            "{body}"
+        );
+        assert!(
+            body["manifest_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("promotion committed")),
+            "{body}"
+        );
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-api")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_run_downstream_failure_after_promotion_preserves_manifest_warning() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (project_id, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state.wiki.backfill_scope_manifests().await.unwrap();
+        let manifest = temp
+            .path()
+            .join("wiki")
+            .join(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join("_meta.md");
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+
+        let response = prepare_run(
+            State(state),
+            None,
+            None,
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "acme-api".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: Some("missing".into()),
+                new_workstream: None,
+                force_unlock: false,
+                lease_owner: "launcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("managed workstream 'missing'")),
+            "{body}"
+        );
+        assert!(
+            body["manifest_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("promotion committed")),
+            "{body}"
+        );
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-api")
+        );
     }
 
     #[tokio::test]

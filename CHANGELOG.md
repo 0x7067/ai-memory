@@ -224,6 +224,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the name it would otherwise get. The default stays `host_path`. (#1033)
 
 ### Changed
+- Changed static CLI/MCP project-name resolution to accept an existing
+  repository's canonical hostless path name and its v2 basename compatibility
+  key. Reads remain find-only; an authorized write through the canonical key
+  promotes only `projects.name` in place, preserving the project UUID and all
+  dependent rows. Project scope manifests preserve the optional full hostful
+  identity/source and derived keys so clean reindex reconstructs the same UUID
+  and lookup behavior; older manifests remain valid. MCP, admin, and
+  managed-workstream writes refresh the manifest after promotion and disclose a
+  post-commit refresh failure for startup repair on both success and any later
+  operation error, retaining the first warning across busy retries and lease
+  wait-out; managed-run caller validation happens before promotion.
+  Ambiguous cross-forge keys and target-name conflicts fail
+  closed, and the default identity style remains `host_path`. (#1033)
 - Changed the documented precedence between rules and memory: the user's
   instructions, then the repository's rules file, then the project's memory,
   then the cross-project profile. Where no hard rule exists, agents now use

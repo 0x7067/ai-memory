@@ -164,6 +164,140 @@ async fn two_operators_on_two_clones_of_one_repository_share_its_path_named_proj
     assert!(seen.body.contains("alice's note"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_operators_promote_two_clone_keys_to_one_uuid_without_moving_active_pointers() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+    use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorKey};
+    use ai_memory_store::{ProjectPrincipal, ScopeResolver};
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("acme".to_string())
+        .await
+        .unwrap();
+    let repo = RepositoryIdentity {
+        identity: "github.com/acme/api".into(),
+        source: IdentitySource::GitRemote,
+    };
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .resolve_project_by_identity(
+            ws,
+            repo,
+            IdentityStyle::HostPath,
+            "api",
+            Some("/home/alice/api".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .0;
+    let alice = store
+        .writer
+        .create_user(
+            NewUser {
+                username: "alice-promotion".into(),
+                name: None,
+                email: None,
+            },
+            [41; ai_memory_store::TOKEN_HASH_LEN],
+        )
+        .await
+        .unwrap();
+    let bob = store
+        .writer
+        .create_user(
+            NewUser {
+                username: "bob-promotion".into(),
+                name: None,
+                email: None,
+            },
+            [42; ai_memory_store::TOKEN_HASH_LEN],
+        )
+        .await
+        .unwrap();
+    let active = ActiveProject::with_config(
+        ActiveProjectMode::PerActor,
+        Duration::from_secs(60),
+        ai_memory_core::DEFAULT_MAX_ENTRIES,
+    );
+    let alice_actor = ActorKey {
+        user: Some("user:alice-promotion".into()),
+        session_id: Some("alice-clone".into()),
+    };
+    let bob_actor = ActorKey {
+        user: Some("user:bob-promotion".into()),
+        session_id: Some("bob-clone".into()),
+    };
+    active.set_for(&alice_actor, ws, project, false);
+    active.set_for(&bob_actor, ws, project, false);
+    store
+        .writer
+        .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(bob, project, ai_memory_store::GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let resolve = |viewer, actor: ActorKey| {
+        let reader = store.reader.clone();
+        let writer = store.writer.clone();
+        let active = active.clone();
+        async move {
+            ScopeResolver::new(&reader, ws, project)
+                .with_writer(&writer)
+                .with_active_project(&active)
+                .with_project_authz(ProjectPrincipal::user(viewer), true)
+                .resolve_write_args(Some("acme"), Some("acme-api"), &actor)
+                .await
+        }
+    };
+    let (alice_scope, bob_write) = tokio::join!(
+        resolve(alice, alice_actor.clone()),
+        resolve(bob, bob_actor.clone())
+    );
+    let alice_scope = alice_scope.unwrap();
+    assert!(bob_write.unwrap_err().is_forbidden());
+    let bob_scope = ScopeResolver::new(&store.reader, ws, project)
+        .with_active_project(&active)
+        .with_project_authz(ProjectPrincipal::user(bob), true)
+        .resolve_read_args(Some("acme"), Some("api"), &bob_actor)
+        .await
+        .unwrap();
+    assert_eq!(alice_scope.scope.project_id, project);
+    assert_eq!(bob_scope.project_id, project);
+    assert_eq!(active.get_for(&alice_actor), Some((ws, project)));
+    assert_eq!(active.get_for(&bob_actor), Some((ws, project)));
+
+    let mut authored = page(
+        ws,
+        alice_scope.scope.project_id,
+        "notes/promoted.md",
+        "Promoted",
+        "alice wrote after promotion",
+    );
+    authored.author_id = Some(alice);
+    store.writer.upsert_page(authored).await.unwrap();
+    let shared = store
+        .reader
+        .page_body_by_ids(ws, bob_scope.project_id, "notes/promoted.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(shared.body.contains("alice wrote after promotion"));
+}
+
 /// The collaboration guarantee, and the reason a team can use one server:
 /// what Alice writes, Carol reads.
 ///

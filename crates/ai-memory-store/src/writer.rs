@@ -109,6 +109,14 @@ pub(crate) enum WriteCmd {
         creator: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<(ProjectId, ops::IdentityResolution)>>,
     },
+    ResolveProjectNameForWrite {
+        workspace_id: WorkspaceId,
+        name: String,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        promote: bool,
+        reply: oneshot::Sender<StoreResult<ops::ProjectNameWriteResolution>>,
+    },
     EnsureProjectWorkspace {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -124,6 +132,7 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         name: String,
         repo_path: Option<String>,
+        identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     ScopeIsPurged {
@@ -1072,6 +1081,61 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    pub(crate) async fn resolve_project_name_for_write(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        self.resolve_project_name_for_write_mode(
+            workspace_id,
+            name,
+            principal,
+            distinguishes_operators,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_project_name_for_write_without_promotion(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        self.resolve_project_name_for_write_mode(
+            workspace_id,
+            name,
+            principal,
+            distinguishes_operators,
+            false,
+        )
+        .await
+    }
+
+    async fn resolve_project_name_for_write_mode(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        promote: bool,
+    ) -> StoreResult<ops::ProjectNameWriteResolution> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectNameForWrite {
+            workspace_id,
+            name: name.into(),
+            principal,
+            distinguishes_operators,
+            promote,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Assert that a project still belongs to the supplied workspace.
     ///
     /// # Errors
@@ -1125,6 +1189,7 @@ impl WriterHandle {
         workspace_id: WorkspaceId,
         name: impl Into<String>,
         repo_path: Option<String>,
+        identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EnsureProjectWithId {
@@ -1132,6 +1197,7 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            identity,
             reply: tx,
         })
         .await?;
@@ -3458,6 +3524,25 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "resolve_project_by_identity");
             }
+            WriteCmd::ResolveProjectNameForWrite {
+                workspace_id,
+                name,
+                principal,
+                distinguishes_operators,
+                promote,
+                reply,
+            } => {
+                let result = ops::resolve_project_name_for_write(
+                    &mut conn,
+                    &workspace_id,
+                    &name,
+                    principal.as_ref(),
+                    distinguishes_operators,
+                    promote,
+                    new_project_mode,
+                );
+                send_or_warn(reply, result, "resolve_project_name_for_write");
+            }
             WriteCmd::EnsureProjectWorkspace {
                 workspace_id,
                 project_id,
@@ -3475,6 +3560,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 name,
                 repo_path,
+                identity,
                 reply,
             } => {
                 let result = ops::ensure_project_with_id(
@@ -3483,6 +3569,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     workspace_id,
                     &name,
                     repo_path.as_deref(),
+                    identity.as_ref(),
                 );
                 send_or_warn(reply, result, "ensure_project_with_id");
             }

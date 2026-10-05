@@ -451,6 +451,9 @@ async fn run_once_with_wiring(
             return Err(error);
         }
     };
+    if let Some(warning) = prepared.manifest_warning.as_deref() {
+        eprintln!("ai-memory: warning: {warning}");
+    }
     if let Err(error) = super::project_registry::record_prepared_checkout(
         config,
         &endpoint,
@@ -2857,6 +2860,50 @@ async fn finish_with_retry(
         .context("persisting the managed transcript; the native process has already exited")
 }
 
+struct PrepareRunOutcome {
+    result: Result<PrepareManagedRunResponse>,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+}
+
+impl PrepareRunOutcome {
+    fn from_result(result: Result<PrepareManagedRunResponse>) -> Self {
+        let manifest_warning = match &result {
+            Ok(response) => response.manifest_warning.clone(),
+            Err(error) => server_manifest_warning(error),
+        };
+        Self {
+            result,
+            manifest_warning,
+        }
+    }
+
+    fn prefer_warning(
+        mut self,
+        first: Option<ai_memory_core::repository_identity::ManifestWarning>,
+    ) -> Self {
+        self.manifest_warning = first.or(self.manifest_warning);
+        self
+    }
+}
+
+fn complete_prepare_run(
+    outcome: PrepareRunOutcome,
+    output: &mut impl io::Write,
+) -> Result<PrepareManagedRunResponse> {
+    match outcome.result {
+        Ok(mut response) => {
+            response.manifest_warning = outcome.manifest_warning.or(response.manifest_warning);
+            Ok(response)
+        }
+        Err(error) => {
+            if let Some(warning) = outcome.manifest_warning {
+                let _ = writeln!(output, "ai-memory: warning: {warning}");
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn prepare_managed_run(
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
@@ -2864,15 +2911,16 @@ async fn prepare_managed_run(
     interrupted: &CancellationToken,
 ) -> Result<PrepareManagedRunResponse> {
     if request.force_unlock {
-        return match post_json(endpoint, "/workstream/runs", request).await {
+        let result = match post_json(endpoint, "/workstream/runs", request).await {
             Err(error) if is_active_workstream_conflict(&error) => Err(error.context(
                 "--force-unlock was refused: the active lease belongs to another operator, or \
                  the server does not support forced lease recovery",
             )),
             other => other,
         };
+        return complete_prepare_run(PrepareRunOutcome::from_result(result), &mut io::stderr());
     }
-    let result = prepare_managed_run_with_retry(
+    let outcome = prepare_managed_run_with_retry(
         endpoint,
         request,
         PREPARE_BUSY_RETRY_WINDOW,
@@ -2880,22 +2928,22 @@ async fn prepare_managed_run(
         true,
     )
     .await;
-    match result {
+    let outcome = if interactive && outcome.result.is_err() {
         // Scripts, hooks, and CI keep the short window: they must never hang
         // silently for up to a full lease.
-        Err(error) if interactive => {
-            wait_out_held_lease(
-                endpoint,
-                request,
-                error,
-                interrupted,
-                HELD_LEASE_EXPIRY_SLACK,
-                PREPARE_BUSY_RETRY_WINDOW,
-            )
-            .await
-        }
-        other => other,
-    }
+        wait_out_held_lease(
+            endpoint,
+            request,
+            outcome,
+            interrupted,
+            HELD_LEASE_EXPIRY_SLACK,
+            PREPARE_BUSY_RETRY_WINDOW,
+        )
+        .await
+    } else {
+        outcome
+    };
+    complete_prepare_run(outcome, &mut io::stderr())
 }
 
 /// After the quick retry window, an interactive launch waits out a lease left
@@ -2907,16 +2955,32 @@ async fn prepare_managed_run(
 async fn wait_out_held_lease(
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
-    error: anyhow::Error,
+    outcome: PrepareRunOutcome,
     interrupted: &CancellationToken,
     slack: Duration,
     retry_window: Duration,
-) -> Result<PrepareManagedRunResponse> {
+) -> PrepareRunOutcome {
+    let PrepareRunOutcome {
+        result,
+        manifest_warning,
+    } = outcome;
+    let Err(error) = result else {
+        return PrepareRunOutcome {
+            result,
+            manifest_warning,
+        };
+    };
     let Some(held) = held_lease(&error) else {
-        return Err(error);
+        return PrepareRunOutcome {
+            result: Err(error),
+            manifest_warning,
+        };
     };
     let Some(wait) = held_lease_wait(held.expires, jiff::Timestamp::now(), slack) else {
-        return Err(error);
+        return PrepareRunOutcome {
+            result: Err(error),
+            manifest_warning,
+        };
     };
     eprintln!(
         "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
@@ -2929,11 +2993,14 @@ async fn wait_out_held_lease(
     tokio::select! {
         biased;
         () = interrupted.cancelled() => {
-            return Err(error.context("interrupted while waiting for the workstream lease to lapse"));
+            return PrepareRunOutcome {
+                result: Err(error.context("interrupted while waiting for the workstream lease to lapse")),
+                manifest_warning,
+            };
         }
         () = tokio::time::sleep(wait) => {}
     }
-    match prepare_managed_run_with_retry(
+    let retry = prepare_managed_run_with_retry(
         endpoint,
         request,
         retry_window,
@@ -2941,12 +3008,19 @@ async fn wait_out_held_lease(
         false,
     )
     .await
-    {
-        Err(retry) if held_lease(&retry).is_some() => Err(retry.context(
-            "the workstream is still held: its owner renewed the lease, so another launcher \
-             is running there; stop it, or pass `--new <name>` for a separate workstream",
-        )),
-        other => other,
+    .prefer_warning(manifest_warning);
+    match retry.result {
+        Err(error) if held_lease(&error).is_some() => PrepareRunOutcome {
+            result: Err(error.context(
+                "the workstream is still held: its owner renewed the lease, so another launcher \
+                 is running there; stop it, or pass `--new <name>` for a separate workstream",
+            )),
+            manifest_warning: retry.manifest_warning,
+        },
+        result => PrepareRunOutcome {
+            result,
+            manifest_warning: retry.manifest_warning,
+        },
     }
 }
 
@@ -2990,16 +3064,23 @@ async fn prepare_managed_run_with_retry(
     retry_window: Duration,
     retry_interval: Duration,
     announce_wait: bool,
-) -> Result<PrepareManagedRunResponse> {
+) -> PrepareRunOutcome {
     let deadline = tokio::time::Instant::now() + retry_window;
     let mut reported_wait = !announce_wait;
+    let mut manifest_warning = None;
     loop {
         match post_json(endpoint, "/workstream/runs", request).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                return PrepareRunOutcome::from_result(Ok(response))
+                    .prefer_warning(manifest_warning);
+            }
             Err(error)
                 if is_active_workstream_conflict(&error)
                     && tokio::time::Instant::now() < deadline =>
             {
+                if manifest_warning.is_none() {
+                    manifest_warning = server_manifest_warning(&error);
+                }
                 if !reported_wait {
                     eprintln!(
                         "ai-memory: another launcher owns this workstream; waiting briefly in case it is finalizing"
@@ -3008,13 +3089,26 @@ async fn prepare_managed_run_with_retry(
                 }
                 tokio::time::sleep(retry_interval).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return PrepareRunOutcome::from_result(Err(error)).prefer_warning(manifest_warning);
+            }
         }
     }
 }
 
 fn is_active_workstream_conflict(error: &anyhow::Error) -> bool {
     active_workstream_conflict_message(error).is_some()
+}
+
+fn server_manifest_warning(
+    error: &anyhow::Error,
+) -> Option<ai_memory_core::repository_identity::ManifestWarning> {
+    let response = error.downcast_ref::<ServerResponseError>()?;
+    serde_json::from_str::<ai_memory_core::repository_identity::ManifestWarningContext>(
+        response.body(),
+    )
+    .ok()?
+    .manifest_warning
 }
 
 fn active_workstream_conflict_message(error: &anyhow::Error) -> Option<String> {
@@ -4010,6 +4104,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                     .into_response()
                 }
@@ -4051,11 +4146,162 @@ mod tests {
             true,
         )
         .await
+        .result
         .unwrap();
 
         assert_eq!(prepared.workstream_name, "default");
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn busy_retry_keeps_first_warning_and_final_error_unchanged() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move || {
+                let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let until = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60);
+                    match attempt {
+                        0 => (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": format!(
+                                    "workstream is already active: owned by first until {until}"
+                                ),
+                                "manifest_warning": "first repair warning"
+                            })),
+                        )
+                            .into_response(),
+                        1 => (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": format!(
+                                    "workstream is already active: owned by second until {until}"
+                                )
+                            })),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({
+                                "error": "final missing workstream",
+                                "manifest_warning": "later repair warning"
+                            })),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let outcome = prepare_managed_run_with_retry(
+            &endpoint,
+            &held_lease_request(),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            false,
+        )
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            outcome.manifest_warning.as_deref(),
+            Some("first repair warning"),
+            "the first warning wins over a later distinct warning"
+        );
+
+        let mut output = Vec::new();
+        let error = complete_prepare_run(outcome, &mut output).expect_err("final 404 is preserved");
+        let response = error.downcast_ref::<ServerResponseError>().unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(response.body().contains("final missing workstream"));
+        assert!(response.body().contains("later repair warning"));
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "ai-memory: warning: first repair warning\n"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn busy_retry_returns_first_warning_with_later_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move || {
+                let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        let until = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60);
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": format!(
+                                    "workstream is already active: owned by first until {until}"
+                                ),
+                                "manifest_warning": "first repair warning"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: Some(AgentKind::Codex),
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                        manifest_warning: None,
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let outcome = prepare_managed_run_with_retry(
+            &endpoint,
+            &held_lease_request(),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            false,
+        )
+        .await;
+        let mut output = Vec::new();
+        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            response.manifest_warning.as_deref(),
+            Some("first repair warning")
+        );
+        assert!(
+            output.is_empty(),
+            "success returns the warning for one caller print"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn managed_run_error_extracts_manifest_warning() {
+        let error = crate::http_client::server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": "managed workstream 'missing' not found",
+                "manifest_warning": "project name promotion committed; repair needed"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            server_manifest_warning(&error).as_deref(),
+            Some("project name promotion committed; repair needed")
+        );
     }
 
     #[test]
@@ -4129,6 +4375,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                     .into_response()
                 }
@@ -4179,12 +4426,13 @@ mod tests {
         let prepared = wait_out_held_lease(
             &endpoint,
             &request,
-            first,
+            PrepareRunOutcome::from_result(Err(first)),
             &CancellationToken::new(),
             Duration::ZERO,
             Duration::from_millis(50),
         )
         .await
+        .result
         .expect("proceeds once the lease lapsed");
         assert_eq!(prepared.workstream_name, "default");
         assert!(
@@ -4192,6 +4440,42 @@ mod tests {
             "it waited for the expiry"
         );
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_out_keeps_the_initial_warning_through_a_successful_retry() {
+        let (app, attempts) = held_lease_server(0, Duration::ZERO);
+        let (endpoint, server) = serve(app).await;
+        let request = held_lease_request();
+        let until = jiff::Timestamp::now() + jiff::SignedDuration::from_millis(10);
+        let first = crate::http_client::server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": format!("workstream is already active: owned by first until {until}"),
+                "manifest_warning": "first repair warning"
+            })
+            .to_string(),
+        );
+        let outcome = wait_out_held_lease(
+            &endpoint,
+            &request,
+            PrepareRunOutcome::from_result(Err(first)),
+            &CancellationToken::new(),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .await;
+        let mut output = Vec::new();
+        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response.manifest_warning.as_deref(),
+            Some("first repair warning")
+        );
+        assert!(output.is_empty());
         server.abort();
     }
 
@@ -4209,12 +4493,13 @@ mod tests {
         let error = wait_out_held_lease(
             &endpoint,
             &request,
-            first,
+            PrepareRunOutcome::from_result(Err(first)),
             &CancellationToken::new(),
             Duration::ZERO,
             Duration::from_millis(50),
         )
         .await
+        .result
         .expect_err("a renewing owner is never displaced");
         assert!(
             format!("{error:#}").contains("renewed the lease"),
@@ -4259,12 +4544,13 @@ mod tests {
         let error = wait_out_held_lease(
             &endpoint,
             &request,
-            first,
+            PrepareRunOutcome::from_result(Err(first)),
             &interrupted,
             Duration::ZERO,
             Duration::from_millis(50),
         )
         .await
+        .result
         .expect_err("interrupted");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
@@ -5038,6 +5324,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -5166,6 +5453,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -5867,6 +6155,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -6012,6 +6301,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -6062,6 +6352,7 @@ mod tests {
                             sync_after: 0,
                             sync_through: 0,
                             may_adopt_existing_session: false,
+                            manifest_warning: None,
                         })
                     }),
                 )
@@ -7204,6 +7495,7 @@ mod tests {
                             sync_after: 0,
                             sync_through: 0,
                             may_adopt_existing_session: false,
+                            manifest_warning: None,
                         })
                     }),
                 )

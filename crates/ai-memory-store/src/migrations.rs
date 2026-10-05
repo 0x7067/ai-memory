@@ -1142,6 +1142,46 @@ mod tests {
         assert!(!after.contains("supersedes IS NULL"), "{after}");
     }
 
+    #[test]
+    fn project_coordinate_keys_upgrade_and_backfill_without_changing_project_ids() {
+        let coordinate_version = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.name() == "project_coordinate_keys")
+            .map(refinery::Migration::version)
+            .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, coordinate_version - 1).unwrap();
+        let workspace_id = [8_u8; 16];
+        let project_id = [9_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'acme', 1)",
+            params![workspace_id.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at, identity, identity_source) \
+             VALUES (?1, ?2, 'api', 1, 'github.com/acme/group/api', 'git_remote')",
+            params![project_id.as_slice(), workspace_id.as_slice()],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        assert_eq!(crate::project_coordinates::backfill(&mut conn).unwrap(), 1);
+        let row: (Vec<u8>, String, String, String) = conn
+            .query_row(
+                "SELECT id, name, canonical_name, legacy_name FROM projects",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, project_id);
+        assert_eq!(row.1, "api");
+        assert_eq!(row.2, "acme-group-api");
+        assert_eq!(row.3, "api");
+        assert_eq!(crate::project_coordinates::backfill(&mut conn).unwrap(), 0);
+    }
+
     /// Upstream's `UNIQUE (workspace_id, name)` is case-sensitive, so one
     /// workspace may hold both `API` and `api`. The identity index is on
     /// case-folded values, and backfilling `lower(name)` into it failed the

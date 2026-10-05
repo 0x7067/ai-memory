@@ -24,6 +24,7 @@ mod admin_write_page;
 mod agent_messages_briefing;
 mod agent_messages_tools;
 mod autoscope_multiuser;
+mod dual_key_scope;
 mod handoff_admission;
 mod handoff_identity;
 mod mcp_stateless_http;

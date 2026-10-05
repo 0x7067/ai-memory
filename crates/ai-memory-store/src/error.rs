@@ -71,6 +71,10 @@ pub enum StoreError {
     #[error("project name '{0}' is already taken in this workspace")]
     ProjectNameTaken(String),
 
+    /// More than one project in a workspace matched a compatibility name.
+    #[error("project name '{0}' is ambiguous in this workspace")]
+    ProjectNameAmbiguous(String),
+
     /// The supplied project name failed validation (empty, slash, etc.).
     #[error("invalid project name: {0}")]
     InvalidProjectName(String),

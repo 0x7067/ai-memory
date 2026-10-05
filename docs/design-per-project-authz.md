@@ -250,10 +250,24 @@ project. #1033 makes a remote-derived key the default name, landing in steps on
 2. **Default naming chain** (`upstream` → `origin` → folder) for **new**
    projects without opting in, with marker `project`/`identity` still
    outranking remotes and the same collision fallback.
-3. **Dual-key resolve and in-place rename** (UUID foreign keys kept, no alias
-   table) until v3, so existing basename projects are renamed toward their
-   canonical key rather than split. Two operators on different clones of one
-   repository must land in one project (`multi_session.rs`).
+3. **Dual-key resolve and in-place name promotion (landed).** Static callers
+   still pass only `workspace` + `project`. Within that workspace, exact stored
+   name, the canonical path-style name derived from a stored full hostful git
+   identity, and the v2 repository basename resolve to one UUID only when the
+   candidate set is unique. Reads are no-create and never rename. An existing
+   write path resolves, authorizes at `ProjectAccess::Write`, and promotes only
+   `projects.name` in one writer transaction with its audit row; UUID foreign
+   keys stay put. A target-name conflict, two forges sharing the hostless key,
+   or multiple candidates fails closed. The legacy basename remains readable
+   after promotion through v2. No alias table was added. V76 stores the two
+    deterministic keys derived from V70's full `projects.identity` and indexes
+    them so hot reads/writes use three bounded equality probes instead of
+    scanning a workspace; startup backfills pre-V76 identity rows before traffic.
+    Project `_meta.md` stores optional typed `identity` and `identity_source`
+    plus the derived `canonical_name`/`legacy_name` keys. Clean
+    reindex validates the pair, derives the indexed keys from the identity, and
+    recreates the original UUID/name; pre-V76 manifests without identity remain
+    valid and rebuild an identity-less project.
 4. Marker `aliases`, then 5. identity- or path-keyed blocks in `~/.ai-memory.toml`.
 
 Paths stay lexically normalised throughout; nothing canonicalises.

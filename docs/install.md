@@ -2519,7 +2519,10 @@ chunks it plans reflect the margin.
 manifest (at `<wiki>/<workspace>/<project>/bootstrap.md`) listing every
 page generated + a one-paragraph rationale. Re-running without `--force`
 errors out. Delete the manifest (and the generated pages) if you want a
-clean re-bootstrap.
+clean re-bootstrap. If canonical scope resolution promotes a legacy project but
+its `_meta.md` refresh/checkpoint fails, the result includes `manifest_warning`
+and the CLI prints it; the name change is committed and startup backfill can
+repair the scope manifest.
 
 **Dry-run first.** Always worth doing before the real call to see
 which sources would actually be sent + how many tokens that

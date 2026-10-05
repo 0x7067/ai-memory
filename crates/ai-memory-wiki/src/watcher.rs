@@ -910,7 +910,8 @@ fn is_tempfile(path: &Path) -> bool {
 }
 
 /// `_meta.md` is the per-scope manifest the engine writes (workspace/project
-/// name + repo_path) so the wiki tree is self-describing. It describes the
+/// name, repo path, and optional repository identity coordinates) so the wiki
+/// tree is self-describing. It describes the
 /// scope, it is never a wiki page.
 fn is_manifest_filename(page_path: &PagePath) -> bool {
     page_path

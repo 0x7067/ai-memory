@@ -288,6 +288,9 @@ pub struct PrepareManagedRunResponse {
     /// session. Old servers omit this field, which safely defaults to fresh.
     #[serde(default)]
     pub may_adopt_existing_session: bool,
+    /// Warning when project-name promotion committed but its wiki manifest did not refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<crate::repository_identity::ManifestWarning>,
 }
 
 /// One-time startup context for harnesses without a SessionStart hook.
@@ -530,6 +533,7 @@ mod tests {
 
         assert!(!response.may_adopt_existing_session);
         assert!(response.resolved_agent.is_none());
+        assert!(response.manifest_warning.is_none());
     }
 
     #[test]

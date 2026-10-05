@@ -72,8 +72,7 @@ use ai_memory_store::{
     ApproveAutoImproveProposalResult, AuditLogFilter, AutoImproveProposalOperation,
     AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool,
     RejectAutoImproveProposal, ScopeResolutionError, SkippedProposal, StageAutoImproveRun,
-    StoreError, WriterHandle, create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
-    lookup_existing_workspace,
+    StoreError, WriterHandle, f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
 use ai_memory_wiki::{
     AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
@@ -1851,15 +1850,51 @@ const OPERATOR: Option<ai_memory_core::UserId> = None;
 
 /// Resolve workspace + project IDs, creating them if absent. Returns
 /// either the IDs or a ready-to-return error response.
+struct AdminWriteScope {
+    scope: ai_memory_store::ResolvedScope,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+}
+
 async fn create_ws_proj(
     state: &AdminState,
     workspace: &str,
     project: &str,
-) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
-    create_explicit_scope(&state.writer, workspace, project)
+) -> Result<AdminWriteScope, (StatusCode, Json<serde_json::Value>)> {
+    let resolved = ai_memory_store::create_explicit_scope(&state.writer, workspace, project)
         .await
-        .map(ai_memory_store::ResolvedScope::as_tuple)
-        .map_err(scope_err)
+        .map_err(scope_err)?;
+    let manifest_warning = refresh_promoted_scope(state, &resolved).await;
+    Ok(AdminWriteScope {
+        scope: resolved.scope,
+        manifest_warning,
+    })
+}
+
+async fn refresh_promoted_scope(
+    state: &AdminState,
+    resolved: &ai_memory_store::ResolvedWriteScope,
+) -> Option<ai_memory_core::repository_identity::ManifestWarning> {
+    resolved.promoted_from.as_ref()?;
+    match state
+        .wiki
+        .refresh_renamed_scope(resolved.scope.workspace_id, resolved.scope.project_id)
+        .await
+    {
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                error = %error,
+                workspace_id = %resolved.scope.workspace_id,
+                project_id = %resolved.scope.project_id,
+                "project name promotion committed; manifest refresh/checkpoint failed; startup backfill can repair"
+            );
+            Some(
+                ai_memory_core::repository_identity::ManifestWarning::promotion_refresh_failed(
+                    error,
+                ),
+            )
+        }
+    }
 }
 
 /// Look up workspace + project by name **without** auto-creating them.
@@ -1885,6 +1920,16 @@ async fn lookup_ws_no_create(
     lookup_existing_workspace(&state.reader, workspace)
         .await
         .map_err(scope_err)
+}
+
+fn with_manifest_warning(
+    (status, Json(mut body)): (StatusCode, Json<serde_json::Value>),
+    warning: Option<&ai_memory_core::repository_identity::ManifestWarning>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let (Some(warning), Some(object)) = (warning, body.as_object_mut()) {
+        object.insert("manifest_warning".into(), serde_json::json!(warning));
+    }
+    (status, Json(body))
 }
 
 fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
@@ -1951,7 +1996,8 @@ async fn handle_bootstrap(
             })),
         ));
     }
-    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = target.scope.as_tuple();
 
     // Serialise live bootstrap runs. Two parallel `process_sources`
     // calls would race the wiki's `commit_all` (libgit2 ops on the
@@ -2002,11 +2048,17 @@ async fn handle_bootstrap(
     };
 
     match bootstrap.process_sources(&cfg, req.sources).await {
-        Ok(outcome) => Ok((
-            StatusCode::OK,
-            Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
+        Ok(mut outcome) => {
+            outcome.manifest_warning = target.manifest_warning.map(|warning| warning.to_string());
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
+            ))
+        }
+        Err(e) => Err(with_manifest_warning(
+            bootstrap_error_response(e),
+            target.manifest_warning.as_ref(),
         )),
-        Err(e) => Err(bootstrap_error_response(e)),
     }
 }
 
@@ -2090,6 +2142,7 @@ fn dry_run_outcome(
         rationale: "(dry-run; LLM not invoked)".to_string(),
         dry_run: true,
         llm_chunks,
+        manifest_warning: None,
     };
     Ok((
         StatusCode::OK,
@@ -5601,6 +5654,9 @@ pub struct RenameProjectSummary {
     /// Post-rename checkpoint, if `_meta.md` changed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after the database rename committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
 }
 
 async fn handle_rename_project(
@@ -5662,23 +5718,29 @@ async fn handle_rename_project(
         }
     };
 
+    let (checkpoint, manifest_warning) = match state
+        .wiki
+        .refresh_renamed_scope(ws_id, proj_id)
+        .await
+    {
+        Ok(checkpoint) => (checkpoint, None),
+        Err(error) => {
+            warn!(
+                error = %error,
+                workspace_id = %ws_id,
+                project_id = %proj_id,
+                "rename-project committed; manifest refresh/checkpoint failed; startup backfill can repair"
+            );
+            (None, Some(error.to_string()))
+        }
+    };
     let summary = RenameProjectSummary {
         workspace: req.workspace.clone(),
         from: req.from.clone(),
         to: req.to.clone(),
         pages,
-        checkpoint: {
-            if let Err(e) = state.wiki.backfill_scope_manifests().await {
-                warn!(error = %e, "rename-project: scope-manifest backfill failed after rename");
-            }
-            checkpoint_or_warn(
-                &state.wiki,
-                format!(
-                    "rename-project {}/{} -> {}",
-                    req.workspace, req.from, req.to
-                ),
-            )
-        },
+        checkpoint,
+        manifest_warning,
     };
     (
         StatusCode::OK,
@@ -5790,6 +5852,9 @@ pub struct MoveProjectReport {
     /// Post-move checkpoint, if the move changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after destination promotion committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 /// One same-path collision resolved by de-duplicating the source page's path.
@@ -5928,6 +5993,7 @@ async fn true_move_project(
         conflicts: Vec::new(),
         pre_checkpoint,
         checkpoint,
+        manifest_warning: None,
     };
     Ok(report)
 }
@@ -6164,14 +6230,12 @@ async fn move_project_core(
 
     // Detect MERGE: does the destination workspace already hold a same-named
     // project? (find_workspace may be None when the dest ws doesn't exist yet.)
-    let merged_into_existing = match state.reader.find_workspace(req.to_workspace.clone()).await {
-        Ok(Some(dst_ws)) => matches!(
-            state.reader.find_project(dst_ws, req.project.clone()).await,
-            Ok(Some(_))
-        ),
-        Ok(None) => false,
-        Err(e) => return Err(internal_err(e.to_string())),
-    };
+    let merged_into_existing =
+        match lookup_existing_scope(&state.reader, &req.to_workspace, &req.project).await {
+            Ok(_) => true,
+            Err(error) if error.is_not_found() => false,
+            Err(error) => return Err(scope_err(error)),
+        };
 
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
@@ -6196,8 +6260,10 @@ async fn move_project_core(
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let (dst_ws, dst_proj) = create_ws_proj(state, &req.to_workspace, &req.project).await?;
+    let destination = create_ws_proj(state, &req.to_workspace, &req.project).await?;
+    let (dst_ws, dst_proj) = destination.scope.as_tuple();
 
+    let warning = destination.manifest_warning;
     copy_purge_merge(
         state,
         req,
@@ -6207,8 +6273,10 @@ async fn move_project_core(
         dst_proj,
         pre_checkpoint,
         actor,
+        warning.clone(),
     )
     .await
+    .map_err(|error| with_manifest_warning(error, warning.as_ref()))
 }
 
 // ---------------------------------------------------------------------
@@ -6344,6 +6412,9 @@ pub struct MoveSessionReport {
     /// Post-move checkpoint, if the move changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after destination promotion committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 /// Wire-format report for the batch form of `POST /admin/move-session`.
@@ -6372,6 +6443,9 @@ pub struct MoveSessionBatchReport {
     /// Post-move checkpoint, if the batch changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Non-fatal manifest/checkpoint failure after destination promotion committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 /// One session move, resolved and validated, before any guard runs.
@@ -6398,16 +6472,28 @@ impl MoveSessionPlan {
 
 /// The destination of a move: an existing scope, or (dry run with `create`
 /// only) a scope that does not exist yet and would be created on confirm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MoveTarget {
-    Existing((WorkspaceId, ProjectId)),
+    Existing {
+        scope: (WorkspaceId, ProjectId),
+        manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+    },
     WouldCreate,
 }
 
 impl MoveTarget {
-    fn existing(self) -> Option<(WorkspaceId, ProjectId)> {
+    fn existing(&self) -> Option<(WorkspaceId, ProjectId)> {
         match self {
-            Self::Existing(scope) => Some(scope),
+            Self::Existing { scope, .. } => Some(*scope),
+            Self::WouldCreate => None,
+        }
+    }
+
+    fn manifest_warning(&self) -> Option<ai_memory_core::repository_identity::ManifestWarning> {
+        match self {
+            Self::Existing {
+                manifest_warning, ..
+            } => manifest_warning.clone(),
             Self::WouldCreate => None,
         }
     }
@@ -6480,10 +6566,16 @@ async fn resolve_move_session_target(
     if create && confirm {
         return create_ws_proj(state, workspace, project)
             .await
-            .map(MoveTarget::Existing);
+            .map(|target| MoveTarget::Existing {
+                scope: target.scope.as_tuple(),
+                manifest_warning: target.manifest_warning,
+            });
     }
     match lookup_existing_scope(&state.reader, workspace, project).await {
-        Ok(scope) => Ok(MoveTarget::Existing(scope.as_tuple())),
+        Ok(scope) => Ok(MoveTarget::Existing {
+            scope: scope.as_tuple(),
+            manifest_warning: None,
+        }),
         Err(e) if create && e.is_not_found() => Ok(MoveTarget::WouldCreate),
         Err(e) => Err(scope_err(e)),
     }
@@ -6703,8 +6795,9 @@ async fn move_planned_session(
     // Dry run with `create` against an absent destination: nothing exists to
     // collide with, and the store cannot re-stamp into a scope that has no
     // row, so the counts come from a read-only preview.
-    let to = match plan.to {
-        MoveTarget::Existing(to) => to,
+    let manifest_warning = plan.to.manifest_warning();
+    let to = match &plan.to {
+        MoveTarget::Existing { scope, .. } => *scope,
         MoveTarget::WouldCreate => {
             debug_assert!(
                 !req.confirm,
@@ -6728,6 +6821,7 @@ async fn move_planned_session(
                 cwd_warning,
                 pre_checkpoint: None,
                 checkpoint: None,
+                manifest_warning,
             });
         }
     };
@@ -6774,6 +6868,7 @@ async fn move_planned_session(
             cwd_warning,
             pre_checkpoint: None,
             checkpoint: None,
+            manifest_warning: manifest_warning.clone(),
         });
     }
 
@@ -6814,6 +6909,7 @@ async fn move_planned_session(
         cwd_warning,
         pre_checkpoint: None,
         checkpoint: None,
+        manifest_warning,
     })
 }
 
@@ -6866,8 +6962,12 @@ async fn move_single_session(
         plan.to_label.workspace,
         plan.to_label.project
     );
-    let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))?;
-    let mut report = move_planned_session(state, req, plan, author_id, &actor).await?;
+    let warning = plan.to.manifest_warning();
+    let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))
+        .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
+    let mut report = move_planned_session(state, req, plan, author_id, &actor)
+        .await
+        .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
     if let Err(e) = state.wiki.backfill_scope_manifests().await {
         warn!(error = %e, "move-session: scope-manifest backfill failed after move");
     }
@@ -6915,33 +7015,43 @@ async fn move_session_batch(
         workspace: to_workspace,
         project: req.project.clone(),
     };
+    let manifest_warning = to.manifest_warning();
     if to.existing() == Some(from) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "source and destination scopes are identical"
-            })),
+        return with_manifest_warning(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "source and destination scopes are identical"
+                })),
+            ),
+            manifest_warning.as_ref(),
         )
-            .into_response();
+        .into_response();
     }
     // Same guard as move-project: the project the hook router is writing to
     // is not emptied out from under it without an explicit `force`.
     if !req.force && state.active_project.contains_project(from.1) {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!(
-                    "{}/{} is the active session's project; force the move (--force / \
-                     force: true) to move its sessions anyway",
-                    from_label.workspace, from_label.project
-                )
-            })),
+        return with_manifest_warning(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{}/{} is the active session's project; force the move (--force / \
+                         force: true) to move its sessions anyway",
+                        from_label.workspace, from_label.project
+                    )
+                })),
+            ),
+            manifest_warning.as_ref(),
         )
-            .into_response();
+        .into_response();
     }
     let sessions = match list_scope_sessions(&state.reader, from.0, from.1).await {
         Ok(v) => v,
-        Err(e) => return internal_err(e.to_string()).into_response(),
+        Err(e) => {
+            return with_manifest_warning(internal_err(e.to_string()), manifest_warning.as_ref())
+                .into_response();
+        }
     };
 
     let label = format!(
@@ -6951,7 +7061,9 @@ async fn move_session_batch(
     let pre_checkpoint = if req.confirm && !sessions.is_empty() {
         match checkpoint_or_500(&state.wiki, format!("pre-{label}")) {
             Ok(oid) => oid,
-            Err(e) => return e.into_response(),
+            Err(e) => {
+                return with_manifest_warning(e, manifest_warning.as_ref()).into_response();
+            }
         }
     } else {
         None
@@ -6979,7 +7091,7 @@ async fn move_session_batch(
             session_id,
             from: plan_from,
             from_label: plan_from_label,
-            to,
+            to: to.clone(),
             to_label: to_label.clone(),
             row_scope,
             cwd,
@@ -7017,6 +7129,9 @@ async fn move_session_batch(
             if let Some(oid) = checkpoint {
                 obj.insert("checkpoint".into(), serde_json::json!(oid));
             }
+            if let Some(warning) = manifest_warning.clone() {
+                obj.insert("manifest_warning".into(), serde_json::json!(warning));
+            }
         }
         return (status, Json(body)).into_response();
     }
@@ -7030,6 +7145,7 @@ async fn move_session_batch(
         sessions: reports,
         pre_checkpoint,
         checkpoint,
+        manifest_warning,
     };
     (StatusCode::OK, Json(json_or_empty(&report))).into_response()
 }
@@ -7143,6 +7259,7 @@ async fn copy_purge_merge(
     dst_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 ) -> Result<MoveProjectReport, MoveErr> {
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
@@ -7380,6 +7497,7 @@ async fn copy_purge_merge(
             conflicts,
             pre_checkpoint,
             checkpoint,
+            manifest_warning: manifest_warning.clone(),
         };
         return Ok(report);
     }
@@ -7510,6 +7628,7 @@ async fn copy_purge_merge(
         conflicts,
         pre_checkpoint,
         checkpoint,
+        manifest_warning,
     };
     Ok(report)
 }
@@ -7732,6 +7851,9 @@ struct WritePageResponse {
     /// Post-write checkpoint, if the write changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint: Option<String>,
+    /// Non-fatal committed promotion manifest/checkpoint failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
 }
 
 async fn handle_write_page(
@@ -7770,7 +7892,9 @@ async fn handle_write_page(
         )
     })?;
 
-    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = target.scope.as_tuple();
+    let manifest_warning = target.manifest_warning;
 
     let mut fm = metadata;
     if let Some(title) = &req.title {
@@ -7834,7 +7958,9 @@ async fn handle_write_page(
             evidence: Vec::new(),
         })
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
+        .map_err(|e| {
+            with_manifest_warning(internal_err(e.to_string()), manifest_warning.as_ref())
+        })?;
     let checkpoint = checkpoint_or_warn(
         &state.wiki,
         format!(
@@ -7852,6 +7978,7 @@ async fn handle_write_page(
                 page_id: page_id.to_string(),
                 path: path.to_string(),
                 checkpoint,
+                manifest_warning,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),

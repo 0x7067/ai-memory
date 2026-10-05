@@ -4,6 +4,7 @@
 //! verify it appears in `/admin/search` results. Also tests that an
 //! unknown tier returns 422.
 
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::Wiki;
@@ -15,7 +16,9 @@ use tower::ServiceExt;
 
 async fn make_state(tmp: &TempDir) -> AdminState {
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
@@ -64,6 +67,33 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
 }
 
+async fn seed_identity_project(
+    state: &AdminState,
+) -> (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId) {
+    let workspace = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let (project, _) = state
+        .writer
+        .resolve_project_by_identity(
+            workspace,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    (workspace, project)
+}
+
 #[tokio::test]
 async fn write_page_returns_page_id_and_path() {
     let tmp = TempDir::new().unwrap();
@@ -92,6 +122,43 @@ async fn write_page_returns_page_id_and_path() {
         body["path"].as_str().unwrap(),
         "notes/test-write.md",
         "response path must match request: {body}"
+    );
+}
+
+#[tokio::test]
+async fn write_page_surfaces_manifest_failure_after_promotion() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let (workspace, project) = seed_identity_project(&state).await;
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(workspace.to_string())
+        .join(project.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post_json(
+        state,
+        "/admin/write-page",
+        json!({
+            "workspace": "default",
+            "project": "acme-api",
+            "path": "notes/promoted.md",
+            "body": "survives the manifest failure",
+            "tier": "semantic",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("committed")),
+        "{body}"
     );
 }
 

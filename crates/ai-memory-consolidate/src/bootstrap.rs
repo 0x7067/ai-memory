@@ -252,6 +252,9 @@ pub struct BootstrapOutcome {
     /// Number of LLM calls made (1 when chunking is off or unnecessary).
     #[serde(default)]
     pub llm_chunks: usize,
+    /// Non-fatal scope-manifest repair warning supplied by the admin transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
 }
 
 /// Bootstrap configuration. Built by the CLI from `BootstrapArgs`
@@ -456,6 +459,7 @@ impl Bootstrap {
                 pages_written: Vec::new(),
                 rationale: "(dry-run; LLM not invoked)".to_string(),
                 dry_run: true,
+                manifest_warning: None,
                 llm_chunks: plan_bootstrap_chunks(kept.clone(), chunk_budget).len(),
             });
         }
@@ -664,6 +668,7 @@ impl Bootstrap {
             rationale,
             dry_run: false,
             llm_chunks,
+            manifest_warning: None,
         })
     }
 

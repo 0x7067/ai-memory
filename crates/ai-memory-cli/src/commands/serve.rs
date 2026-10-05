@@ -1527,6 +1527,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 writer: store.writer.clone(),
                 reader: store.reader.clone(),
                 sanitizer: sanitizer.clone(),
+                wiki: wiki.clone(),
                 data_dir: config.data_dir.clone(),
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
@@ -4059,7 +4060,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            written.as_tuple(),
+            written.scope.as_tuple(),
             (workspace_id, scratch),
             "the seed must not retarget unscoped writes"
         );

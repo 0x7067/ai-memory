@@ -1783,6 +1783,9 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             sanitizer: ai_memory_core::Sanitizer::default(),
+            wiki: ai_memory_wiki::Wiki::new(root, store.writer.clone())
+                .unwrap()
+                .with_store_reader(store.reader.clone()),
             data_dir: root.into(),
             trusted_proxy_identity: auth.actor_proxy_bearer().is_some(),
         })
@@ -1971,6 +1974,9 @@ mod tests {
                 writer: store.writer.clone(),
                 reader: store.reader.clone(),
                 sanitizer: ai_memory_core::Sanitizer::default(),
+                wiki: ai_memory_wiki::Wiki::new(tmp.path(), store.writer.clone())
+                    .unwrap()
+                    .with_store_reader(store.reader.clone()),
                 data_dir: tmp.path().into(),
                 trusted_proxy_identity: false,
             })
@@ -2428,6 +2434,9 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             sanitizer: ai_memory_core::Sanitizer::default(),
+            wiki: ai_memory_wiki::Wiki::new(tmp.path(), store.writer.clone())
+                .unwrap()
+                .with_store_reader(store.reader.clone()),
             data_dir: tmp.path().into(),
             trusted_proxy_identity: false,
         })

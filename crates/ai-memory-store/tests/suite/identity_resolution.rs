@@ -9,9 +9,14 @@
 //! who may not write to it cannot take its identity.
 
 use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
-use ai_memory_core::{NewUser, ProjectId, UserId, WorkspaceId};
+use ai_memory_core::{
+    AgentKind, NewHandoff, NewPage, NewSession, NewUser, OwnerFilter, PagePath, ProjectId,
+    SessionId, Tier, UserId, WorkspaceId,
+};
 use ai_memory_store::{
-    AccessMode, GrantLevel, IdentityResolution, ProjectAccess, ProjectPrincipal, Store,
+    AccessMode, GrantLevel, IdentityResolution, ProjectAccess, ProjectPrincipal, ScopeName,
+    ScopeResolutionError, Store, create_explicit_scope_guarded, lookup_existing_scope,
+    lookup_existing_scope_guarded, resolve_many_existing_scopes,
 };
 
 fn remote(identity: &str) -> RepositoryIdentity {
@@ -511,6 +516,468 @@ async fn the_path_style_leaves_a_declared_identity_named_as_sent() {
     .await;
     assert_eq!(how, IdentityResolution::Created);
     assert_eq!(row(&store, id).0, "platform");
+}
+
+fn preserved_page(ws: WorkspaceId, project: ProjectId) -> NewPage {
+    NewPage {
+        workspace_id: ws,
+        project_id: project,
+        path: PagePath::new("notes/preserved.md").unwrap(),
+        title: "Preserved".into(),
+        body: "preserved page".into(),
+        tier: Tier::Semantic,
+        frontmatter_json: serde_json::json!({}),
+        pinned: false,
+        links: Vec::new(),
+        author_id: None,
+        expires_at: None,
+        entities: Vec::new(),
+        evidence: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn canonical_and_legacy_reads_resolve_one_legacy_row_without_renaming() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    for name in ["api", "acme-api"] {
+        assert_eq!(
+            lookup_existing_scope(&store.reader, "default", name)
+                .await
+                .unwrap()
+                .project_id,
+            project
+        );
+    }
+    assert_eq!(row(&store, project).0, "api");
+
+    let deduplicated = resolve_many_existing_scopes(
+        &store.reader,
+        &[
+            ScopeName::new("default", "api"),
+            ScopeName::new("default", "acme-api"),
+        ],
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(deduplicated.len(), 1);
+    assert_eq!(deduplicated[0].project_id, project);
+}
+
+#[tokio::test]
+async fn authorized_write_promotes_in_place_and_preserves_dependents_and_legacy_lookup() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let owner = user(&store, "promotion-owner", 7).await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        "api",
+        Some(owner),
+    )
+    .await
+    .0;
+    store
+        .writer
+        .upsert_page(preserved_page(ws, project))
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: ws,
+            project_id: project,
+            agent_kind: AgentKind::Codex,
+            cwd: Some("/clone/api".into()),
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(owner, project, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: project,
+            from_session_id: Some(session),
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: Some("/clone/api".into()),
+            summary: "continue".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let promoted = create_explicit_scope_guarded(
+        &store.reader,
+        &store.writer,
+        "default",
+        "acme-api",
+        Some(owner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(promoted.scope.project_id, project);
+    assert_eq!(row(&store, project).0, "acme-api");
+    let audit: (i64, Option<Vec<u8>>, String) = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*), MAX(author_id), MAX(detail) FROM audit_log \
+             WHERE op = 'promote_project_name' AND project_id = ?1",
+            [project.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(audit.0, 1);
+    assert_eq!(audit.1.as_deref(), Some(owner.as_bytes().as_slice()));
+    assert!(audit.2.contains("\"from\":\"api\""));
+    assert!(audit.2.contains("\"to\":\"acme-api\""));
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, project, "notes/preserved.md")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    for table in ["sessions", "project_grants", "handoffs"] {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1"),
+                [project.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{table}");
+    }
+    assert_eq!(
+        store
+            .reader
+            .list_handoffs(ws, project, None, OwnerFilter::Any, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        lookup_existing_scope(&store.reader, "default", "api")
+            .await
+            .unwrap()
+            .project_id,
+        project
+    );
+}
+
+#[tokio::test]
+async fn distinct_current_canonical_and_legacy_keys_resolve_without_guessing_checkout_names() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/group/api"),
+        "checkout-blue",
+        None,
+    )
+    .await
+    .0;
+    for key in ["checkout-blue", "acme-group-api", "api"] {
+        assert_eq!(
+            lookup_existing_scope(&store.reader, "default", key)
+                .await
+                .unwrap()
+                .project_id,
+            project
+        );
+    }
+    assert_eq!(row(&store, project).0, "checkout-blue");
+    for key in ["group-api", "checkout-red"] {
+        assert!(
+            lookup_existing_scope(&store.reader, "default", key)
+                .await
+                .unwrap_err()
+                .is_not_found()
+        );
+    }
+    let foreign = store
+        .writer
+        .get_or_create_workspace("foreign")
+        .await
+        .unwrap();
+    for key in ["checkout-blue", "acme-group-api", "api"] {
+        assert!(
+            lookup_existing_scope(&store.reader, "foreign", key)
+                .await
+                .unwrap_err()
+                .is_not_found()
+        );
+        assert!(
+            store
+                .reader
+                .find_project(foreign, key.to_owned())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_only_user_cannot_promote_a_legacy_name() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let owner = user(&store, "promotion-owner", 8).await;
+    let reader = user(&store, "promotion-reader", 9).await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        "api",
+        Some(owner),
+    )
+    .await
+    .0;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(reader, project, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "acme-api",
+            Some(reader),
+            ProjectAccess::Read,
+        )
+        .await
+        .unwrap()
+        .project_id,
+        project
+    );
+    assert!(
+        create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "acme-api",
+            Some(reader),
+        )
+        .await
+        .unwrap_err()
+        .is_forbidden()
+    );
+    assert_eq!(row(&store, project).0, "api");
+}
+
+#[tokio::test]
+async fn canonical_target_conflict_rolls_back_the_promotion() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let legacy = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    let conflict = store
+        .writer
+        .get_or_create_project(ws, "acme-api", None)
+        .await
+        .unwrap();
+    let error =
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        ScopeResolutionError::ProjectNameAmbiguous { .. }
+    ));
+    assert_eq!(row(&store, legacy).0, "api");
+    assert_eq!(row(&store, conflict).0, "acme-api");
+}
+
+#[tokio::test]
+async fn audit_failure_rolls_back_promotion_and_keeps_the_writer_alive() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    store
+        .writer
+        .upsert_page(preserved_page(ws, project))
+        .await
+        .unwrap();
+    let owner = user(&store, "rollback-owner", 31).await;
+    store
+        .writer
+        .grant_memory(owner, project, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: session,
+            workspace_id: ws,
+            project_id: project,
+            agent_kind: AgentKind::Other,
+            cwd: Some("/rollback/api".into()),
+            actor_user: None,
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: project,
+            from_session_id: Some(session),
+            from_agent: AgentKind::Other,
+            to_agent: None,
+            cwd: None,
+            summary: "rollback baton".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let snapshot = || {
+        ["pages", "sessions", "project_grants", "handoffs"].map(|table| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} WHERE project_id = ?1"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([project.as_bytes().to_vec()], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    };
+    let before = snapshot();
+    assert!(before.iter().all(|rows| !rows.is_empty()));
+    conn.execute_batch(
+        "CREATE TRIGGER fail_promotion_audit BEFORE INSERT ON audit_log \
+         WHEN NEW.op = 'promote_project_name' \
+         BEGIN SELECT RAISE(ABORT, 'forced promotion audit failure'); END;",
+    )
+    .unwrap();
+
+    assert!(
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None,)
+            .await
+            .is_err()
+    );
+    assert_eq!(row(&store, project).0, "api");
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE op = 'promote_project_name'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_count, 0);
+    assert_eq!(snapshot(), before, "every dependent row is unchanged");
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, project, "notes/preserved.md")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    conn.execute_batch("DROP TRIGGER fail_promotion_audit")
+        .unwrap();
+    let later = store
+        .writer
+        .get_or_create_project(ws, "writer-still-alive", None)
+        .await
+        .unwrap();
+    assert_ne!(later, project);
+}
+
+#[tokio::test]
+async fn exact_name_that_is_another_forges_canonical_key_fails_closed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let exact = resolve(
+        &store,
+        ws,
+        &remote("github.com/unrelated/tool"),
+        "acme-api",
+        None,
+    )
+    .await
+    .0;
+    let canonical = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/api"),
+        "gitlab-api",
+        None,
+    )
+    .await
+    .0;
+    assert_ne!(exact, canonical);
+    let error = lookup_existing_scope(&store.reader, "default", "acme-api")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ScopeResolutionError::ProjectNameAmbiguous { .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_legacy_and_canonical_resolve_or_create_converge_on_one_uuid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    let resolve =
+        |name| create_explicit_scope_guarded(&store.reader, &store.writer, "default", name, None);
+    let (a, b) = tokio::join!(resolve("api"), resolve("acme-api"));
+    assert_eq!(a.unwrap().scope.project_id, project);
+    assert_eq!(b.unwrap().scope.project_id, project);
+    assert_eq!(row(&store, project).0, "acme-api");
 }
 
 /// Naming a project differently changes nothing about reads: a lookup is
