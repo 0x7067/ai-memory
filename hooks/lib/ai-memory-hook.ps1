@@ -167,18 +167,18 @@ function Get-AiMemoryTomlAliases {
         $text = [IO.File]::ReadAllText($File)
         $lines = $text -split "`r?`n"
         $inTable = $false
-        $matches = [Collections.Generic.List[string]]::new()
+        $declarations = [Collections.Generic.List[string]]::new()
         foreach ($line in $lines) {
             $trimmed = $line.Trim()
             if ($trimmed.StartsWith("[")) { $inTable = $true }
             if ($trimmed -match '^aliases\s*=') {
                 if ($inTable) { return "invalid" }
-                $matches.Add($trimmed)
+                $declarations.Add($trimmed)
             }
         }
-        if ($matches.Count -eq 0) { return $null }
-        if ($matches.Count -ne 1) { return "invalid" }
-        $match = [regex]::Match($matches[0], '^aliases\s*=\s*\[([^\]]*)\]\s*$')
+        if ($declarations.Count -eq 0) { return $null }
+        if ($declarations.Count -ne 1) { return "invalid" }
+        $match = [regex]::Match($declarations[0], '^aliases\s*=\s*\[([^\]]*)\]\s*$')
         if (-not $match.Success) { return "invalid" }
         $aliases = [Collections.Generic.List[string]]::new()
         if (-not $match.Groups[1].Value.Trim()) { return $null }
