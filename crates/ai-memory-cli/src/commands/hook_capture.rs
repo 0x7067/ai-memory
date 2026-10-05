@@ -329,6 +329,7 @@ pub struct HookScope {
     identity: Option<String>,
     identity_src: Option<&'static str>,
     identity_style: Option<&'static str>,
+    aliases: Option<String>,
     server_may_remap: bool,
 }
 
@@ -478,15 +479,36 @@ fn hook_scope_from_marker(
     let mut strategy = None;
     let mut explicit_identity = None;
     let mut style = None;
+    let mut aliases = None;
     if let Some(marker) = marker {
         workspace = parse_toml_key(marker, "workspace");
         project = parse_toml_key(marker, "project");
         strategy = parse_toml_key(marker, "project_strategy");
         explicit_identity = parse_toml_key(marker, "identity");
         style = parse_toml_key(marker, "identity_style");
+        aliases = match crate::marker::parse_toml_aliases(marker) {
+            Ok(Some(aliases)) if !aliases.is_empty() => serde_json::to_string(&aliases).ok(),
+            Ok(_) => None,
+            Err(_) => Some("invalid".to_owned()),
+        };
     }
+    let canonical_project = project.clone();
     let mut project_src = project.as_ref().map(|_| "marker");
-    let identity = repository_identity(cwd, explicit_identity.as_deref(), project.as_deref());
+    let identity = if aliases.is_none() {
+        repository_identity(cwd, explicit_identity.as_deref(), project.as_deref())
+    } else {
+        repository_identity(cwd, None, None).filter(|identity| {
+            identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote
+        })
+    };
+    if aliases.is_some()
+        && (canonical_project.is_none()
+            || identity.as_ref().is_none_or(|identity| {
+                identity.source != ai_memory_core::repository_identity::IdentitySource::GitRemote
+            }))
+    {
+        aliases = Some("invalid".to_owned());
+    }
     if strategy.is_none() {
         strategy = default_strategy.map(str::to_owned);
     }
@@ -515,6 +537,7 @@ fn hook_scope_from_marker(
         identity,
         identity_src,
         identity_style,
+        aliases,
         server_may_remap,
     }
 }
@@ -592,6 +615,9 @@ fn marker_query_suffix_impl(
     }
     if let Some(style) = scope.identity_style {
         qs.push_str(&format!("&identity_style={style}"));
+    }
+    if let Some(aliases) = scope.aliases {
+        qs.push_str(&format!("&aliases={}", url_encode(&aliases)));
     }
     // Per-project `drop_subagent_captures` opt-in: forward the marker's value as
     // the `drop_subagent` flag so the server scopes the drop to this project.
@@ -1278,6 +1304,39 @@ mod tests {
         assert!(
             qs.contains("&identity=acme%2Fplatform&identity_src=explicit"),
             "{qs}"
+        );
+    }
+
+    #[test]
+    fn marker_aliases_keep_project_canonical_and_forward_remote_identity() {
+        let Some(repo) = repo_with_remotes(&[("origin", "git@git.example.test:acme/api.git")])
+        else {
+            return;
+        };
+        let cwd = repo.path().to_str().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "project = \"acme-api\"\naliases = [\" former-name \", \"legacy_name\", \"former-name\"]\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        let url = reqwest::Url::parse(&format!("http://localhost/handoff?agent=test{qs}")).unwrap();
+        let params = url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(params.get("project").map(String::as_str), Some("acme-api"));
+        assert_eq!(
+            params.get("identity").map(String::as_str),
+            Some("git.example.test/acme/api")
+        );
+        assert_eq!(
+            params.get("identity_src").map(String::as_str),
+            Some("git_remote")
+        );
+        assert_eq!(
+            params.get("aliases").map(String::as_str),
+            Some("[\"former-name\",\"legacy_name\"]")
         );
     }
 

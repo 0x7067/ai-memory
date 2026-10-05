@@ -117,6 +117,15 @@ pub(crate) enum WriteCmd {
         promote: bool,
         reply: oneshot::Sender<StoreResult<ops::ProjectNameWriteResolution>>,
     },
+    ResolveProjectAliasesForWrite {
+        workspace_id: WorkspaceId,
+        canonical: String,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+        reply: oneshot::Sender<StoreResult<Option<ops::ProjectAliasWriteResolution>>>,
+    },
     EnsureProjectWorkspace {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -1075,6 +1084,31 @@ impl WriterHandle {
             repo_path,
             candidate,
             creator,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Resolve marker aliases inside one workspace and atomically authorize any
+    /// Phase 1 canonical-name promotion. Returns `None` when no alias exists.
+    pub async fn resolve_project_aliases_for_write(
+        &self,
+        workspace_id: WorkspaceId,
+        canonical: impl Into<String>,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+        principal: Option<crate::ProjectPrincipal>,
+        distinguishes_operators: bool,
+    ) -> StoreResult<Option<ops::ProjectAliasWriteResolution>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectAliasesForWrite {
+            workspace_id,
+            canonical: canonical.into(),
+            aliases,
+            repository,
+            principal,
+            distinguishes_operators,
             reply: tx,
         })
         .await?;
@@ -3542,6 +3576,26 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     new_project_mode,
                 );
                 send_or_warn(reply, result, "resolve_project_name_for_write");
+            }
+            WriteCmd::ResolveProjectAliasesForWrite {
+                workspace_id,
+                canonical,
+                aliases,
+                repository,
+                principal,
+                distinguishes_operators,
+                reply,
+            } => {
+                let result = ops::resolve_project_aliases_for_write(
+                    &mut conn,
+                    &workspace_id,
+                    &canonical,
+                    &aliases,
+                    &repository,
+                    principal.as_ref(),
+                    distinguishes_operators,
+                );
+                send_or_warn(reply, result, "resolve_project_aliases_for_write");
             }
             WriteCmd::EnsureProjectWorkspace {
                 workspace_id,

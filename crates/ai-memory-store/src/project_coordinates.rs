@@ -4,7 +4,7 @@ use ai_memory_core::repository_identity::{
     IdentitySource, RepositoryIdentity, legacy_basename_name, path_style_name,
 };
 use ai_memory_core::{ProjectId, WorkspaceId};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{StoreError, StoreResult};
 
@@ -159,6 +159,86 @@ pub(crate) fn resolve(
         1 => Ok(matches.pop()),
         _ => Err(StoreError::ProjectNameAmbiguous(requested.to_owned())),
     }
+}
+
+fn row_to_match(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectCoordinateMatch> {
+    Ok(ProjectCoordinateMatch {
+        id: ProjectId::from_slice(&row.get::<_, Vec<u8>>(0)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?,
+        current_name: row.get(1)?,
+        identity: row.get(2)?,
+        identity_source: row.get(3)?,
+        canonical_name: row.get(4)?,
+        legacy_name: row.get(5)?,
+        provenance: MatchProvenance {
+            exact: true,
+            ..MatchProvenance::default()
+        },
+    })
+}
+
+pub(crate) fn resolve_aliases(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    canonical: &str,
+    aliases: &ai_memory_core::repository_identity::MarkerAliases,
+    repository: &RepositoryIdentity,
+) -> StoreResult<Option<ProjectCoordinateMatch>> {
+    if repository.source != IdentitySource::GitRemote || aliases.is_empty() {
+        return Err(StoreError::ProjectNameAmbiguous(canonical.to_owned()));
+    }
+    let canonical_match = conn
+        .query_row(
+            "SELECT id, name, NULLIF(identity, ''), NULLIF(identity_source, ''), \
+             NULLIF(canonical_name, ''), NULLIF(legacy_name, '') FROM projects \
+             INDEXED BY sqlite_autoindex_projects_2 WHERE workspace_id = ?1 AND name = ?2",
+            params![workspace_id.as_bytes(), canonical],
+            row_to_match,
+        )
+        .optional()?;
+    if let Some(canonical_match) = canonical_match {
+        if canonical_match.identity.as_deref() == Some(repository.identity.as_str())
+            && canonical_match.identity_source.as_deref()
+                == Some(IdentitySource::GitRemote.as_str())
+        {
+            return Ok(Some(canonical_match));
+        }
+        return Err(StoreError::ProjectNameAmbiguous(canonical.to_owned()));
+    }
+    let mut candidates = Vec::new();
+    for alias in aliases.as_slice() {
+        let local = conn
+            .query_row(
+                "SELECT id, name, NULLIF(identity, ''), NULLIF(identity_source, ''), \
+                 NULLIF(canonical_name, ''), NULLIF(legacy_name, '') FROM projects \
+                 INDEXED BY sqlite_autoindex_projects_2 WHERE workspace_id = ?1 AND name = ?2",
+                params![workspace_id.as_bytes(), alias],
+                row_to_match,
+            )
+            .optional()?;
+        if let Some(candidate) = local {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.id.to_string());
+    candidates.dedup_by_key(|candidate| candidate.id);
+    if candidates.len() > 1 {
+        return Err(StoreError::ProjectNameAmbiguous(canonical.to_owned()));
+    }
+    let Some(candidate) = candidates.pop() else {
+        return Ok(None);
+    };
+    if candidate.identity.as_deref() != Some(repository.identity.as_str())
+        || candidate.identity_source.as_deref() != Some(IdentitySource::GitRemote.as_str())
+    {
+        return Err(StoreError::ProjectNameAmbiguous(canonical.to_owned()));
+    }
+    Ok(Some(candidate))
 }
 
 pub(crate) fn promotion_target<'a>(

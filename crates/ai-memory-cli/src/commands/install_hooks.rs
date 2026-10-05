@@ -3858,6 +3858,7 @@ pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(te
   for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures", "identity", "identity_style"]) {
     if (tomlKey(text, key) !== undefined) return true;
   }
+  if (/^\s*aliases\s*=/m.test(text)) return true;
   if (/^\s*server\s*=/m.test(text)) return true;
   for (const key of ["default_global", "inject_on_session_start", "max_chars", "contribute", "consume"]) {
     if (tomlFlag(text, key) !== undefined) return true;
@@ -3919,7 +3920,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (managedRun) url.searchParams.set("managed_run", managedRun);
   const marker = findSettingsMarker(cwd);
   if (!marker || !cwd) {
-    applyIdentityParams(url, cwd, undefined, undefined, undefined);
+    applyIdentityParams(url, cwd, undefined, undefined, undefined, undefined);
     return;
   }
   url.searchParams.set("cwd", cwd);
@@ -3927,7 +3928,9 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const body = readFileSync(marker, "utf8");
     const workspace = tomlKey(body, "workspace");
     const project = tomlKey(body, "project");
-    applyIdentityParams(url, cwd, tomlKey(body, "identity"), project, tomlKey(body, "identity_style"));
+    const aliases = markerAliases(body);
+    const remoteIdentity = applyIdentityParams(url, cwd, tomlKey(body, "identity"), project, tomlKey(body, "identity_style"), aliases);
+    if (aliases) url.searchParams.set("aliases", project && remoteIdentity ? aliases : "invalid");
     const projectStrategy = tomlKey(body, "project_strategy");
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
     const defaultGlobal = tomlFlag(body, "default_global");
@@ -3937,6 +3940,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const profileConsume = profileFlag(tomlFlag(body, "consume"));
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
+    if (project) url.searchParams.set("project_src", "marker");
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
     if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
     if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
@@ -3969,6 +3973,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let profileConsume: string | undefined;
   let explicitIdentity: string | undefined;
   let identityStyle: string | undefined;
+  let aliases: string | undefined;
   const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
@@ -3984,11 +3989,13 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       profileConsume = profileFlag(tomlFlag(body, "consume"));
       explicitIdentity = tomlKey(body, "identity");
       identityStyle = tomlKey(body, "identity_style");
+      aliases = markerAliases(body);
     } catch (_e) {
     }
   }
   // Before repo-root can fill `project`: a repo-root name is an inference.
-  applyIdentityParams(url, cwd, explicitIdentity, project, identityStyle);
+  const remoteIdentity = applyIdentityParams(url, cwd, explicitIdentity, project, identityStyle, aliases);
+  if (aliases) url.searchParams.set("aliases", project && remoteIdentity ? aliases : "invalid");
   if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;
   if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
     const repoProject = repoRootProject(cwd);
@@ -3996,6 +4003,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   }
   if (workspace) url.searchParams.set("workspace", workspace);
   if (project) url.searchParams.set("project", project);
+  if (project) url.searchParams.set("project_src", "marker");
   if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
   if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
   if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
@@ -4018,7 +4026,39 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
 /// `project` outranks the remote and routes by name, so git is not consulted;
 /// otherwise the `upstream` remote, else `origin`. Normalising here keeps
 /// credentials embedded in a remote URL on the host.
-pub(crate) const TS_IDENTITY: &str = r#"function normalizeRemote(raw: string): string | undefined {
+pub(crate) const TS_IDENTITY: &str = r#"function markerAliases(text: string): string | undefined {
+  let inTable = false;
+  const declarations: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("[")) inTable = true;
+    if (/^aliases\s*=/.test(trimmed)) {
+      if (inTable) return "invalid";
+      declarations.push(trimmed);
+    }
+  }
+  if (declarations.length === 0) return undefined;
+  if (declarations.length !== 1) return "invalid";
+  const match = /^aliases\s*=\s*\[([^\]]*)\]\s*$/.exec(declarations[0]);
+  if (!match) return "invalid";
+  const aliases: string[] = [];
+  if (!match[1].trim()) return undefined;
+  const parts = match[1].split(",");
+  if (parts.length > 16) return "invalid";
+  for (const raw of parts) {
+    if (raw.includes("\\")) return "invalid";
+    const item = /^\s*"([^"]*)"\s*$/.exec(raw);
+    if (!item) return "invalid";
+    const alias = item[1].trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(alias) || Buffer.byteLength(alias, "utf8") > 128) return "invalid";
+    if (!aliases.includes(alias)) {
+      aliases.push(alias);
+    }
+  }
+  return JSON.stringify(aliases);
+}
+
+function normalizeRemote(raw: string): string | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
   let scheme: string | undefined;
@@ -4068,14 +4108,15 @@ function applyIdentityParams(
   explicit: string | undefined,
   project: string | undefined,
   style: string | undefined,
-): void {
+  aliases: string | undefined,
+): boolean {
   const declared = explicit?.trim();
-  if (declared) {
+  if (!aliases && declared) {
     url.searchParams.set("identity", declared.toLowerCase());
     url.searchParams.set("identity_src", "explicit");
-    return;
+    return false;
   }
-  if (project?.trim() || !cwd) return;
+  if ((project?.trim() && !aliases) || !cwd) return false;
   for (const name of ["upstream", "origin"]) {
     try {
       const remote = execFileSync("git", ["-C", cwd, "config", "--get", `remote.${name}.url`], {
@@ -4088,11 +4129,12 @@ function applyIdentityParams(
         url.searchParams.set("identity_src", "git_remote");
         const forwarded = identityStyleParam(style);
         if (forwarded) url.searchParams.set("identity_style", forwarded);
-        return;
+        return true;
       }
     } catch (_e) {
     }
   }
+  return false;
 }"#;
 
 /// `tomlFlag` mirrors the native hook's `parse_toml_flag`: unlike `tomlKey`
@@ -9537,6 +9579,7 @@ model = "gpt-5"
         assert!(plugin.contains(
             "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\", \"identity\", \"identity_style\"])"
         ));
+        assert!(plugin.contains("if (/^\\s*aliases\\s*=/m.test(text)) return true;"));
         assert!(plugin.contains(
             "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\", \"contribute\", \"consume\"])"
         ));
@@ -12737,6 +12780,40 @@ mod identity_parity_tests {
             .collect()
     }
 
+    fn alias_cases() -> Vec<(String, Option<String>)> {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        cases["marker_aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| {
+                (
+                    case["toml"].as_str().unwrap().to_owned(),
+                    match case["status"].as_str().unwrap() {
+                        "valid" => case["aliases"].as_array().and_then(|aliases| {
+                            (!aliases.is_empty()).then(|| serde_json::to_string(aliases).unwrap())
+                        }),
+                        "absent" => None,
+                        "invalid" => Some("invalid".to_owned()),
+                        status => panic!("unknown fixture status {status}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn assert_aliases_agree(port: &str, lines: &str) {
+        let got: Vec<&str> = lines.split('\n').collect();
+        for (index, (toml, expected)) in alias_cases().iter().enumerate() {
+            let got = got
+                .get(index)
+                .copied()
+                .unwrap_or("<missing>")
+                .trim_end_matches('\r');
+            assert_eq!(got, expected.as_deref().unwrap_or(""), "{port}: {toml}");
+        }
+    }
+
     /// Compare one port's forwarding decisions, one line per style case.
     fn assert_styles_agree(port: &str, lines: &str) {
         let got: Vec<&str> = lines.split('\n').collect();
@@ -12810,6 +12887,31 @@ mod identity_parity_tests {
             .unwrap();
         assert!(output.status.success());
         assert_styles_agree("hooks/_lib.sh", &String::from_utf8_lossy(&output.stdout));
+
+        let temp = tempfile::tempdir().unwrap();
+        let files = alias_cases()
+            .iter()
+            .enumerate()
+            .map(|(index, (toml, _))| {
+                let path = temp.path().join(format!("alias-{index:03}.toml"));
+                std::fs::write(&path, toml).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(r#". "$1"; shift; for f in "$@"; do printf '%s\n' "$(ai_memory_aliases_json "$f")"; done"#)
+            .arg("sh")
+            .arg(repo_file("hooks/_lib.sh"))
+            .args(&files)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_aliases_agree("hooks/_lib.sh", &String::from_utf8_lossy(&output.stdout));
     }
 
     #[test]
@@ -12826,7 +12928,7 @@ mod identity_parity_tests {
         let script = tmp.path().join("parity.ps1");
         std::fs::write(
             &script,
-            "param([string] $Lib, [string] $Cases, [string] $Styles)\n\
+            "param([string] $Lib, [string] $Cases, [string] $Styles, [string] $AliasesDir)\n\
              . $Lib\n\
              foreach ($u in (Get-Content -Raw $Cases | ConvertFrom-Json)) {\n\
                  $id = ConvertTo-AiMemoryRepositoryIdentity -Url $u\n\
@@ -12840,6 +12942,9 @@ mod identity_parity_tests {
              [Console]::Error.Write($decisions -join '|')\n\
              foreach ($s in (Get-Content -Raw $Styles | ConvertFrom-Json)) {\n\
                  [Console]::Out.Write(\"S:$(Get-AiMemoryIdentityStyleQuery -Style $s)`n\")\n\
+             }\n\
+             Get-ChildItem $AliasesDir -Filter '*.toml' | Sort-Object Name | ForEach-Object {\n\
+                 [Console]::Out.Write(\"A:$(Get-AiMemoryTomlAliases -File $_.FullName)`n\")\n\
              }\n",
         )
         .unwrap();
@@ -12849,12 +12954,18 @@ mod identity_parity_tests {
         let styles = tmp.path().join("styles.json");
         let values: Vec<String> = style_cases().into_iter().map(|(value, _)| value).collect();
         std::fs::write(&styles, serde_json::to_string(&values).unwrap()).unwrap();
+        let aliases_dir = tmp.path().join("aliases");
+        std::fs::create_dir(&aliases_dir).unwrap();
+        for (index, (toml, _)) in alias_cases().iter().enumerate() {
+            std::fs::write(aliases_dir.join(format!("alias-{index:03}.toml")), toml).unwrap();
+        }
         let output = Command::new(pwsh)
             .args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&script)
             .arg(repo_file("hooks/lib/ai-memory-hook.ps1"))
             .arg(&urls)
             .arg(&styles)
+            .arg(&aliases_dir)
             .output()
             .unwrap();
         assert!(
@@ -12865,17 +12976,135 @@ mod identity_parity_tests {
         // Style decisions are tagged `S:` so they can share stdout with the
         // normalised URLs.
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (styles, urls): (Vec<&str>, Vec<&str>) =
-            stdout.split('\n').partition(|line| line.starts_with("S:"));
+        let lines = stdout.split('\n').collect::<Vec<_>>();
+        let styles = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("S:"))
+            .collect::<Vec<_>>();
+        let aliases = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("A:"))
+            .map(|line| &line[2..])
+            .collect::<Vec<_>>();
+        let urls = lines
+            .iter()
+            .copied()
+            .filter(|line| !line.starts_with("S:") && !line.starts_with("A:"))
+            .collect::<Vec<_>>();
         assert_agrees("hooks/lib/ai-memory-hook.ps1", urls.join("\n").as_bytes());
         let styles: Vec<&str> = styles.iter().map(|line| &line[2..]).collect();
         assert_styles_agree("hooks/lib/ai-memory-hook.ps1", &styles.join("\n"));
+        assert_aliases_agree("hooks/lib/ai-memory-hook.ps1", &aliases.join("\n"));
         // Same decisions as the other clients: explicit wins over a declared
         // project; a declared project alone sends nothing; no cwd sends nothing.
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
             "&identity=acme%2Fplatform&identity_src=explicit||"
         );
+    }
+
+    #[test]
+    fn generated_typescript_applies_marker_alias_params_together() {
+        let strips_types = Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !strips_types {
+            return;
+        }
+        for default_strategy in [None, Some("basename")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .args([
+                        "remote",
+                        "add",
+                        "origin",
+                        "git@git.example.test:Acme/API.git",
+                    ])
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::write(
+                repo.join(".ai-memory.toml"),
+                "project = \"acme-api\"\naliases = [\"former-name\"]\n",
+            )
+            .unwrap();
+            let module = tmp.path().join("apply-marker.ts");
+            let source = format!(
+                "import {{ execFileSync }} from \"node:child_process\";\n\
+                 import {{ existsSync, readFileSync }} from \"node:fs\";\n\
+                 import {{ basename, dirname, join, resolve, sep }} from \"node:path\";\n\
+                 import {{ homedir }} from \"node:os\";\n\
+                 function tomlKey(text: string, key: string): string | undefined {{\n\
+                   const re = new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`);\n\
+                   for (const line of text.split(/\\r?\\n/)) {{\n\
+                     const match = re.exec(line);\n\
+                     if (match) return match[1];\n\
+                   }}\n\
+                   return undefined;\n\
+                 }}\n\
+                 {}\n\
+                 {}\n\
+                 const url = new URL(\"http://h/hook\");\n\
+                 applyMarkerParams(url, {});\n\
+                 process.stdout.write(url.search);\n",
+                super::TS_REPO_ROOT_PROJECT,
+                super::ts_apply_marker_params(default_strategy),
+                serde_json::to_string(&repo.to_string_lossy()).unwrap(),
+            );
+            std::fs::write(&module, source).unwrap();
+            let output = Command::new("node")
+                .args(["--experimental-strip-types", "--no-warnings"])
+                .arg(&module)
+                .env("HOME", tmp.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let params = reqwest::Url::parse(&format!(
+                "http://h/hook{}",
+                String::from_utf8(output.stdout).unwrap()
+            ))
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(params.get("project").map(String::as_str), Some("acme-api"));
+            assert_eq!(
+                params.get("identity").map(String::as_str),
+                Some("git.example.test/acme/api")
+            );
+            assert_eq!(
+                params.get("identity_src").map(String::as_str),
+                Some("git_remote")
+            );
+            assert_eq!(
+                params.get("aliases").map(String::as_str),
+                Some("[\"former-name\"]")
+            );
+            assert_eq!(
+                params.get("project_src").map(String::as_str),
+                Some("marker")
+            );
+        }
     }
 
     #[test]
@@ -12897,6 +13126,8 @@ mod identity_parity_tests {
              {}\n\
              const urls: string[] = {};\n\
              process.stdout.write(urls.map((u) => normalizeRemote(u) ?? \"\").join(\"\\n\") + \"\\n\");\n\
+             const aliasCases: string[] = {};\n\
+             for (const marker of aliasCases) process.stdout.write(`A:${{markerAliases(marker) ?? \"\"}}\\n`);\n\
              const styles: string[] = {};\n\
              for (const s of styles) {{\n\
                const forwarded = identityStyleParam(s);\n\
@@ -12904,12 +13135,19 @@ mod identity_parity_tests {
              }}\n\
              const decide = (explicit?: string, project?: string): string => {{\n\
                const url = new URL(\"http://h/hook\");\n\
-               applyIdentityParams(url, undefined, explicit, project, \"path\");\n\
+               applyIdentityParams(url, undefined, explicit, project, \"path\", undefined);\n\
                return url.search;\n\
              }};\n\
              process.stderr.write([decide(\" Acme/Platform \", \"proj\"), decide(undefined, \"proj\"), decide()].join(\"|\"));\n",
             super::TS_IDENTITY,
             serde_json::to_string(&list).unwrap(),
+            serde_json::to_string(
+                &alias_cases()
+                    .into_iter()
+                    .map(|(toml, _)| toml)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
             serde_json::to_string(&styles).unwrap()
         );
         std::fs::write(&module, source).unwrap();
@@ -12924,10 +13162,26 @@ mod identity_parity_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (styles, urls): (Vec<&str>, Vec<&str>) =
-            stdout.split('\n').partition(|line| line.starts_with("S:"));
+        let lines = stdout.split('\n').collect::<Vec<_>>();
+        let aliases = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("A:"))
+            .map(|line| &line[2..])
+            .collect::<Vec<_>>();
+        let styles = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("S:"))
+            .map(|line| &line[2..])
+            .collect::<Vec<_>>();
+        let urls = lines
+            .iter()
+            .copied()
+            .filter(|line| !line.starts_with("S:") && !line.starts_with("A:"))
+            .collect::<Vec<_>>();
         assert_agrees("TS_IDENTITY", urls.join("\n").as_bytes());
-        let styles: Vec<&str> = styles.iter().map(|line| &line[2..]).collect();
+        assert_aliases_agree("TS_IDENTITY", &aliases.join("\n"));
         assert_styles_agree("TS_IDENTITY", &styles.join("\n"));
         // An explicit identity wins over a declared project; a declared
         // project alone sends nothing; no cwd sends nothing. A requested

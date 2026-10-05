@@ -8,7 +8,9 @@
 //! existing project is claimed in place rather than split away, and somebody
 //! who may not write to it cannot take its identity.
 
-use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+use ai_memory_core::repository_identity::{
+    IdentitySource, IdentityStyle, MarkerAliases, RepositoryIdentity,
+};
 use ai_memory_core::{
     AgentKind, NewHandoff, NewPage, NewSession, NewUser, OwnerFilter, PagePath, ProjectId,
     SessionId, Tier, UserId, WorkspaceId,
@@ -535,6 +537,203 @@ fn preserved_page(ws: WorkspaceId, project: ProjectId) -> NewPage {
         entities: Vec::new(),
         evidence: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn marker_aliases_require_same_remote_identity_and_preserve_uuid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "former-name", None)
+        .await
+        .0;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let writer = user(&store, "alias-writer", 7).await;
+    store
+        .writer
+        .grant_memory(writer, project, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    let aliases = MarkerAliases::new(["former-name"]).unwrap();
+
+    let read = store
+        .reader
+        .resolve_existing_project_aliases(
+            ws,
+            "acme-api".into(),
+            aliases.clone(),
+            repository.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, Some(project));
+    assert_eq!(
+        row(&store, project).0,
+        "former-name",
+        "read does not rename"
+    );
+
+    let outsider = user(&store, "alias-outsider", 8).await;
+    let refused = store
+        .writer
+        .resolve_project_aliases_for_write(
+            ws,
+            "acme-api",
+            aliases.clone(),
+            repository.clone(),
+            Some(ProjectPrincipal::user(outsider)),
+            true,
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        Err(ai_memory_store::StoreError::Forbidden(_))
+    ));
+    assert_eq!(row(&store, project).0, "former-name");
+
+    let promoted = store
+        .writer
+        .resolve_project_aliases_for_write(
+            ws,
+            "acme-api",
+            aliases,
+            repository,
+            Some(ProjectPrincipal::user(writer)),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(promoted.project_id, project);
+    assert_eq!(promoted.promoted_from.as_deref(), Some("former-name"));
+    assert_eq!(row(&store, project).0, "acme-api");
+}
+
+#[tokio::test]
+async fn marker_aliases_cannot_promote_to_an_arbitrary_marker_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "former-name", None)
+        .await
+        .0;
+    let aliases = MarkerAliases::new(["former-name"]).unwrap();
+
+    let resolved = store
+        .writer
+        .resolve_project_aliases_for_write(
+            ws,
+            "attacker-chosen-name",
+            aliases,
+            repository,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(resolved.project_id, project);
+    assert_eq!(resolved.promoted_from, None);
+    assert_eq!(row(&store, project).0, "former-name");
+}
+
+#[tokio::test]
+async fn hostile_ambiguous_and_cross_workspace_marker_aliases_fail_closed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let legitimate = resolve(&store, ws, &repository, "former-name", None)
+        .await
+        .0;
+    let hostile = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/other/private"),
+        "restricted",
+        None,
+    )
+    .await
+    .0;
+    store
+        .writer
+        .set_access_mode(hostile, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let open_hostile = resolve(
+        &store,
+        ws,
+        &remote("bitbucket.org/other/public"),
+        "open-project",
+        None,
+    )
+    .await
+    .0;
+    assert_ne!(open_hostile, legitimate);
+
+    assert_eq!(
+        store
+            .reader
+            .resolve_existing_project_aliases(
+                ws,
+                "acme-api".into(),
+                MarkerAliases::new(["former-name"]).unwrap(),
+                repository.clone(),
+            )
+            .await
+            .unwrap(),
+        Some(legitimate)
+    );
+    for hostile_name in ["restricted", "open-project"] {
+        assert!(
+            store
+                .reader
+                .resolve_existing_project_aliases(
+                    ws,
+                    "future-api".into(),
+                    MarkerAliases::new([hostile_name]).unwrap(),
+                    repository.clone(),
+                )
+                .await
+                .is_err(),
+            "{hostile_name}"
+        );
+    }
+    assert!(
+        store
+            .reader
+            .resolve_existing_project_aliases(
+                ws,
+                "future-api".into(),
+                MarkerAliases::new(["former-name", "restricted"]).unwrap(),
+                repository.clone(),
+            )
+            .await
+            .is_err()
+    );
+
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let _foreign = resolve(&store, other_ws, &repository, "foreign-only", None).await;
+    assert_eq!(
+        store
+            .reader
+            .resolve_existing_project_aliases(
+                ws,
+                "missing-canonical".into(),
+                MarkerAliases::new(["foreign-only"]).unwrap(),
+                remote("github.com/acme/else"),
+            )
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

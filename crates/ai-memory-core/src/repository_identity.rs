@@ -78,6 +78,150 @@ pub const MARKER_FILENAMES: &[&str] = &[MARKER_FILENAME];
 /// bound exists so a client cannot park an arbitrary blob in a unique index.
 pub const MAX_IDENTITY_LEN: usize = 512;
 
+/// Maximum former project names accepted from one local marker.
+pub const MAX_MARKER_ALIASES: usize = 16;
+
+/// Maximum UTF-8 byte length of one marker alias.
+pub const MAX_MARKER_ALIAS_LEN: usize = 128;
+
+/// Why a marker alias list was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerAliasError {
+    /// More aliases were supplied than the bounded routing request permits.
+    TooMany,
+    /// One alias was empty, oversized, escaped, or not a plain project token.
+    Invalid,
+    /// The marker or wire value did not use the portable array grammar.
+    InvalidWire,
+}
+
+impl std::fmt::Display for MarkerAliasError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TooMany => "too many marker aliases",
+            Self::Invalid => "invalid marker alias",
+            Self::InvalidWire => "invalid marker aliases wire value",
+        })
+    }
+}
+
+impl std::error::Error for MarkerAliasError {}
+
+/// A validated, bounded marker alias list.
+///
+/// Construction is limited to the parsers below, so store and router APIs
+/// cannot accidentally iterate an unbounded caller-supplied vector.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct MarkerAliases(Vec<String>);
+
+impl MarkerAliases {
+    /// Validate, trim, and first-occurrence-deduplicate aliases.
+    pub fn new<I, S>(aliases: I) -> Result<Self, MarkerAliasError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut normalized = Vec::new();
+        let mut count = 0_usize;
+        for alias in aliases {
+            count += 1;
+            if count > MAX_MARKER_ALIASES {
+                return Err(MarkerAliasError::TooMany);
+            }
+            let alias = alias.as_ref().trim();
+            let mut chars = alias.chars();
+            let first_valid = chars.next().is_some_and(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit()
+            });
+            if !first_valid
+                || alias.len() > MAX_MARKER_ALIAS_LEN
+                || !chars.all(|c| {
+                    c.is_ascii_lowercase()
+                        || c.is_ascii_uppercase()
+                        || c.is_ascii_digit()
+                        || matches!(c, '.' | '_' | '-')
+                })
+            {
+                return Err(MarkerAliasError::Invalid);
+            }
+            if !normalized.iter().any(|seen| seen == alias) {
+                normalized.push(alias.to_owned());
+            }
+        }
+        Ok(Self(normalized))
+    }
+
+    /// Borrow the bounded names in deterministic marker order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether the marker supplied no effective aliases.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Stable cache-key representation; aliases cannot contain this separator.
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        self.0.join("\u{1f}")
+    }
+}
+
+/// Decode the compact JSON-array query value used by hook and handoff clients.
+pub fn accept_wire_aliases(raw: Option<&str>) -> Result<MarkerAliases, MarkerAliasError> {
+    let Some(raw) = raw else {
+        return Ok(MarkerAliases::default());
+    };
+    if raw.len() > (MAX_MARKER_ALIAS_LEN + 6) * MAX_MARKER_ALIASES + 2 {
+        return Err(MarkerAliasError::TooMany);
+    }
+    if raw.contains('\\') {
+        return Err(MarkerAliasError::Invalid);
+    }
+    let aliases: Vec<String> =
+        serde_json::from_str(raw).map_err(|_| MarkerAliasError::InvalidWire)?;
+    MarkerAliases::new(aliases)
+}
+
+/// Parse the portable local-marker alias grammar.
+///
+/// The only accepted declaration is one root-level, one-line
+/// `aliases = ["name", "other"]`. Strings may contain only the alias token
+/// characters accepted by [`MarkerAliases::new`]; escapes, trailing commas,
+/// comments/trailing junk, duplicate declarations, multiline arrays, and an
+/// `aliases` key inside any table are rejected.
+pub fn parse_marker_aliases(text: &str) -> Result<Option<MarkerAliases>, MarkerAliasError> {
+    let mut found = None;
+    let mut in_table = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_table = true;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "aliases" {
+            continue;
+        }
+        if in_table || found.is_some() {
+            return Err(MarkerAliasError::InvalidWire);
+        }
+        let value = value.trim();
+        if value.contains('\\') {
+            return Err(MarkerAliasError::Invalid);
+        }
+        let aliases: Vec<String> =
+            serde_json::from_str(value).map_err(|_| MarkerAliasError::InvalidWire)?;
+        found = Some(MarkerAliases::new(aliases)?);
+    }
+    Ok(found)
+}
+
 /// Which rung of the chain produced an identity.
 ///
 /// Stored alongside the identity so an operator can tell a globally unique
@@ -968,6 +1112,61 @@ mod tests {
                 case["style"].as_str(),
                 "{value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn marker_aliases_are_bounded_trimmed_deduplicated_and_reject_paths() {
+        assert_eq!(
+            MarkerAliases::new([" former-name ", "legacy_name", "former-name"])
+                .unwrap()
+                .as_slice(),
+            ["former-name", "legacy_name"]
+        );
+        for invalid in [
+            "",
+            "-leading",
+            "../foreign",
+            "nested/project",
+            "bad\u{7}name",
+        ] {
+            assert_eq!(
+                MarkerAliases::new([invalid]),
+                Err(MarkerAliasError::Invalid),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            MarkerAliases::new((0..=MAX_MARKER_ALIASES).map(|index| format!("a{index}"))),
+            Err(MarkerAliasError::TooMany)
+        );
+        assert_eq!(
+            MarkerAliases::new([format!("a{}", "x".repeat(MAX_MARKER_ALIAS_LEN))]),
+            Err(MarkerAliasError::Invalid)
+        );
+    }
+
+    #[test]
+    fn marker_alias_values_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in cases["marker_aliases"].as_array().unwrap() {
+            let toml = case["toml"].as_str().unwrap();
+            let parsed = parse_marker_aliases(toml);
+            match case["status"].as_str().unwrap() {
+                "valid" => {
+                    let got = parsed.unwrap().unwrap().as_slice().to_vec();
+                    let expected = case["aliases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>();
+                    assert_eq!(got, expected, "{toml}");
+                }
+                "absent" => assert_eq!(parsed.unwrap(), None, "{toml}"),
+                "invalid" => assert!(parsed.is_err(), "{toml}"),
+                status => panic!("unknown fixture status {status}"),
+            }
         }
     }
 

@@ -253,6 +253,15 @@ assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&worksp
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> cwd only" "&cwd=$(ai_memory_url_encode "$TMP/nonexistent")" "$QS3"
 
+mkdir -p "$TMP/aliases"
+git -C "$TMP/aliases" init -q
+git -C "$TMP/aliases" remote add origin git@git.example.test:acme/api.git
+printf 'project = "acme-api"\naliases = [" former-name ", "legacy_name", "former-name"]\n' >"$TMP/aliases/.ai-memory.toml"
+ALIAS_JSON='["former-name","legacy_name"]'
+ALIAS_QS=$(ai_memory_marker_qs "$TMP/aliases")
+assert_eq "marker aliases keep canonical project and forward remote identity" "yes" \
+    "$(case "$ALIAS_QS" in *'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; *) printf no ;; esac)"
+
 # --- capture-only marker transparency (#668) ---------------------------
 # A nested marker whose only content is [capture] must not shadow an outer
 # marker's workspace/project: ai_memory_marker_qs skips it and forwards the

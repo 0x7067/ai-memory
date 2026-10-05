@@ -101,6 +101,9 @@ pub struct HookQuery {
     /// project from its repository path without the host; anything else keeps
     /// the default. Never changes routing, only what a creation is called.
     pub identity_style: Option<String>,
+    /// Compact JSON array of validated former project names from the local
+    /// marker. Accepted only with a full git-remote identity.
+    pub aliases: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -136,6 +139,10 @@ pub struct HookEnvelope {
     /// How a project this event creates is named; see
     /// [`ai_memory_core::repository_identity::IdentityStyle`].
     pub identity_style: ai_memory_core::repository_identity::IdentityStyle,
+    /// Validated, normalized former project names supplied by the local marker.
+    pub aliases: ai_memory_core::repository_identity::MarkerAliases,
+    /// Whether an alias query was malformed or lacked a git-remote identity.
+    pub aliases_invalid: bool,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -190,6 +197,8 @@ impl std::fmt::Debug for HookEnvelope {
             .field("project_override", &self.project_override)
             .field("project_strategy", &self.project_strategy)
             .field("identity", &self.identity)
+            .field("alias_count", &self.aliases.as_slice().len())
+            .field("aliases_invalid", &self.aliases_invalid)
             .field("drop_subagent_requested", &self.drop_subagent_requested)
             .field(
                 "recall_default_global_requested",
@@ -265,6 +274,28 @@ pub(crate) fn query_flag_falsy(value: Option<&str>) -> bool {
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("0" | "false" | "no" | "off")
     )
+}
+
+pub(crate) fn marker_aliases_from_wire(
+    project: Option<&str>,
+    project_source: ProjectSource,
+    identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+    raw: Option<&str>,
+) -> Result<
+    ai_memory_core::repository_identity::MarkerAliases,
+    ai_memory_core::repository_identity::MarkerAliasError,
+> {
+    let aliases = ai_memory_core::repository_identity::accept_wire_aliases(raw)?;
+    if raw.is_some()
+        && (project.is_none_or(|project| project.trim().is_empty())
+            || project_source != ProjectSource::Marker
+            || !identity.is_some_and(|identity| {
+                identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote
+            }))
+    {
+        return Err(ai_memory_core::repository_identity::MarkerAliasError::InvalidWire);
+    }
+    Ok(aliases)
 }
 
 /// How the hook router derives a project name when no explicit
@@ -561,6 +592,18 @@ impl HookEnvelope {
             .as_deref()
             .and_then(ai_memory_core::repository_identity::IdentityStyle::from_str_opt)
             .unwrap_or_default();
+        let aliases = marker_aliases_from_wire(
+            project_override.as_deref(),
+            project_source,
+            identity.as_ref(),
+            query.aliases.as_deref(),
+        );
+        let aliases_invalid = aliases.is_err();
+        let aliases = if aliases_invalid {
+            ai_memory_core::repository_identity::MarkerAliases::default()
+        } else {
+            aliases.unwrap_or_default()
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
@@ -646,6 +689,8 @@ impl HookEnvelope {
             project_source,
             identity,
             identity_style,
+            aliases,
+            aliases_invalid,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,

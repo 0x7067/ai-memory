@@ -224,9 +224,10 @@ pub(crate) fn manifest_json() -> String {
 fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     let toml_flag = super::install_hooks::TS_TOML_FLAG;
     let find_settings_marker = super::install_hooks::TS_FIND_SETTINGS_MARKER;
+    let identity = super::install_hooks::TS_IDENTITY;
     let Some(default) = default_strategy else {
         return format!(
-            "{toml_flag}\n{find_settings_marker}\n{}",
+            "{toml_flag}\n{find_settings_marker}\n{identity}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   if (!cwd) return;
   url.searchParams.set("cwd", cwd);
@@ -236,6 +237,11 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     const body = readFileSync(marker, "utf8");
     const workspace = tomlKey(body, "workspace");
     const project = tomlKey(body, "project");
+    const aliases = markerAliases(body);
+    if (aliases) {
+      const remoteIdentity = applyIdentityParams(url, cwd, undefined, project, tomlKey(body, "identity_style"), aliases);
+      url.searchParams.set("aliases", project && remoteIdentity ? aliases : "invalid");
+    }
     const projectStrategy = tomlKey(body, "project_strategy");
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
     const defaultGlobal = tomlFlag(body, "default_global");
@@ -279,6 +285,8 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   let briefingBudget: string | undefined;
   let profileContribute: string | undefined;
   let profileConsume: string | undefined;
+  let identityStyle: string | undefined;
+  let aliases: string | undefined;
   const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
@@ -292,8 +300,14 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
       briefingBudget = tomlFlag(body, "max_chars");
       profileContribute = profileFlag(tomlFlag(body, "contribute"));
       profileConsume = profileFlag(tomlFlag(body, "consume"));
+      identityStyle = tomlKey(body, "identity_style");
+      aliases = markerAliases(body);
     } catch (_e) {
     }
+  }
+  if (aliases) {
+    const remoteIdentity = applyIdentityParams(url, cwd, undefined, project, identityStyle, aliases);
+    url.searchParams.set("aliases", project && remoteIdentity ? aliases : "invalid");
   }
   // `project_src` tells the server a marker rescope from a host-derived
   // repo-root name; only the latter yields to sticky routing (#394).
@@ -318,7 +332,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{find_settings_marker}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{find_settings_marker}\n{identity}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -740,6 +754,22 @@ mod tests {
             plugin.contains("const marker = findSettingsMarker(cwd);"),
             "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
         );
+    }
+
+    #[test]
+    fn openclaw_identity_discovery_is_alias_gated() {
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let apply = plugin
+            .split_once("function applyMarkerParams")
+            .unwrap()
+            .1
+            .split_once("function postHook")
+            .unwrap()
+            .0;
+        assert!(apply.contains("if (!marker) return;"));
+        assert_eq!(apply.matches("applyIdentityParams(").count(), 1);
+        assert!(apply.contains("if (aliases) {\n      const remoteIdentity = applyIdentityParams"));
+        assert!(!apply.contains("tomlKey(body, \"identity\")"));
     }
 
     #[test]

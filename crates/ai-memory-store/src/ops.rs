@@ -419,6 +419,15 @@ pub(crate) struct ProjectNameWriteResolution {
     pub authorization_error: Option<ai_memory_core::AuthzError>,
 }
 
+/// Result of resolving transient marker aliases for a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAliasWriteResolution {
+    /// Existing project UUID.
+    pub project_id: ai_memory_core::ProjectId,
+    /// Previous name when canonical promotion committed.
+    pub promoted_from: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_project_name_for_write(
     conn: &mut Connection,
@@ -501,6 +510,65 @@ pub(crate) fn resolve_project_name_for_write(
         promoted_from: None,
         authorization_error,
     })
+}
+
+pub(crate) fn resolve_project_aliases_for_write(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    canonical: &str,
+    aliases: &ai_memory_core::repository_identity::MarkerAliases,
+    repository: &ai_memory_core::repository_identity::RepositoryIdentity,
+    principal: Option<&crate::ProjectPrincipal>,
+    distinguishes_operators: bool,
+) -> StoreResult<Option<ProjectAliasWriteResolution>> {
+    let tx = conn.transaction()?;
+    let Some(matched) = crate::project_coordinates::resolve_aliases(
+        &tx,
+        *workspace_id,
+        canonical,
+        aliases,
+        repository,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(principal) = principal {
+        crate::project_authz::resolve_project_authz(
+            &tx,
+            *workspace_id,
+            matched.id,
+            principal,
+            distinguishes_operators,
+        )?
+        .authorize(crate::ProjectAccess::Write)
+        .map_err(|error| StoreError::Forbidden(error.message()))?;
+    }
+    let derived_canonical = ai_memory_core::repository_identity::path_style_name(repository)
+        .as_deref()
+        == Some(canonical);
+    let promote_to = derived_canonical
+        .then(|| crate::project_coordinates::promotion_target(&matched, canonical))
+        .flatten()
+        .map(str::to_owned);
+    let promoted_from = if let Some(canonical) = promote_to {
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            &matched.id,
+            Some(&matched.current_name),
+            &canonical,
+            principal.and_then(|principal| principal.user_id),
+            "promote_project_name",
+        )?;
+        Some(matched.current_name)
+    } else {
+        None
+    };
+    tx.commit()?;
+    Ok(Some(ProjectAliasWriteResolution {
+        project_id: matched.id,
+        promoted_from,
+    }))
 }
 
 fn insert_project_with_identityless_name(

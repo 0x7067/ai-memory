@@ -40,13 +40,30 @@ pub(crate) struct MarkerScope {
     pub(crate) project_strategy: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct RoutingFields {
     pub(crate) workspace: Option<String>,
     pub(crate) project: Option<String>,
     pub(crate) project_strategy: Option<String>,
     pub(crate) identity: Option<String>,
     pub(crate) identity_style: Option<String>,
+    pub(crate) aliases: Result<
+        Option<ai_memory_core::repository_identity::MarkerAliases>,
+        ai_memory_core::repository_identity::MarkerAliasError,
+    >,
+}
+
+impl Default for RoutingFields {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            identity: None,
+            identity_style: None,
+            aliases: Ok(None),
+        }
+    }
 }
 
 impl RoutingFields {
@@ -57,6 +74,7 @@ impl RoutingFields {
             project_strategy: parse_key_in(text, "project_strategy"),
             identity: parse_key_in(text, "identity"),
             identity_style: parse_key_in(text, "identity_style"),
+            aliases: parse_aliases_in(text),
         }
     }
 }
@@ -117,12 +135,14 @@ pub(crate) fn inspect_scope(cwd: &str, env: &RuntimeEnv) -> MarkerInspection {
                     return Some(empty("conflicting"));
                 }
             }
-            if fields.identity_style.as_deref().is_some_and(|style| {
-                ai_memory_core::repository_identity::IdentityStyle::from_str_opt(style).is_none()
-            }) || fields
-                .project_strategy
-                .as_deref()
-                .is_some_and(|strategy| !matches!(strategy, "repo-root" | "repo_root" | "basename"))
+            if fields.aliases.is_err()
+                || fields.identity_style.as_deref().is_some_and(|style| {
+                    ai_memory_core::repository_identity::IdentityStyle::from_str_opt(style)
+                        .is_none()
+                })
+                || fields.project_strategy.as_deref().is_some_and(|strategy| {
+                    !matches!(strategy, "repo-root" | "repo_root" | "basename")
+                })
             {
                 return Some(empty("conflicting"));
             }
@@ -326,6 +346,11 @@ fn declares_more_than_capture(text: &str) -> bool {
             .iter()
             .any(|key| parse_flag_in(text, key).is_some())
         || server_selection_in(text).is_some()
+        || text.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix("aliases")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
 }
 
 /// A marker's `server = "<profile>"` selection (#992), and the directory of
@@ -496,6 +521,26 @@ fn parse_key_in(text: &str, key: &str) -> Option<String> {
     None
 }
 
+pub(crate) fn parse_toml_aliases(
+    file: &Path,
+) -> Result<
+    Option<ai_memory_core::repository_identity::MarkerAliases>,
+    ai_memory_core::repository_identity::MarkerAliasError,
+> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|_| ai_memory_core::repository_identity::MarkerAliasError::InvalidWire)?;
+    parse_aliases_in(&text)
+}
+
+fn parse_aliases_in(
+    text: &str,
+) -> Result<
+    Option<ai_memory_core::repository_identity::MarkerAliases>,
+    ai_memory_core::repository_identity::MarkerAliasError,
+> {
+    ai_memory_core::repository_identity::parse_marker_aliases(text)
+}
+
 /// Parse a root-level `key = <value>` line, accepting a quoted string
 /// (`key = "true"`) OR a bare token (`key = true` / `key = 1`), so a
 /// `[recall] default_global = true` marker works whether or not the operator
@@ -655,6 +700,32 @@ mod tests {
 
     /// Happy-path TOML parser: extracts each declared root-level
     /// `key = "value"` pair. Mirrors the shell `ai_memory_parse_toml_key`.
+    #[test]
+    fn marker_aliases_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../ai-memory-core/fixtures/remote_identity_cases.json"
+        ))
+        .unwrap();
+        for case in cases["marker_aliases"].as_array().unwrap() {
+            let parsed = parse_aliases_in(case["toml"].as_str().unwrap());
+            match case["status"].as_str().unwrap() {
+                "valid" => {
+                    let got = parsed.unwrap().unwrap().as_slice().to_vec();
+                    let expected = case["aliases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>();
+                    assert_eq!(got, expected, "{}", case["toml"]);
+                }
+                "absent" => assert_eq!(parsed.unwrap(), None, "{}", case["toml"]),
+                "invalid" => assert!(parsed.is_err(), "{}", case["toml"]),
+                status => panic!("unknown fixture status {status}"),
+            }
+        }
+    }
+
     #[test]
     fn parse_toml_key_extracts_root_level_strings() {
         let tmp = TempDir::new().unwrap();

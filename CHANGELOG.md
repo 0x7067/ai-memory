@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added bounded local `.ai-memory.toml` `aliases = ["former-name"]` routing for
+  existing project-coordinate compatibility. Native, POSIX shell, PowerShell,
+  and generated TypeScript hook clients forward the same validated aliases for
+  capture and SessionStart handoff lookup; resolution remains workspace-local,
+  requires the checkout's matching hostful git-remote identity, preserves the
+  existing UUID, and permits only write-authorized canonical-name promotion.
+  Aliases are not persisted, and the default naming style is unchanged. (#1033)
 - Added read-only project-coordinate diagnostics to `ai-memory doctor` and the
   root-gated `GET /admin/project-coordinate` endpoint. The report classifies
   exact, canonical-compatibility, legacy-compatibility, missing, and ambiguous

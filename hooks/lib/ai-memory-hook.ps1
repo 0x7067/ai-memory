@@ -52,6 +52,25 @@ function Get-AiMemoryUserHome {
     return $trimmed
 }
 
+function Test-AiMemoryMarkerDeclaresSettings {
+    param([string] $File)
+    if (-not (Test-Path $File -PathType Leaf)) { return $false }
+    try {
+        $text = [IO.File]::ReadAllText($File)
+    } catch {
+        return $false
+    }
+    foreach ($key in @("workspace", "project", "project_strategy", "drop_subagent_captures", "identity", "identity_style")) {
+        if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
+    }
+    if ([regex]::IsMatch($text, '(?m)^\s*aliases\s*=')) { return $true }
+    if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
+    foreach ($key in @("default_global", "inject_on_session_start", "max_chars", "contribute", "consume")) {
+        if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
+    }
+    return $false
+}
+
 function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
@@ -82,7 +101,7 @@ function Get-AiMemoryMarkerToml {
     }
     while ($dir -and (Test-Path $dir)) {
         $candidate = Join-Path $dir ".ai-memory.toml"
-        if (Test-Path $candidate -PathType Leaf) { return $candidate }
+        if ((Test-Path $candidate -PathType Leaf) -and (Test-AiMemoryMarkerDeclaresSettings -File $candidate)) { return $candidate }
         if ($boundary -and $dir -eq $boundary) { return $null }
         $parent = Split-Path $dir -Parent
         if (-not $parent -or $parent -eq $dir) { return $null }
@@ -141,6 +160,46 @@ function Get-AiMemoryTomlKey {
 # `[briefing] inject_on_session_start = true` work quoted or not. Parity
 # with `parse_toml_flag` in hook_capture.rs: line-based, first match wins,
 # trailing `# comment` stripped.
+function Get-AiMemoryTomlAliases {
+    param([string] $File)
+    if (-not (Test-Path $File -PathType Leaf)) { return $null }
+    try {
+        $text = [IO.File]::ReadAllText($File)
+        $lines = $text -split "`r?`n"
+        $inTable = $false
+        $matches = [Collections.Generic.List[string]]::new()
+        foreach ($line in $lines) {
+            $trimmed = $line.Trim()
+            if ($trimmed.StartsWith("[")) { $inTable = $true }
+            if ($trimmed -match '^aliases\s*=') {
+                if ($inTable) { return "invalid" }
+                $matches.Add($trimmed)
+            }
+        }
+        if ($matches.Count -eq 0) { return $null }
+        if ($matches.Count -ne 1) { return "invalid" }
+        $match = [regex]::Match($matches[0], '^aliases\s*=\s*\[([^\]]*)\]\s*$')
+        if (-not $match.Success) { return "invalid" }
+        $aliases = [Collections.Generic.List[string]]::new()
+        if (-not $match.Groups[1].Value.Trim()) { return $null }
+        $parts = $match.Groups[1].Value.Split(',')
+        if ($parts.Count -gt 16) { return "invalid" }
+        foreach ($part in $parts) {
+            if ($part.Contains("\")) { return "invalid" }
+            $item = [regex]::Match($part, '^\s*"([^"]*)"\s*$')
+            if (-not $item.Success) { return "invalid" }
+            $value = $item.Groups[1].Value.Trim()
+            if (-not $value -or $value.Length -gt 128 -or $value -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { return "invalid" }
+            if (-not $aliases.Contains($value)) {
+                $aliases.Add($value)
+            }
+        }
+        return [string](ConvertTo-Json -InputObject @($aliases) -Compress)
+    } catch {
+        return "invalid"
+    }
+}
+
 function Get-AiMemoryTomlFlag {
     param([string] $File, [string] $Key)
     if (-not (Test-Path $File -PathType Leaf)) { return $null }
@@ -301,12 +360,12 @@ function Get-AiMemoryIdentityStyleQuery {
 # $Style (the marker's `identity_style`) is forwarded only with a remote
 # identity.
 function Get-AiMemoryIdentityQuery {
-    param([string] $Cwd, [string] $Explicit, [string] $Project, [string] $Style)
-    if ($Explicit -and $Explicit.Trim()) {
+    param([string] $Cwd, [string] $Explicit, [string] $Project, [string] $Style, [string] $Aliases)
+    if (-not $Aliases -and $Explicit -and $Explicit.Trim()) {
         $value = $Explicit.Trim().ToLowerInvariant()
         return "&identity=$([uri]::EscapeDataString($value))&identity_src=explicit"
     }
-    if ($Project -and $Project.Trim()) { return "" }
+    if (-not $Aliases -and $Project -and $Project.Trim()) { return "" }
     if (-not $Cwd) { return "" }
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return "" }
     foreach ($name in @("upstream", "origin")) {
@@ -336,6 +395,7 @@ function Get-AiMemoryMarkerQuery {
     $identityStyle = $null
     $profileContribute = $null
     $profileConsume = $null
+    $aliases = $null
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
@@ -344,6 +404,7 @@ function Get-AiMemoryMarkerQuery {
         $dropSubagent = Get-AiMemoryTomlKey -File $marker -Key "drop_subagent_captures"
         $explicitIdentity = Get-AiMemoryTomlKey -File $marker -Key "identity"
         $identityStyle = Get-AiMemoryTomlKey -File $marker -Key "identity_style"
+        $aliases = Get-AiMemoryTomlAliases -File $marker
         # `[profile] contribute` / `consume`, quoted or bare; the server
         # decides truthiness and keeps both on unless explicitly falsy.
         # Always explicit once a marker resolved (0 when falsy, else 1): removing
@@ -355,7 +416,7 @@ function Get-AiMemoryMarkerQuery {
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
     # the identity chain's declared-project rung means a name in the marker.
-    $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj -Style $identityStyle
+    $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj -Style $identityStyle -Aliases $aliases
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.
@@ -373,6 +434,10 @@ function Get-AiMemoryMarkerQuery {
     if ($projSrc) { $qs += "&project_src=$([uri]::EscapeDataString($projSrc))" }
     if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
     $qs += $identityQuery
+    if ($aliases) {
+        if (-not $proj -or -not $identityQuery.Contains("identity_src=git_remote")) { $aliases = "invalid" }
+        $qs += "&aliases=$([uri]::EscapeDataString($aliases))"
+    }
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     if ($dropSubagent) { $qs += "&drop_subagent=$([uri]::EscapeDataString($dropSubagent))" }

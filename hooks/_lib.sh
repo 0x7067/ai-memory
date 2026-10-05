@@ -104,6 +104,7 @@ ai_memory_marker_declares_settings() {
     for key in workspace project project_strategy drop_subagent_captures identity identity_style; do
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
+    LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' "$file" && return 0
     ai_memory_marker_declares_server "$file" && return 0
     for key in default_global inject_on_session_start max_chars contribute consume; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
@@ -430,6 +431,70 @@ ai_memory_identity_style_qs() {
     return 0
 }
 
+ai_memory_aliases_json() {
+    [ -f "$1" ] || return 0
+    _ai_alias_body=$(LC_ALL=C awk '
+        BEGIN { table = 0; count = 0; bad = 0 }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            trimmed = line
+            sub(/^[ \t]*/, "", trimmed)
+            if (trimmed ~ /^\[/) table = 1
+            if (trimmed ~ /^aliases[ \t]*=/) {
+                count++
+                if (table || count > 1 || trimmed !~ /^aliases[ \t]*=[ \t]*\[[^]]*\][ \t]*$/) {
+                    bad = 1
+                } else {
+                    sub(/^aliases[ \t]*=[ \t]*\[/, "", trimmed)
+                    sub(/\][ \t]*$/, "", trimmed)
+                    body = trimmed
+                }
+            }
+        }
+        END {
+            if (bad) print "invalid"
+            else if (count == 1) print body
+        }
+    ' "$1")
+    [ "$_ai_alias_body" = "invalid" ] && { printf 'invalid'; return 0; }
+    [ -n "$_ai_alias_body" ] || return 0
+    _ai_alias_trimmed=$(printf '%s' "$_ai_alias_body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$_ai_alias_trimmed" ] || return 0
+    case "$_ai_alias_trimmed" in *,) printf 'invalid'; return 0 ;; esac
+    _ai_alias_out=""
+    _ai_alias_count=0
+    _ai_alias_old_ifs=$IFS
+    IFS=,
+    for _ai_alias_raw in $_ai_alias_body; do
+        IFS=$_ai_alias_old_ifs
+        _ai_alias_count=$((_ai_alias_count + 1))
+        [ "$_ai_alias_count" -le 16 ] || { printf 'invalid'; return 0; }
+        case "$_ai_alias_raw" in *\\*) printf 'invalid'; return 0 ;; esac
+        _ai_alias=$(printf '%s' "$_ai_alias_raw" | sed -n -E 's/^[[:space:]]*"([^"]*)"[[:space:]]*$/\1/p' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        case "$_ai_alias" in
+            ""|*[!A-Za-z0-9._-]*) printf 'invalid'; return 0 ;;
+        esac
+        [ "${#_ai_alias}" -le 128 ] || { printf 'invalid'; return 0; }
+        case "$_ai_alias" in [A-Za-z0-9]*) ;; *) printf 'invalid'; return 0 ;; esac
+        case "|$_ai_alias_out|" in *"|$_ai_alias|"*) ;; *)
+            _ai_alias_out="${_ai_alias_out}|${_ai_alias}"
+        esac
+        IFS=,
+    done
+    IFS=$_ai_alias_old_ifs
+    _ai_alias_json="["
+    _ai_alias_sep=""
+    _ai_alias_rest=${_ai_alias_out#|}
+    IFS='|'
+    for _ai_alias in $_ai_alias_rest; do
+        _ai_alias_json="${_ai_alias_json}${_ai_alias_sep}\"${_ai_alias}\""
+        _ai_alias_sep=,
+    done
+    IFS=$_ai_alias_old_ifs
+    printf '%s]' "$_ai_alias_json"
+}
+
 # Print `&identity=<v>&identity_src=<rung>` for the checkout at "$1", or
 # nothing. "$2" is the marker's `identity`, "$3" its declared `project`, "$4"
 # its `identity_style`, forwarded only with a remote identity.
@@ -437,14 +502,14 @@ ai_memory_identity_style_qs() {
 # sent; a declared project outranks the remote and routes by name, so git is
 # not consulted; otherwise the `upstream` remote, else `origin`.
 ai_memory_identity_qs() {
-    _ai_id_cwd="$1"; _ai_id_explicit="$2"; _ai_id_project="$3"; _ai_id_style="$4"
+    _ai_id_cwd="$1"; _ai_id_explicit="$2"; _ai_id_project="$3"; _ai_id_style="$4"; _ai_id_aliases="$5"
     _ai_id_explicit=$(printf '%s' "$_ai_id_explicit" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    if [ -n "$_ai_id_explicit" ]; then
+    if [ -z "$_ai_id_aliases" ] && [ -n "$_ai_id_explicit" ]; then
         _ai_id_value=$(printf '%s' "$_ai_id_explicit" | tr '[:upper:]' '[:lower:]')
         printf '&identity=%s&identity_src=explicit' "$(ai_memory_url_encode "$_ai_id_value")"
         return 0
     fi
-    [ -n "$(printf '%s' "$_ai_id_project" | tr -d '[:space:]')" ] && return 0
+    [ -z "$_ai_id_aliases" ] && [ -n "$(printf '%s' "$_ai_id_project" | tr -d '[:space:]')" ] && return 0
     [ -n "$_ai_id_cwd" ] || return 0
     command -v git >/dev/null 2>&1 || return 0
     for _ai_id_remote in upstream origin; do
@@ -485,6 +550,7 @@ ai_memory_marker_qs() {
     isty=""
     pcon=""
     pcons=""
+    aliases=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
     # capture-only marker (e.g. one that only sets ignore_paths) must not
     # shadow an outer marker's workspace/project/etc.
@@ -496,6 +562,7 @@ ai_memory_marker_qs() {
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
         idn=$(ai_memory_parse_toml_key "$marker" identity)
         isty=$(ai_memory_parse_toml_key "$marker" identity_style)
+        aliases=$(ai_memory_aliases_json "$marker")
         # `[profile] contribute` / `consume`, quoted or bare, always sent
         # explicitly once a marker resolved (0 when falsy, else 1): removing
         # the key re-enables; no marker sends nothing and the server keeps
@@ -506,7 +573,7 @@ ai_memory_marker_qs() {
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
     # the identity chain's declared-project rung means a name in the marker.
-    iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr" "$isty")
+    iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr" "$isty" "$aliases")
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.
@@ -532,6 +599,14 @@ ai_memory_marker_qs() {
     [ -n "$ps" ] && qs="${qs}&project_src=$(ai_memory_url_encode "$ps")"
     [ -n "$st" ] && qs="${qs}&project_strategy=$(ai_memory_url_encode "$st")"
     qs="${qs}${iq}"
+    if [ -n "$aliases" ]; then
+        case "$iq" in *'identity_src=git_remote'*)
+            [ -n "$pr" ] || aliases=invalid
+            ;;
+            *) aliases=invalid ;;
+        esac
+        qs="${qs}&aliases=$(ai_memory_url_encode "$aliases")"
+    fi
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     [ -n "$ds" ] && qs="${qs}&drop_subagent=$(ai_memory_url_encode "$ds")"

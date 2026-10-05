@@ -9259,6 +9259,28 @@ impl ReaderPool {
         .await
     }
 
+    /// Resolve a local marker's former names inside one workspace, requiring
+    /// the selected row to carry the checkout's full git-remote identity.
+    pub async fn resolve_existing_project_aliases(
+        &self,
+        workspace_id: WorkspaceId,
+        canonical: String,
+        aliases: ai_memory_core::repository_identity::MarkerAliases,
+        repository: ai_memory_core::repository_identity::RepositoryIdentity,
+    ) -> StoreResult<Option<ProjectId>> {
+        self.with_conn(move |conn| {
+            crate::project_coordinates::resolve_aliases(
+                conn,
+                workspace_id,
+                &canonical,
+                &aliases,
+                &repository,
+            )
+            .map(|matched| matched.map(|matched| matched.id))
+        })
+        .await
+    }
+
     /// Find the existing project whose `repo_path` is the longest
     /// prefix of `cwd`, if any. Used by the hook router before
     /// auto-creating a new project from `basename(cwd)` so an event
