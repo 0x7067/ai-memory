@@ -12,7 +12,7 @@ use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
     FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, PurgeSessionSummary,
-    ReaderPool, WriterHandle, artifact_path_for, f32_vec_to_bytes,
+    ReaderPool, ScopeRow, WriterHandle, artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -671,15 +671,16 @@ impl Wiki {
             }
         };
         let ws_dir = self.root.join(workspace_id.to_string());
-        let mut project_fm = serde_json::json!({ "project": scope.project_name });
-        if let Some(repo_path) = scope.repo_path {
-            project_fm["repo_path"] = serde_json::Value::String(repo_path);
-        }
+        let workspace_name = scope.workspace_name.clone();
+        let project_fm = match Self::project_scope_frontmatter(scope) {
+            Ok(frontmatter) => frontmatter,
+            Err(e) => {
+                tracing::warn!(error = %e, "scope-manifest identity is invalid (non-fatal)");
+                return;
+            }
+        };
         let written = self
-            .write_scope_manifest(
-                &ws_dir,
-                serde_json::json!({ "workspace": scope.workspace_name }),
-            )
+            .write_scope_manifest(&ws_dir, serde_json::json!({ "workspace": workspace_name }))
             .and_then(|_| {
                 self.write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm)
             });
@@ -1821,6 +1822,48 @@ impl Wiki {
         Ok((id, pending_embed))
     }
 
+    fn project_scope_frontmatter(scope: ScopeRow) -> WikiResult<serde_json::Value> {
+        let project_id = scope.project_id;
+        let identity = match (scope.identity.as_deref(), scope.identity_source.as_deref()) {
+            (Some(identity), Some(source)) => Some(
+                ai_memory_core::repository_identity::accept_wire_identity(identity, source)
+                    .ok_or_else(|| {
+                        WikiError::Io(std::io::Error::other(format!(
+                            "project {} has an invalid identity/source pair",
+                            scope.project_id
+                        )))
+                    })?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "project {} has an incomplete identity/source pair",
+                    scope.project_id
+                ))));
+            }
+        };
+        let canonical_name = identity
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::path_style_name);
+        let legacy_name = identity
+            .as_ref()
+            .and_then(ai_memory_core::repository_identity::legacy_basename_name);
+        if scope.canonical_name != canonical_name || scope.legacy_name != legacy_name {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "project {project_id} has coordinate keys inconsistent with its identity"
+            ))));
+        }
+        let manifest = ai_memory_core::repository_identity::ProjectManifest {
+            project: scope.project_name,
+            repo_path: scope.repo_path,
+            identity: identity.as_ref().map(|value| value.identity.clone()),
+            identity_source: identity.map(|value| value.source),
+            canonical_name,
+            legacy_name,
+        };
+        serde_json::to_value(manifest).map_err(WikiError::from)
+    }
+
     /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
     fn read_scope_meta(dir: &Path) -> WikiResult<serde_json::Value> {
         let path = dir.join("_meta.md");
@@ -1852,8 +1895,9 @@ impl Wiki {
 
     /// Rebuild the **entire** store index from the on-disk wiki tree — the
     /// "DB is rebuildable from files" guarantee made concrete. Walks every
-    /// `<ws-uuid>/<proj-uuid>/` directory, recreates the workspace/project rows
-    /// from each dir's self-describing `_meta.md` manifest (preserving the ids
+    /// `<ws-uuid>/<proj-uuid>/` directory, recreates workspace/project rows and
+    /// optional repository identity from each self-describing `_meta.md`
+    /// manifest (preserving the ids
     /// the tree is keyed by, via [`WriterHandle::ensure_workspace_with_id`] /
     /// [`ensure_project_with_id`]), then reindexes every page. Pages are
     /// detected by content (a frontmatter file named `log.md` is a page; the
@@ -1918,21 +1962,58 @@ impl Wiki {
             }
 
             let meta = Self::read_scope_meta(&proj_root)?;
-            let name = meta
+            if meta
                 .get("project")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    WikiError::Io(std::io::Error::other(format!(
-                        "{}/_meta.md is missing the `project` name",
+                .and_then(|value| value.as_str())
+                .is_none()
+            {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "{}/_meta.md is missing the `project` name",
+                    proj_root.display()
+                ))));
+            }
+            let manifest: ai_memory_core::repository_identity::ProjectManifest =
+                serde_json::from_value(meta)?;
+            let identity = match (manifest.identity.as_deref(), manifest.identity_source) {
+                (Some(identity), Some(source)) => Some(
+                    ai_memory_core::repository_identity::accept_wire_identity(
+                        identity,
+                        source.as_str(),
+                    )
+                    .ok_or_else(|| {
+                        WikiError::Io(std::io::Error::other(format!(
+                            "{}/_meta.md has an invalid repository identity/source pair",
+                            proj_root.display()
+                        )))
+                    })?,
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(WikiError::Io(std::io::Error::other(format!(
+                        "{}/_meta.md must provide identity and identity_source together",
                         proj_root.display()
-                    )))
-                })?;
-            let repo_path = meta
-                .get("repo_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+                    ))));
+                }
+            };
+            let derived_canonical = identity
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::path_style_name);
+            let derived_legacy = identity
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::legacy_basename_name);
+            let has_coordinate_assertion =
+                manifest.canonical_name.is_some() || manifest.legacy_name.is_some();
+            if has_coordinate_assertion
+                && (manifest.canonical_name != derived_canonical
+                    || manifest.legacy_name != derived_legacy)
+            {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "{}/_meta.md repository coordinate keys do not match its identity",
+                    proj_root.display()
+                ))));
+            }
             self.writer
-                .ensure_project_with_id(proj, ws, name, repo_path)
+                .ensure_project_with_id(proj, ws, manifest.project, manifest.repo_path, identity)
                 .await?;
             summary.projects += 1;
 
@@ -2014,11 +2095,52 @@ impl Wiki {
         Ok(true)
     }
 
+    /// Refresh one committed renamed scope from its current store row and checkpoint it.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for store, filesystem, or checkpoint errors.
+    pub async fn refresh_renamed_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<Option<String>> {
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            WikiError::Io(std::io::Error::other(
+                "scope refresh requires a store reader",
+            ))
+        })?;
+        let _guard = self.mutation_lock.write().await;
+        self.manifested_scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(workspace_id, project_id));
+        let scope = reader
+            .scope_row_by_ids(workspace_id, project_id)
+            .await?
+            .ok_or_else(|| {
+                WikiError::Io(std::io::Error::other("renamed scope no longer exists"))
+            })?;
+        let ws_dir = self.root.join(workspace_id.to_string());
+        self.write_scope_manifest(
+            &ws_dir,
+            serde_json::json!({ "workspace": scope.workspace_name }),
+        )?;
+        let project_fm = Self::project_scope_frontmatter(scope)?;
+        self.write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm)?;
+        let checkpoint = self
+            .commit_all(&format!("rename-project {workspace_id}/{project_id}"))?
+            .map(|oid| oid.to_string());
+        self.manifested_scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((workspace_id, project_id));
+        Ok(checkpoint)
+    }
+
     /// Ensure every workspace/project scope has its self-describing `_meta.md`
-    /// manifest on disk (`workspace`/`project` name + `repo_path`), so the wiki
-    /// tree alone is enough to rebuild the index via [`Self::reindex_all`] —
-    /// the "DB is rebuildable from files" guarantee. Idempotent; safe to run on
-    /// every startup. No-op without a store reader. Returns the count written.
+    /// manifest on disk (names, `repo_path`, and optional repository identity
+    /// coordinates). Idempotent, safe at startup, and a no-op without a store
+    /// reader.
     ///
     /// # Errors
     /// Returns [`WikiError`] for store or filesystem errors.
@@ -2041,11 +2163,9 @@ impl Wiki {
         }
         for s in scopes {
             let ws_dir = self.root().join(s.workspace_id.to_string());
-            let mut fm = serde_json::json!({ "project": s.project_name });
-            if let Some(rp) = s.repo_path {
-                fm["repo_path"] = serde_json::Value::String(rp);
-            }
-            if self.write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
+            let project_dir = ws_dir.join(s.project_id.to_string());
+            let fm = Self::project_scope_frontmatter(s)?;
+            if self.write_scope_manifest(&project_dir, fm)? {
                 written += 1;
             }
         }
@@ -6461,6 +6581,341 @@ mod tests {
         );
         assert_eq!(entity_hits[0].path.as_str(), "notes/a.md");
         drop(s2);
+    }
+
+    #[tokio::test]
+    async fn promoted_identity_round_trips_through_manifest_and_clean_reindex() {
+        let src = TempDir::new().unwrap();
+        let source = Store::open(src.path()).unwrap();
+        let workspace = source
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let identity = ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/platform/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        };
+        let (project, _) = source
+            .writer
+            .resolve_project_by_identity(
+                workspace,
+                identity.clone(),
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                Some("/src/api".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let wiki = Wiki::new(src.path(), source.writer.clone())
+            .unwrap()
+            .with_store_reader(source.reader.clone());
+        wiki.write_page(req(
+            workspace,
+            project,
+            "notes/history.md",
+            "history survives reindex",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let promoted =
+            ai_memory_store::create_explicit_scope(&source.writer, "default", "acme-platform-api")
+                .await
+                .unwrap();
+        assert_eq!(promoted.scope.project_id, project);
+        assert_eq!(promoted.promoted_from.as_deref(), Some("api"));
+        assert!(
+            wiki.refresh_renamed_scope(workspace, project)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let manifest_path = src
+            .path()
+            .join("wiki")
+            .join(workspace.to_string())
+            .join(project.to_string())
+            .join("_meta.md");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            manifest.contains("project: acme-platform-api"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("identity: github.com/acme/platform/api"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("identity_source: git_remote"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("canonical_name: acme-platform-api"),
+            "{manifest}"
+        );
+        assert!(manifest.contains("legacy_name: api"), "{manifest}");
+        let source_history = wiki.recent_checkpoints(10).unwrap();
+        assert!(
+            source_history
+                .iter()
+                .any(|checkpoint| checkpoint.summary.contains("rename-project"))
+        );
+        drop(source);
+
+        let dst = TempDir::new().unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let rebuilt = Store::open(dst.path()).unwrap();
+        let rebuilt_wiki = Wiki::new(dst.path(), rebuilt.writer.clone()).unwrap();
+        let summary = rebuilt_wiki.reindex_all().await.unwrap();
+        assert_eq!(summary.projects, 1);
+        assert_eq!(summary.pages, 1);
+        let restored_history = rebuilt_wiki.recent_checkpoints(10).unwrap();
+        assert_eq!(
+            restored_history
+                .iter()
+                .map(|checkpoint| &checkpoint.oid)
+                .collect::<Vec<_>>(),
+            source_history
+                .iter()
+                .map(|checkpoint| &checkpoint.oid)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rebuilt
+                .reader
+                .project_name_by_id(workspace, project)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-platform-api")
+        );
+        let rebuilt_scope = rebuilt
+            .reader
+            .scope_row_by_ids(workspace, project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rebuilt_scope.identity.as_deref(),
+            Some("github.com/acme/platform/api")
+        );
+        assert_eq!(rebuilt_scope.identity_source.as_deref(), Some("git_remote"));
+        assert_eq!(
+            rebuilt_scope.canonical_name.as_deref(),
+            Some("acme-platform-api")
+        );
+        assert_eq!(rebuilt_scope.legacy_name.as_deref(), Some("api"));
+        assert!(
+            rebuilt
+                .reader
+                .page_body_by_ids(workspace, project, "notes/history.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body
+                .contains("history survives reindex")
+        );
+        for key in ["acme-platform-api", "api"] {
+            assert_eq!(
+                ai_memory_store::lookup_existing_scope(&rebuilt.reader, "default", key)
+                    .await
+                    .unwrap()
+                    .project_id,
+                project
+            );
+        }
+        let (captured, resolution) = rebuilt
+            .writer
+            .resolve_project_by_identity(
+                workspace,
+                identity,
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                "another-checkout",
+                Some("/other/api".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured, project);
+        assert_eq!(resolution, ai_memory_store::IdentityResolution::Matched);
+        let count: i64 = rebuilt
+            .reader
+            .with_conn(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "capture must not create a second project UUID");
+    }
+
+    #[tokio::test]
+    async fn reindex_rejects_project_coordinate_fields_that_do_not_match_identity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let workspace = WorkspaceId::new();
+        let project = ProjectId::new();
+        let workspace_dir = tmp.path().join("wiki").join(workspace.to_string());
+        let project_dir = workspace_dir.join(project.to_string());
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            workspace_dir.join("_meta.md"),
+            "---\nworkspace: default\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("_meta.md"),
+            "---\nproject: acme-api\nidentity: github.com/acme/api\nidentity_source: git_remote\ncanonical_name: forged-api\nlegacy_name: api\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+
+        let error = wiki.reindex_all().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("coordinate keys do not match its identity"),
+            "{error}"
+        );
+        assert!(
+            store
+                .reader
+                .scope_row_by_ids(workspace, project)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_manifest_without_derived_keys_reindexes_and_derives_them() {
+        let src = TempDir::new().unwrap();
+        let source = Store::open(src.path()).unwrap();
+        let wiki = Wiki::new(src.path(), source.writer.clone())
+            .unwrap()
+            .with_store_reader(source.reader.clone());
+        let workspace = source
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (project, _) = source
+            .writer
+            .resolve_project_by_identity(
+                workspace,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/acme/api".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "api",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        wiki.write_page(req(
+            workspace,
+            project,
+            "notes/a.md",
+            "identity history",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let manifest_path = src
+            .path()
+            .join("wiki")
+            .join(workspace.to_string())
+            .join(project.to_string())
+            .join("_meta.md");
+        std::fs::write(
+            &manifest_path,
+            "---\nproject: api\nidentity: github.com/acme/api\nidentity_source: git_remote\ntype: Scope Manifest\n---\n",
+        ).unwrap();
+        drop(source);
+
+        let dst = TempDir::new().unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let rebuilt = Store::open(dst.path()).unwrap();
+        Wiki::new(dst.path(), rebuilt.writer.clone())
+            .unwrap()
+            .reindex_all()
+            .await
+            .unwrap();
+        let scope = rebuilt
+            .reader
+            .scope_row_by_ids(workspace, project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.canonical_name.as_deref(), Some("acme-api"));
+        assert_eq!(scope.legacy_name.as_deref(), Some("api"));
+    }
+
+    #[tokio::test]
+    async fn old_project_manifest_without_identity_still_reindexes() {
+        let src = TempDir::new().unwrap();
+        let source = Store::open(src.path()).unwrap();
+        let wiki = Wiki::new(src.path(), source.writer.clone())
+            .unwrap()
+            .with_store_reader(source.reader.clone());
+        let workspace = source
+            .writer
+            .get_or_create_workspace("legacy")
+            .await
+            .unwrap();
+        let project = source
+            .writer
+            .get_or_create_project(workspace, "old-format", Some("/legacy".into()))
+            .await
+            .unwrap();
+        wiki.write_page(req(
+            workspace,
+            project,
+            "notes/legacy.md",
+            "legacy manifest history",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let manifest_path = src
+            .path()
+            .join("wiki")
+            .join(workspace.to_string())
+            .join(project.to_string())
+            .join("_meta.md");
+        std::fs::write(
+            &manifest_path,
+            "---\nproject: old-format\nrepo_path: /legacy\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+        drop(source);
+
+        let dst = TempDir::new().unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let rebuilt = Store::open(dst.path()).unwrap();
+        Wiki::new(dst.path(), rebuilt.writer.clone())
+            .unwrap()
+            .reindex_all()
+            .await
+            .unwrap();
+        let row = rebuilt
+            .reader
+            .scope_row_by_ids(workspace, project)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.project_name, "old-format");
+        assert_eq!(row.repo_path.as_deref(), Some("/legacy"));
+        assert!(row.identity.is_none());
+        assert!(row.identity_source.is_none());
+        assert!(row.canonical_name.is_none());
+        assert!(row.legacy_name.is_none());
     }
 
     #[tokio::test]

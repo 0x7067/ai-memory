@@ -30,6 +30,16 @@ pub enum WorkstreamSelection {
     New(String),
 }
 
+impl WorkstreamSelection {
+    /// Validate caller-controlled selection data before any scope mutation.
+    pub fn validate(&self) -> StoreResult<()> {
+        match self {
+            Self::Current => Ok(()),
+            Self::Named(name) | Self::New(name) => validate_workstream_name(name),
+        }
+    }
+}
+
 /// Authenticated authority for a managed-run mutation: finish (its preflight
 /// and its import transaction), cancel, heartbeat, native-session link and
 /// context acceptance.

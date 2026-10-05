@@ -90,8 +90,9 @@ identity = "acme/platform"
 
 # Optional. "path" names a NEW remote-backed project from its repository
 # path without the host ("acme-api" for github.com/acme/api) instead of the
-# folder name. Default "host_path". Never renames an existing project. See
-# "Naming new projects by repository path" below.
+# folder name. Default "host_path". Existing identity-backed projects can be
+# promoted in place only by an authorized write through that canonical name.
+# See "Naming new projects by repository path" below.
 identity_style = "path"
 
 # Optional. Opt this project into drop_subagent_captures: set it to "true"
@@ -632,16 +633,26 @@ route by the full identity (`github.com/acme/api`), and the style rides along
 only with a remote identity — a declared `project` or `identity` keeps its
 own name.
 
-- **Existing projects are never renamed or re-keyed.** A repository that
-  already has a project, claimed or not, resolves exactly as before.
+- **Existing projects keep their UUID.** Reads by the canonical path name or
+  the v2 basename are find-only and never rename. An authorized write that
+  explicitly uses the canonical path name promotes only `projects.name` in one
+  transaction; pages, sessions, grants, handoffs and every other dependent row
+  remain attached to the same UUID. The v2 basename remains readable after
+  promotion.
 - **Another forge is never merged in.** When the path name is already held by
   a different repository — typically the same path on another forge
   (`gitlab.com/acme/api` after `github.com/acme/api`) — the newcomer falls
   back to the name it would get without the style.
 - Put it in `~/.ai-memory.toml` to apply it to every checkout under `$HOME`
   that has no nearer marker, like any other marker key.
-- Static MCP clients still resolve by name, so pass the path name (`acme-api`)
-  as `project`.
+- Static CLI/MCP clients still pass only `workspace` + `project`. They may use
+  the canonical path name (`acme-api`) or the v2 basename (`api`) while it is
+  unambiguous. A hostless key shared by multiple forges fails closed.
+- The UUID-keyed project `_meta.md` persists optional `identity`,
+  `identity_source`, `canonical_name`, and `legacy_name` fields. A clean
+  `reindex` restores the original UUID/name and recomputes the indexed keys
+  from the validated identity. Older manifests without these fields remain
+  valid and rebuild an identity-less project.
 
 ### Single workspace, no per-repo overrides
 

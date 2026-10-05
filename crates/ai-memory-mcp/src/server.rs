@@ -2086,37 +2086,86 @@ impl AiMemoryServer {
     /// `workspace`. Falls back to the baked default only when no `ActiveProject`
     /// has been published yet (early startup / no hooks).
     /// Legacy single-slot wrapper retained for test fixtures that pre-date
-    /// the actor-aware variant. Production tools must use
-    /// [`Self::write_target_ids_with_actor`] so per-session/per-actor
-    /// isolation modes route the write to the caller's project, not
-    /// whichever single-slot value was published last.
+    /// the actor-aware variant. Production tools use
+    /// [`Self::resolve_write_target_with_actor`] so promotion metadata cannot
+    /// be discarded before manifest repair.
     #[cfg(test)]
     async fn write_target_ids(
         &self,
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.write_target_ids_with_actor(
+        self.resolve_write_target_with_actor(
             explicit_workspace,
             explicit_project,
             &ai_memory_core::ActorKey::default(),
             None,
         )
         .await
+        .map(|resolved| resolved.scope.as_tuple())
     }
 
-    async fn write_target_ids_with_actor(
+    async fn resolve_write_target_with_actor(
         &self,
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
         viewer: Option<ai_memory_core::UserId>,
-    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+    ) -> Result<ai_memory_store::ResolvedWriteScope, McpError> {
         self.scope_resolver_as(viewer)
             .resolve_write_args(explicit_workspace, explicit_project, actor)
             .await
-            .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
+    }
+
+    fn with_manifest_warning(
+        mut error: McpError,
+        warning: Option<&ai_memory_core::repository_identity::ManifestWarning>,
+    ) -> McpError {
+        if let Some(warning) = warning {
+            let context = ai_memory_core::repository_identity::ManifestWarningContext {
+                manifest_warning: Some(warning.clone()),
+            };
+            let mut data = error
+                .data
+                .take()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            if let Ok(serde_json::Value::Object(context)) = serde_json::to_value(context) {
+                data.extend(context);
+            }
+            error.data = Some(serde_json::Value::Object(data));
+        }
+        error
+    }
+
+    async fn refresh_promoted_scope(
+        &self,
+        resolved: &ai_memory_store::ResolvedWriteScope,
+    ) -> Option<ai_memory_core::repository_identity::ManifestWarning> {
+        resolved.promoted_from.as_ref()?;
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Some(ai_memory_core::repository_identity::ManifestWarning::wiki_unavailable());
+        };
+        match wiki
+            .refresh_renamed_scope(resolved.scope.workspace_id, resolved.scope.project_id)
+            .await
+        {
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    workspace_id = %resolved.scope.workspace_id,
+                    project_id = %resolved.scope.project_id,
+                    "project name promotion committed; manifest refresh/checkpoint failed; startup backfill can repair"
+                );
+                Some(
+                    ai_memory_core::repository_identity::ManifestWarning::promotion_refresh_failed(
+                        error,
+                    ),
+                )
+            }
+        }
     }
 
     async fn resolve_query_scopes(
@@ -4256,15 +4305,27 @@ impl AiMemoryServer {
         let tier: Tier = tier_name
             .parse()
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+        if let Some(expires_at) = args
+            .expires_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && ai_memory_core::parse_expires_at_instant(expires_at).is_none()
+        {
+            return Err(McpError::invalid_params(
+                format!("invalid expires_at (want RFC3339 or YYYY-MM-DD): {expires_at}"),
+                None,
+            ));
+        }
         if session_id.is_some() && args.scope.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             return Err(McpError::invalid_params(
                 "session_id cannot be combined with scope; a session belongs to one project",
                 None,
             ));
         }
-        let (ws, proj) = match args.scope.as_deref().map(str::trim) {
+        let resolved_scope = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
-                self.write_target_ids_with_actor(
+                self.resolve_write_target_with_actor(
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
@@ -4289,7 +4350,7 @@ impl AiMemoryServer {
                 }
                 // The same resolver and choke point as an explicit
                 // `default/_global` write, so both spellings are gated alike.
-                self.write_target_ids_with_actor(
+                self.resolve_write_target_with_actor(
                     Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
                     Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
                     &aps_actor,
@@ -4312,7 +4373,15 @@ impl AiMemoryServer {
                         None,
                     ));
                 }
-                self.profile_target_ids(&parts, &aps_actor, true).await?
+                let (workspace_id, project_id) =
+                    self.profile_target_ids(&parts, &aps_actor, true).await?;
+                ai_memory_store::ResolvedWriteScope {
+                    scope: ai_memory_store::ResolvedScope {
+                        workspace_id,
+                        project_id,
+                    },
+                    promoted_from: None,
+                }
             }
             Some(other) => {
                 return Err(McpError::internal_error(
@@ -4323,9 +4392,14 @@ impl AiMemoryServer {
                 ));
             }
         };
+        let (ws, proj) = resolved_scope.scope.as_tuple();
+        let manifest_warning = self.refresh_promoted_scope(&resolved_scope).await;
         if let Some(session_id) = session_id {
-            self.require_session_in_scope(session_id, ws, proj).await?;
-            Self::refuse_pinned_page_overwrite(wiki, ws, proj, &path)?;
+            self.require_session_in_scope(session_id, ws, proj)
+                .await
+                .map_err(|error| Self::with_manifest_warning(error, manifest_warning.as_ref()))?;
+            Self::refuse_pinned_page_overwrite(wiki, ws, proj, &path)
+                .map_err(|error| Self::with_manifest_warning(error, manifest_warning.as_ref()))?;
         }
 
         let mut fm = metadata;
@@ -4367,7 +4441,9 @@ impl AiMemoryServer {
         let mut body = args.body;
         let mut title = args.title;
         if let Some(session_id) = session_id.filter(|_| session_page) {
-            self.stamp_session_page(&mut fm, session_id).await?;
+            self.stamp_session_page(&mut fm, session_id)
+                .await
+                .map_err(|error| Self::with_manifest_warning(error, manifest_warning.as_ref()))?;
             let current =
                 ai_memory_wiki::derive_title(&serde_json::Value::Object(fm.clone()), &body, &path);
             let existing = ai_memory_consolidate::existing_session_page_titles(
@@ -4432,7 +4508,12 @@ impl AiMemoryServer {
                     .collect(),
             })
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| {
+                Self::with_manifest_warning(
+                    McpError::internal_error(e.to_string(), None),
+                    manifest_warning.as_ref(),
+                )
+            })?;
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_write_page: {}", path.as_str()));
         // Only the session page settles the job: evidence on another page
         // must not close it while `sessions/<id>.md` is still missing.
@@ -4440,11 +4521,15 @@ impl AiMemoryServer {
             self.reconcile_consolidation_job(session_id).await;
         }
 
-        ok_json(&serde_json::json!({
+        let mut result = serde_json::json!({
             "page_id": page_id.to_string(),
             "path": path.to_string(),
             "checkpoint": checkpoint
-        }))
+        });
+        if let Some(warning) = manifest_warning {
+            result["manifest_warning"] = serde_json::Value::String(warning.to_string());
+        }
+        ok_json(&result)
     }
 
     /// Fetch the full body of a single wiki page.
@@ -5001,14 +5086,16 @@ impl AiMemoryServer {
         // the project-only `effective_ids_with_actor` here dropped the
         // workspace arg, so a cross-workspace handoff landed in whatever project
         // the contaminable active-project slot pointed at (the scope-bleed bug).
-        let (ws, proj) = self
-            .write_target_ids_with_actor(
+        let resolved_scope = self
+            .resolve_write_target_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
+        let (ws, proj) = resolved_scope.scope.as_tuple();
+        let manifest_warning = self.refresh_promoted_scope(&resolved_scope).await;
         let open_questions = cap_handoff_list(
             args.open_questions.iter().map(|q| s.scrub(q)),
             HANDOFF_ITEM_MAX_CHARS,
@@ -5037,7 +5124,12 @@ impl AiMemoryServer {
             let distinguishes = self
                 .deployment_distinguishes_operators()
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| {
+                    Self::with_manifest_warning(
+                        McpError::internal_error(e.to_string(), None),
+                        manifest_warning.as_ref(),
+                    )
+                })?;
             ai_memory_core::owner_stamp(creator.identity_key().as_ref(), distinguishes)
         };
         let handoff = NewHandoff {
@@ -5065,14 +5157,20 @@ impl AiMemoryServer {
         };
         let admission = self
             .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffBegin, &parts)
-            .await?;
-        let id = self
-            .writer
-            .insert_handoff(handoff)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|error| Self::with_manifest_warning(error, manifest_warning.as_ref()))?;
+        let id = self.writer.insert_handoff(handoff).await.map_err(|e| {
+            Self::with_manifest_warning(
+                McpError::internal_error(e.to_string(), None),
+                manifest_warning.as_ref(),
+            )
+        })?;
         self.notify_operation_observers(admission.as_ref());
-        ok_json(&serde_json::json!({ "handoff_id": id.to_string() }))
+        let mut result = serde_json::json!({ "handoff_id": id.to_string() });
+        if let Some(warning) = manifest_warning {
+            result["manifest_warning"] = serde_json::Value::String(warning.to_string());
+        }
+        ok_json(&result)
     }
 
     /// List open handoffs without claiming them.

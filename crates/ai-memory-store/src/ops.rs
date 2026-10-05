@@ -412,6 +412,125 @@ impl IdentityResolution {
         matches!(self, Self::Created | Self::Split)
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectNameWriteResolution {
+    pub project_id: ai_memory_core::ProjectId,
+    pub promoted_from: Option<String>,
+    pub authorization_error: Option<ai_memory_core::AuthzError>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_project_name_for_write(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    requested: &str,
+    principal: Option<&crate::ProjectPrincipal>,
+    distinguishes_operators: bool,
+    promote: bool,
+    new_project_mode: crate::AccessMode,
+) -> StoreResult<ProjectNameWriteResolution> {
+    let tx = conn.transaction()?;
+    let matched = crate::project_coordinates::resolve(&tx, *workspace_id, requested)?;
+    if let Some(matched) = matched {
+        if let Some(principal) = principal {
+            crate::project_authz::resolve_project_authz(
+                &tx,
+                *workspace_id,
+                matched.id,
+                principal,
+                distinguishes_operators,
+            )?
+            .authorize(crate::ProjectAccess::Write)
+            .map_err(|error| StoreError::Forbidden(error.message()))?;
+        }
+        let promote_to = if promote {
+            matched
+                .canonical_name
+                .filter(|canonical| canonical == requested && canonical != &matched.current_name)
+        } else {
+            None
+        };
+        let promoted_from = if let Some(canonical) = promote_to {
+            rename_project_in_tx(
+                &tx,
+                workspace_id,
+                &matched.id,
+                Some(&matched.current_name),
+                &canonical,
+                principal.and_then(|principal| principal.user_id),
+                "promote_project_name",
+            )?;
+            Some(matched.current_name)
+        } else {
+            None
+        };
+        tx.commit()?;
+        return Ok(ProjectNameWriteResolution {
+            project_id: matched.id,
+            promoted_from,
+            authorization_error: None,
+        });
+    }
+
+    let also_in = project_name_in_other_workspaces(&tx, workspace_id, requested)?;
+    let id = insert_project_with_identityless_name(
+        &tx,
+        workspace_id,
+        requested,
+        None,
+        initial_access_mode(requested, new_project_mode),
+        principal.and_then(|principal| principal.user_id),
+        Timestamp::now().as_microsecond(),
+    )?;
+    let authorization_error = match principal {
+        Some(principal) => crate::project_authz::resolve_project_authz(
+            &tx,
+            *workspace_id,
+            id,
+            principal,
+            distinguishes_operators,
+        )?
+        .authorize(crate::ProjectAccess::Write)
+        .err(),
+        None => None,
+    };
+    tx.commit()?;
+    if scheduler_state_table_exists(conn)? {
+        crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
+    }
+    warn_project_name_in_other_workspaces(requested, &also_in);
+    Ok(ProjectNameWriteResolution {
+        project_id: id,
+        promoted_from: None,
+        authorization_error,
+    })
+}
+
+fn insert_project_with_identityless_name(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    repo_path: Option<&str>,
+    mode: crate::AccessMode,
+    creator: Option<ai_memory_core::UserId>,
+    now: i64,
+) -> StoreResult<ai_memory_core::ProjectId> {
+    let id = ai_memory_core::ProjectId::new();
+    tx.execute(
+        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at, access_mode, created_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id.as_bytes(),
+            workspace_id.as_bytes(),
+            name,
+            repo_path,
+            now,
+            mode.as_str(),
+            creator.map(|creator| creator.as_bytes().to_vec()),
+        ],
+    )?;
+    Ok(id)
+}
 
 /// Resolve the project a repository identity routes to, creating it if
 /// needed, in one transaction (#708).
@@ -544,9 +663,22 @@ pub fn resolve_project_by_identity(
                     .is_ok(),
                 };
                 if may_write {
+                    let canonical_name =
+                        ai_memory_core::repository_identity::path_style_name(identity)
+                            .unwrap_or_default();
+                    let legacy_name =
+                        ai_memory_core::repository_identity::legacy_basename_name(identity)
+                            .unwrap_or_default();
                     tx.execute(
-                        "UPDATE projects SET identity = ?1, identity_source = ?2 WHERE id = ?3",
-                        params![identity.identity, identity.source.as_str(), id.as_bytes()],
+                        "UPDATE projects SET identity = ?1, identity_source = ?2, \
+                         canonical_name = ?3, legacy_name = ?4 WHERE id = ?5",
+                        params![
+                            identity.identity,
+                            identity.source.as_str(),
+                            canonical_name,
+                            legacy_name,
+                            id.as_bytes()
+                        ],
                     )?;
                     (id, IdentityResolution::Claimed)
                 } else {
@@ -602,11 +734,15 @@ fn insert_project_with_identity(
     now: i64,
 ) -> StoreResult<ai_memory_core::ProjectId> {
     let id = ai_memory_core::ProjectId::new();
+    let canonical_name =
+        ai_memory_core::repository_identity::path_style_name(identity).unwrap_or_default();
+    let legacy_name =
+        ai_memory_core::repository_identity::legacy_basename_name(identity).unwrap_or_default();
     tx.execute(
         "INSERT INTO projects \
          (id, workspace_id, name, repo_path, created_at, identity, identity_source, access_mode, \
-          created_by) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          created_by, canonical_name, legacy_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             id.as_bytes(),
             workspace_id.as_bytes(),
@@ -617,6 +753,8 @@ fn insert_project_with_identity(
             identity.source.as_str(),
             mode.as_str(),
             creator.map(|creator| creator.as_bytes().to_vec()),
+            canonical_name,
+            legacy_name,
         ],
     )?;
     Ok(id)
@@ -806,18 +944,32 @@ pub fn ensure_project_with_id(
     workspace_id: ai_memory_core::WorkspaceId,
     name: &str,
     repo_path: Option<&str>,
+    identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
 ) -> StoreResult<()> {
     let repo_path = repo_path.map(normalize_repo_path_key);
+    let identity_value = identity.map(|value| value.identity.as_str()).unwrap_or("");
+    let identity_source = identity.map(|value| value.source.as_str()).unwrap_or("");
+    let canonical_name = identity
+        .and_then(ai_memory_core::repository_identity::path_style_name)
+        .unwrap_or_default();
+    let legacy_name = identity
+        .and_then(ai_memory_core::repository_identity::legacy_basename_name)
+        .unwrap_or_default();
     let tx = conn.transaction()?;
     let inserted = tx.execute(
-        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING",
+        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at, \
+         identity, identity_source, canonical_name, legacy_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
         params![
             id.as_bytes(),
             workspace_id.as_bytes(),
             name,
             repo_path.as_deref(),
-            Timestamp::now().as_microsecond()
+            Timestamp::now().as_microsecond(),
+            identity_value,
+            identity_source,
+            canonical_name,
+            legacy_name
         ],
     )?;
     let also_in = if inserted > 0 {
@@ -825,28 +977,64 @@ pub fn ensure_project_with_id(
     } else {
         Vec::new()
     };
-    type ProjectRow = (Vec<u8>, String, Option<String>);
+    type ProjectRow = (
+        Vec<u8>,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    );
     let existing: Option<ProjectRow> = tx
         .query_row(
-            "SELECT workspace_id, name, repo_path FROM projects WHERE id = ?1",
+            "SELECT workspace_id, name, repo_path, identity, identity_source, \
+             canonical_name, legacy_name FROM projects WHERE id = ?1",
             params![id.as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
         )
         .optional()?;
     match existing {
-        Some((existing_ws, existing_name, existing_repo_path))
-            if existing_ws.as_slice() == workspace_id.as_bytes()
-                && existing_name == name
-                && existing_repo_path.as_deref() == repo_path.as_deref() =>
+        Some((
+            existing_ws,
+            existing_name,
+            existing_repo_path,
+            existing_identity,
+            existing_source,
+            existing_canonical,
+            existing_legacy,
+        )) if existing_ws.as_slice() == workspace_id.as_bytes()
+            && existing_name == name
+            && existing_repo_path.as_deref() == repo_path.as_deref()
+            && existing_identity == identity_value
+            && existing_source == identity_source
+            && existing_canonical == canonical_name
+            && existing_legacy == legacy_name =>
         {
             Ok(())
         }
-        Some((existing_ws, existing_name, existing_repo_path)) => {
-            Err(StoreError::Duplicate(format!(
-                "project id {id} already exists with workspace_id bytes length {}, name='{existing_name}', repo_path={existing_repo_path:?}; manifest has workspace={workspace_id}, name='{name}', repo_path={repo_path:?}",
-                existing_ws.len(),
-            )))
-        }
+        Some((
+            existing_ws,
+            existing_name,
+            existing_repo_path,
+            existing_identity,
+            existing_source,
+            existing_canonical,
+            existing_legacy,
+        )) => Err(StoreError::Duplicate(format!(
+            "project id {id} already exists with workspace_id bytes length {}, name='{existing_name}', repo_path={existing_repo_path:?}, identity={existing_identity:?}, identity_source={existing_source:?}, canonical_name={existing_canonical:?}, legacy_name={existing_legacy:?}; manifest has workspace={workspace_id}, name='{name}', repo_path={repo_path:?}, identity={identity_value:?}, identity_source={identity_source:?}, canonical_name={canonical_name:?}, legacy_name={legacy_name:?}",
+            existing_ws.len(),
+        ))),
         None => Err(StoreError::NotFound(format!(
             "project id {id} was not inserted"
         ))),
@@ -4857,6 +5045,89 @@ pub fn reorg_sessions(
     })
 }
 
+fn validate_project_rename<'a>(current_name: &str, new_name: &'a str) -> StoreResult<&'a str> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err(StoreError::InvalidProjectName(
+            "project name must not be empty or all whitespace".into(),
+        ));
+    }
+    if trimmed.contains('/') {
+        return Err(StoreError::InvalidProjectName(
+            "project name must not contain '/' (it appears in URL paths)".into(),
+        ));
+    }
+    if ai_memory_core::profile::is_profile_project(trimmed) {
+        return Err(StoreError::InvalidProjectName(format!(
+            "{trimmed} is reserved for the cross-project profile"
+        )));
+    }
+    if ai_memory_core::profile::is_profile_project(current_name) {
+        return Err(StoreError::InvalidProjectName(
+            "a cross-project profile project cannot be renamed".into(),
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn rename_project_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    current_name: Option<&str>,
+    new_name: &str,
+    author_id: Option<ai_memory_core::UserId>,
+    audit_op: &str,
+) -> StoreResult<()> {
+    let current = match current_name {
+        Some(current) => current.to_owned(),
+        None => tx
+            .query_row(
+                "SELECT name FROM projects WHERE id = ?1 AND workspace_id = ?2",
+                params![project_id.as_bytes(), workspace_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "project id {project_id} no longer exists in workspace {workspace_id} \
+                     (race with concurrent purge or delete)"
+                ))
+            })?,
+    };
+    let trimmed = validate_project_rename(&current, new_name)?;
+    let rows = tx.execute(
+        "UPDATE projects SET name = ?1 WHERE id = ?2 AND workspace_id = ?3",
+        params![trimmed, project_id.as_bytes(), workspace_id.as_bytes()],
+    );
+    match rows {
+        Ok(0) => Err(StoreError::NotFound(format!(
+            "project id {project_id} no longer exists in workspace {workspace_id} \
+             (race with concurrent purge or delete)"
+        ))),
+        Ok(_) => {
+            let detail = serde_json::json!({ "from": current, "to": trimmed }).to_string();
+            audit_with_detail(
+                tx,
+                audit_op,
+                Some(workspace_id.as_bytes()),
+                Some(project_id.as_bytes()),
+                None,
+                author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+                Timestamp::now().as_microsecond(),
+                &detail,
+            )
+        }
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || error.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(StoreError::ProjectNameTaken(trimmed.to_owned()))
+        }
+        Err(error) => Err(StoreError::Sqlite(error)),
+    }
+}
+
 /// Rename a project within its workspace.
 ///
 /// Only the `name` column is updated — all pages, sessions, observations,
@@ -4877,83 +5148,18 @@ pub fn rename_project(
     new_name: &str,
     author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<()> {
-    let trimmed = new_name.trim();
-    if trimmed.is_empty() {
-        return Err(StoreError::InvalidProjectName(
-            "project name must not be empty or all whitespace".into(),
-        ));
-    }
-    if trimmed.contains('/') {
-        return Err(StoreError::InvalidProjectName(
-            "project name must not contain '/' (it appears in URL paths)".into(),
-        ));
-    }
-    // A profile project is found by its name (and a private one's owner is
-    // its name), so renaming one away orphans it and renaming a project onto
-    // a profile name hands someone else's pages to that profile.
-    if ai_memory_core::profile::is_profile_project(trimmed) {
-        return Err(StoreError::InvalidProjectName(format!(
-            "{trimmed} is reserved for the cross-project profile"
-        )));
-    }
-    let current: Option<String> = conn
-        .query_row(
-            "SELECT name FROM projects WHERE id = ?1 AND workspace_id = ?2",
-            params![project_id.as_bytes(), workspace_id.as_bytes()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if current
-        .as_deref()
-        .is_some_and(ai_memory_core::profile::is_profile_project)
-    {
-        return Err(StoreError::InvalidProjectName(
-            "a cross-project profile project cannot be renamed".into(),
-        ));
-    }
-
-    // Wrap the UPDATE + audit row in one transaction so the trail can never
-    // diverge from the rename it records (on any error the tx drops without
-    // commit, rolling both back).
     let tx = conn.transaction()?;
-    let rows = tx.execute(
-        "UPDATE projects SET name = ?1 WHERE id = ?2 AND workspace_id = ?3",
-        params![trimmed, project_id.as_bytes(), workspace_id.as_bytes()],
-    );
-
-    match rows {
-        // Zero rows affected means the project row vanished between the
-        // admin handler's `lookup_ws_proj_no_create` and this UPDATE —
-        // the classic shape is a concurrent `purge-project` racing the
-        // rename. Without this check, the rename would happily return
-        // `Ok(())` and the admin handler would respond `200 OK` for an
-        // operation that touched nothing, contradicting the purge's
-        // (also `200 OK`) destruction of the same row.
-        Ok(0) => Err(StoreError::NotFound(format!(
-            "project id {project_id} no longer exists in workspace {workspace_id} \
-             (race with concurrent purge or delete)",
-        ))),
-        Ok(_) => {
-            audit(
-                &tx,
-                "rename_project",
-                Some(workspace_id.as_bytes()),
-                Some(project_id.as_bytes()),
-                None,
-                author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
-                Timestamp::now().as_microsecond(),
-            )?;
-            tx.commit()?;
-            Ok(())
-        }
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                || err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            Err(StoreError::ProjectNameTaken(trimmed.to_string()))
-        }
-        Err(e) => Err(StoreError::Sqlite(e)),
-    }
+    rename_project_in_tx(
+        &tx,
+        workspace_id,
+        project_id,
+        None,
+        new_name,
+        author_id,
+        "rename_project",
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Record a successfully-applied wiki-structure migration.
@@ -7291,7 +7497,7 @@ pub(crate) mod tests {
         let id = ProjectId::new();
 
         let logs = capture_warnings(|| {
-            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None, None).unwrap();
         });
         assert!(
             logs.contains("already exists in other workspace")
@@ -7301,7 +7507,7 @@ pub(crate) mod tests {
         );
 
         let logs = capture_warnings(|| {
-            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None, None).unwrap();
         });
         assert!(
             !logs.contains("already exists in other workspace"),
@@ -7316,10 +7522,10 @@ pub(crate) mod tests {
         let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
         get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
         let id = ProjectId::new();
-        ensure_project_with_id(&mut conn, id, ws_b, "other", None).unwrap();
+        ensure_project_with_id(&mut conn, id, ws_b, "other", None, None).unwrap();
 
         let logs = capture_warnings(|| {
-            let err = ensure_project_with_id(&mut conn, id, ws_b, "shared", None)
+            let err = ensure_project_with_id(&mut conn, id, ws_b, "shared", None, None)
                 .expect_err("same id with different name must fail validation");
             assert!(
                 matches!(err, StoreError::Duplicate(_)),
@@ -13637,9 +13843,9 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, _proj) = fresh_db();
         let id = ProjectId::new();
 
-        ensure_project_with_id(&mut conn, id, ws, "from-manifest", Some("/repo/a")).unwrap();
-        let err =
-            ensure_project_with_id(&mut conn, id, ws, "renamed", Some("/repo/a")).unwrap_err();
+        ensure_project_with_id(&mut conn, id, ws, "from-manifest", Some("/repo/a"), None).unwrap();
+        let err = ensure_project_with_id(&mut conn, id, ws, "renamed", Some("/repo/a"), None)
+            .unwrap_err();
 
         assert!(
             matches!(err, StoreError::Duplicate(_)),

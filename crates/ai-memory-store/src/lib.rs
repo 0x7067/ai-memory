@@ -27,6 +27,7 @@ mod ops;
 pub mod password;
 mod profile;
 mod project_authz;
+mod project_coordinates;
 mod reader;
 mod retrieval_tuning;
 mod scope;
@@ -93,12 +94,12 @@ pub use reader::{
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
-    PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver,
-    ScopeSource, WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for, create_explicit_scope,
-    create_explicit_scope_guarded, create_global_scope, create_profile_scope,
-    lookup_existing_scope, lookup_existing_scope_guarded, lookup_existing_workspace,
-    lookup_global_scope, lookup_profile_scope, resolve_many_existing_scopes,
-    resolve_many_existing_scopes_guarded,
+    PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ResolvedWriteScope, ScopeName, ScopeResolutionError,
+    ScopeResolver, ScopeSource, WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for,
+    create_explicit_scope, create_explicit_scope_guarded, create_global_scope,
+    create_profile_scope, lookup_existing_scope, lookup_existing_scope_guarded,
+    lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
+    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{
@@ -188,6 +189,13 @@ impl Store {
         // before the server accepts traffic. A store already backfilled (every
         // page has a non-NULL `valid_from`) is a fast no-op.
         ops::backfill_page_windows(&mut conn)?;
+        let coordinate_keys = project_coordinates::backfill(&mut conn)?;
+        if coordinate_keys > 0 {
+            tracing::info!(
+                projects = coordinate_keys,
+                "project coordinate keys backfilled"
+            );
+        }
 
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;

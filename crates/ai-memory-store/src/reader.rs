@@ -1488,6 +1488,14 @@ pub struct ScopeRow {
     pub project_name: String,
     /// Filesystem path the project's cwd-based routing resolves to, if any.
     pub repo_path: Option<String>,
+    /// Stable hostful repository identity, when the project has one.
+    pub identity: Option<String>,
+    /// Source spelling for `identity`, when present.
+    pub identity_source: Option<String>,
+    /// Canonical path-style compatibility key derived from the identity.
+    pub canonical_name: Option<String>,
+    /// Legacy basename compatibility key derived from the identity.
+    pub legacy_name: Option<String>,
 }
 
 /// One row per workspace with aggregate stats.
@@ -7933,31 +7941,62 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
     ) -> StoreResult<Option<ScopeRow>> {
-        // (ws_name, proj_name, repo_path) — the ids are already known.
-        type RawScope = (String, String, Option<String>);
+        type RawScope = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let raw: Option<RawScope> = self
             .with_conn(move |conn| {
                 let row = conn
                     .query_row(
-                        "SELECT w.name, p.name, p.repo_path \
+                        "SELECT w.name, p.name, p.repo_path, NULLIF(p.identity, ''), \
+                         NULLIF(p.identity_source, ''), NULLIF(p.canonical_name, ''), \
+                         NULLIF(p.legacy_name, '') \
                          FROM projects p JOIN workspaces w ON w.id = p.workspace_id \
                          WHERE p.id = ?1 AND p.workspace_id = ?2",
                         params![project_id.as_bytes(), workspace_id.as_bytes()],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 Ok(row)
             })
             .await?;
-        Ok(
-            raw.map(|(workspace_name, project_name, repo_path)| ScopeRow {
+        Ok(raw.map(
+            |(
+                workspace_name,
+                project_name,
+                repo_path,
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+            )| ScopeRow {
                 workspace_id,
                 workspace_name,
                 project_id,
                 project_name,
                 repo_path,
-            }),
-        )
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+            },
+        ))
     }
 
     /// Return every `(workspace, project)` scope with its ids, names and
@@ -7968,12 +8007,23 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn list_all_scopes(&self) -> StoreResult<Vec<ScopeRow>> {
-        // (ws_id, ws_name, proj_id, proj_name, repo_path) as raw SQL columns.
-        type RawScope = (Vec<u8>, String, Vec<u8>, String, Option<String>);
+        type RawScope = (
+            Vec<u8>,
+            String,
+            Vec<u8>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let raw: Vec<RawScope> = self
             .with_conn(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT w.id, w.name, p.id, p.name, p.repo_path \
+                    "SELECT w.id, w.name, p.id, p.name, p.repo_path, \
+                     NULLIF(p.identity, ''), NULLIF(p.identity_source, ''), \
+                     NULLIF(p.canonical_name, ''), NULLIF(p.legacy_name, '') \
                      FROM projects p JOIN workspaces w ON w.id = p.workspace_id",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -7983,6 +8033,10 @@ impl ReaderPool {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 })?;
                 let out: rusqlite::Result<Vec<_>> = rows.collect();
@@ -7990,15 +8044,21 @@ impl ReaderPool {
             })
             .await?;
         raw.into_iter()
-            .map(|(wi, wn, pi, pn, rp)| {
-                Ok(ScopeRow {
-                    workspace_id: WorkspaceId::from_slice(&wi)?,
-                    workspace_name: wn,
-                    project_id: ProjectId::from_slice(&pi)?,
-                    project_name: pn,
-                    repo_path: rp,
-                })
-            })
+            .map(
+                |(wi, wn, pi, pn, rp, identity, identity_source, canonical_name, legacy_name)| {
+                    Ok(ScopeRow {
+                        workspace_id: WorkspaceId::from_slice(&wi)?,
+                        workspace_name: wn,
+                        project_id: ProjectId::from_slice(&pi)?,
+                        project_name: pn,
+                        repo_path: rp,
+                        identity,
+                        identity_source,
+                        canonical_name,
+                        legacy_name,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -8947,6 +9007,20 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| ProjectId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Resolve an existing project by its exact, canonical path-style, or v2
+    /// legacy basename key without creating or renaming anything.
+    pub(crate) async fn resolve_existing_project_name(
+        &self,
+        workspace_id: WorkspaceId,
+        name: String,
+    ) -> StoreResult<Option<ProjectId>> {
+        self.with_conn(move |conn| {
+            crate::project_coordinates::resolve(conn, workspace_id, &name)
+                .map(|matched| matched.map(|matched| matched.id))
         })
         .await
     }
@@ -11137,6 +11211,10 @@ mod tests {
         assert_eq!(row.workspace_name, "acme");
         assert_eq!(row.project_name, "webapp");
         assert_eq!(row.repo_path.as_deref(), Some("/repo/webapp"));
+        assert!(row.identity.is_none());
+        assert!(row.identity_source.is_none());
+        assert!(row.canonical_name.is_none());
+        assert!(row.legacy_name.is_none());
 
         assert!(
             store

@@ -389,9 +389,17 @@ resume, continue, session, or fork selector.
 ## What happens on each run
 
 1. The host client resolves the normal workspace/project scope and a stable
-   repository plus worktree fingerprint. It opens a 90-second renewable lease.
-   One writer may own a workstream at a time, so two terminals cannot silently
-   race its native-session pointers or delivery cursors.
+   repository plus worktree fingerprint. If an identity-backed project still
+   carries its legacy basename, this authorized write promotes the same UUID to
+   its canonical path name and refreshes the wiki scope manifest before opening
+   the lease; a post-commit manifest failure is returned as
+   `manifest_warning` on either success or a later prepare error, retaining the
+   first warning across busy retries and lease wait-out, printed once by the CLI,
+   and left for startup repair. Pure request validation, including mutually
+   exclusive workstream selectors, runs before promotion. It opens a 90-second
+   renewable lease. One writer may own a workstream at a time, so
+   two terminals cannot silently race its native-session pointers
+   or delivery cursors.
 2. Bare mode resolves the correct available harness. For an empty workstream,
    an explicit interactive adapter can offer matching local sessions for
    one-time adoption. Otherwise the adapter passes native arguments through in

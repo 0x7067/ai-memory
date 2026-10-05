@@ -156,6 +156,87 @@ pub struct RepositoryIdentity {
     pub source: IdentitySource,
 }
 
+/// Backward-compatible project scope metadata stored in `_meta.md`.
+///
+/// Identity and source are optional together for manifests created before
+/// identity-aware reindex. Canonical and legacy names are persisted as
+/// consistency assertions and recomputed from the accepted identity on import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectManifest {
+    /// Human-readable project name.
+    pub project: String,
+    /// Optional checkout path used for local routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    /// Full repository identity, including the host for a remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Source of the stored repository identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<IdentitySource>,
+    /// Optional consistency assertion, never an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_name: Option<String>,
+    /// Optional consistency assertion, never an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_name: Option<String>,
+}
+
+/// Operator-visible warning for a committed project-name promotion whose
+/// derived wiki manifest still needs repair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ManifestWarning(String);
+
+impl ManifestWarning {
+    /// Build the warning emitted when the SQL promotion committed but the
+    /// `_meta.md` refresh/checkpoint failed.
+    pub fn promotion_refresh_failed(error: impl std::fmt::Display) -> Self {
+        Self(format!(
+            "project name promotion committed, but _meta.md refresh/checkpoint failed and needs startup repair: {error}"
+        ))
+    }
+
+    /// Build the warning emitted when no wiki handle is available to refresh
+    /// the promoted scope.
+    #[must_use]
+    pub fn wiki_unavailable() -> Self {
+        Self(
+            "project name promotion committed; wiki handle unavailable, so _meta.md needs startup repair"
+                .to_owned(),
+        )
+    }
+
+    /// Borrow the stable wire message.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ManifestWarning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for ManifestWarning {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+/// Stable transport context for an operation that may follow a committed
+/// project-name promotion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestWarningContext {
+    /// Repair warning when promotion committed before the operation failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ManifestWarning>,
+}
+
 /// Everything the chain needs, gathered by the caller.
 ///
 /// Taking these as data rather than reading git and the filesystem here keeps
@@ -289,6 +370,23 @@ pub fn path_style_name(identity: &RepositoryIdentity) -> Option<String> {
     let key = styled_key(identity, IdentityStyle::Path);
     let joined: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
     Some(project_name_from(&joined.join("-")))
+}
+
+/// The v2 basename key for a stored git-remote identity.
+///
+/// Before path-style naming, a checkout commonly created its project from the
+/// repository folder (`github.com/acme/api` → `api`). Dual-key lookup keeps
+/// that key readable after an in-place promotion to [`path_style_name`].
+#[must_use]
+pub fn legacy_basename_name(identity: &RepositoryIdentity) -> Option<String> {
+    if identity.source != IdentitySource::GitRemote {
+        return None;
+    }
+    identity
+        .identity
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .map(project_name_from)
 }
 
 /// Characters a project name cannot carry become `-`, runs collapse, and the
@@ -839,6 +937,22 @@ mod tests {
                 identity.identity
             );
         }
+    }
+
+    #[test]
+    fn legacy_basename_is_derived_only_from_remote_identities() {
+        let remote = RepositoryIdentity {
+            identity: "github.com/acme/group/api".into(),
+            source: IdentitySource::GitRemote,
+        };
+        assert_eq!(legacy_basename_name(&remote).as_deref(), Some("api"));
+        assert_eq!(
+            legacy_basename_name(&RepositoryIdentity {
+                identity: "acme/platform".into(),
+                source: IdentitySource::Explicit,
+            }),
+            None
+        );
     }
 
     /// The marker spellings every client forwards: only `path` asks for

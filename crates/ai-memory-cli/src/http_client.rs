@@ -71,6 +71,22 @@ fn server_response_error(
     .into()
 }
 
+#[cfg(test)]
+pub(crate) fn server_response_error_for_test(
+    method: reqwest::Method,
+    path: &str,
+    status: reqwest::StatusCode,
+    body: String,
+) -> anyhow::Error {
+    ServerResponseError {
+        method,
+        path: path.to_owned(),
+        status,
+        body,
+    }
+    .into()
+}
+
 /// Pass a 2xx response through, else consume the body into a
 /// [`ServerResponseError`].
 ///
