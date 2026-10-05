@@ -76,10 +76,10 @@ pub(crate) struct CoverageRow {
     agent: String,
     local_total: usize,
     local_recent: usize,
-    captured: u64,
+    captured: Option<u64>,
     /// True when the harness ran here recently but captured nothing — the
     /// high-confidence "hook is missing" signal.
-    uncaptured: bool,
+    uncaptured: Option<bool>,
     mixed_capture_sessions: Option<u64>,
 }
 
@@ -112,6 +112,18 @@ struct AgentCount {
     mixed_capture_sessions: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ProjectCoordinateReport {
+    local: super::hook_capture::RepositoryCoordinateEvidence,
+    server: Option<ai_memory_store::ProjectCoordinateDiagnostic>,
+    server_problem: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CaptureCoverageProblem {
+    reason: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct OperatorIdentity {
     version: String,
@@ -139,6 +151,7 @@ struct DoctorReport {
     server: String,
     since_days: u32,
     rows: Vec<CoverageRow>,
+    capture_coverage_problem: Option<CaptureCoverageProblem>,
     /// The agent kinds (kebab form) flagged as uncaptured, for quick scripting.
     uncaptured: Vec<String>,
     /// Set when the nearest `.ai-memory.toml`'s `[capture]` section is
@@ -149,6 +162,7 @@ struct DoctorReport {
     marker_capture_problem: Option<MarkerCaptureProblem>,
     capture_owner_active: bool,
     identity: Option<OperatorIdentity>,
+    project_coordinate: Option<ProjectCoordinateReport>,
     /// Native "memory" stores found for harnesses that keep one, and whether
     /// the nearest marker would exclude a read of them (harness-issue
     /// #1003). Only Claude Code's location is known today; harnesses with no
@@ -158,8 +172,7 @@ struct DoctorReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct MarkerCaptureProblem {
-    marker_path: String,
-    reason: String,
+    classification: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,18 +226,19 @@ pub(crate) fn build_rows(
                 agent,
                 local_total,
                 local_recent,
-                captured,
-                uncaptured,
+                captured: Some(captured),
+                uncaptured: Some(uncaptured),
                 mixed_capture_sessions: None,
             }
         })
-        .filter(|row| row.local_total > 0 || row.captured > 0)
+        .filter(|row| row.local_total > 0 || row.captured.is_some_and(|count| count > 0))
         .collect();
 
     // Surface the actionable warnings first, then a stable alphabetical order.
     rows.sort_by(|a, b| {
         b.uncaptured
-            .cmp(&a.uncaptured)
+            .unwrap_or(false)
+            .cmp(&a.uncaptured.unwrap_or(false))
             .then_with(|| a.agent.cmp(&b.agent))
     });
     rows
@@ -376,6 +390,49 @@ fn is_recent(updated_at: SystemTime, cutoff: Option<SystemTime>) -> bool {
     }
 }
 
+async fn project_coordinate_report(
+    ep: &ServerEndpoint,
+    identity_cwd: &str,
+    marker: &crate::marker::MarkerInspection,
+    workspace: &str,
+    project: &str,
+    explicit_workspace: Option<&str>,
+    explicit_project: Option<&str>,
+) -> ProjectCoordinateReport {
+    let inspection = super::hook_capture::inspect_repository_coordinate(
+        identity_cwd,
+        marker,
+        explicit_workspace,
+        explicit_project,
+    );
+    let mut query = vec![("workspace", workspace), ("project", project)];
+    if let Some(repository) = inspection.repository.as_ref() {
+        query.push(("identity", repository.identity.as_str()));
+        query.push(("identity_source", repository.source.as_str()));
+        if let Some(style) = inspection.evidence.identity_style.as_deref() {
+            query.push(("identity_style", style));
+        }
+    }
+    match get_json::<ai_memory_store::ProjectCoordinateDiagnostic>(
+        ep,
+        "/admin/project-coordinate",
+        &query,
+    )
+    .await
+    {
+        Ok(server) => ProjectCoordinateReport {
+            local: inspection.evidence,
+            server: Some(server),
+            server_problem: None,
+        },
+        Err(error) => ProjectCoordinateReport {
+            local: inspection.evidence,
+            server: None,
+            server_problem: Some(ai_memory_core::Sanitizer::builtin().scrub(&error.to_string())),
+        },
+    }
+}
+
 /// Run the capture-coverage doctor.
 ///
 /// # Errors
@@ -383,14 +440,39 @@ fn is_recent(updated_at: SystemTime, cutoff: Option<SystemTime>) -> bool {
 /// directory is unreadable, or the server cannot be reached / its response
 /// cannot be parsed.
 pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
-    let (workspace, project) =
-        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    let (identity_cwd, lookup_cwd) = super::scope_directories(config)
+        .ok_or_else(|| anyhow::anyhow!("resolving the current working directory"))?;
+    let marker = crate::marker::inspect_scope(&lookup_cwd, &config.runtime_env);
+    let scope_marker = marker
+        .scope
+        .clone()
+        .map(|scope| (scope, identity_cwd.clone(), lookup_cwd.clone()));
+    let (workspace, project) = super::resolve_scope_with_marker(
+        config,
+        args.workspace.as_deref(),
+        args.project.as_deref(),
+        scope_marker,
+        false,
+    )?;
 
-    let cwd = std::env::current_dir().context("resolving the current working directory")?;
+    let cwd = PathBuf::from(&identity_cwd);
     let home =
         super::run::native_home(config).context("locating the local harness session stores")?;
 
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let project_coordinate = Some(
+        project_coordinate_report(
+            &ep,
+            &identity_cwd,
+            &marker,
+            &workspace,
+            &project,
+            args.workspace.as_deref(),
+            args.project.as_deref(),
+        )
+        .await,
+    );
+    let mut capture_coverage_problem = None;
     let captured = match get_json::<ByAgentResponse>(
         &ep,
         "/admin/sessions/by-agent",
@@ -402,10 +484,13 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     .await
     {
         Ok(response) => response.by_agent,
-        // A project that has never been captured into does not exist
-        // server-side yet (404) — that is "nothing captured", not an error, so
-        // every local harness correctly reads as uncaptured.
         Err(error) if super::is_scope_not_found(&error) => Vec::new(),
+        Err(error) if super::is_scope_ambiguous(&error) => {
+            capture_coverage_problem = Some(CaptureCoverageProblem {
+                reason: "server scope is ambiguous; captured counts are unavailable".to_owned(),
+            });
+            Vec::new()
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("asking the server for captured session counts for {workspace}/{project}")
@@ -414,14 +499,18 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     };
 
     let identity = read_identity(&ep).await;
-
     let local = scan_local(&home, &cwd, args.since_days).await;
+
     let counts = captured
         .iter()
         .map(|count| (count.agent.clone(), count.sessions))
         .collect();
     let mut rows = build_rows(&local, &counts);
     for row in &mut rows {
+        if capture_coverage_problem.is_some() {
+            row.captured = None;
+            row.uncaptured = None;
+        }
         row.mixed_capture_sessions = captured
             .iter()
             .find(|count| count.agent == row.agent)
@@ -429,16 +518,13 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     }
     let uncaptured: Vec<String> = rows
         .iter()
-        .filter(|r| r.uncaptured)
+        .filter(|r| r.uncaptured == Some(true))
         .map(|r| r.agent.clone())
         .collect();
 
     let marker_capture_problem = cwd.to_str().and_then(|cwd| {
-        super::hook_capture::capture_config_problem(cwd).map(|(marker_path, reason)| {
-            MarkerCaptureProblem {
-                marker_path: marker_path.display().to_string(),
-                reason,
-            }
+        super::hook_capture::capture_config_problem(cwd).map(|_| MarkerCaptureProblem {
+            classification: "settings_marker_invalid",
         })
     });
 
@@ -450,10 +536,12 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         server: ep.url.clone(),
         since_days: args.since_days,
         rows,
+        capture_coverage_problem,
         uncaptured,
         marker_capture_problem,
         capture_owner_active: config.runtime_env.capture_owner_active(),
         identity,
+        project_coordinate,
         native_memory,
     };
 
@@ -463,6 +551,60 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         render_human(&report);
     }
     Ok(())
+}
+
+fn render_project_coordinate(coordinate: &ProjectCoordinateReport) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    match &coordinate.server {
+        Some(server) => {
+            let current = server.current_name.as_deref().unwrap_or("none");
+            let _ = writeln!(
+                output,
+                "  project coordinate: {} (requested {}, current {})",
+                server.status, server.requested_name, current
+            );
+            if server.rename_eligible {
+                output.push_str("    an authorized write can promote this project name in place\n");
+            }
+            if let Some(reason) = &server.collision_reason {
+                let _ = writeln!(output, "    collision: {reason}");
+            }
+        }
+        None => {
+            let _ = writeln!(
+                output,
+                "  project coordinate: unavailable ({})",
+                coordinate
+                    .server_problem
+                    .as_deref()
+                    .unwrap_or("unknown error")
+            );
+        }
+    }
+    let local = &coordinate.local;
+    let _ = writeln!(
+        output,
+        "    local: scope {}, marker {}",
+        local.scope_source, local.marker_status
+    );
+    if let Some(source) = &local.identity_source {
+        let _ = writeln!(
+            output,
+            "    repository: source {source}, style {}",
+            local.identity_style.as_deref().unwrap_or("host_path")
+        );
+    }
+    if let Some(canonical) = &local.canonical_candidate {
+        let _ = writeln!(output, "    canonical candidate: {canonical}");
+    }
+    if let Some(legacy) = &local.legacy_candidate {
+        let _ = writeln!(output, "    legacy candidate: {legacy}");
+    }
+    for message in &local.messages {
+        let _ = writeln!(output, "    marker diagnostic: {message}");
+    }
+    output
 }
 
 fn render_human(report: &DoctorReport) {
@@ -486,6 +628,12 @@ fn render_human(report: &DoctorReport) {
              Confirm the external producer is delivering events."
         );
     }
+    if let Some(coordinate) = &report.project_coordinate {
+        print!("{}", render_project_coordinate(coordinate));
+    }
+    if let Some(problem) = &report.capture_coverage_problem {
+        println!("  capture coverage: unavailable ({})", problem.reason);
+    }
     if report.since_days == 0 {
         println!("  recent window: all on-disk sessions\n");
     } else {
@@ -494,11 +642,11 @@ fn render_human(report: &DoctorReport) {
 
     if let Some(problem) = &report.marker_capture_problem {
         println!(
-            "⚠ {} has an invalid `[capture]` section: {}\n  \
+            "⚠ {}: the settings marker has an invalid `[capture]` section.\n  \
              It fails closed — file and shell tool content is reduced to metadata there, \
              nothing leaks — but its `ignore_paths` exclusions are NOT applying while it stays \
              invalid. Fix the TOML and re-run `ai-memory doctor` to confirm.\n",
-            problem.marker_path, problem.reason
+            problem.classification
         );
     }
 
@@ -512,17 +660,32 @@ fn render_human(report: &DoctorReport) {
     }
 
     if report.rows.is_empty() {
-        println!("  No local harness sessions found for this project and nothing captured yet.");
+        if report.capture_coverage_problem.is_some() {
+            println!(
+                "  No local harness sessions found for this project; server capture counts are unavailable."
+            );
+        } else {
+            println!(
+                "  No local harness sessions found for this project and nothing captured yet."
+            );
+        }
         return;
     }
 
     for row in &report.rows {
-        let mark = if row.uncaptured { "⚠" } else { "✓" };
+        let mark = match row.uncaptured {
+            Some(true) => "⚠",
+            Some(false) => "✓",
+            None => "?",
+        };
+        let captured = row
+            .captured
+            .map_or_else(|| "unavailable".to_owned(), |count| count.to_string());
         println!(
-            "  {mark} {:<14} {:>4} local ({} recent) → {:>4} captured",
-            row.agent, row.local_total, row.local_recent, row.captured
+            "  {mark} {:<14} {:>4} local ({} recent) → {:>11} captured",
+            row.agent, row.local_total, row.local_recent, captured
         );
-        if row.uncaptured {
+        if row.uncaptured == Some(true) {
             if report.capture_owner_active {
                 println!(
                     "      No captured session: check the external producer and repository policy."
@@ -552,7 +715,9 @@ fn render_human(report: &DoctorReport) {
         }
     }
 
-    if report.uncaptured.is_empty() {
+    if report.capture_coverage_problem.is_some() {
+        println!("\nCapture verdict unavailable: server capture counts could not be resolved.");
+    } else if report.uncaptured.is_empty() {
         println!("\n✓ Every harness that ran in this project recently is captured on the server.");
     } else {
         let remedy = if report.capture_owner_active {
@@ -571,6 +736,173 @@ fn render_human(report: &DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_coordinate(
+        status: ai_memory_store::ProjectCoordinateStatus,
+        collision_reason: Option<ai_memory_store::ProjectCoordinateCollisionReason>,
+    ) -> ai_memory_store::ProjectCoordinateDiagnostic {
+        ai_memory_store::ProjectCoordinateDiagnostic {
+            workspace: "default".into(),
+            requested_name: "acme-api".into(),
+            status,
+            project_id: Some(ai_memory_core::ProjectId::new()),
+            current_name: Some("api".into()),
+            canonical_candidate: Some("acme-api".into()),
+            legacy_candidate: Some("api".into()),
+            identity_source: Some("git_remote".into()),
+            identity_style: Some("path".into()),
+            rename_eligible: collision_reason.is_none(),
+            collision_reason,
+            candidate_count: 1,
+        }
+    }
+
+    #[test]
+    fn project_coordinate_renders_promotion_and_cross_forge_fallback_concisely() {
+        let local = super::super::hook_capture::RepositoryCoordinateEvidence {
+            marker_status: "valid",
+            scope_source: "marker_or_fallback",
+            identity_source: Some("git_remote".into()),
+            identity_style: Some("path".into()),
+            canonical_candidate: Some("acme-api".into()),
+            legacy_candidate: Some("api".into()),
+            messages: Vec::new(),
+        };
+        let promotion = render_project_coordinate(&ProjectCoordinateReport {
+            local: local.clone(),
+            server: Some(server_coordinate(
+                ai_memory_store::ProjectCoordinateStatus::CanonicalCompat,
+                None,
+            )),
+            server_problem: None,
+        });
+        assert!(promotion.contains("canonical_compat"), "{promotion}");
+        assert!(
+            promotion.contains("promote this project name in place"),
+            "{promotion}"
+        );
+
+        let collision = render_project_coordinate(&ProjectCoordinateReport {
+            local,
+            server: Some(server_coordinate(
+                ai_memory_store::ProjectCoordinateStatus::Ambiguous,
+                Some(ai_memory_store::ProjectCoordinateCollisionReason::CrossForgeCollision),
+            )),
+            server_problem: None,
+        });
+        assert!(collision.contains("cross_forge_collision"), "{collision}");
+        assert!(
+            !collision.contains("promote this project name"),
+            "{collision}"
+        );
+    }
+
+    #[test]
+    fn local_coordinate_reports_marker_precedence_invalid_toml_and_no_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://user:top-secret@example.test/acme/api.git",
+            ])
+            .status()
+            .unwrap();
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"marker-ws\"\nproject = \"marker-project\"\nidentity_style = \"path\"\n",
+        )
+        .unwrap();
+        let marker = crate::marker::inspect_scope(
+            &nested.to_string_lossy(),
+            &crate::config::RuntimeEnv::default(),
+        );
+        let evidence = super::super::hook_capture::inspect_repository_coordinate(
+            &nested.to_string_lossy(),
+            &marker,
+            Some("flag-ws"),
+            Some("flag-project"),
+        )
+        .evidence;
+        assert_eq!(evidence.marker_status, "valid");
+        assert_eq!(evidence.scope_source, "cli");
+        assert_eq!(evidence.identity_source.as_deref(), Some("git_remote"));
+        assert_eq!(evidence.identity_style.as_deref(), Some("path"));
+        assert!(evidence.messages.is_empty());
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(!json.contains("top-secret"), "{json}");
+        assert!(!json.contains("user@"), "{json}");
+
+        std::fs::write(repo.join(".ai-memory.toml"), "identity_style = \"path\"\n").unwrap();
+        let marker = crate::marker::inspect_scope(
+            &nested.to_string_lossy(),
+            &crate::config::RuntimeEnv::default(),
+        );
+        let remote = super::super::hook_capture::inspect_repository_coordinate(
+            &nested.to_string_lossy(),
+            &marker,
+            Some("default"),
+            Some("api"),
+        )
+        .evidence;
+        assert_eq!(remote.identity_source.as_deref(), Some("git_remote"));
+        assert_eq!(remote.identity_style.as_deref(), Some("path"));
+        assert_eq!(remote.canonical_candidate.as_deref(), Some("acme-api"));
+        let json = serde_json::to_string(&remote).unwrap();
+        assert!(!json.contains("top-secret"), "{json}");
+        assert!(!json.contains("user@"), "{json}");
+
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = [\nsecret = \"top-secret\"\n",
+        )
+        .unwrap();
+        let marker = crate::marker::inspect_scope(
+            &nested.to_string_lossy(),
+            &crate::config::RuntimeEnv::default(),
+        );
+        let invalid = super::super::hook_capture::inspect_repository_coordinate(
+            &nested.to_string_lossy(),
+            &marker,
+            Some("default"),
+            Some("repo"),
+        )
+        .evidence;
+        assert_eq!(invalid.marker_status, "invalid");
+        assert_eq!(
+            invalid.messages,
+            vec!["invalid marker TOML; marker routing was ignored"]
+        );
+        assert!(
+            !serde_json::to_string(&invalid)
+                .unwrap()
+                .contains("top-secret")
+        );
+    }
+
+    #[test]
+    fn coordinate_server_errors_are_scrubbed_before_output() {
+        let error = crate::http_client::server_response_error_for_test(
+            reqwest::Method::GET,
+            "/admin/project-coordinate",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "Bearer abcdefghijklmnopqrstuvwxyz".into(),
+        );
+        let problem = ai_memory_core::Sanitizer::builtin().scrub(&error.to_string());
+        assert!(!problem.contains("abcdefghijklmnopqrstuvwxyz"), "{problem}");
+        assert!(problem.contains("[REDACTED:bearer_token]"), "{problem}");
+    }
 
     #[tokio::test]
     async fn identity_diagnostics_degrade_on_server_and_decode_errors() {
@@ -645,9 +977,13 @@ mod tests {
         let local = vec![scan(AgentKind::KimiCode, 2, 2)];
         let rows = build_rows(&local, &captured(&[]));
         let kimi = row(&rows, "kimi-code");
-        assert!(kimi.uncaptured, "recent local + zero captured must warn");
+        assert_eq!(
+            kimi.uncaptured,
+            Some(true),
+            "recent local + zero captured must warn"
+        );
         assert_eq!(kimi.local_recent, 2);
-        assert_eq!(kimi.captured, 0);
+        assert_eq!(kimi.captured, Some(0));
     }
 
     #[test]
@@ -656,7 +992,7 @@ mod tests {
         // in count (resume reuse maps many local files to one server session).
         let local = vec![scan(AgentKind::ClaudeCode, 12, 4)];
         let rows = build_rows(&local, &captured(&[("claude-code", 3)]));
-        assert!(!row(&rows, "claude-code").uncaptured);
+        assert_eq!(row(&rows, "claude-code").uncaptured, Some(false));
     }
 
     #[test]
@@ -664,7 +1000,7 @@ mod tests {
         // Local sessions exist but none are recent → not actionable.
         let local = vec![scan(AgentKind::Codex, 5, 0)];
         let rows = build_rows(&local, &captured(&[]));
-        assert!(!row(&rows, "codex").uncaptured);
+        assert_eq!(row(&rows, "codex").uncaptured, Some(false));
     }
 
     #[test]
@@ -679,7 +1015,7 @@ mod tests {
         let kiro = row(&rows, "kiro-cli");
         assert_eq!(kiro.local_total, 5);
         assert_eq!(kiro.local_recent, 3);
-        assert!(kiro.uncaptured);
+        assert_eq!(kiro.uncaptured, Some(true));
     }
 
     #[test]
@@ -689,8 +1025,8 @@ mod tests {
         let rows = build_rows(&[], &captured(&[("gemini-cli", 4)]));
         let gemini = row(&rows, "gemini-cli");
         assert_eq!(gemini.local_total, 0);
-        assert_eq!(gemini.captured, 4);
-        assert!(!gemini.uncaptured);
+        assert_eq!(gemini.captured, Some(4));
+        assert_eq!(gemini.uncaptured, Some(false));
     }
 
     #[test]
@@ -710,7 +1046,7 @@ mod tests {
             rows[0].agent, "kimi-code",
             "the warning must lead: {rows:?}"
         );
-        assert!(rows[0].uncaptured);
+        assert_eq!(rows[0].uncaptured, Some(true));
     }
 
     #[test]
@@ -842,6 +1178,29 @@ mod tests {
         let reports = native_memory_reports(home.path(), cwd.path());
         let claude = find_claude_report(&reports);
         assert_eq!(claude.status, "excluded");
+    }
+
+    #[test]
+    fn marker_capture_problem_exposes_only_a_safe_classification() {
+        let cwd = tempfile::tempdir().unwrap();
+        let private_path = cwd.path().join("secret-project-name");
+        std::fs::create_dir_all(&private_path).unwrap();
+        std::fs::write(
+            private_path.join(".ai-memory.toml"),
+            "[capture] private-toml-sentinel\nignore_paths = [\"**\"]\n",
+        )
+        .unwrap();
+
+        let problem =
+            super::super::hook_capture::capture_config_problem(private_path.to_str().unwrap())
+                .map(|_| MarkerCaptureProblem {
+                    classification: "settings_marker_invalid",
+                })
+                .expect("invalid marker problem");
+        let json = serde_json::to_string(&problem).unwrap();
+        assert_eq!(json, r#"{"classification":"settings_marker_invalid"}"#);
+        assert!(!json.contains(private_path.to_str().unwrap()));
+        assert!(!json.contains("private-toml-sentinel"));
     }
 
     #[test]

@@ -146,6 +146,15 @@ mod slow {
         .expect("doctor --json report");
         assert_eq!(report["capture_owner_active"], false);
         assert_eq!(report["identity"]["level"], "anonymous");
+        assert_eq!(report["project_coordinate"]["server"]["status"], "exact");
+        assert_eq!(
+            report["project_coordinate"]["server"]["requested_name"],
+            PROJECT
+        );
+        assert_eq!(
+            report["project_coordinate"]["local"]["marker_status"],
+            "absent"
+        );
         assert_eq!(report["identity"]["version"], env!("CARGO_PKG_VERSION"));
 
         let claude = find_row(&report, "claude-code")
@@ -194,6 +203,10 @@ mod slow {
         assert!(
             human.contains("ran here but nothing was captured"),
             "doctor must explain the gap in prose: {human}"
+        );
+        assert!(
+            human.contains("project coordinate: exact"),
+            "doctor must render the coordinate diagnosis: {human}"
         );
 
         // Import the local history through the same `/hook` ingress live capture
@@ -354,6 +367,211 @@ mod slow {
             human3.contains("does not prove duplicate capture"),
             "{human3}"
         );
+
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_coordinate_keeps_local_sessions_and_marks_capture_unavailable() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project cwd");
+        let cwd = fs::canonicalize(project.path()).expect("canonicalize project cwd");
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&cwd)
+            .status()
+            .expect("initialize git repository");
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&cwd)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://user:credential-sentinel@github.com/acme/api.git",
+            ])
+            .status()
+            .expect("add git remote");
+
+        let encoded = cwd.to_string_lossy().replace('/', "-");
+        let session_dir = home.path().join(".claude").join("projects").join(encoded);
+        fs::create_dir_all(&session_dir).expect("session dir");
+        write_jsonl(
+            &session_dir.join("ambiguous-coordinate.jsonl"),
+            &[json!({
+                "sessionId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "cwd": cwd.to_string_lossy(),
+                "type": "user",
+                "message": {"role": "user", "content": "Local evidence remains visible."},
+            })],
+        );
+
+        let client = reqwest::Client::new();
+        let (server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
+            let mut cmd = hermetic(BIN);
+            cmd.args([
+                "serve",
+                "--transport",
+                "http",
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                "server-default",
+                "--no-watcher",
+            ])
+            .env("AI_MEMORY_DATA_DIR", data_dir.path())
+            .env("AI_MEMORY_HOME", home.path())
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
+            cmd.current_dir(&cwd);
+            cmd
+        })
+        .await;
+
+        for (index, (project_name, identity)) in [
+            ("github-api", "github.com/acme/api"),
+            ("gitlab-api", "gitlab.com/acme/api"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = client
+                .post(format!("{base}/hook"))
+                .query(&[
+                    ("event", "session-start"),
+                    ("agent", "claude-code"),
+                    ("workspace", WORKSPACE),
+                    ("project", project_name),
+                    ("identity", identity),
+                    ("identity_src", "git_remote"),
+                ])
+                .json(&json!({
+                    "session_id": format!("00000000-0000-4000-8000-0000000001{index:02x}"),
+                    "cwd": cwd,
+                }))
+                .send()
+                .await
+                .expect("send identity hook");
+            assert!(response.status().is_success(), "{response:?}");
+        }
+        for project_name in ["github-api", "gitlab-api"] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while session_count(&client, &base, WORKSPACE, project_name).await == 0 {
+                assert!(Instant::now() < deadline, "project was not created");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        let output = run_cli(
+            &[
+                "doctor",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                "acme-api",
+                "--since-days",
+                "0",
+                "--json",
+            ],
+            data_dir.path(),
+            home.path(),
+            Some(&cwd),
+            &base,
+        );
+        let report: Value = serde_json::from_str(&output).expect("doctor report");
+        assert_eq!(
+            report["project_coordinate"]["server"]["status"],
+            "ambiguous"
+        );
+        assert_eq!(
+            report["project_coordinate"]["server"]["collision_reason"],
+            "cross_forge_collision"
+        );
+        assert!(
+            report["capture_coverage_problem"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("ambiguous"))
+        );
+        let claude = find_row(&report, "claude-code")
+            .unwrap_or_else(|| panic!("local session row disappeared: {report}"));
+        assert!(claude["local_recent"].as_u64().unwrap_or(0) >= 1);
+        assert!(claude["captured"].is_null());
+        assert!(claude["uncaptured"].is_null());
+        assert!(!output.contains("credential-sentinel"), "{output}");
+        assert!(!output.contains("github.com/acme/api"), "{output}");
+
+        let human = run_cli(
+            &[
+                "doctor",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                "acme-api",
+                "--since-days",
+                "0",
+            ],
+            data_dir.path(),
+            home.path(),
+            Some(&cwd),
+            &base,
+        );
+        assert!(human.contains("capture coverage: unavailable"), "{human}");
+        assert!(human.contains("unavailable captured"), "{human}");
+        assert!(human.contains("Capture verdict unavailable"), "{human}");
+        assert!(!human.contains("nothing was captured"), "{human}");
+        assert!(!human.contains("nothing captured yet"), "{human}");
+        assert!(!human.contains("Every harness"), "{human}");
+
+        let marker_path = cwd.join(".ai-memory.toml");
+        fs::write(
+            &marker_path,
+            "[capture] private-toml-sentinel\nignore_paths = [\"**\"]\n",
+        )
+        .expect("write invalid marker");
+        let malformed_json = run_cli(
+            &[
+                "doctor",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                "github-api",
+                "--since-days",
+                "0",
+                "--json",
+            ],
+            data_dir.path(),
+            home.path(),
+            Some(&cwd),
+            &base,
+        );
+        let malformed_report: Value =
+            serde_json::from_str(&malformed_json).expect("malformed-marker doctor report");
+        assert_eq!(
+            malformed_report["marker_capture_problem"]["classification"],
+            "settings_marker_invalid"
+        );
+        assert!(!malformed_json.contains(marker_path.to_str().unwrap()));
+        assert!(!malformed_json.contains("private-toml-sentinel"));
+        let malformed_human = run_cli(
+            &[
+                "doctor",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                "github-api",
+                "--since-days",
+                "0",
+            ],
+            data_dir.path(),
+            home.path(),
+            Some(&cwd),
+            &base,
+        );
+        assert!(malformed_human.contains("settings_marker_invalid"));
+        assert!(!malformed_human.contains(marker_path.to_str().unwrap()));
+        assert!(!malformed_human.contains("private-toml-sentinel"));
 
         drop(server);
     }

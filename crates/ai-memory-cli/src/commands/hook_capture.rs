@@ -332,6 +332,22 @@ pub struct HookScope {
     server_may_remap: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RepositoryCoordinateEvidence {
+    pub(crate) marker_status: &'static str,
+    pub(crate) scope_source: &'static str,
+    pub(crate) identity_source: Option<String>,
+    pub(crate) identity_style: Option<String>,
+    pub(crate) canonical_candidate: Option<String>,
+    pub(crate) legacy_candidate: Option<String>,
+    pub(crate) messages: Vec<String>,
+}
+
+pub(crate) struct RepositoryCoordinateInspection {
+    pub(crate) evidence: RepositoryCoordinateEvidence,
+    pub(crate) repository: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+}
+
 const MAX_SCOPE_HINT_BYTES: usize = 512;
 
 fn serialize_scope_hint<S: serde::Serializer>(
@@ -388,6 +404,68 @@ impl HookScope {
 pub fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
     let marker = find_settings_marker(cwd);
     hook_scope_from_marker(cwd, default_strategy, marker.as_deref())
+}
+
+pub(crate) fn inspect_repository_coordinate(
+    identity_cwd: &str,
+    marker: &crate::marker::MarkerInspection,
+    explicit_workspace: Option<&str>,
+    explicit_project: Option<&str>,
+) -> RepositoryCoordinateInspection {
+    let declared_project = if explicit_project.is_some_and(|value| !value.is_empty()) {
+        None
+    } else {
+        marker.fields.project.as_deref()
+    };
+    let repository = repository_identity(
+        identity_cwd,
+        marker.fields.identity.as_deref(),
+        declared_project,
+    );
+    let identity_style = repository.as_ref().and_then(|identity| {
+        (identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote).then(
+            || {
+                forwarded_identity_style(marker.fields.identity_style.as_deref())
+                    .unwrap_or("host_path")
+                    .to_owned()
+            },
+        )
+    });
+    RepositoryCoordinateInspection {
+        evidence: RepositoryCoordinateEvidence {
+            marker_status: marker.status,
+            scope_source: match (
+                explicit_workspace.is_some_and(|value| !value.is_empty()),
+                explicit_project.is_some_and(|value| !value.is_empty()),
+                marker.scope.is_some(),
+            ) {
+                (true, true, _) => "cli",
+                (true, false, _) | (false, true, _) => "cli_and_marker_or_fallback",
+                (false, false, true) => "marker_or_fallback",
+                _ => "fallback",
+            },
+            identity_source: repository
+                .as_ref()
+                .map(|identity| identity.source.as_str().to_owned()),
+            identity_style,
+            canonical_candidate: repository
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::path_style_name),
+            legacy_candidate: repository
+                .as_ref()
+                .and_then(ai_memory_core::repository_identity::legacy_basename_name),
+            messages: match marker.status {
+                "invalid" => vec!["invalid marker TOML; marker routing was ignored".to_owned()],
+                "unreadable" => vec!["unreadable marker; marker routing was ignored".to_owned()],
+                "conflicting" => {
+                    vec!["conflicting marker settings; marker routing was ignored".to_owned()]
+                }
+                "ignored" => vec!["marker ignored by configuration".to_owned()],
+                _ => Vec::new(),
+            },
+        },
+        repository,
+    }
 }
 
 fn hook_scope_from_marker(

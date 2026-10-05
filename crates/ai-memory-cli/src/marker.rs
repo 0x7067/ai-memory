@@ -40,6 +40,115 @@ pub(crate) struct MarkerScope {
     pub(crate) project_strategy: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RoutingFields {
+    pub(crate) workspace: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) project_strategy: Option<String>,
+    pub(crate) identity: Option<String>,
+    pub(crate) identity_style: Option<String>,
+}
+
+impl RoutingFields {
+    fn from_text(text: &str) -> Self {
+        Self {
+            workspace: parse_key_in(text, "workspace"),
+            project: parse_key_in(text, "project"),
+            project_strategy: parse_key_in(text, "project_strategy"),
+            identity: parse_key_in(text, "identity"),
+            identity_style: parse_key_in(text, "identity_style"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MarkerInspection {
+    pub(crate) status: &'static str,
+    pub(crate) fields: RoutingFields,
+    pub(crate) scope: Option<MarkerScope>,
+}
+
+pub(crate) fn inspect_scope(cwd: &str, env: &RuntimeEnv) -> MarkerInspection {
+    use std::io::Read as _;
+    let empty = |status| MarkerInspection {
+        status,
+        fields: RoutingFields::default(),
+        scope: None,
+    };
+    if env.ignore_marker() {
+        return empty("ignored");
+    }
+    let found = find_marker_matching(
+        cwd,
+        env.home_dir().map(Path::new),
+        OutsideHome::StopAtCheckoutRoot,
+        |path| {
+            let limit = ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
+            let text = (|| {
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)
+                    .ok()?
+                    .take((limit + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                (bytes.len() <= limit).then_some(())?;
+                String::from_utf8(bytes).ok()
+            })();
+            let Some(text) = text else {
+                return Some(empty("unreadable"));
+            };
+            let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+                return Some(empty("invalid"));
+            };
+            let fields = RoutingFields::from_text(&text);
+            for (key, parsed) in [
+                ("workspace", &fields.workspace),
+                ("project", &fields.project),
+                ("project_strategy", &fields.project_strategy),
+                ("identity", &fields.identity),
+                ("identity_style", &fields.identity_style),
+            ] {
+                let strict = document.get(key).and_then(toml_edit::Item::as_str);
+                if strict != parsed.as_deref()
+                    || document
+                        .get(key)
+                        .is_some_and(|item| item.as_str().is_none())
+                {
+                    return Some(empty("conflicting"));
+                }
+            }
+            if fields.identity_style.as_deref().is_some_and(|style| {
+                ai_memory_core::repository_identity::IdentityStyle::from_str_opt(style).is_none()
+            }) || fields
+                .project_strategy
+                .as_deref()
+                .is_some_and(|strategy| !matches!(strategy, "repo-root" | "repo_root" | "basename"))
+            {
+                return Some(empty("conflicting"));
+            }
+            if !declares_more_than_capture(&text) {
+                return None;
+            }
+            let scope = MarkerScope {
+                path: path.to_path_buf(),
+                workspace: fields.workspace.clone(),
+                project: fields.project.clone(),
+                project_strategy: fields.project_strategy.clone().or_else(|| {
+                    env.project_strategy()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                }),
+            };
+            Some(MarkerInspection {
+                status: "valid",
+                fields,
+                scope: scope.declares_scope().then_some(scope),
+            })
+        },
+    );
+    found.unwrap_or_else(|| empty("absent"))
+}
+
 impl MarkerScope {
     /// Whether this marker declares anything that changes scope resolution.
     /// A marker that only carries `[capture]` rules does not.
@@ -73,8 +182,6 @@ pub(crate) fn read_scope(cwd: &str, env: &RuntimeEnv) -> Option<MarkerScope> {
         return None;
     }
     let path = find_settings_marker_with_home(cwd, env.home_dir().map(Path::new))?;
-    // One read, three keys: the marker is re-read per key nowhere else on a
-    // hot path, but this one runs on every client command.
     let text = std::fs::read_to_string(&path).ok()?;
     let mut scope = MarkerScope {
         workspace: parse_key_in(&text, "workspace"),
@@ -83,8 +190,6 @@ pub(crate) fn read_scope(cwd: &str, env: &RuntimeEnv) -> Option<MarkerScope> {
         path,
     };
     if scope.project_strategy.is_none() {
-        // The install-wide `--project-strategy` default, if one was baked into
-        // the environment. Empty values are treated as unset.
         scope.project_strategy = env
             .project_strategy()
             .filter(|value| !value.trim().is_empty())
@@ -709,6 +814,45 @@ project = "infra" # this is fine
             None,
             "a briefing-only marker is a settings boundary: it stops the walk \
              but declares no scope of its own"
+        );
+    }
+
+    #[test]
+    fn strict_inspection_rejects_invalid_routing_without_exposing_fields() {
+        let tmp = TempDir::new().unwrap();
+        let inner = tmp.path().join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(
+            tmp.path(),
+            "workspace = [\nproject = \"private-project\"\nidentity = \"private/identity\"\n",
+        );
+
+        let inspection = inspect_scope(inner.to_str().unwrap(), &RuntimeEnv::default());
+        assert_eq!(inspection.status, "invalid");
+        assert!(inspection.scope.is_none());
+        assert!(inspection.fields.workspace.is_none());
+        assert!(inspection.fields.project.is_none());
+        assert!(inspection.fields.identity.is_none());
+    }
+
+    #[test]
+    fn strict_inspection_uses_the_same_capture_only_walk_as_scope_resolution() {
+        let tmp = TempDir::new().unwrap();
+        write_marker(
+            tmp.path(),
+            "workspace = \"acme\"\nproject = \"infra\"\nidentity_style = \"path\"\n",
+        );
+        let inner = tmp.path().join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(&inner, "[capture]\nignore_paths = [\"secret/**\"]\n");
+
+        let inspection = inspect_scope(inner.to_str().unwrap(), &RuntimeEnv::default());
+        assert_eq!(inspection.status, "valid");
+        assert_eq!(inspection.fields.workspace.as_deref(), Some("acme"));
+        assert_eq!(inspection.fields.project.as_deref(), Some("infra"));
+        assert_eq!(
+            inspection.scope,
+            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default())
         );
     }
 

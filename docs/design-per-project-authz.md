@@ -267,7 +267,23 @@ project. #1033 makes a remote-derived key the default name, landing in steps on
     plus the derived `canonical_name`/`legacy_name` keys. Clean
     reindex validates the pair, derives the indexed keys from the identity, and
     recreates the original UUID/name; pre-V76 manifests without identity remain
-    valid and rebuild an identity-less project.
-4. Marker `aliases`, then 5. identity- or path-keyed blocks in `~/.ai-memory.toml`.
+     valid and rebuild an identity-less project.
+4. **Coordinate diagnostics (landed).** `GET /admin/project-coordinate` and
+   `ai-memory doctor` classify exact, canonical-compatibility,
+   legacy-compatibility, missing, and ambiguous coordinates. They report
+   rename eligibility and collision reasons from read-only indexed store
+   queries; no project, claim, rename, audit entry, or manifest is written.
+   The admin route follows the existing single-user compatibility contract and
+   becomes root-only whenever the deployment distinguishes operators. Stored
+   remote identities are not returned; the CLI parses one typed local marker
+   inspection, honours CLI-over-marker scope precedence, supplies only its
+   normalized credential-free identity, and renders safe marker/source classes,
+   source/style and derived names. Ambiguous server scope leaves local session
+   evidence intact and marks captured counts unavailable rather than zero. An
+   ambiguous result may carry the preferred identity-backed candidate UUID and
+   current name for operator context; it still represents no unique resolution
+   and is never rename-eligible.
+5. Marker `aliases`, then 6. identity- or path-keyed blocks in `~/.ai-memory.toml`.
+
 
 Paths stay lexically normalised throughout; nothing canonicalises.

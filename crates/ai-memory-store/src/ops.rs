@@ -443,13 +443,10 @@ pub(crate) fn resolve_project_name_for_write(
             .authorize(crate::ProjectAccess::Write)
             .map_err(|error| StoreError::Forbidden(error.message()))?;
         }
-        let promote_to = if promote {
-            matched
-                .canonical_name
-                .filter(|canonical| canonical == requested && canonical != &matched.current_name)
-        } else {
-            None
-        };
+        let promote_to = promote
+            .then(|| crate::project_coordinates::promotion_target(&matched, requested))
+            .flatten()
+            .map(str::to_owned);
         let promoted_from = if let Some(canonical) = promote_to {
             rename_project_in_tx(
                 &tx,

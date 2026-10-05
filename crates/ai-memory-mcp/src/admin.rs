@@ -9,6 +9,7 @@
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
+//! - `GET  /admin/project-coordinate` — read-only exact/compatibility diagnosis.
 //! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent
 //!   (an exact `session_id` plus `include_ended=true` also matches an ended one).
 //! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
@@ -584,6 +585,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
 /// - `GET  /admin/projects`
+/// - `GET  /admin/project-coordinate`
 /// - `GET  /admin/open-sessions`
 /// - `GET  /admin/sessions/by-agent`
 /// - `GET  /admin/activity/by-client`
@@ -665,6 +667,7 @@ pub fn admin_router_with_sweep_tuning(
         )
         .route("/admin/status", get(handle_status))
         .route("/admin/projects", get(handle_list_projects))
+        .route("/admin/project-coordinate", get(handle_project_coordinate))
         .route("/admin/open-sessions", get(handle_open_sessions))
         .route("/admin/sessions/by-agent", get(handle_sessions_by_agent))
         .route("/admin/activity/by-client", get(handle_activity_by_client))
@@ -1432,6 +1435,76 @@ async fn handle_activity_by_client(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectCoordinateQuery {
+    workspace: String,
+    project: String,
+    identity: Option<String>,
+    identity_source: Option<String>,
+    identity_style: Option<String>,
+}
+
+async fn handle_project_coordinate(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ProjectCoordinateQuery>,
+) -> impl IntoResponse {
+    if query.workspace.trim().is_empty() || query.project.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "workspace and project must be non-empty"
+            })),
+        );
+    }
+    let repository = match (query.identity.as_deref(), query.identity_source.as_deref()) {
+        (None, None) => None,
+        (Some(identity), Some(source)) => {
+            match ai_memory_core::repository_identity::accept_wire_identity(identity, source) {
+                Some(identity) => Some(identity),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "invalid repository identity" })),
+                    );
+                }
+            }
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "identity and identity_source must be provided together"
+                })),
+            );
+        }
+    };
+    let style = match query.identity_style.as_deref() {
+        None => ai_memory_core::repository_identity::IdentityStyle::HostPath,
+        Some(style) => {
+            match ai_memory_core::repository_identity::IdentityStyle::from_str_opt(style) {
+                Some(style) => style,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "invalid identity_style" })),
+                    );
+                }
+            }
+        }
+    };
+    match state
+        .reader
+        .diagnose_project_coordinate(query.workspace, query.project, repository, style)
+        .await
+    {
+        Ok(diagnostic) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(diagnostic).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(error) => internal_err(error.to_string()),
     }
 }
 
@@ -13252,6 +13325,11 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/project-coordinate?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
             (
                 "GET",
                 "/admin/sessions/by-agent?workspace=default&project=scratch",
