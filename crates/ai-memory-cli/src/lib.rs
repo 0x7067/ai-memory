@@ -44,15 +44,18 @@ pub async fn run() -> Result<()> {
         command,
     } = cli::parse_process();
 
-    // Hooks fire on every tool call: they must be cheap and must emit ONLY
-    // their JSON object to stdout. Short-circuit before config load and
-    // tracing init (added latency + possible stdout noise). The hook reads
-    // its server URL + token from flags; it only needs the data-dir to locate
-    // a stored OIDC token when no explicit `--auth-token` is given, so we pass
-    // the bare path rather than loading the full config.
+    // Hooks fire on every tool call and must emit only their JSON object to
+    // stdout. Load configuration once at this command boundary, but still
+    // short-circuit before tracing initialization so the hot path stays quiet.
     let command = match command {
-        Command::Hook(args) => return commands::hook::run(data_dir, args).await,
-        Command::HookDrain(_args) => return commands::hook::run_drain(data_dir).await,
+        Command::Hook(args) => {
+            let config = Config::load(config_path.as_deref(), data_dir)?;
+            return commands::hook::run(&config, args).await;
+        }
+        Command::HookDrain(_args) => {
+            let config = Config::load(config_path.as_deref(), data_dir)?;
+            return commands::hook::run_drain(&config).await;
+        }
         // Completions are pure text derived from the command tree. Emitting
         // them must not require a loadable config or an initialised data dir
         // (they are typically generated before `init`, or in a packaging
@@ -145,9 +148,9 @@ pub async fn run() -> Result<()> {
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),
         // `Hook` is handled in the fast-path above (before config/tracing).
-        Command::Hook(args) => commands::hook::run(Some(config.data_dir.clone()), args).await,
+        Command::Hook(args) => commands::hook::run(&config, args).await,
         // `HookDrain` is handled in the fast-path above (before config/tracing).
-        Command::HookDrain(_args) => commands::hook::run_drain(Some(config.data_dir.clone())).await,
+        Command::HookDrain(_args) => commands::hook::run_drain(&config).await,
         Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
         Command::McpBridge(args) => commands::mcp_bridge::run(&config, args).await,
         Command::Commit(args) => commands::commit::run(&config, args).await,

@@ -25,6 +25,7 @@ use ai_memory_hooks::{
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
+use crate::config::{Config, RuntimeEnv};
 use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
 
 use sha2::{Digest as _, Sha256};
@@ -331,8 +332,9 @@ fn after_background_drain_event_enqueue(
 }
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
-pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let dd = resolve_data_dir(data_dir.as_deref());
+pub async fn run_drain(config: &Config) -> anyhow::Result<()> {
+    let dd = config.data_dir.clone();
+    let max_attempts = hook_spool::MaxAttempts::new(config.hook_spool.max_attempts);
     let spool = hook_spool::spool_dir(&dd);
     match hook_spool::drain_until_quiescent(
         &spool,
@@ -340,6 +342,7 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         background_drain_budget(),
         drain_event_timeout(),
         hook_spool::DrainLockWait::Bounded(Duration::from_secs(30)),
+        max_attempts,
     )
     .await
     {
@@ -555,20 +558,23 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
 ///
 /// `data_dir` is the resolved global `--data-dir` (if any); used to locate the
 /// spool and the stored OIDC token.
-pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()> {
+pub async fn run(config: &Config, args: HookArgs) -> anyhow::Result<()> {
     let mut payload = String::new();
     std::io::stdin().read_to_string(&mut payload).ok();
     let mut stdout = std::io::stdout();
-    run_with_payload(
-        data_dir,
+    run_with_payload_and_settings(
+        Some(config.data_dir.clone()),
         args,
         payload,
         &mut stdout,
         spawn_background_drainer,
+        config.runtime_env.clone(),
+        hook_spool::MaxAttempts::new(config.hook_spool.max_attempts),
     )
     .await
 }
 
+#[cfg(test)]
 async fn run_with_payload<W, S>(
     data_dir: Option<PathBuf>,
     args: HookArgs,
@@ -580,10 +586,40 @@ where
     W: std::io::Write,
     S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
+    let runtime_env = RuntimeEnv::from_process();
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+    let config =
+        Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd), runtime_env.clone())
+            .unwrap_or_default();
+    run_with_payload_and_settings(
+        data_dir,
+        args,
+        payload,
+        stdout,
+        spawn_background_drainer,
+        runtime_env,
+        hook_spool::MaxAttempts::new(config.hook_spool.max_attempts),
+    )
+    .await
+}
+
+async fn run_with_payload_and_settings<W, S>(
+    data_dir: Option<PathBuf>,
+    args: HookArgs,
+    payload: String,
+    stdout: &mut W,
+    spawn_background_drainer: S,
+    runtime_env: RuntimeEnv,
+    max_attempts: hook_spool::MaxAttempts,
+) -> anyhow::Result<()>
+where
+    W: std::io::Write,
+    S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
+{
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
-    // than server configuration. Hooks deliberately bypass Config::load.
+    // than server configuration.
     let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
@@ -596,7 +632,10 @@ where
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
         if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
-            clear_session_id(&resolve_data_dir(data_dir.as_deref()), agent_kind);
+            clear_session_id(
+                &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+                agent_kind,
+            );
         }
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -688,7 +727,7 @@ where
             inspection_cwd.as_deref().unwrap_or(""),
         )
     });
-    let dd = resolve_data_dir(data_dir.as_deref());
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
     // persisted per-install mode; otherwise the historical default.
     let capture_mode = args.capture_mode.map_or_else(
@@ -901,6 +940,7 @@ where
                 INCREMENTAL_DRAIN_BUDGET,
                 INCREMENTAL_DRAIN_BUDGET,
                 hook_spool::DrainLockWait::NoWait,
+                max_attempts,
             )
             .await;
         }
@@ -932,6 +972,7 @@ where
                 &dd,
                 start_drain_budget(),
                 drain_event_timeout(),
+                max_attempts,
             )
             .await;
         }
@@ -1331,13 +1372,18 @@ fn is_tool_event(event: &str) -> bool {
     )
 }
 
-/// Resolve the data dir cheaply, without loading the full config (the hook
-/// fast-path skips config for latency). Mirrors `config.rs`: explicit
-/// `--data-dir`, else `AI_MEMORY_DATA_DIR`, else the platform local-data dir.
+/// Resolve the data dir for tests that exercise the hook implementation
+/// directly: explicit `--data-dir`, then the captured runtime environment, then
+/// the platform local-data directory.
+#[cfg(test)]
 fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
+    resolve_data_dir_with(data_dir, &RuntimeEnv::from_process())
+}
+
+fn resolve_data_dir_with(data_dir: Option<&Path>, runtime_env: &RuntimeEnv) -> PathBuf {
     let dir = data_dir
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("AI_MEMORY_DATA_DIR").map(PathBuf::from))
+        .or_else(|| runtime_env.data_dir().map(Path::to_path_buf))
         .unwrap_or_else(|| {
             dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -3912,6 +3958,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("INSTALL-TOKEN"),
+            hook_spool::MaxAttempts::new(crate::config::DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS),
         )
         .await;
         assert_eq!(result.sent, 2, "{result:?}");

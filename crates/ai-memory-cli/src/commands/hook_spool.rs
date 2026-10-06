@@ -32,7 +32,20 @@ use super::hook_capture::{BatchOutcome, PostOutcome, build_client, post_batch, p
 
 /// Default number of failed drain passes before dropping an event — bounds
 /// retries of a permanently-undeliverable event (e.g. a dead server URL).
-const MAX_ATTEMPTS: u32 = 8;
+#[cfg(test)]
+const MAX_ATTEMPTS: u32 = crate::config::DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS;
+
+/// Failed drain-pass limit resolved at the hook command boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxAttempts(u32);
+
+impl MaxAttempts {
+    /// Preserve an explicitly configured limit, including zero (no attempt drop).
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+}
 /// Drop a spooled event older than this regardless of attempts (7 days), so a
 /// long-dead instance can't leave the spool growing without bound.
 const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -383,8 +396,18 @@ pub async fn drain_exclusive(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
 ) -> Option<DrainResult> {
-    match drain_exclusive_result(spool, data_dir, total_budget, per_event_timeout, wait).await {
+    match drain_exclusive_result(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        max_attempts,
+    )
+    .await
+    {
         Ok(LockedDrainResult::Drained(result)) => Some(result),
         Ok(LockedDrainResult::LockBusy) | Err(_) => None,
     }
@@ -397,12 +420,20 @@ pub async fn drain_exclusive_result(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     let Some(_lock) = acquire_drain_lock(spool, wait)? else {
         return Ok(LockedDrainResult::LockBusy);
     };
     Ok(LockedDrainResult::Drained(
-        drain(spool, data_dir, total_budget, per_event_timeout).await,
+        drain_with_max_attempts(
+            spool,
+            data_dir,
+            total_budget,
+            per_event_timeout,
+            max_attempts,
+        )
+        .await,
     ))
 }
 
@@ -412,6 +443,7 @@ pub async fn drain_exclusive_within_budget(
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     let started = Instant::now();
     let Some(_lock) = acquire_drain_lock(spool, DrainLockWait::Bounded(total_budget))? else {
@@ -430,7 +462,14 @@ pub async fn drain_exclusive_within_budget(
         }));
     }
     Ok(LockedDrainResult::Drained(
-        drain(spool, data_dir, remaining_budget, per_event_timeout).await,
+        drain_with_max_attempts(
+            spool,
+            data_dir,
+            remaining_budget,
+            per_event_timeout,
+            max_attempts,
+        )
+        .await,
     ))
 }
 
@@ -441,6 +480,7 @@ pub async fn drain_until_quiescent(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     let Some(_lock) = acquire_drain_lock(spool, wait)? else {
         return Ok(LockedDrainResult::LockBusy);
@@ -458,7 +498,14 @@ pub async fn drain_until_quiescent(
             return Ok(LockedDrainResult::Drained(combined));
         }
 
-        let result = drain(spool, data_dir, remaining_budget, per_event_timeout).await;
+        let result = drain_with_max_attempts(
+            spool,
+            data_dir,
+            remaining_budget,
+            per_event_timeout,
+            max_attempts,
+        )
+        .await;
         combined.sent += result.sent;
         combined.dropped += result.dropped;
         combined.remaining = result.remaining;
@@ -495,11 +542,29 @@ pub async fn drain_until_quiescent(
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
-pub async fn drain(
+#[cfg(test)]
+async fn drain(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
+) -> DrainResult {
+    drain_with_max_attempts(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        MaxAttempts::new(MAX_ATTEMPTS),
+    )
+    .await
+}
+
+pub async fn drain_with_max_attempts(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    max_attempts: MaxAttempts,
 ) -> DrainResult {
     drain_with_live_token(
         spool,
@@ -507,22 +572,23 @@ pub async fn drain(
         total_budget,
         per_event_timeout,
         live_static_token().as_deref(),
+        max_attempts,
     )
     .await
 }
 
-/// [`drain`] with the current static bearer supplied explicitly.
+/// [`drain_with_max_attempts`] with the current static bearer supplied explicitly.
 ///
-/// The environment is read once, at the boundary in [`drain`], and passed down
-/// as data. Tests drive this directly: mutating process-wide environment from a
-/// test would race every other test in the binary, and `set_var` is `unsafe` in
-/// this edition — which this workspace forbids outright.
+/// The live token and retry policy are resolved at the command boundary and
+/// passed down as data. Tests drive this directly, so drain behavior is isolated
+/// from ambient process configuration.
 pub async fn drain_with_live_token(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
     live_token: Option<&str>,
+    max_attempts: MaxAttempts,
 ) -> DrainResult {
     let (mut files, unreadable) = match list_entries(spool) {
         Ok(listed) => listed,
@@ -551,7 +617,7 @@ pub async fn drain_with_live_token(
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut profile_tokens = ProfileTokens::new(data_dir);
     let mut result = DrainResult::default();
-    let max_attempts = configured_max_attempts(data_dir);
+    let max_attempts = max_attempts.0;
 
     let mut idx = 0;
     let mut batch_supported = true;
@@ -908,6 +974,12 @@ pub async fn drain_with_live_token(
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
                 }
+                BatchOutcome::Refused => {
+                    for (path, _) in &chunk {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    result.dropped += chunk.len();
+                }
                 BatchOutcome::Failed => {
                     // The batch didn't land (server answered with an unexpected
                     // status, or the body did not parse).
@@ -1209,27 +1281,6 @@ fn configured_server_url(data_dir: &Path) -> Option<String> {
     doc.get("server_url")?
         .as_str()
         .map(std::string::ToString::to_string)
-}
-
-/// Hook commands bypass `Config::load`; read this store's retry setting once
-/// per drain, with the process environment taking precedence.
-fn configured_max_attempts(data_dir: &Path) -> u32 {
-    configured_max_attempts_from(data_dir, |name| std::env::var(name).ok())
-}
-
-fn configured_max_attempts_from(
-    data_dir: &Path,
-    mut env_lookup: impl FnMut(&str) -> Option<String>,
-) -> u32 {
-    if let Some(raw) = env_lookup("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS") {
-        return raw.trim().parse().unwrap_or(MAX_ATTEMPTS);
-    }
-    std::fs::read_to_string(data_dir.join("config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
-        .and_then(|doc| doc.get("hook_spool")?.get("max_attempts")?.as_integer())
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(MAX_ATTEMPTS)
 }
 
 /// The `/hook/batch` URL for a spooled per-event URL: strip the `?…` query and
@@ -1700,6 +1751,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(100),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -1721,6 +1773,7 @@ mod tests {
             tmp.path(),
             Duration::ZERO,
             Duration::from_millis(100),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .unwrap();
@@ -1752,6 +1805,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(2),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .expect("lock acquired");
@@ -1777,6 +1831,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(100),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .unwrap_err();
@@ -1822,11 +1877,6 @@ mod tests {
     #[tokio::test]
     async fn zero_max_attempts_keeps_unreachable_event_after_twenty_drains() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("config.toml"),
-            "[hook_spool]\nmax_attempts = 0\n",
-        )
-        .unwrap();
         let spool = spool_dir(tmp.path());
         enqueue(
             &spool,
@@ -1840,11 +1890,12 @@ mod tests {
         .unwrap();
 
         for _ in 0..20 {
-            let result = drain(
+            let result = drain_with_max_attempts(
                 &spool,
                 tmp.path(),
                 Duration::from_secs(2),
                 Duration::from_millis(100),
+                MaxAttempts::new(0),
             )
             .await;
             assert_eq!(result.dropped, 0);
@@ -1857,13 +1908,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_max_attempts_isolated_from_ambient_zero() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_HOOK_SPOOL_AMBIENT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert_eq!(
+                std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").as_deref(),
+                Ok("0")
+            );
+            let tmp = tempfile::tempdir().unwrap();
+            let spool = spool_dir(tmp.path());
+            enqueue(
+                &spool,
+                &entry_for(
+                    "http://127.0.0.1:1/hook?event=dead".into(),
+                    "{}".into(),
+                    None,
+                    false,
+                ),
+            )
+            .unwrap();
+
+            let result = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                MaxAttempts::new(1),
+            )
+            .await;
+
+            assert_eq!(result.dropped, 1);
+            assert!(list_entries(&spool).unwrap().0.is_empty());
+            println!("ambient-zero-isolated");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("commands::hook_spool::tests::explicit_max_attempts_isolated_from_ambient_zero")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ambient-zero-isolated"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[tokio::test]
     async fn configured_max_attempts_drops_after_three_drains() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("config.toml"),
-            "[hook_spool]\nmax_attempts = 3\n",
-        )
-        .unwrap();
         let spool = spool_dir(tmp.path());
         enqueue(
             &spool,
@@ -1877,11 +1981,12 @@ mod tests {
         .unwrap();
 
         for pass in 1..=3 {
-            let result = drain(
+            let result = drain_with_max_attempts(
                 &spool,
                 tmp.path(),
                 Duration::from_secs(2),
                 Duration::from_millis(100),
+                MaxAttempts::new(3),
             )
             .await;
             assert_eq!(result.dropped, usize::from(pass == 3));
@@ -1890,33 +1995,35 @@ mod tests {
         assert!(list_entries(&spool).unwrap().0.is_empty());
     }
 
-    #[test]
-    fn max_attempts_env_overrides_config_and_invalid_values_use_default() {
+    #[tokio::test]
+    async fn zero_max_attempts_still_drops_stale_event() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("config.toml");
-        std::fs::write(&config, "[hook_spool]\nmax_attempts = 3\n").unwrap();
-        assert_eq!(configured_max_attempts_from(tmp.path(), |_| None), 3);
-        assert_eq!(
-            configured_max_attempts_from(tmp.path(), |name| {
-                assert_eq!(name, "AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS");
-                Some("0".into())
-            }),
-            0
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        let mut entry = entry_for(
+            "http://127.0.0.1:1/hook?event=old".into(),
+            "{}".into(),
+            None,
+            false,
         );
-        assert_eq!(
-            configured_max_attempts_from(tmp.path(), |_| Some("invalid".into())),
-            MAX_ATTEMPTS
-        );
-        std::fs::write(&config, "[hook_spool]\nmax_attempts = -1\n").unwrap();
-        assert_eq!(
-            configured_max_attempts_from(tmp.path(), |_| None),
-            MAX_ATTEMPTS
-        );
-        std::fs::write(&config, "[hook_spool]\nmax_attempts = \"invalid\"\n").unwrap();
-        assert_eq!(
-            configured_max_attempts_from(tmp.path(), |_| None),
-            MAX_ATTEMPTS
-        );
+        entry.created_ms = now_ms().saturating_sub(MAX_AGE_MS + 1);
+        std::fs::write(
+            spool.join("stale.json"),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let result = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            MaxAttempts::new(0),
+        )
+        .await;
+
+        assert_eq!(result.dropped, 1);
+        assert!(list_entries(&spool).unwrap().0.is_empty());
     }
 
     #[tokio::test]
@@ -2485,6 +2592,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("rotated-new"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2517,6 +2625,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             None,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2549,6 +2658,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2590,6 +2700,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 

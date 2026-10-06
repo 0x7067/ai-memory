@@ -1026,8 +1026,8 @@ idle_window_secs = 300            # operator must be quiet this long before a ru
 
 [hook_spool]
 max_attempts = 8                  # failed drain passes before dropping an event; 0 disables
-                                  # this limit. Age (7 days) and spool size (10,000 files)
-                                  # still bound retention. Env:
+                                  # only this limit. Age (7 days) and spool size (10,000 files)
+                                  # still bound retention. Runtime env wins when set:
                                   # AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS
 ```
 

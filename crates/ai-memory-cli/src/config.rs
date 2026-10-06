@@ -35,6 +35,9 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
 /// Default base URL used by thin-client CLI subcommands.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
 
+/// Default number of failed hook-spool drain passes before dropping an event.
+pub const DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS: u32 = 8;
+
 /// Placeholder credential that lets `Config::load` validate a fallback
 /// profile whose `api_key_env` is absent from this process. Never reaches a
 /// provider: the config built from it is discarded (#762).
@@ -586,6 +589,8 @@ pub struct Config {
     /// Default `follow-cwd` preserves the historical per-event resolution;
     /// `sticky` keeps the session's project. See [`RoutingSettings`].
     pub routing: RoutingSettings,
+    /// Client-side hook spool retry policy.
+    pub hook_spool: HookSpoolSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -664,10 +669,11 @@ pub struct RuntimeEnv {
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
     opencode_api_key: Option<SecretString>,
+    hook_spool_max_attempts: Option<String>,
 }
 
 impl RuntimeEnv {
-    fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         let platform_home = dirs::home_dir();
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
@@ -718,7 +724,14 @@ impl RuntimeEnv {
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
             opencode_api_key: env_secret("OPENCODE_API_KEY"),
+            hook_spool_max_attempts: std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").ok(),
         }
+    }
+
+    /// Data directory captured from the process environment, if present.
+    #[must_use]
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
     }
 
     /// Host cwd forwarded by the docker wrapper, if present.
@@ -762,6 +775,12 @@ impl RuntimeEnv {
     #[must_use]
     pub fn claude_code_session_id(&self) -> Option<&str> {
         self.claude_code_session_id.as_deref()
+    }
+
+    /// Hook-spool attempt override captured from the process environment.
+    #[must_use]
+    pub fn hook_spool_max_attempts(&self) -> Option<&str> {
+        self.hook_spool_max_attempts.as_deref()
     }
 
     #[cfg(test)]
@@ -974,6 +993,41 @@ pub struct RoutingSettings {
     pub mid_session: ai_memory_core::MidSessionRouting,
 }
 
+/// Client-side hook spool retry policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HookSpoolSettings {
+    /// Failed drain passes before an event is dropped; zero disables this limit.
+    #[serde(
+        default = "default_hook_spool_max_attempts",
+        deserialize_with = "deserialize_hook_spool_max_attempts"
+    )]
+    pub max_attempts: u32,
+}
+
+impl Default for HookSpoolSettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_hook_spool_max_attempts(),
+        }
+    }
+}
+
+const fn default_hook_spool_max_attempts() -> u32 {
+    DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS
+}
+
+fn deserialize_hook_spool_max_attempts<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS))
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1026,6 +1080,7 @@ impl Default for Config {
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
+            hook_spool: HookSpoolSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -1753,6 +1808,14 @@ fn apply_fts_stopwords_env(config: &mut Config, raw: Option<&str>) {
     );
 }
 
+fn apply_hook_spool_max_attempts_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    config.hook_spool.max_attempts = raw
+        .trim()
+        .parse()
+        .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS);
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -1760,8 +1823,14 @@ impl Config {
     /// Returns an error if the config file is malformed or any required
     /// field is missing.
     pub fn load(config_path: Option<&Path>, cli_data_dir: Option<PathBuf>) -> Result<Self> {
-        let runtime_env = RuntimeEnv::from_process();
+        Self::load_with_runtime_env(config_path, cli_data_dir, RuntimeEnv::from_process())
+    }
 
+    pub(crate) fn load_with_runtime_env(
+        config_path: Option<&Path>,
+        cli_data_dir: Option<PathBuf>,
+        runtime_env: RuntimeEnv,
+    ) -> Result<Self> {
         // Figure out where the config file *would* live so we can read it
         // before knowing the final data dir. CLI > env > default.
         let probe_data_dir = cli_data_dir
@@ -1829,6 +1898,7 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -3039,6 +3109,7 @@ mod tests {
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert_eq!(cfg.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(
             cfg.llm_timeout_secs,
@@ -3198,6 +3269,107 @@ mod tests {
     /// A configured list parses verbatim and resolves to exactly those
     /// words (lowercased), replacing the default outright rather than
     /// extending it.
+    #[test]
+    fn hook_spool_max_attempts_config_and_runtime_override_precedence() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[hook_spool]\nmax_attempts = 3\n").unwrap();
+
+        let from_config = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(from_config.hook_spool.max_attempts, 3);
+
+        let overridden = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                hook_spool_max_attempts: Some("0".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(overridden.hook_spool.max_attempts, 0);
+    }
+
+    #[test]
+    fn loader_hook_spool_runtime_env_overrides_config() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_HOOK_SPOOL_CONFIG_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[hook_spool]\nmax_attempts = 3\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert_eq!(config.hook_spool.max_attempts, 0);
+            println!("runtime-override-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::loader_hook_spool_runtime_env_overrides_config")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("runtime-override-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn invalid_hook_spool_max_attempts_values_use_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        for invalid in ["-1", "\"invalid\""] {
+            std::fs::write(
+                &config_path,
+                format!("[hook_spool]\nmax_attempts = {invalid}\n"),
+            )
+            .unwrap();
+            let config = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                config.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS,
+                "invalid config value {invalid} must use the default"
+            );
+        }
+
+        std::fs::remove_file(&config_path).unwrap();
+        for invalid in ["invalid", "-1", ""] {
+            let invalid_env = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv {
+                    hook_spool_max_attempts: Some(invalid.into()),
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                invalid_env.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS,
+                "invalid env value {invalid:?} must use the default"
+            );
+        }
+    }
+
     #[test]
     fn configured_search_fts_stopwords_list_parses_and_replaces_default() {
         let tmp = TempDir::new().unwrap();
