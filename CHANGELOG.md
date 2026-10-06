@@ -345,6 +345,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probes now skip those as transient churn exactly like the NotFound vanish
   race, while every entry that does stat is still refused when link-like and
   root-level probes keep their strict semantics. (#1107)
+- Fixed `strip_leading_h1` failing to strip setext H1 headings on CRLF line
+  endings. The underline check required every character of the second line
+  to be `=`, which failed when the line contained a trailing carriage return,
+  trailing whitespace or tabs, or when the document ended at the underline
+  without a trailing newline. (#1108)
 - Fixed generic OpenCode commands selecting integration contracts from command
   spelling instead of the executable's major version. `run opencode` now probes
   the exact executable once and carries the resolved V1/V2 dialect through

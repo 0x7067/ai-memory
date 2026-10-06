@@ -638,12 +638,13 @@ pub fn strip_leading_h1<'a>(body: &'a str, title: &str) -> &'a str {
     // Setext form: `Title\n====…` (1+ equals signs). Look ahead.
     if let Some((first_line, after_first)) = trimmed.split_once('\n')
         && !first_line.is_empty()
-        && let Some((second_line, after_second)) = after_first.split_once('\n')
-        && !second_line.is_empty()
-        && second_line.chars().all(|c| c == '=')
         && first_line.trim() == title
     {
-        return after_second.trim_start_matches(['\n', '\r']);
+        let (second_line, after_second) = after_first.split_once('\n').unwrap_or((after_first, ""));
+        let underline = second_line.trim_end_matches(['\r', ' ', '\t']);
+        if !underline.is_empty() && underline.chars().all(|c| c == '=') {
+            return after_second.trim_start_matches(['\n', '\r']);
+        }
     }
     body
 }
@@ -809,6 +810,30 @@ mod tests {
         // `----` underlines are H2, not H1. Leave them alone.
         let out = strip_leading_h1("Title\n----\n\nbody\n", "Title");
         assert_eq!(out, "Title\n----\n\nbody\n");
+    }
+
+    #[test]
+    fn strip_setext_h1_handles_crlf_and_trailing_whitespace() {
+        let out = strip_leading_h1("Title\r\n=====\r\n\r\nbody\r\n", "Title");
+        assert_eq!(out, "body\r\n");
+
+        let out = strip_leading_h1("Title\n=====   \t\n\nbody\n", "Title");
+        assert_eq!(out, "body\n");
+
+        let out = strip_leading_h1("Title\r\n=====  \r\n\r\nbody\r\n", "Title");
+        assert_eq!(out, "body\r\n");
+
+        // Negative control: an underline with inner spaces is not a setext
+        // H1 underline — the heading must survive stripping.
+        let out = strip_leading_h1("Title\r\n== x ==\r\nbody", "Title");
+        assert_eq!(out, "Title\r\n== x ==\r\nbody");
+    }
+
+    #[test]
+    fn strip_setext_h1_handles_eof_without_trailing_newline() {
+        assert_eq!(strip_leading_h1("Title\n=====", "Title"), "");
+        assert_eq!(strip_leading_h1("Title\r\n=====\r", "Title"), "");
+        assert_eq!(strip_leading_h1("\r\n\r\nTitle\r\n=====", "Title"), "");
     }
 
     #[test]
