@@ -36,12 +36,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::cli::{AgentChoice, InstallHooksArgs, InstallMcpArgs, McpClient, SetupAgentArgs};
+use crate::cli::{
+    AgentChoice, HookInstallScope, InstallHooksArgs, InstallMcpArgs, McpClient, SetupAgentArgs,
+};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
-    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_claude_code_payload, build_devin_payload, build_grok_payload, build_pool_settings_yaml,
-    hook_script_for_current_platform,
+    COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
+    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_grok_payload,
+    build_pool_settings_yaml, hook_script_for_current_platform,
 };
 use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -194,6 +196,9 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
         AgentChoice::Pool => emit_pool(&emit_root, &args),
+        AgentChoice::CopilotCli => {
+            emit_other(&emit_root, agent_sub, &args, &[COPILOT_CLI_PROFILE.events]);
+        }
         AgentChoice::OpenCode
         | AgentChoice::OpenCode2
         | AgentChoice::Pi
@@ -361,6 +366,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
                 as_user: None,
                 apply: false,
                 config_file: None,
+                scope: HookInstallScope::Global,
                 project_strategy: None,
                 capture_assistant: false,
                 capture_mode: None,
@@ -469,7 +475,7 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
 fn emit_pool(emit_root: &Path, args: &SetupAgentArgs) {
     let snippet = build_pool_settings_yaml(emit_root, &args.server_url, args.auth_token.as_deref());
     println!("# Pool (Poolside Agent CLI) — merge into the repo-root .poolside/settings.yaml");
-    println!("# of each project Pool runs in; ai-memory does not write project-local files.");
+    println!("# of each project Pool runs in; ai-memory does not write committed project files.");
     println!("# Hook scripts (must be reachable from the host that runs Pool):");
     println!("#   {}", emit_root.display());
     println!("# AI-memory server: {}", args.server_url);

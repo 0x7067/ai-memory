@@ -50,12 +50,12 @@ const SKIPPED_DIRS: [&str; 8] = [
 const MAX_SCAN_ENTRIES: usize = 4096;
 const NEW_PROJECT_LABEL: &str = "+ New project";
 
-#[derive(Debug, Clone, Deserialize)]
-struct ProjectRow {
-    workspace_name: String,
-    project_name: String,
-    page_count: u64,
-    last_updated: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ProjectRow {
+    pub(crate) workspace_name: String,
+    pub(crate) project_name: String,
+    pub(crate) page_count: u64,
+    pub(crate) last_updated: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +102,7 @@ impl Candidate {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Choice {
     pub(super) label: String,
     pub(super) detail: String,
@@ -231,6 +232,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             fresh: args.fresh,
             force_unlock: false,
             no_autowire: false,
+            profile: None,
             env: Vec::new(),
             env_file: None,
             harness: Some(harness),
@@ -668,16 +670,63 @@ pub(super) enum HorizontalDirection {
 type HorizontalHandler<'a> = &'a mut dyn FnMut(usize, HorizontalDirection, &mut Choice);
 
 pub(super) fn select(title: &str, choices: &mut [Choice]) -> Result<Option<usize>> {
-    select_inner(title, choices, None, None)
+    select_inner(title, choices, None, None, None)
 }
 
 pub(super) fn select_with_horizontal(
     title: &str,
     choices: &mut [Choice],
     horizontal_hint: &str,
+    initial_search: Option<&str>,
     on_horizontal: &mut dyn FnMut(usize, HorizontalDirection, &mut Choice),
 ) -> Result<Option<usize>> {
-    select_inner(title, choices, Some(horizontal_hint), Some(on_horizontal))
+    select_inner(
+        title,
+        choices,
+        Some(horizontal_hint),
+        Some(on_horizontal),
+        Some(initial_search.unwrap_or_default()),
+    )
+}
+
+#[derive(Default)]
+struct PickerSearch {
+    query: String,
+}
+
+impl PickerSearch {
+    fn indices(&self, choices: &[Choice]) -> Vec<usize> {
+        let query = self.query.to_lowercase();
+        choices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                choice
+                    .label
+                    .to_lowercase()
+                    .contains(&query)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        match code {
+            KeyCode::Esc if !self.query.is_empty() => self.query.clear(),
+            KeyCode::Backspace => {
+                self.query.pop();
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => self.query.clear(),
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.query.push(character)
+            }
+            _ => return false,
+        }
+        true
+    }
 }
 
 fn select_inner(
@@ -685,6 +734,7 @@ fn select_inner(
     choices: &mut [Choice],
     horizontal_hint: Option<&str>,
     mut on_horizontal: Option<HorizontalHandler<'_>>,
+    initial_search: Option<&str>,
 ) -> Result<Option<usize>> {
     if choices.is_empty() {
         bail!("nothing to choose from");
@@ -699,14 +749,41 @@ fn select_inner(
     let mut selected = 0usize;
     let mut offset = 0usize;
     let mut drawn = 0u16;
+    let mut search = PickerSearch {
+        query: initial_search.unwrap_or_default().to_owned(),
+    };
     loop {
+        let indices = search.indices(choices);
+        let visible = if indices.is_empty() {
+            vec![Choice {
+                label: "No matching workstreams — edit the search or press Esc to clear".into(),
+                detail: String::new(),
+            }]
+        } else {
+            indices
+                .iter()
+                .map(|index| choices[*index].clone())
+                .collect::<Vec<_>>()
+        };
+        selected = selected.min(visible.len() - 1);
+        let title = if initial_search.is_some() {
+            format!(
+                "{title} [{}/{}] | search: {}",
+                indices.len(),
+                choices.len(),
+                search.query
+            )
+        } else {
+            title.to_owned()
+        };
         drawn = draw(
-            title,
-            choices,
+            &title,
+            &visible,
             selected,
             &mut offset,
             drawn,
             horizontal_hint,
+            initial_search.is_some(),
         )?;
         let Event::Key(KeyEvent {
             code,
@@ -717,26 +794,48 @@ fn select_inner(
         else {
             continue;
         };
+        if initial_search.is_some() {
+            let previous_query = search.query.clone();
+            if search.handle_key(code, modifiers) {
+                if search.query != previous_query {
+                    selected = 0;
+                    offset = 0;
+                }
+                continue;
+            }
+        }
+        // The resume picker reserves every printable character for search,
+        // including the other pickers' j/k/q shortcuts. Ctrl-C still cancels.
+        if initial_search.is_some()
+            && matches!(code, KeyCode::Char(_))
+            && !(code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
+        {
+            continue;
+        }
         if let Some(direction) = horizontal_direction(&code) {
-            if let Some(callback) = on_horizontal.as_mut() {
-                callback(selected, direction, &mut choices[selected]);
+            if let Some(callback) = on_horizontal.as_mut()
+                && let Some(&index) = indices.get(selected)
+            {
+                callback(index, direction, &mut choices[index]);
             }
             continue;
         }
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
-                selected = selected.checked_sub(1).unwrap_or(choices.len() - 1);
+                selected = selected.checked_sub(1).unwrap_or(visible.len() - 1);
             }
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % choices.len(),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % visible.len(),
             KeyCode::Home => selected = 0,
-            KeyCode::End => selected = choices.len() - 1,
+            KeyCode::End => selected = visible.len() - 1,
             KeyCode::PageUp => selected = selected.saturating_sub(viewport_rows()),
             KeyCode::PageDown => {
-                selected = (selected + viewport_rows()).min(choices.len() - 1);
+                selected = (selected + viewport_rows()).min(visible.len() - 1);
             }
             KeyCode::Enter => {
-                clear(drawn)?;
-                return Ok(Some(selected));
+                if let Some(&index) = indices.get(selected) {
+                    clear(drawn)?;
+                    return Ok(Some(index));
+                }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 clear(drawn)?;
@@ -895,6 +994,7 @@ fn draw(
     offset: &mut usize,
     previous: u16,
     horizontal_hint: Option<&str>,
+    searchable: bool,
 ) -> Result<u16> {
     let (columns, _) = terminal::size().unwrap_or((80, 24));
     let width = usize::from(columns.max(20)).saturating_sub(1);
@@ -938,7 +1038,9 @@ fn draw(
     let horizontal_hint = horizontal_hint
         .map(|hint| format!(" | {hint}"))
         .unwrap_or_default();
-    let hint = if choices.len() > viewport {
+    let hint = if searchable {
+        "  type to search | ↑↓ move | ←→ harness | enter select | esc clear/cancel".to_owned()
+    } else if choices.len() > viewport {
         format!(
             "  up/down move{horizontal_hint} | pgup/pgdn page | enter select | esc cancel [{}/{}]",
             selected + 1,
@@ -967,6 +1069,66 @@ fn clear(drawn: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_matches_names_case_insensitively_and_keeps_original_indices() {
+        let choices = ["one", "Fix CHECKOUT", "three", "checkout search"].map(|label| Choice {
+            label: label.into(),
+            detail: "unrelated detail".into(),
+        });
+        let mut search = PickerSearch {
+            query: "checkout".into(),
+        };
+        assert_eq!(search.indices(&choices), [1, 3]);
+        search.query = "missing".into();
+        assert!(search.indices(&choices).is_empty());
+        search.query.clear();
+        assert_eq!(search.indices(&choices), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn typing_searches_immediately_including_navigation_letters() {
+        let mut search = PickerSearch::default();
+        for character in "qjké".chars() {
+            assert!(search.handle_key(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(search.query, "qjké");
+        assert!(search.handle_key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(search.query, "qjk");
+        assert!(search.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(search.query.is_empty());
+        assert!(search.handle_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!search.handle_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(search.query, "q");
+        assert!(search.handle_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(search.query.is_empty());
+        assert!(!search.handle_key(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn search_does_not_consume_selection_arrows_or_cancel_shortcuts() {
+        let mut search = PickerSearch {
+            query: "auth".into(),
+        };
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Enter,
+        ] {
+            assert!(!search.handle_key(code, KeyModifiers::NONE));
+        }
+        assert!(!search.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!search.handle_key(KeyCode::Char('q'), KeyModifiers::ALT));
+        assert_eq!(search.query, "auth");
+        assert!(search.handle_key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(search.query, "auth/");
+    }
 
     fn config_at(path: &Path) -> Config {
         Config {
