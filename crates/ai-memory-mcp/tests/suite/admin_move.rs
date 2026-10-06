@@ -848,12 +848,10 @@ async fn ids(
     (ws_id, proj_id)
 }
 
-/// W1: when the on-disk dir rename fails mid true-move, the SQL re-stamp is
-/// rolled back so NOTHING moves (no DB-ahead-of-disk split-brain). We force the
-/// rename to fail by planting a FILE where the destination workspace dir would
-/// be created.
+/// A non-directory namespace component is refused before the project move, so
+/// neither disk nor SQLite changes.
 #[tokio::test]
-async fn true_move_rolls_back_when_dir_rename_fails() {
+async fn true_move_refuses_an_invalid_destination_namespace_without_db_changes() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
@@ -882,7 +880,7 @@ async fn true_move_rolls_back_when_dir_rename_fails() {
         body["error"]
             .as_str()
             .unwrap_or("")
-            .contains("nothing changed"),
+            .contains("not a directory"),
         "{body}"
     );
 
@@ -2946,7 +2944,7 @@ async fn delete_workspace_reject_policy_aborts_before_db_or_disk_destruction() {
 }
 
 #[tokio::test]
-async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notification() {
+async fn delete_workspace_refuses_invalid_namespace_before_db_or_notification() {
     let (url, rx) = spawn_capture_hook().await;
 
     let tmp = TempDir::new().unwrap();
@@ -2978,28 +2976,28 @@ async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notificati
     )
     .await;
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = body_json(resp).await;
     assert!(
-        body["files_deleted"].as_array().unwrap().is_empty(),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a directory"),
         "{body}"
     );
-    assert_eq!(body["files_failed"].as_array().unwrap().len(), 1, "{body}");
     assert!(
         store
             .reader
             .find_workspace("victim".into())
             .await
             .unwrap()
-            .is_none(),
-        "DB delete should still commit and be reported as partial filesystem failure"
+            .is_some(),
+        "namespace refusal must leave DB rows intact"
     );
-
-    let payload = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
-        .await
-        .expect("async purge_workspace dispatch should fire")
-        .unwrap();
-    assert_eq!(payload["ctx"]["op"], "purge_workspace");
-    assert_eq!(payload["ctx"]["workspace"], "victim");
-    assert_eq!(payload["ctx"]["partial_failure"], true);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+            .await
+            .is_err(),
+        "a refused operation must not notify observers"
+    );
 }
