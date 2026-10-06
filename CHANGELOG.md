@@ -336,6 +336,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ceiling, no cache hit guaranteed). (#1102)
 
 ### Fixed
+- Fixed `memory_feedback` storing an unmatched secret prefix when a `reason`
+  straddled the 500-character cap: the reason is now scrubbed before the cap
+  is applied, matching the #980 title-hint order. (#1109)
 - Fixed hook `title_hint` extraction leaving a trailing CR on Windows CRLF
   payloads and keeping embedded newlines on SessionStart, Notification, and
   PostCompaction titles. First-line splitting now uses `str::lines`. (#1111)
