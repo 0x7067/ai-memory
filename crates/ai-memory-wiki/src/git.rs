@@ -392,9 +392,16 @@ impl GitAdapter {
     where
         F: FnOnce(&Path, &str, git2::Error) -> WikiResult<Option<git2::Oid>>,
     {
+        // One hold of the commit lock spans the confinement walk and the
+        // commit. Our own commit activity churns `.git` lock and temp
+        // files and atomic temp names in the tree; a walk beside it saw
+        // entries that vanished between read_dir and stat. Writers we do
+        // not serialize (the git CLI, a second adapter) remain covered by
+        // the walk's own vanish tolerance.
+        let mut slot = self.writing();
         let git_dir = crate::confinement::inspect_git_directory(&self.root)?;
         crate::confinement::inspect_tree_except(&self.root, &[git_dir.as_path()])?;
-        match self.commit_all_git2(message) {
+        match self.commit_all_git2(&mut slot, message) {
             Ok(result) => Ok(result),
             Err(CommitGit2Error::Open(error)) => commit_open_error_with_fallback_on(
                 cfg!(windows),
@@ -408,8 +415,13 @@ impl GitAdapter {
         }
     }
 
-    fn commit_all_git2(&self, message: &str) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let mut slot = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
+    /// Called with the commit lock already held by
+    /// [`commit_all_with_fallback`]; `slot` is that lock's payload.
+    fn commit_all_git2(
+        &self,
+        slot: &mut Option<Open>,
+        message: &str,
+    ) -> Result<Option<git2::Oid>, CommitGit2Error> {
         if slot.is_none() {
             let repo = open_validated_repository(&self.root).map_err(|error| match error {
                 OpenRepositoryError::Git(error) => CommitGit2Error::Open(error),

@@ -197,10 +197,32 @@ pub(crate) fn inspect_tree_except(root: &Path, excluded_roots: &[&Path]) -> Wiki
     }
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            // The directory vanished after the walk observed it (concurrent
+            // commits churn lock and temp files); an absent directory hides
+            // nothing that was observed. Same tolerance as the absent root.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                // The directory went away mid-listing; the rest of it is
+                // as unobserved as the part already read.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            };
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path)?;
+            // Vanish-tolerant, never link-tolerant: an entry gone by the
+            // time it is statted was not observed, so there is nothing to
+            // refuse; every entry that IS stat-able must pass the
+            // link-like check below.
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             if is_link_like(&metadata) {
                 return Err(confined(&path));
             }
@@ -303,5 +325,96 @@ mod tests {
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(temp.path().join("missing"), &link).unwrap();
         assert!(is_link_like(&std::fs::symlink_metadata(link).unwrap()));
+    }
+
+    #[cfg(unix)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("skipping link assertion: Windows privilege unavailable");
+                false
+            }
+            Err(error) => panic!("failed to create directory link: {error}"),
+        }
+    }
+
+    /// A walk beside create/delete churn (a concurrent commit's `.git`
+    /// lock and temp files, an atomic writer's temp renames) must not
+    /// fail on an entry that vanishes between read_dir and stat — while
+    /// a link the walk does observe is still refused.
+    #[test]
+    fn tree_walks_skip_entries_that_vanish_but_still_refuse_observed_links() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wiki");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("page.md"), b"x").unwrap();
+        let scratch = root.join("scratch");
+        let stop = Arc::new(AtomicBool::new(false));
+        let racer = {
+            let scratch = scratch.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::write(&scratch, b"churn");
+                    let _ = std::fs::remove_file(&scratch);
+                }
+            })
+        };
+        for _ in 0..200 {
+            inspect_tree_except(&root, &[]).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        racer.join().unwrap();
+        let _ = std::fs::remove_file(&scratch);
+
+        #[cfg(any(unix, windows))]
+        {
+            let outside = temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            if link_directory(&outside, &root.join("escape")) {
+                assert!(matches!(
+                    inspect_tree_except(&root, &[]),
+                    Err(WikiError::Confinement { .. })
+                ));
+            }
+        }
+    }
+
+    /// Vanish tolerance is for read_dir race entries only: a direct
+    /// target's own semantics are unchanged — absent stays acceptable
+    /// (nothing to confine), an observed link stays refused.
+    #[test]
+    fn direct_targets_keep_their_own_absence_and_link_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wiki");
+        std::fs::create_dir_all(&root).unwrap();
+        let absent = root.join("absent.md");
+        assert!(inspect_final(&absent).is_ok());
+
+        std::fs::write(&absent, b"x").unwrap();
+        assert!(inspect_final(&absent).is_ok());
+
+        #[cfg(any(unix, windows))]
+        {
+            let outside = temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let linked = root.join("linked.md");
+            if link_directory(&outside, &linked) {
+                assert!(matches!(
+                    inspect_final(&linked),
+                    Err(WikiError::Confinement { .. })
+                ));
+            }
+        }
     }
 }
