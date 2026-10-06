@@ -16,7 +16,7 @@ use ai_memory_workstream::{
     JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode, LaunchPlan,
     LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env, claude_attached_background_session,
+    build_launch_plan, build_launch_plan_with_env_lookup, claude_attached_background_session,
     claude_live_background_attach_id, claude_session_ran_in_background, clean_path,
     crush_global_config_path, discover_native_session, export_transcript,
     has_native_session_selector, inside_ai_jail_here, inspect_repository, jail_checklist,
@@ -53,6 +53,114 @@ const IMPORT_BATCH_BYTES: usize = 1024 * 1024;
 const ADOPTION_CANDIDATE_LIMIT: usize = 8;
 /// Bound on `claude agents --json`, which only reads the daemon's session list.
 const CLAUDE_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Default)]
+pub(crate) struct EffectiveChildEnv {
+    entries: Vec<(OsString, OsString)>,
+}
+
+impl EffectiveChildEnv {
+    pub(super) fn from_runtime(env: &crate::config::RuntimeEnv) -> Self {
+        Self {
+            entries: env.process_env().to_vec(),
+        }
+    }
+
+    pub(crate) fn with_overrides(
+        env: &crate::config::RuntimeEnv,
+        overrides: &[(String, String)],
+    ) -> Self {
+        Self::with_overrides_for_platform(env.process_env(), overrides, cfg!(windows))
+    }
+
+    pub(crate) fn with_overrides_for_platform(
+        base: &[(OsString, OsString)],
+        overrides: &[(String, String)],
+        windows: bool,
+    ) -> Self {
+        let mut effective = Self {
+            entries: base.to_vec(),
+        };
+        for (key, value) in overrides {
+            effective.upsert(OsString::from(key), OsString::from(value), windows);
+        }
+        effective
+    }
+
+    fn upsert(&mut self, key: OsString, value: OsString, windows: bool) {
+        self.entries
+            .retain(|(existing, _)| !environment_keys_equal(existing, &key, windows));
+        self.entries.push((key, value));
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&OsStr> {
+        self.get_for_platform(name, cfg!(windows))
+    }
+
+    fn get_for_platform(&self, name: &str, windows: bool) -> Option<&OsStr> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|(key, _)| environment_keys_equal(key, OsStr::new(name), windows))
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    pub(crate) fn with_additional_overrides(&self, overrides: &[(String, String)]) -> Self {
+        Self::with_overrides_for_platform(&self.entries, overrides, cfg!(windows))
+    }
+
+    pub(crate) fn executable_search(&self) -> ExecutableSearch<'_> {
+        ExecutableSearch {
+            path: self.get("PATH"),
+            extensions: self.get("PATHEXT"),
+        }
+    }
+
+    pub(crate) fn apply_to_std(&self, command: &mut std::process::Command) {
+        command
+            .env_clear()
+            .envs(self.entries.iter().map(|(key, value)| (key, value)));
+    }
+
+    fn apply_to_tokio(&self, command: &mut Command) {
+        command
+            .env_clear()
+            .envs(self.entries.iter().map(|(key, value)| (key, value)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        entries: impl IntoIterator<Item = (impl Into<OsString>, impl Into<OsString>)>,
+    ) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[(OsString, OsString)] {
+        &self.entries
+    }
+}
+
+pub(crate) fn environment_keys_equal(left: &OsStr, right: &OsStr, windows: bool) -> bool {
+    if windows {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExecutableSearch<'a> {
+    path: Option<&'a OsStr>,
+    extensions: Option<&'a OsStr>,
+}
+
 const AUTO_HARNESSES: [ManagedHarness; 9] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
@@ -87,6 +195,28 @@ impl HeartbeatHealth {
         let recovered = self.consecutive_failures > 0;
         self.consecutive_failures = 0;
         recovered
+    }
+}
+
+fn resolve_opencode_for_launch(
+    requested: Option<RunHarnessChoice>,
+    executable: Option<&OsStr>,
+    env: &EffectiveChildEnv,
+) -> Result<Option<super::opencode_dialect::ResolvedOpenCode>> {
+    let search = env.executable_search();
+    let automatic = requested.is_none();
+    if !(matches!(requested, Some(RunHarnessChoice::OpenCode))
+        || automatic && executable_available(OsStr::new("opencode"), search))
+    {
+        return Ok(None);
+    }
+    match super::opencode_dialect::resolve_generic(executable, env) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(error) if automatic => {
+            eprintln!("ai-memory: automatic OpenCode scan skipped: {error:#}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -125,6 +255,8 @@ pub(super) async fn run_from_with_wiring(
     let repository = inspect_repository(cwd)?;
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
+    let requested_harness = args.harness;
+    let mut executable = args.executable.map(PathBuf::into_os_string);
     let mut native_args = args.native_args;
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
     let trailing_true_yolo = remove_wrapper_true_yolo(&mut native_args);
@@ -144,33 +276,72 @@ pub(super) async fn run_from_with_wiring(
     let no_autowire = args.no_autowire || trailing_no_autowire;
     let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
         .context("resolving --env/--env-file for the managed run")?;
+    let child_env = EffectiveChildEnv::with_overrides(&config.runtime_env, &run_env);
+    let executable_search = child_env.executable_search();
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
         ));
     }
-    if automatic_harness && args.executable.is_some() {
+    if automatic_harness && executable.is_some() {
         return Err(anyhow!(
             "--executable requires an explicit harness; try `ai-memory run --executable <path> codex`"
         ));
     }
+    let resolved_opencode =
+        resolve_opencode_for_launch(requested_harness, executable.as_deref(), &child_env)?;
+    if matches!(requested_harness, Some(RunHarnessChoice::OpenCode))
+        && let Some(resolved) = &resolved_opencode
+    {
+        executable = Some(resolved.executable.clone().into_os_string());
+    }
     let auto_candidates = if automatic_harness {
         filter_usable_auto_sessions(
-            list_auto_sessions(&home, &repository.cwd, &run_env).await?,
-            |harness| executable_available(OsStr::new(harness.executable())),
+            list_auto_sessions(
+                &home,
+                &repository.cwd,
+                &child_env,
+                resolved_opencode
+                    .as_ref()
+                    .map(|resolved| resolved.dialect.harness()),
+            )
+            .await?,
+            |harness| {
+                matches!(
+                    harness,
+                    ManagedHarness::OpenCode | ManagedHarness::OpenCode2
+                ) && resolved_opencode.is_some()
+                    || executable_available(OsStr::new(harness.executable()), executable_search)
+            },
         )?
     } else {
         Vec::new()
     };
-    let provisional_harness = match args.harness {
+    let provisional_harness = match requested_harness {
+        Some(RunHarnessChoice::OpenCode) => resolved_opencode
+            .as_ref()
+            .map(|resolved| resolved.dialect.harness())
+            .context("OpenCode dialect was not resolved")?,
         Some(choice) => managed_harness_for_args(choice, &native_args),
         None => auto_candidates
             .first()
             .map(|candidate| candidate.harness)
             .ok_or_else(no_auto_session_error)?,
     };
-    let executable = args.executable.map(PathBuf::into_os_string);
-    ensure_executable_available(provisional_harness, executable.as_deref())?;
+    if automatic_harness
+        && matches!(
+            provisional_harness,
+            ManagedHarness::OpenCode | ManagedHarness::OpenCode2
+        )
+        && let Some(resolved) = &resolved_opencode
+    {
+        executable = Some(resolved.executable.clone().into_os_string());
+    }
+    ensure_executable_available(
+        provisional_harness,
+        executable.as_deref(),
+        executable_search,
+    )?;
     // Resolve BOTH halves here. `--workspace` used to default to a literal
     // `default`, so a checkout whose marker declared another workspace put its
     // managed workstream in one scope while its hook-captured sessions went to
@@ -292,6 +463,9 @@ pub(super) async fn run_from_with_wiring(
             selected,
             provisional_harness,
             prepared.native_session_id.as_deref(),
+            resolved_opencode
+                .as_ref()
+                .map(|resolved| resolved.dialect.harness()),
         )
     } else {
         provisional_harness
@@ -308,7 +482,20 @@ pub(super) async fn run_from_with_wiring(
     } else {
         resolved_harness
     };
-    acquired_try!(ensure_executable_available(harness, executable.as_deref()));
+    if automatic_harness
+        && matches!(
+            harness,
+            ManagedHarness::OpenCode | ManagedHarness::OpenCode2
+        )
+        && let Some(resolved) = &resolved_opencode
+    {
+        executable = Some(resolved.executable.clone().into_os_string());
+    }
+    acquired_try!(ensure_executable_available(
+        harness,
+        executable.as_deref(),
+        executable_search,
+    ));
     // Warn, and offer ai-jail, before any further native-session work — a
     // yolo re-exec under ai-jail must forward the original argv, not the
     // resolved launch plan, and restarting cleanly under ai-jail before
@@ -334,7 +521,7 @@ pub(super) async fn run_from_with_wiring(
         force_fresh,
         &home,
         &repository.cwd,
-        &run_env,
+        &child_env,
     ));
     let resumes_linked_session = !force_fresh
         && orphaned_session.is_none()
@@ -382,12 +569,12 @@ pub(super) async fn run_from_with_wiring(
                 .find(|candidate| candidate.harness == harness)
                 .context("the selected automatic harness no longer has a checkout-local session")
         );
-        plan = acquired_try!(build_launch_plan_with_env(
+        plan = acquired_try!(build_launch_plan_with_env_lookup(
             harness,
             executable.clone(),
             native_args.clone(),
             Some(&candidate.session.native_session_id),
-            &run_env,
+            |name| child_env.get(name).map(OsStr::to_os_string),
             Some(LaunchRoots {
                 home: &home,
                 cwd: &repository.cwd,
@@ -429,12 +616,12 @@ pub(super) async fn run_from_with_wiring(
                 );
                 match selection {
                     Ok(Some(native_session_id)) => {
-                        plan = acquired_try!(build_launch_plan_with_env(
+                        plan = acquired_try!(build_launch_plan_with_env_lookup(
                             harness,
                             executable,
                             native_args,
                             Some(&native_session_id),
-                            &run_env,
+                            |name| child_env.get(name).map(OsStr::to_os_string),
                             Some(LaunchRoots {
                                 home: &home,
                                 cwd: &repository.cwd,
@@ -502,13 +689,7 @@ pub(super) async fn run_from_with_wiring(
     // home the child will read, and before the child spawns so the harness
     // picks up the fresh hooks.
     // The environment the child runs with: `--env` over ai-memory's own.
-    let launch_env = |name: &str| {
-        run_env
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| OsString::from(value))
-            .or_else(|| std::env::var_os(name))
-    };
+    let launch_env = |name: &str| child_env.get(name).map(OsStr::to_os_string);
     if config.run_autowire && !no_autowire {
         // A Kiro v3 resume from the default store drops `KIRO_HOME` from the
         // child, so its hooks and MCP belong under the default home.
@@ -520,7 +701,14 @@ pub(super) async fn run_from_with_wiring(
                 home.join(".kiro").display().to_string(),
             );
         }
-        super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &wire_env);
+        let wire_child_env = child_env.with_additional_overrides(&wire_env);
+        super::run_autowire::ensure_wired_with_env(
+            config,
+            harness,
+            wire_overrides,
+            &wire_env,
+            &wire_child_env,
+        );
     }
     // A Kiro v3 resume that dropped `KIRO_HOME` runs against the default store.
     let linked_store = effective_store(
@@ -558,8 +746,15 @@ pub(super) async fn run_from_with_wiring(
         && resumes_linked_session
         && let Some(native_session_id) = plan.expected_session_id.as_deref()
     {
-        claude_background_attach_id(&plan, &home, &repository.cwd, &run_env, native_session_id)
-            .await
+        claude_background_attach_id(
+            &plan,
+            &home,
+            &repository.cwd,
+            &child_env,
+            native_session_id,
+            executable_search,
+        )
+        .await
     } else {
         None
     };
@@ -610,14 +805,11 @@ pub(super) async fn run_from_with_wiring(
     // alone can match an unlaunchable extension-less shim (see
     // `resolve_program`). Falling back to the plan's own value keeps an
     // unresolvable program reaching the spawn error below, which explains it.
-    let program = resolve_program(&plan.program).unwrap_or_else(|| plan.program.clone().into());
+    let program = resolve_program(&plan.program, executable_search)
+        .unwrap_or_else(|| plan.program.clone().into());
     let mut command = Command::new(&program);
+    child_env.apply_to_tokio(&mut command);
     command.args(&plan.args).current_dir(&repository.cwd);
-    // Caller-supplied `--env`/`--env-file` entries go first so the fixed
-    // AI_MEMORY_* plumbing below always wins on a key collision.
-    for (key, value) in &run_env {
-        command.env(key, value);
-    }
     command
         .env("AI_MEMORY_RUN_ID", prepared.run_id.to_string())
         .env(
@@ -1549,16 +1741,23 @@ async fn resolve_native_session_after_run(
 async fn list_auto_sessions(
     home: &Path,
     cwd: &Path,
-    env_overrides: &[(String, String)],
+    env: &EffectiveChildEnv,
+    opencode_harness: Option<ManagedHarness>,
 ) -> Result<Vec<AutoSessionCandidate>> {
     let mut found = Vec::new();
     let mut failures = Vec::new();
-    for harness in AUTO_HARNESSES {
+    for mut harness in AUTO_HARNESSES {
+        if harness == ManagedHarness::OpenCode {
+            let Some(resolved) = opencode_harness else {
+                continue;
+            };
+            harness = resolved;
+        }
         // Scan the store the launch would resume from. With a custom
         // `CLAUDE_CONFIG_DIR` (or another store override) the default store
         // holds none of this checkout's sessions, so scanning it either finds
         // nothing or picks a session the launched harness cannot see.
-        let session_dir = match auto_session_dir(harness, home, cwd, env_overrides) {
+        let session_dir = match auto_session_dir(harness, home, cwd, env) {
             Ok(session_dir) => session_dir,
             Err(error) => {
                 failures.push(format!("{}: {error}", harness.as_str()));
@@ -1599,14 +1798,14 @@ fn auto_session_dir(
     harness: ManagedHarness,
     home: &Path,
     cwd: &Path,
-    env_overrides: &[(String, String)],
+    env: &EffectiveChildEnv,
 ) -> Result<Option<PathBuf>> {
-    Ok(build_launch_plan_with_env(
+    Ok(build_launch_plan_with_env_lookup(
         harness,
         None,
         Vec::new(),
         None,
-        env_overrides,
+        |name| env.get(name).map(OsStr::to_os_string),
         Some(LaunchRoots { home, cwd }),
     )?
     .session_dir)
@@ -1627,12 +1826,15 @@ fn automatic_harness_flavor(
     selected: ManagedHarness,
     provisional: ManagedHarness,
     linked_session_id: Option<&str>,
+    opencode_harness: Option<ManagedHarness>,
 ) -> ManagedHarness {
     if selected == ManagedHarness::Kiro
         && provisional.agent_kind() == AgentKind::KiroCli
         && linked_session_id.is_none()
     {
         provisional
+    } else if selected == ManagedHarness::OpenCode {
+        opencode_harness.unwrap_or(selected)
     } else {
         selected
     }
@@ -1810,10 +2012,19 @@ fn resolve_run_env(
 /// Insert or replace one entry in an ordered env list, keeping the position
 /// of an existing key so `--env-file` order stays stable across overrides.
 fn upsert_env(entries: &mut Vec<(String, String)>, key: String, value: String) {
-    if let Some(existing) = entries
-        .iter_mut()
-        .find(|(existing_key, _)| *existing_key == key)
-    {
+    upsert_env_for_platform(entries, key, value, cfg!(windows));
+}
+
+fn upsert_env_for_platform(
+    entries: &mut Vec<(String, String)>,
+    key: String,
+    value: String,
+    windows: bool,
+) {
+    if let Some(existing) = entries.iter_mut().find(|(existing_key, _)| {
+        environment_keys_equal(OsStr::new(existing_key), OsStr::new(&key), windows)
+    }) {
+        existing.0 = key;
         existing.1 = value;
     } else {
         entries.push((key, value));
@@ -1877,7 +2088,7 @@ fn build_preflighted_launch_plan(
     force_fresh: bool,
     home: &Path,
     cwd: &Path,
-    env_overrides: &[(String, String)],
+    env: &EffectiveChildEnv,
 ) -> Result<(LaunchPlan, Option<String>)> {
     let explicit_selector = has_native_session_selector(harness, &native_args);
     if force_fresh && explicit_selector {
@@ -1886,12 +2097,12 @@ fn build_preflighted_launch_plan(
         ));
     }
     let linked_session_id = if force_fresh { None } else { linked_session_id };
-    let plan = build_launch_plan_with_env(
+    let plan = build_launch_plan_with_env_lookup(
         harness,
         executable.clone(),
         native_args.clone(),
         linked_session_id,
-        env_overrides,
+        |name| env.get(name).map(OsStr::to_os_string),
         Some(LaunchRoots { home, cwd }),
     )?;
     let Some(linked_session_id) = linked_session_id else {
@@ -1909,12 +2120,12 @@ fn build_preflighted_launch_plan(
     ) {
         Ok(true) => Ok((plan, None)),
         Ok(false) => Ok((
-            build_launch_plan_with_env(
+            build_launch_plan_with_env_lookup(
                 harness,
                 executable,
                 native_args,
                 None,
-                env_overrides,
+                |name| env.get(name).map(OsStr::to_os_string),
                 Some(LaunchRoots { home, cwd }),
             )?,
             Some(linked_session_id.to_string()),
@@ -2027,9 +2238,13 @@ fn store_mismatch_error(
     ))
 }
 
-fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsStr>) -> Result<()> {
+fn ensure_executable_available(
+    harness: ManagedHarness,
+    executable: Option<&OsStr>,
+    search: ExecutableSearch<'_>,
+) -> Result<()> {
     let program = executable.unwrap_or_else(|| OsStr::new(harness.executable()));
-    if executable_available(program) {
+    if executable_available(program, search) {
         return Ok(());
     }
     Err(anyhow!(
@@ -2045,12 +2260,12 @@ fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsSt
 /// [`ensure_executable_available`] would accept a moment later. Harnesses
 /// reached only through `--executable` are not covered: the picker has no way
 /// to ask for that path.
-pub(super) fn harness_available(choice: RunHarnessChoice) -> bool {
-    executable_available(OsStr::new(managed_harness(choice).executable()))
+pub(super) fn harness_available(choice: RunHarnessChoice, search: ExecutableSearch<'_>) -> bool {
+    executable_available(OsStr::new(managed_harness(choice).executable()), search)
 }
 
-fn executable_available(program: &OsStr) -> bool {
-    resolve_program(program).is_some()
+fn executable_available(program: &OsStr, search: ExecutableSearch<'_>) -> bool {
+    resolve_program(program, search).is_some()
 }
 
 /// The `claude attach` id for a linked Claude session that is still running in
@@ -2062,8 +2277,9 @@ async fn claude_background_attach_id(
     plan: &LaunchPlan,
     home: &Path,
     cwd: &Path,
-    env: &[(String, String)],
+    env: &EffectiveChildEnv,
     native_session_id: &str,
+    search: ExecutableSearch<'_>,
 ) -> Option<String> {
     let background =
         claude_session_ran_in_background(home, cwd, plan.session_dir.as_deref(), native_session_id)
@@ -2071,13 +2287,14 @@ async fn claude_background_attach_id(
     if !background {
         return None;
     }
-    let program = resolve_program(&plan.program).unwrap_or_else(|| plan.program.clone().into());
+    let program =
+        resolve_program(&plan.program, search).unwrap_or_else(|| plan.program.clone().into());
     let mut command = Command::new(&program);
+    env.apply_to_tokio(&mut command);
     command
         .args(["agents", "--json", "--cwd"])
         .arg(cwd)
         .current_dir(cwd)
-        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -2102,18 +2319,27 @@ async fn claude_background_attach_id(
 /// to spawn with "program not found". Resolving to the concrete file keeps the
 /// availability check and the launch agreeing on one answer, and lets the
 /// launch use a path that works.
-pub(super) fn resolve_program(program: &OsStr) -> Option<std::path::PathBuf> {
+pub(super) fn resolve_program(
+    program: &OsStr,
+    search: ExecutableSearch<'_>,
+) -> Option<std::path::PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
-        return resolve_candidate(path);
+        return resolve_candidate(path, search.extensions);
     }
-    std::env::var_os("PATH").and_then(|path_value| {
-        std::env::split_paths(&path_value).find_map(|dir| resolve_candidate(&dir.join(path)))
+    search.path.and_then(|path_value| {
+        std::env::split_paths(path_value)
+            .find_map(|dir| resolve_candidate(&dir.join(path), search.extensions))
     })
 }
 
 /// Concrete launchable file for one candidate location.
-fn resolve_candidate(path: &Path) -> Option<std::path::PathBuf> {
+fn resolve_candidate(
+    path: &Path,
+    executable_extensions: Option<&OsStr>,
+) -> Option<std::path::PathBuf> {
+    #[cfg(not(windows))]
+    let _ = executable_extensions;
     #[cfg(windows)]
     {
         // An explicit extension is taken at face value; otherwise only a
@@ -2121,8 +2347,9 @@ fn resolve_candidate(path: &Path) -> Option<std::path::PathBuf> {
         if path.extension().is_some() && executable_file(path) {
             return Some(path.to_path_buf());
         }
-        let extensions =
-            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let extensions = executable_extensions
+            .and_then(OsStr::to_str)
+            .unwrap_or(".COM;.EXE;.BAT;.CMD");
         extensions
             .split(';')
             .filter(|extension| !extension.is_empty())
@@ -3374,9 +3601,11 @@ mod tests {
     /// offer an agent that cannot start.
     #[test]
     fn executable_available_rejects_a_program_that_is_not_installed() {
-        assert!(!executable_available(OsStr::new(
-            "ai-memory-no-such-harness-binary"
-        )));
+        let env = EffectiveChildEnv::from_runtime(&crate::config::RuntimeEnv::default());
+        assert!(!executable_available(
+            OsStr::new("ai-memory-no-such-harness-binary"),
+            env.executable_search(),
+        ));
     }
 
     /// An absolute path that exists resolves without consulting `PATH`, which
@@ -3384,11 +3613,81 @@ mod tests {
     #[test]
     fn executable_available_accepts_an_existing_absolute_path() {
         let current = std::env::current_exe().unwrap();
-        assert!(executable_available(current.as_os_str()));
+        let runtime = crate::config::RuntimeEnv::default();
+        let env = EffectiveChildEnv::from_runtime(&runtime);
+        let search = env.executable_search();
+        assert!(executable_available(current.as_os_str(), search));
         assert_eq!(
-            resolve_program(current.as_os_str()).as_deref(),
+            resolve_program(current.as_os_str(), search).as_deref(),
             Some(current.as_path())
         );
+    }
+
+    #[test]
+    fn resolved_run_env_overlays_windows_keys_case_insensitively() {
+        let mut entries = vec![("Path".to_string(), "C:\\base".to_string())];
+        upsert_env_for_platform(
+            &mut entries,
+            "PATH".to_string(),
+            "C:\\override".to_string(),
+            true,
+        );
+
+        assert_eq!(
+            entries,
+            vec![("PATH".to_string(), "C:\\override".to_string())]
+        );
+    }
+
+    #[test]
+    fn effective_child_env_keeps_unix_path_keys_case_sensitive() {
+        let base = [(OsString::from("PATH"), OsString::from("/base"))];
+        let overrides = [("Path".to_string(), "/override".to_string())];
+        let env = EffectiveChildEnv::with_overrides_for_platform(&base, &overrides, false);
+
+        assert_eq!(
+            env.get_for_platform("PATH", false),
+            Some(OsStr::new("/base"))
+        );
+        assert_eq!(
+            env.get_for_platform("Path", false),
+            Some(OsStr::new("/override"))
+        );
+        assert_eq!(env.entries().len(), 2);
+    }
+
+    #[test]
+    fn effective_child_env_overlays_windows_path_keys_case_insensitively() {
+        for override_key in ["PATH", "Path", "path"] {
+            let base = [
+                (OsString::from("Path"), OsString::from("C:\\base")),
+                (OsString::from("PATHEXT"), OsString::from(".EXE;.CMD")),
+            ];
+            let overrides = [
+                (override_key.to_string(), "C:\\override".to_string()),
+                ("pathext".to_string(), ".BAT;.CMD".to_string()),
+            ];
+            let env = EffectiveChildEnv::with_overrides_for_platform(&base, &overrides, true);
+
+            assert_eq!(
+                env.get_for_platform("PATH", true),
+                Some(OsStr::new("C:\\override")),
+                "{override_key}"
+            );
+            assert_eq!(
+                env.get_for_platform("PATHEXT", true),
+                Some(OsStr::new(".BAT;.CMD")),
+                "{override_key}"
+            );
+            assert_eq!(
+                env.entries()
+                    .iter()
+                    .filter(|(key, _)| environment_keys_equal(key, OsStr::new("PATH"), true))
+                    .count(),
+                1,
+                "{override_key}"
+            );
+        }
     }
 
     /// npm-style installs drop an extension-less shell script beside the
@@ -3402,7 +3701,7 @@ mod tests {
         std::fs::write(tmp.path().join("faux-harness"), "#!/bin/sh\n").unwrap();
 
         assert_eq!(
-            resolve_candidate(&tmp.path().join("faux-harness")),
+            resolve_candidate(&tmp.path().join("faux-harness"), None),
             None,
             "an extension-less script is not launchable by CreateProcess"
         );
@@ -3412,8 +3711,11 @@ mod tests {
             "@echo off\r\nexit /b 0\r\n",
         )
         .unwrap();
-        let resolved =
-            resolve_candidate(&tmp.path().join("faux-harness")).expect("the wrapper resolves");
+        let resolved = resolve_candidate(
+            &tmp.path().join("faux-harness"),
+            Some(OsStr::new(".COM;.EXE;.BAT;.CMD")),
+        )
+        .expect("the wrapper resolves");
         // PATHEXT is upper-case, and Windows paths are case-insensitive, so the
         // resolved name carries whichever casing the probe used.
         assert_eq!(
@@ -3437,7 +3739,7 @@ mod tests {
     #[test]
     fn unix_resolution_returns_the_file_itself() {
         let current = std::env::current_exe().unwrap();
-        assert_eq!(resolve_candidate(&current), Some(current));
+        assert_eq!(resolve_candidate(&current, None), Some(current));
     }
 
     fn candidates() -> Vec<NativeSessionCandidate> {
@@ -3839,6 +4141,46 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn automatic_opencode_probe_failure_keeps_another_harness_available() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (name, body) in [
+            ("opencode", "#!/bin/sh\nprintf 'OpenCode latest\\n'\n"),
+            ("codex", "#!/bin/sh\nexit 0\n"),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = EffectiveChildEnv::for_tests([("PATH", bin.as_os_str())]);
+        let search = env.executable_search();
+
+        assert!(
+            resolve_opencode_for_launch(None, None, &env)
+                .unwrap()
+                .is_none()
+        );
+        let usable = filter_usable_auto_sessions(
+            vec![auto_candidate(ManagedHarness::Codex, 100)],
+            |harness| executable_available(OsStr::new(harness.executable()), search),
+        )
+        .unwrap();
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].harness, ManagedHarness::Codex);
+
+        let explicit =
+            resolve_opencode_for_launch(Some(RunHarnessChoice::OpenCode), None, &env).unwrap_err();
+        assert!(
+            format!("{explicit:#}").contains("could not determine the OpenCode major"),
+            "{explicit:#}"
+        );
+    }
+
     #[test]
     fn automatic_selection_skips_newer_sessions_for_unavailable_harnesses() {
         let candidates = vec![
@@ -4124,12 +4466,30 @@ mod tests {
 
         assert_eq!(unique_auto_agents(&candidates), [AgentKind::KiroCli]);
         assert_eq!(
-            automatic_harness_flavor(ManagedHarness::Kiro, ManagedHarness::KiroV3, None),
+            automatic_harness_flavor(ManagedHarness::Kiro, ManagedHarness::KiroV3, None, None,),
             ManagedHarness::KiroV3
         );
         assert_eq!(
-            automatic_harness_flavor(ManagedHarness::Kiro, ManagedHarness::KiroV3, Some("linked"),),
+            automatic_harness_flavor(
+                ManagedHarness::Kiro,
+                ManagedHarness::KiroV3,
+                Some("linked"),
+                None,
+            ),
             ManagedHarness::Kiro
+        );
+    }
+
+    #[test]
+    fn automatic_opencode_selection_keeps_the_resolved_major() {
+        assert_eq!(
+            automatic_harness_flavor(
+                ManagedHarness::OpenCode,
+                ManagedHarness::OpenCode2,
+                Some("linked"),
+                Some(ManagedHarness::OpenCode2),
+            ),
+            ManagedHarness::OpenCode2
         );
     }
 
@@ -4139,6 +4499,7 @@ mod tests {
         let cwd = temp.path().join("repo");
         std::fs::create_dir_all(&cwd).unwrap();
 
+        let env = EffectiveChildEnv::default();
         let (fresh, orphaned) = build_preflighted_launch_plan(
             ManagedHarness::KiroV3,
             None,
@@ -4147,7 +4508,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
-            &[],
+            &env,
         )
         .unwrap();
         assert_eq!(
@@ -4382,7 +4743,7 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_string(),
             "/accounts/work".to_string(),
         )];
-        let plan = build_launch_plan_with_env(
+        let plan = ai_memory_workstream::build_launch_plan_with_env(
             ManagedHarness::Claude,
             None,
             Vec::new(),
@@ -4420,7 +4781,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let env = vec![
+        let env = [
             ("FAKE_CALLS".to_string(), calls.display().to_string()),
             ("FAKE_AGENTS".to_string(), listing.display().to_string()),
         ];
@@ -4441,7 +4802,13 @@ mod tests {
         )
         .unwrap();
         plan.session_dir = None;
-        let attach = || claude_background_attach_id(&plan, temp.path(), &cwd, &env, full);
+        let child_env = EffectiveChildEnv::for_tests(
+            env.iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        );
+        let search = child_env.executable_search();
+        let attach =
+            || claude_background_attach_id(&plan, temp.path(), &cwd, &child_env, full, search);
         let transcript = |kind: Option<&str>| {
             let mut record = serde_json::json!({"type": "user", "sessionId": full, "cwd": cwd});
             if let Some(kind) = kind {
@@ -4724,6 +5091,7 @@ mod tests {
             session_root.as_os_str().to_os_string(),
         ]
         .to_vec();
+        let env = EffectiveChildEnv::default();
 
         let (resumed, orphaned) = build_preflighted_launch_plan(
             ManagedHarness::Pi,
@@ -4733,7 +5101,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
-            &[],
+            &env,
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -4749,7 +5117,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
-            &[],
+            &env,
         )
         .unwrap();
         assert_eq!(orphaned.as_deref(), Some("linked"));
@@ -4768,7 +5136,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
-            &[],
+            &env,
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -4904,8 +5272,15 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_string(),
             custom.to_string_lossy().into_owned(),
         )];
+        let env = EffectiveChildEnv::for_tests(
+            overrides
+                .iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        );
 
-        let found = list_auto_sessions(&home, &cwd, &overrides).await.unwrap();
+        let found = list_auto_sessions(&home, &cwd, &env, Some(ManagedHarness::OpenCode))
+            .await
+            .unwrap();
         let claude: Vec<&str> = found
             .iter()
             .filter(|candidate| candidate.harness == ManagedHarness::Claude)
@@ -4919,6 +5294,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("repo");
         std::fs::create_dir_all(&cwd).unwrap();
+        let env = EffectiveChildEnv::default();
         let (fresh, orphaned) = build_preflighted_launch_plan(
             ManagedHarness::Claude,
             None,
@@ -4927,7 +5303,7 @@ mod tests {
             true,
             temp.path(),
             &cwd,
-            &[],
+            &env,
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -4942,7 +5318,7 @@ mod tests {
             true,
             temp.path(),
             &cwd,
-            &[],
+            &env,
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
@@ -5265,6 +5641,122 @@ mod tests {
         assert_eq!(paths[0], "/existing.md");
         let packet = paths[1].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(packet).unwrap(), "managed packet");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_executable_probe_selects_v2_for_launch_and_autowire() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::commands::run_autowire::WireOverrides;
+        use crate::config::Config;
+
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(|| async {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let launched = repo.path().join("launched");
+        let executable_dir = repo.path().join("child-bin");
+        std::fs::create_dir_all(&executable_dir).unwrap();
+        let executable = executable_dir.join("opencode");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'opencode v%s.0.23\\n' \"$OPENCODE_MAJOR\"; exit 0; fi\nprintf '%s|%s\\n' \"$*\" \"$OPENCODE_MAJOR\" > {}\n",
+                launched.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let plugins = data.path().join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let plugin = plugins.join("ai-memory-opencode2.ts");
+        let mcp = data.path().join("opencode.json");
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = true;
+        let overrides = WireOverrides {
+            hooks_config_file: Some(plugin.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+        let args = RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: None,
+            yolo: false,
+            true_yolo: false,
+            jail: None,
+            no_jail: false,
+            fresh: false,
+            force_unlock: false,
+            no_autowire: false,
+            env: vec![
+                ("PATH".into(), executable_dir.display().to_string()),
+                ("OPENCODE_MAJOR".into(), "2".into()),
+            ],
+            env_file: None,
+            harness: Some(RunHarnessChoice::OpenCode),
+            native_args: vec![OsString::from("--help")],
+        };
+
+        let exit = run_from_with_wiring(&config, args, repo.path(), &overrides)
+            .await
+            .unwrap();
+        assert_eq!(exit, 0);
+        assert_eq!(
+            std::fs::read_to_string(launched).unwrap().trim(),
+            "--help|2"
+        );
+        assert!(
+            std::fs::read_to_string(plugin)
+                .unwrap()
+                .contains("const AiMemoryOpencode2: Plugin.Plugin")
+        );
+        let mcp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(mcp).unwrap()).unwrap();
+        assert!(mcp["mcp"]["servers"]["ai-memory"].is_object());
+        let sentinels = std::fs::read_dir(crate::commands::run_autowire::autowire_state_dir(
+            data.path(),
+        ))
+        .unwrap()
+        .count();
+        assert_eq!(sentinels, 1);
+        server.abort();
     }
 
     /// The `ai-memory run` -> autowire -> child-spawn seam: driving the launcher

@@ -372,9 +372,39 @@ fn kiro_cli_home_join(
 ///
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
-pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
-    let inferred = if args.server_url.is_none() {
-        infer_installed_mcp_config(args.agent)?
+pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
+    run_with_opencode_dialect(config, args, None)
+}
+
+pub(crate) fn run_with_opencode_dialect(
+    config: &Config,
+    args: InstallHooksArgs,
+    dialect: Option<ai_memory_workstream::OpenCodeDialect>,
+) -> Result<()> {
+    run_with_opencode_dialect_and_mcp_path(config, args, dialect, None)
+}
+
+pub(crate) fn run_with_opencode_dialect_and_mcp_path(
+    config: &Config,
+    mut args: InstallHooksArgs,
+    dialect: Option<ai_memory_workstream::OpenCodeDialect>,
+    mcp_config_path: Option<&Path>,
+) -> Result<()> {
+    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    args.agent = match (args.agent, dialect) {
+        (AgentChoice::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V1)) => {
+            AgentChoice::OpenCode
+        }
+        (AgentChoice::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V2)) => {
+            AgentChoice::OpenCode2
+        }
+        (agent, None) => super::opencode_dialect::resolve_agent(agent, &child_env)?,
+        (agent, Some(_)) => agent,
+    };
+    let needs_inferred_url = args.server_url.is_none() && !config.server_url_configured();
+    let needs_inferred_token = args.auth_token.is_none() && config.auth.bearer_token.is_none();
+    let inferred = if needs_inferred_url || needs_inferred_token {
+        infer_installed_mcp_config(args.agent, mcp_config_path)?
     } else {
         None
     };
@@ -783,7 +813,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct InferredMcpConfig {
     hook_server_url: Option<String>,
     auth_token: Option<String>,
@@ -1193,7 +1223,10 @@ fn infer_first_toml_mcp_config(
     })
 }
 
-fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpConfig>> {
+fn infer_installed_mcp_config(
+    agent: AgentChoice,
+    config_path: Option<&Path>,
+) -> Result<Option<InferredMcpConfig>> {
     if agent == AgentChoice::Grok {
         let cwd = std::env::current_dir()
             .context("could not resolve current dir for Grok project configuration")?;
@@ -1208,7 +1241,10 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
     let Some(client) = mcp_client_for_agent(agent) else {
         return Ok(None);
     };
-    let path = install_mcp::mcp_config_path(client)?;
+    let path = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => install_mcp::mcp_config_path(client)?,
+    };
     if matches!(client, McpClient::Codex) {
         // An entry written before `install-mcp` honored CODEX_HOME still sits
         // in ~/.codex/config.toml; keep inferring from it until it is rewritten.
@@ -1235,16 +1271,7 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             "url",
         )),
         McpClient::Grok => infer_grok_mcp_config(&content),
-        McpClient::OpenCode => Ok(infer_json_mcp_config(
-            &content,
-            &["mcp", "ai-memory"],
-            "url",
-        )),
-        McpClient::OpenCode2 => Ok(infer_json_mcp_config(
-            &content,
-            &["mcp", "servers", "ai-memory"],
-            "url",
-        )),
+        McpClient::OpenCode | McpClient::OpenCode2 => infer_opencode_mcp_config(&content, client),
         McpClient::Cursor => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1421,16 +1448,36 @@ pub(crate) fn hook_config_target_with(
     }
 }
 
+fn infer_opencode_mcp_config(
+    content: &str,
+    selected: McpClient,
+) -> Result<Option<InferredMcpConfig>> {
+    Ok(
+        install_mcp::infer_owned_opencode_mcp_config(content, selected)?.map(|inferred| {
+            InferredMcpConfig {
+                hook_server_url: hook_server_url_from_mcp_url(&inferred.mcp_url),
+                auth_token: inferred.auth_token,
+            }
+        }),
+    )
+}
+
+fn json_value_at_path<'a>(
+    root: &'a serde_json::Value,
+    entry_path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    entry_path
+        .iter()
+        .try_fold(root, |entry, key| entry.get(*key))
+}
+
 fn infer_json_mcp_config(
     content: &str,
     entry_path: &[&str],
     url_key: &str,
 ) -> Option<InferredMcpConfig> {
     let root: serde_json::Value = serde_json::from_str(content).ok()?;
-    let mut entry = &root;
-    for key in entry_path {
-        entry = entry.get(*key)?;
-    }
+    let entry = json_value_at_path(&root, entry_path)?;
     let hook_server_url = entry
         .get(url_key)
         .and_then(|v| v.as_str())
@@ -3066,6 +3113,7 @@ fn apply_to_opencode_plugin(
     let body = build_opencode_plugin(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
+    remove_incompatible_opencode_plugin(&path, AgentChoice::OpenCode)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -3083,6 +3131,142 @@ fn apply_to_opencode_plugin(
         println!("new plugin to take effect.");
     }
     Ok(())
+}
+
+fn opencode_plugin_content_is_owned(content: &str, agent: AgentChoice) -> bool {
+    match agent {
+        AgentChoice::OpenCode => {
+            content.starts_with(
+                "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.",
+            ) && content.contains("const AGENT = \"open-code\";")
+        }
+        AgentChoice::OpenCode2 => {
+            content.starts_with(
+                "// Auto-generated by `ai-memory install-hooks --agent opencode2 --apply`.",
+            ) && content.contains("const AGENT = \"opencode2\";")
+        }
+        _ => false,
+    }
+}
+
+fn remove_incompatible_opencode_plugin(path: &Path, installed: AgentChoice) -> Result<()> {
+    remove_incompatible_opencode_plugin_with(path, installed, |_| Ok(()))
+}
+
+fn remove_incompatible_opencode_plugin_with(
+    path: &Path,
+    installed: AgentChoice,
+    after_quarantine: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let (installed_name, sibling_name) = match installed {
+        AgentChoice::OpenCode => ("ai-memory.ts", "ai-memory-opencode2.ts"),
+        AgentChoice::OpenCode2 => ("ai-memory-opencode2.ts", "ai-memory.ts"),
+        _ => return Ok(()),
+    };
+    if path.file_name().and_then(|name| name.to_str()) != Some(installed_name) {
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let sibling = parent.join(sibling_name);
+    let incompatible = match installed {
+        AgentChoice::OpenCode => AgentChoice::OpenCode2,
+        AgentChoice::OpenCode2 => AgentChoice::OpenCode,
+        _ => return Ok(()),
+    };
+    if sibling == path || !sibling.exists() {
+        return Ok(());
+    }
+    let quarantine = parent.join(format!(
+        ".ai-memory-opencode-quarantine-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::rename(&sibling, &quarantine).with_context(|| {
+        format!(
+            "quarantining incompatible plugin {} before ownership verification",
+            sibling.display()
+        )
+    })?;
+    if let Err(error) = after_quarantine(&sibling) {
+        restore_quarantined_opencode_plugin(&quarantine, &sibling)?;
+        return Err(error);
+    }
+    let content = fs::read_to_string(&quarantine);
+    if content
+        .as_deref()
+        .is_ok_and(|content| opencode_plugin_content_is_owned(content, incompatible))
+    {
+        fs::remove_file(&quarantine).with_context(|| {
+            format!(
+                "removing quarantined generated plugin {}",
+                quarantine.display()
+            )
+        })?;
+        println!(
+            "✓ removed incompatible generated plugin {}",
+            sibling.display()
+        );
+        return Ok(());
+    }
+    restore_quarantined_opencode_plugin(&quarantine, &sibling)?;
+    Ok(())
+}
+
+fn restore_quarantined_opencode_plugin(quarantine: &Path, sibling: &Path) -> Result<()> {
+    restore_quarantined_opencode_plugin_with(quarantine, sibling, || Ok(()))
+}
+
+fn restore_quarantined_opencode_plugin_with(
+    quarantine: &Path,
+    sibling: &Path,
+    before_restore: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    match fs::symlink_metadata(sibling) {
+        Ok(_) => {
+            warn_opencode_plugin_restore_conflict(quarantine, sibling);
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "checking {} before restoring user plugin; original preserved at {}",
+                    sibling.display(),
+                    quarantine.display()
+                )
+            });
+        }
+    }
+    before_restore()?;
+    match fs::hard_link(quarantine, sibling) {
+        Ok(()) => fs::remove_file(quarantine).with_context(|| {
+            format!(
+                "restored user plugin {} but could not remove its quarantine {}; both copies were preserved",
+                sibling.display(),
+                quarantine.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            warn_opencode_plugin_restore_conflict(quarantine, sibling);
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "restoring user plugin {} without replacing concurrent content; original preserved at {}",
+                sibling.display(),
+                quarantine.display()
+            )
+        }),
+    }
+}
+
+fn warn_opencode_plugin_restore_conflict(quarantine: &Path, sibling: &Path) {
+    eprintln!(
+        "[ai-memory] warning: {} changed during cleanup; preserved both it and the quarantined prior file {}",
+        sibling.display(),
+        quarantine.display()
+    );
 }
 
 fn render_opencode_plugin(
@@ -3118,13 +3302,11 @@ pub(crate) fn opencode2_plugin_path() -> anyhow::Result<std::path::PathBuf> {
 /// Generate an OpenCode 2.0 beta plugin at
 /// `~/.config/opencode/plugins/ai-memory-opencode2.ts`.
 ///
-/// The beta's plugin API (`Plugin.define({ id, setup })` with
-/// `ctx.session.hook` / `ctx.tool.hook` / `ctx.event.subscribe`) is
-/// incompatible with v1's function plugin, so the beta gets its own file.
-/// Both files share the one auto-loaded dir while the beta is side-by-side;
-/// a host may warn about its sibling's file (API mismatch) — that warning
-/// is benign, and `uninstall` removes each file only on its own ownership
-/// markers.
+/// The V2 plugin API (`{ id, setup }` with `ctx.session.hook` /
+/// `ctx.tool.hook` / `ctx.event.subscribe`) is incompatible with V1's function
+/// plugin, so V2 gets its own file. After a successful canonical write, an
+/// incompatible sibling is removed only when its exact ai-memory ownership
+/// markers match.
 fn apply_to_opencode2_plugin(
     server_url: &str,
     auth_token: Option<&str>,
@@ -3145,6 +3327,7 @@ fn apply_to_opencode2_plugin(
     )?;
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
+    remove_incompatible_opencode_plugin(&path, AgentChoice::OpenCode2)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -7762,19 +7945,20 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
 
     #[test]
     fn opencode_mcp_inference_supplies_hook_origin_and_token() {
-        let inferred = infer_json_mcp_config(
+        let inferred = infer_opencode_mcp_config(
             r#"{
               "mcp": {
                 "ai-memory": {
                   "type": "remote",
                   "url": "http://homelab:49374/mcp",
+                  "enabled": true,
                   "headers": { "Authorization": "Bearer secret-token" }
                 }
               }
             }"#,
-            &["mcp", "ai-memory"],
-            "url",
+            McpClient::OpenCode,
         )
+        .unwrap()
         .unwrap();
 
         assert_eq!(
@@ -7782,6 +7966,122 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             Some("http://homelab:49374")
         );
         assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn opencode_mcp_inference_follows_owned_entries_across_major_transitions() {
+        for (selected, content) in [
+            (
+                McpClient::OpenCode2,
+                r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer v1-token"}}}}"#,
+            ),
+            (
+                McpClient::OpenCode,
+                r#"{"mcp":{"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false,"headers":{"Authorization":"Bearer v2-token"}}}}}"#,
+            ),
+        ] {
+            let inferred = infer_opencode_mcp_config(content, selected)
+                .unwrap()
+                .unwrap();
+            let expected = if selected == McpClient::OpenCode2 {
+                ("http://v1-host:49374", "v1-token")
+            } else {
+                ("http://v2-host:49374", "v2-token")
+            };
+            assert_eq!(inferred.hook_server_url.as_deref(), Some(expected.0));
+            assert_eq!(inferred.auth_token.as_deref(), Some(expected.1));
+        }
+    }
+
+    #[test]
+    fn opencode_hook_install_reuses_owned_mcp_settings_across_major_transitions() {
+        for (agent, dialect, mcp_content, plugin_name, expected_server, expected_token) in [
+            (
+                AgentChoice::OpenCode2,
+                ai_memory_workstream::OpenCodeDialect::V2,
+                r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer v1-token"}}}}"#,
+                "ai-memory-opencode2.ts",
+                "http://v1-host:49374",
+                "v1-token",
+            ),
+            (
+                AgentChoice::OpenCode,
+                ai_memory_workstream::OpenCodeDialect::V1,
+                r#"{"mcp":{"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false,"headers":{"Authorization":"Bearer v2-token"}}}}}"#,
+                "ai-memory.ts",
+                "http://v2-host:49374",
+                "v2-token",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mcp = temp.path().join("opencode.json");
+            let plugin = temp.path().join(plugin_name);
+            fs::write(&mcp, mcp_content).unwrap();
+            let config = Config {
+                data_dir: temp.path().join("data"),
+                ..Config::default()
+            };
+            let mut args = default_hook_args();
+            args.agent = agent;
+            args.apply = true;
+            args.config_file = Some(plugin.clone());
+            args.server_url = None;
+            args.auth_token = None;
+
+            run_with_opencode_dialect_and_mcp_path(&config, args, Some(dialect), Some(&mcp))
+                .unwrap();
+
+            assert!(
+                fs::read_to_string(plugin)
+                    .unwrap()
+                    .contains(expected_server)
+            );
+            assert_eq!(
+                crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+                Some(expected_token)
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_mcp_inference_accepts_matching_owned_entries() {
+        let inferred = infer_opencode_mcp_config(
+            r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://same-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer same-token"}},"servers":{"ai-memory":{"type":"remote","url":"http://same-host:49374/mcp","oauth":false,"headers":{"Authorization":"Bearer same-token"}}}}}"#,
+            McpClient::OpenCode2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            inferred,
+            InferredMcpConfig {
+                hook_server_url: Some("http://same-host:49374".to_string()),
+                auth_token: Some("same-token".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn opencode_mcp_inference_rejects_conflicting_owned_entries() {
+        let error = infer_opencode_mcp_config(
+            r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true},"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false}}}}"#,
+            McpClient::OpenCode2,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting generated OpenCode MCP entries")
+        );
+    }
+
+    #[test]
+    fn opencode_mcp_inference_ignores_user_owned_entries() {
+        let inferred = infer_opencode_mcp_config(
+            r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://user-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer user-token","X-User":"route"}}}}"#,
+            McpClient::OpenCode,
+        )
+        .unwrap();
+        assert_eq!(inferred, None);
     }
 
     /// Inferring the hook URL from Kimi Code's flavored mcp.json entry
@@ -8852,6 +9152,169 @@ model = "gpt-5"
             health.oldest_age_ms.is_some(),
             "TS filename's 13-digit timestamp must be readable: {name}"
         );
+    }
+
+    #[test]
+    fn opencode_plugin_cleanup_removes_only_exact_owned_incompatible_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let v1 = temp.path().join("ai-memory.ts");
+        let v2 = temp.path().join("ai-memory-opencode2.ts");
+        fs::write(
+            &v1,
+            "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.\nconst AGENT = \"open-code\";\n",
+        )
+        .unwrap();
+        fs::write(
+            &v2,
+            "// Auto-generated by `ai-memory install-hooks --agent opencode2 --apply`.\nconst AGENT = \"opencode2\";\n",
+        )
+        .unwrap();
+
+        remove_incompatible_opencode_plugin(&v2, AgentChoice::OpenCode2).unwrap();
+        assert!(!v1.exists());
+        assert!(v2.exists());
+
+        fs::write(&v1, "export default function userPlugin() {}\n").unwrap();
+        remove_incompatible_opencode_plugin(&v2, AgentChoice::OpenCode2).unwrap();
+        assert_eq!(
+            fs::read_to_string(&v1).unwrap(),
+            "export default function userPlugin() {}\n"
+        );
+
+        fs::write(
+            &v2,
+            "// Auto-generated by `ai-memory install-hooks --agent opencode2 --apply`.\nconst AGENT = \"opencode2\";\n",
+        )
+        .unwrap();
+        remove_incompatible_opencode_plugin(&v1, AgentChoice::OpenCode).unwrap();
+        assert!(!v2.exists());
+    }
+
+    #[test]
+    fn opencode_plugin_cleanup_preserves_a_concurrent_user_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let v1 = temp.path().join("ai-memory.ts");
+        let v2 = temp.path().join("ai-memory-opencode2.ts");
+        fs::write(
+            &v1,
+            "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.\nconst AGENT = \"open-code\";\n",
+        )
+        .unwrap();
+
+        remove_incompatible_opencode_plugin_with(&v2, AgentChoice::OpenCode2, |sibling| {
+            fs::write(sibling, "export default function userReplacement() {}\n")?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&v1).unwrap(),
+            "export default function userReplacement() {}\n"
+        );
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("quarantine"))
+                .count(),
+            0,
+            "the quarantined generated file is deleted, never the replacement"
+        );
+    }
+
+    #[test]
+    fn opencode_plugin_restore_moves_quarantine_when_destination_is_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let sibling = temp.path().join("ai-memory.ts");
+        let quarantine = temp.path().join(".ai-memory-opencode-quarantine-test");
+        fs::write(&quarantine, "export default function original() {}\n").unwrap();
+
+        restore_quarantined_opencode_plugin_with(&quarantine, &sibling, || Ok(())).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&sibling).unwrap(),
+            "export default function original() {}\n"
+        );
+        assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn opencode_plugin_restore_preserves_an_existing_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let sibling = temp.path().join("ai-memory.ts");
+        let quarantine = temp.path().join(".ai-memory-opencode-quarantine-test");
+        fs::write(&quarantine, "export default function original() {}\n").unwrap();
+        fs::write(&sibling, "export default function replacement() {}\n").unwrap();
+
+        restore_quarantined_opencode_plugin_with(&quarantine, &sibling, || Ok(())).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&sibling).unwrap(),
+            "export default function replacement() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&quarantine).unwrap(),
+            "export default function original() {}\n"
+        );
+    }
+
+    #[test]
+    fn opencode_plugin_restore_does_not_replace_a_file_created_at_restore_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let sibling = temp.path().join("ai-memory.ts");
+        let quarantine = temp.path().join(".ai-memory-opencode-quarantine-test");
+        fs::write(&quarantine, "export default function original() {}\n").unwrap();
+
+        restore_quarantined_opencode_plugin_with(&quarantine, &sibling, || {
+            fs::write(&sibling, "export default function concurrent() {}\n")?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&sibling).unwrap(),
+            "export default function concurrent() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&quarantine).unwrap(),
+            "export default function original() {}\n"
+        );
+    }
+
+    #[test]
+    fn opencode_plugin_apply_is_byte_idempotent_after_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("ai-memory-opencode2.ts");
+        let sibling = temp.path().join("ai-memory.ts");
+        fs::write(
+            &sibling,
+            "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.\nconst AGENT = \"open-code\";\n",
+        )
+        .unwrap();
+        let mut args = default_hook_args();
+        args.agent = AgentChoice::OpenCode2;
+        args.config_file = Some(plugin.clone());
+
+        apply_to_opencode2_plugin("http://127.0.0.1:49374", None, &args, "denylist").unwrap();
+        let first = fs::read(&plugin).unwrap();
+        apply_to_opencode2_plugin("http://127.0.0.1:49374", None, &args, "denylist").unwrap();
+        assert_eq!(fs::read(&plugin).unwrap(), first);
+        assert!(!sibling.exists());
+    }
+
+    #[test]
+    fn opencode_plugin_cleanup_does_not_escape_custom_target_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let custom = temp.path().join("custom.ts");
+        let sibling = temp.path().join("ai-memory.ts");
+        fs::write(
+            &sibling,
+            "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.\nconst AGENT = \"open-code\";\n",
+        )
+        .unwrap();
+
+        remove_incompatible_opencode_plugin(&custom, AgentChoice::OpenCode2).unwrap();
+        assert!(sibling.exists());
     }
 
     #[test]
