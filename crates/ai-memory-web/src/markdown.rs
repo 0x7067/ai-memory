@@ -482,8 +482,7 @@ pub fn strip_leading_h1<'a>(body: &'a str, title: &str) -> &'a str {
         && !first_line.is_empty()
         && first_line.trim() == title
     {
-        let (second_line, after_second) =
-            after_first.split_once('\n').unwrap_or((after_first, ""));
+        let (second_line, after_second) = after_first.split_once('\n').unwrap_or((after_first, ""));
         let underline = second_line.trim_end_matches(['\r', ' ', '\t']);
         if !underline.is_empty() && underline.chars().all(|c| c == '=') {
             return after_second.trim_start_matches(['\n', '\r']);
