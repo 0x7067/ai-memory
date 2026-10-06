@@ -411,6 +411,12 @@ pub fn build_launch_plan_with_env_lookup(
         _ => None,
     });
     let mut expected = explicit_session_id(harness, &args);
+    for id in expected.as_deref().into_iter().chain(linked_session_id) {
+        ai_memory_core::NativeSessionIdentity::parse(id, &ai_memory_core::Sanitizer::builtin())?;
+    }
+    if harness == ManagedHarness::CommandCode {
+        expected = expected.filter(|value| Uuid::parse_str(value).is_ok());
+    }
     let mode = launch_mode(harness, &args);
     if mode == LaunchMode::Session
         && harness == ManagedHarness::KiroV3
@@ -619,6 +625,21 @@ pub fn apply_claude_true_yolo(harness: ManagedHarness, args: &mut Vec<OsString>)
 pub fn allows_native_session_adoption(harness: ManagedHarness, native_args: &[OsString]) -> bool {
     launch_mode(harness, native_args) == LaunchMode::Session
         && !has_native_session_selector(harness, native_args)
+        && !noninteractive_invocation(harness, native_args)
+}
+
+/// Whether a successful managed run represents an interactive session where
+/// follow-up choices may be offered in the parent terminal.
+///
+/// Explicit native session selectors remain interactive; this differs from
+/// [`allows_native_session_adoption`], which also rejects them because that
+/// function controls a separate prompt for choosing an existing session.
+#[must_use]
+pub fn is_interactive_session_invocation(
+    harness: ManagedHarness,
+    native_args: &[OsString],
+) -> bool {
+    launch_mode(harness, native_args) == LaunchMode::Session
         && !noninteractive_invocation(harness, native_args)
 }
 
@@ -1023,8 +1044,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // A bare `--session`/`--resume` opens the picker: `flag_value`
         // returns `None` when no value follows, as intended.
         ManagedHarness::Kimi => flag_value(args, &["--session", "-S", "--resume", "-r"]),
-        ManagedHarness::CommandCode => flag_value(args, &["--session", "--resume", "-r"])
-            .filter(|value| Uuid::parse_str(value).is_ok()),
+        ManagedHarness::CommandCode => flag_value(args, &["--session", "--resume", "-r"]),
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => flag_value(args, &["--resume-id"]),
         ManagedHarness::Grok => flag_value(args, &["--resume", "-r", "--session-id", "-s"]),
         // A bare `--continue` names no conversation: the id is only known
@@ -1869,6 +1889,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("major 3 is not supported"), "{error}");
+    }
+
+    #[test]
+    fn post_run_prompt_is_limited_to_interactive_session_invocations() {
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("resume"), OsString::from("chosen")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("exec"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--print"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Pi,
+            &[OsString::from("--no-session")]
+        ));
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--model"), OsString::from("opus")]
+        ));
     }
 
     #[test]
@@ -3422,5 +3466,58 @@ mod tests {
                 harness.as_str()
             );
         }
+    }
+
+    #[test]
+    fn native_identity_selector_rejects_original_before_resume_arguments() {
+        let bad = "sk-abcdefghijklmnopqrstuvwx";
+        for (args, linked) in [
+            (vec![OsString::from("resume"), OsString::from(bad)], None),
+            (Vec::new(), Some(bad)),
+        ] {
+            let result = build_launch_plan(ManagedHarness::Codex, None, args, linked);
+            assert!(
+                result.is_err(),
+                "selector must refuse dirty original identity"
+            );
+            assert!(!format!("{:#}", result.unwrap_err()).contains(bad));
+        }
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from(bad)],
+            None,
+        );
+        assert!(
+            command_code.is_err(),
+            "Command Code must check original privacy before UUID filtering"
+        );
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from(uuid)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(command_code.expected_session_id.as_deref(), Some(uuid));
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from("vendor-id")],
+            None,
+        )
+        .unwrap();
+        assert!(command_code.expected_session_id.is_none());
+        assert!(command_code.args.iter().any(|arg| arg == "vendor-id"));
+        let plan = build_launch_plan(
+            ManagedHarness::Codex,
+            None,
+            Vec::new(),
+            Some("vendor-界-01"),
+        )
+        .unwrap();
+        assert_eq!(plan.expected_session_id.as_deref(), Some("vendor-界-01"));
+        assert!(plan.args.iter().any(|arg| arg == "vendor-界-01"));
     }
 }

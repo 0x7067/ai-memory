@@ -107,6 +107,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -163,6 +164,7 @@ dependencies = [
  "axum",
  "git2",
  "jiff",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -277,6 +279,7 @@ dependencies = [
  "anyhow",
  "askama",
  "axum",
+ "base64 0.22.1",
  "jiff",
  "pulldown-cmark",
  "serde",

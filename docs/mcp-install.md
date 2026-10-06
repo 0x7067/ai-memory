@@ -1,5 +1,8 @@
 # MCP install guide - additional clients
 
+For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
+It shows direct MCP writes, queries and handoffs without a native hook adapter.
+
 > All snippets below default to `http://127.0.0.1:49374` (local server). For a
 > remote server (homelab, LAN box) substitute the appropriate URL AND add an
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
@@ -51,7 +54,8 @@ manual container/script extraction and explicit compatibility overrides.
 Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, Zed, and Muse Code are **MCP-only** here:
+Claude Desktop's ordinary Chat surface, VS Code Copilot, Zed, and Muse Code
+are **MCP-only** here:
 they expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
@@ -228,6 +232,62 @@ native HTTP or generated bridge paths.
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>
+
+---
+
+## GitHub Copilot CLI
+
+**Status:** MCP and lifecycle hooks are supported. Handoffs are not injected
+at `SessionStart` yet (see below), and there is no managed workstream
+(`ai-memory run copilot`).
+
+**Config files:** `$COPILOT_HOME/mcp-config.json` for MCP and
+`$COPILOT_HOME/hooks/ai-memory.json` for lifecycle hooks (`COPILOT_HOME`
+defaults to `~/.copilot`). Not to be confused with `--client vscode-copilot`
+(alias `copilot`), the VS Code agent-mode client below.
+
+```bash
+ai-memory install-mcp --client copilot-cli --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent copilot-cli --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer merges the documented remote entry into the root
+`mcpServers` map, preserving other servers (including your own `github`
+entry):
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+The equivalent interactive registration is `copilot mcp add --transport http
+ai-memory http://homelab:49374/mcp` (add `--header "Authorization: Bearer
+<token>"` when bearer auth is on). Copilot also reads project-level
+`.mcp.json` and `.github/mcp.json` files; pass that path via `--config-file` to
+write one, keeping in mind that `.github/mcp.json` is meant to be committed,
+so it should not carry a bearer token. `install-hooks --agent copilot-cli`
+run without `--server-url` reads the URL and token back from this entry.
+
+The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
+with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
+payload; native installs spool events locally and enforce capture exclusions.
+Copilot reads a top-level `additionalContext` from `SessionStart` stdout, not
+the `hookSpecificOutput` envelope ai-memory prints, so the prior session's
+handoff is recovered with `memory_handoff_list` and `memory_handoff_accept`.
+
+- Sources: <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers>,
+  <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>,
+  <https://docs.github.com/en/copilot/reference/hooks-reference>
 
 ---
 
@@ -473,9 +533,11 @@ stdio shim. Requires Node.js installed on the same machine.
   `.mcpb` desktop extensions. The ai-memory CLI manages the local
   JSON-config path because it works with localhost/LAN servers and does
   not require publishing an HTTPS connector.
-- Claude Desktop exposes MCP tools but no lifecycle hooks, so automatic
-  prompt/tool capture and session-boundary handoffs are not possible
-  unless Anthropic adds a desktop hook/plugin surface.
+- Claude Desktop's ordinary Chat surface exposes MCP tools but does not run
+  plugin lifecycle hooks, so ai-memory cannot automatically capture its
+  prompts/tools or inject session-boundary handoffs. Cowork is a distinct
+  surface: Anthropic documents that Cowork plugins can run hooks, but ai-memory
+  does not yet ship a Cowork plugin or claim its event/payload semantics.
 - If the MCP indicator doesn't appear after restart, check the logs:
   `~/Library/Logs/Claude/mcp*.log` (macOS). On Windows, check
   `%APPDATA%\Claude\logs\` for an unpackaged install or the corresponding
@@ -490,6 +552,7 @@ stdio shim. Requires Node.js installed on the same machine.
   pass `--config-file` pointed at the `LocalCache` path directly.
 - Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
   <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>,
+  <https://support.claude.com/en/articles/13837440-use-plugins-in-claude>,
   <https://learn.microsoft.com/en-us/windows/msix/msix-containerization-overview>
 
 ---

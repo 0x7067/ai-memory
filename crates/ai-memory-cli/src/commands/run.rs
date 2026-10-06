@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime};
 
 use ai_memory_core::{
     AgentKind, FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ManagedRunContextResponse, ManagedRunStatus, PrepareManagedRunRequest,
-    PrepareManagedRunResponse, SessionId,
+    ManagedRunContextResponse, ManagedRunStatus, NativeSessionIdentity, PrepareManagedRunRequest,
+    PrepareManagedRunResponse, Sanitizer, SessionId,
 };
 use ai_memory_workstream::{
     AmbiguousNativeSession, ExportedTranscript, FORWARDED_ENV_NAMES, JailChecklistItem,
@@ -19,14 +19,16 @@ use ai_memory_workstream::{
     build_launch_plan, build_launch_plan_with_env_lookup, claude_attached_background_session,
     claude_live_background_attach_id, claude_session_ran_in_background, clean_path,
     crush_global_config_path, discover_native_session, export_transcript,
-    has_native_session_selector, inside_ai_jail_here, inspect_repository, jail_checklist,
-    jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
-    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
-    kiro_v3_resume_uses_default_store, list_native_sessions, marked_choices, native_session_exists,
-    native_session_in_checkout, native_store_root, omp_profile_flag, omp_profile_flag_env,
-    parse_jail_toggles, store_override_vars, usable_ai_jail_here, wait_for_transcript_flush,
+    has_native_session_selector, inside_ai_jail_here, inspect_repository,
+    is_interactive_session_invocation, jail_checklist, jail_toggle, kiro_explicit_session_id,
+    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
+    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
+    marked_choices, native_session_exists, native_session_in_checkout, native_store_root,
+    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, store_override_vars,
+    usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
+use clap::ValueEnum as _;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -223,7 +225,7 @@ fn resolve_opencode_for_launch(
 /// Run one native harness and return its exact process exit code.
 pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let cwd = std::env::current_dir().context("getting managed run working directory")?;
-    run_from(config, args, &cwd).await
+    run_with_exit_prompt(config, args, &cwd).await
 }
 
 /// Run one native harness from an explicit checkout without changing the
@@ -252,6 +254,203 @@ pub(super) async fn run_from_with_wiring(
     cwd: &Path,
     wire_overrides: &super::run_autowire::WireOverrides,
 ) -> Result<i32> {
+    run_once_with_wiring(config, args, cwd, wire_overrides)
+        .await
+        .map(|outcome| outcome.exit_code)
+}
+
+#[derive(Debug)]
+struct RunOutcome {
+    exit_code: i32,
+    harness: ManagedHarness,
+    interactive_session: bool,
+    mode: LaunchMode,
+    workstream_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterRunAction {
+    Switch(RunHarnessChoice),
+    Rerun,
+    Quit,
+}
+
+async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    let interactive_terminal =
+        io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal();
+    let custom_executable = args.executable.is_some();
+    let mut next_args = args;
+    preserve_trailing_run_options(&mut next_args);
+
+    loop {
+        let outcome = run_once_with_wiring(
+            config,
+            next_args.clone(),
+            cwd,
+            &super::run_autowire::WireOverrides::default(),
+        )
+        .await?;
+        if !should_offer_after_run(&outcome, interactive_terminal, custom_executable) {
+            return Ok(outcome.exit_code);
+        }
+
+        let switch_env = EffectiveChildEnv::from_runtime(&config.runtime_env);
+        let available = available_switch_harnesses(outcome.harness, &switch_env);
+        let action = {
+            let stdin = io::stdin();
+            let stderr = io::stderr();
+            choose_after_run(
+                outcome.harness,
+                &outcome.workstream_name,
+                &available,
+                &mut stdin.lock(),
+                &mut stderr.lock(),
+            )
+        };
+        let action = match action {
+            Ok(action) => action,
+            Err(error) => {
+                eprintln!("ai-memory: could not read the post-run choice ({error}); exiting");
+                return Ok(outcome.exit_code);
+            }
+        };
+        if !apply_after_run_action(&mut next_args, &outcome, action) {
+            return Ok(outcome.exit_code);
+        }
+    }
+}
+
+fn should_offer_after_run(
+    outcome: &RunOutcome,
+    interactive_terminal: bool,
+    custom_executable: bool,
+) -> bool {
+    outcome.exit_code == 0
+        && outcome.mode == LaunchMode::Session
+        && outcome.interactive_session
+        && interactive_terminal
+        && !custom_executable
+}
+
+fn preserve_trailing_run_options(args: &mut RunArgs) {
+    args.yolo |= remove_wrapper_yolo(&mut args.native_args);
+    args.true_yolo |= remove_wrapper_true_yolo(&mut args.native_args);
+    args.no_autowire |= remove_wrapper_no_autowire(&mut args.native_args);
+    let trailing_jail = remove_wrapper_jail(&mut args.native_args);
+    if trailing_jail.jail.is_some() {
+        args.jail = trailing_jail.jail;
+    }
+    args.no_jail |= trailing_jail.no_jail;
+}
+
+fn available_switch_harnesses(
+    current: ManagedHarness,
+    env: &EffectiveChildEnv,
+) -> Vec<RunHarnessChoice> {
+    let search = env.executable_search();
+    RunHarnessChoice::value_variants()
+        .iter()
+        .copied()
+        .filter(|choice| {
+            managed_harness(*choice).agent_kind() != current.agent_kind()
+                && harness_available(*choice, search)
+        })
+        .collect()
+}
+
+fn choose_after_run(
+    current: ManagedHarness,
+    workstream_name: &str,
+    available: &[RunHarnessChoice],
+    input: &mut impl io::BufRead,
+    output: &mut impl io::Write,
+) -> io::Result<AfterRunAction> {
+    writeln!(
+        output,
+        "ai-memory: {} exited successfully in workstream '{}'.",
+        current.as_str(),
+        workstream_name
+    )?;
+    for (index, choice) in available.iter().enumerate() {
+        writeln!(
+            output,
+            "  {}) switch to {}",
+            index + 1,
+            managed_harness(*choice).as_str()
+        )?;
+    }
+    writeln!(output, "  r) run {} again", current.as_str())?;
+    writeln!(output, "  q) quit (default)")?;
+
+    loop {
+        write!(output, "Select [q]: ")?;
+        output.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(AfterRunAction::Quit);
+        }
+        let choice = line.trim();
+        if choice.is_empty() || choice.eq_ignore_ascii_case("q") || choice == "0" {
+            return Ok(AfterRunAction::Quit);
+        }
+        if choice.eq_ignore_ascii_case("r") {
+            return Ok(AfterRunAction::Rerun);
+        }
+        if let Ok(index) = choice.parse::<usize>()
+            && let Some(harness) = index.checked_sub(1).and_then(|i| available.get(i))
+        {
+            return Ok(AfterRunAction::Switch(*harness));
+        }
+        writeln!(output, "Choose a listed number, r, or q.")?;
+    }
+}
+
+fn apply_after_run_action(
+    args: &mut RunArgs,
+    outcome: &RunOutcome,
+    action: AfterRunAction,
+) -> bool {
+    let choice = match action {
+        AfterRunAction::Quit => return false,
+        AfterRunAction::Switch(choice) => choice,
+        AfterRunAction::Rerun => run_harness_choice(outcome.harness),
+    };
+    args.harness = Some(choice);
+    args.native_args =
+        if action == AfterRunAction::Rerun && outcome.harness == ManagedHarness::KiroV3 {
+            vec![OsString::from("--v3")]
+        } else {
+            Vec::new()
+        };
+    args.workstream = Some(outcome.workstream_name.clone());
+    args.new_workstream = None;
+    args.fresh = false;
+    true
+}
+
+const fn run_harness_choice(harness: ManagedHarness) -> RunHarnessChoice {
+    match harness {
+        ManagedHarness::Claude => RunHarnessChoice::Claude,
+        ManagedHarness::Codex => RunHarnessChoice::Codex,
+        ManagedHarness::OpenCode => RunHarnessChoice::OpenCode,
+        ManagedHarness::OpenCode2 => RunHarnessChoice::OpenCode2,
+        ManagedHarness::Pi => RunHarnessChoice::Pi,
+        ManagedHarness::Crush => RunHarnessChoice::Crush,
+        ManagedHarness::Omp => RunHarnessChoice::Omp,
+        ManagedHarness::Kimi => RunHarnessChoice::Kimi,
+        ManagedHarness::CommandCode => RunHarnessChoice::CommandCode,
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => RunHarnessChoice::Kiro,
+        ManagedHarness::Grok => RunHarnessChoice::Grok,
+        ManagedHarness::Antigravity => RunHarnessChoice::Antigravity,
+    }
+}
+
+async fn run_once_with_wiring(
+    config: &Config,
+    args: RunArgs,
+    cwd: &Path,
+    wire_overrides: &super::run_autowire::WireOverrides,
+) -> Result<RunOutcome> {
     let repository = inspect_repository(cwd)?;
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
@@ -274,8 +473,19 @@ pub(super) async fn run_from_with_wiring(
     let force_fresh = args.fresh || trailing_fresh;
     let force_unlock = args.force_unlock || trailing_force_unlock;
     let no_autowire = args.no_autowire || trailing_no_autowire;
-    let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
-        .context("resolving --env/--env-file for the managed run")?;
+    let profile = args
+        .profile
+        .as_deref()
+        .map(|name| {
+            config
+                .run
+                .profiles
+                .get(name)
+                .ok_or_else(|| unknown_run_profile(&config.run, name))
+        })
+        .transpose()?;
+    let run_env = resolve_run_env(profile, args.env_file.as_deref(), &args.env)
+        .context("resolving --profile/--env-file/--env for the managed run")?;
     let child_env = EffectiveChildEnv::with_overrides(&config.runtime_env, &run_env);
     let executable_search = child_env.executable_search();
     if automatic_harness && !native_args.is_empty() {
@@ -417,6 +627,9 @@ pub(super) async fn run_from_with_wiring(
             return Err(error);
         }
     };
+    if let Some(warning) = prepared.manifest_warning.as_deref() {
+        eprintln!("ai-memory: warning: {warning}");
+    }
     if let Err(error) = super::project_registry::record_prepared_checkout(
         config,
         &endpoint,
@@ -445,6 +658,10 @@ pub(super) async fn run_from_with_wiring(
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
         )));
+    }
+    let privacy = acquired_try!(Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from));
+    if let Some(id) = prepared.native_session_id.as_deref() {
+        acquired_try!(NativeSessionIdentity::parse(id, &privacy).map_err(anyhow::Error::from));
     }
     let resolved_harness = if automatic_harness {
         let resolved = prepared.resolved_agent.unwrap_or_else(|| {
@@ -523,6 +740,7 @@ pub(super) async fn run_from_with_wiring(
         &repository.cwd,
         &child_env,
     ));
+    let interactive_session = is_interactive_session_invocation(harness, &native_args);
     let resumes_linked_session = !force_fresh
         && orphaned_session.is_none()
         && prepared.native_session_id.is_some()
@@ -664,6 +882,13 @@ pub(super) async fn run_from_with_wiring(
     if yolo_modes.claude_true_yolo && harness == ManagedHarness::Claude {
         apply_claude_true_yolo(harness, &mut plan.args);
     }
+    let planned_native_identity = acquired_try!(
+        plan.expected_session_id
+            .as_deref()
+            .map(|id| NativeSessionIdentity::parse(id, &privacy))
+            .transpose()
+            .map_err(anyhow::Error::from)
+    );
     let remove_kiro_home = if harness == ManagedHarness::KiroV3
         && let Some(native_session_id) = plan.expected_session_id.as_deref()
     {
@@ -708,6 +933,7 @@ pub(super) async fn run_from_with_wiring(
             wire_overrides,
             &wire_env,
             &wire_child_env,
+            &repository.cwd,
         );
     }
     // A Kiro v3 resume that dropped `KIRO_HOME` runs against the default store.
@@ -722,20 +948,26 @@ pub(super) async fn run_from_with_wiring(
         },
     );
     if plan.mode == LaunchMode::Session
-        && let Some(native_session_id) = &plan.expected_session_id
+        && let Some(native_identity) = &planned_native_identity
     {
         acquired_try!(
             post_json_no_content(
                 &endpoint,
                 &format!("{run_path}/link"),
                 &LinkManagedRunRequest {
-                    native_session_id: native_session_id.clone(),
+                    native_session_id: native_identity.as_str().to_owned(),
                 },
             )
             .await
             .context("linking the managed native session; the agent was not started")
         );
-        remember_session_store(config, &endpoint, harness, native_session_id, &linked_store);
+        remember_session_store(
+            config,
+            &endpoint,
+            harness,
+            native_identity.as_str(),
+            &linked_store,
+        );
     }
     // Claude refuses `--resume` on a background session that is still running
     // and points at `claude attach`, so open it that way instead. The 2.1.288
@@ -909,6 +1141,7 @@ pub(super) async fn run_from_with_wiring(
         &home,
         &repository.cwd,
         server_status.as_ref(),
+        &privacy,
     ) {
         Ok(own) => own,
         Err(error) => {
@@ -938,6 +1171,7 @@ pub(super) async fn run_from_with_wiring(
             &repository.cwd,
             started_at,
             server_status.as_ref(),
+            &privacy,
         )
         .await
     );
@@ -970,6 +1204,7 @@ pub(super) async fn run_from_with_wiring(
             transcript,
             checkpoint,
             Some(exit_code),
+            &privacy,
         )
         .await
     );
@@ -1021,7 +1256,13 @@ pub(super) async fn run_from_with_wiring(
             ),
         }
     }
-    Ok(exit_code)
+    Ok(RunOutcome {
+        exit_code,
+        harness,
+        interactive_session,
+        mode: plan.mode,
+        workstream_name: prepared.workstream_name,
+    })
 }
 
 /// How long finalizing may hold up the harness's exit code.
@@ -1628,12 +1869,15 @@ fn own_native_session(
     home: &Path,
     cwd: &Path,
     server_status: Option<&ManagedRunStatus>,
+    sanitizer: &Sanitizer,
 ) -> Result<Option<String>> {
     if plan.mode == LaunchMode::Passthrough {
         return Ok(None);
     }
     if let Some(native_session_id) = &plan.expected_session_id {
-        return Ok(Some(native_session_id.clone()));
+        return Ok(Some(
+            NativeSessionIdentity::parse(native_session_id, sanitizer)?.into_string(),
+        ));
     }
     let Some(linked) = server_status
         .filter(|status| status.native_session_linked)
@@ -1641,6 +1885,8 @@ fn own_native_session(
     else {
         return Ok(None);
     };
+    let linked = NativeSessionIdentity::parse(linked, sanitizer)?;
+    let linked = linked.as_str();
     let in_checkout =
         native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
             .with_context(|| format!("reading native session {linked}"))?;
@@ -1688,6 +1934,7 @@ fn follow_claude_background_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_native_session_after_run(
     plan: &LaunchPlan,
     harness: ManagedHarness,
@@ -1695,11 +1942,15 @@ async fn resolve_native_session_after_run(
     cwd: &Path,
     started_at: SystemTime,
     server_status: Option<&ManagedRunStatus>,
+    sanitizer: &Sanitizer,
 ) -> Result<Option<String>> {
     if plan.mode == LaunchMode::Passthrough {
         return Ok(None);
     }
-    if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status) {
+    if let Some(id) = server_status.and_then(|status| status.native_session_id.as_deref()) {
+        NativeSessionIdentity::parse(id, sanitizer)?;
+    }
+    if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status, sanitizer) {
         return Ok(Some(follow_claude_background_session(
             plan, harness, home, cwd, own, started_at,
         )));
@@ -1731,11 +1982,17 @@ async fn resolve_native_session_after_run(
     };
     // A linked session `own_native_session` rejected (not in this checkout,
     // or its native store could not be read) is no fallback either.
-    Ok(discovered.or_else(|| {
+    let resolved = discovered.or_else(|| {
         server_status
             .and_then(|status| status.native_session_id.clone())
             .filter(|reported| Some(reported.as_str()) != linked)
-    }))
+    });
+    Ok(resolved
+        .as_deref()
+        .map(|id| {
+            NativeSessionIdentity::parse(id, sanitizer).map(NativeSessionIdentity::into_string)
+        })
+        .transpose()?)
 }
 
 async fn list_auto_sessions(
@@ -1981,15 +2238,41 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+/// The error for a `--profile` name `config.toml` does not define: it names
+/// the profiles that do exist, or, with none defined, prints a table to paste.
+fn unknown_run_profile(run: &crate::config::RunSettings, name: &str) -> anyhow::Error {
+    if !run.profiles.is_empty() {
+        let known = run.profiles.keys().map(String::as_str).collect::<Vec<_>>();
+        return anyhow!(
+            "unknown run profile {name:?}; defined profiles: {}",
+            known.join(", ")
+        );
+    }
+    // Quoted when needed: a valid profile name may contain `.`, which a bare
+    // TOML key would split into nested tables.
+    let key = toml_edit::Key::new(name);
+    anyhow!(
+        "unknown run profile {name:?}; none are defined. Add to your config.toml:\n\n  \
+         [run.profiles.{}.env]\n  CLAUDE_CONFIG_DIR = \"/absolute/path\"",
+        key.display_repr()
+    )
+}
+
 /// Merge `--env-file` lines with `--env` entries into the final key/value
 /// list applied to the spawned harness, preserving file order but letting a
 /// `--env` entry override a same-key `--env-file` line. Values are taken
 /// literally; neither source is expanded or interpreted.
 fn resolve_run_env(
+    profile: Option<&crate::config::RunProfile>,
     env_file: Option<&Path>,
     env_args: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
     let mut merged: Vec<(String, String)> = Vec::new();
+    if let Some(profile) = profile {
+        for (key, value) in &profile.env {
+            upsert_env(&mut merged, key.clone(), value.clone());
+        }
+    }
     if let Some(path) = env_file {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading --env-file {}", path.display()))?;
@@ -2090,6 +2373,9 @@ fn build_preflighted_launch_plan(
     cwd: &Path,
     env: &EffectiveChildEnv,
 ) -> Result<(LaunchPlan, Option<String>)> {
+    if let Some(id) = linked_session_id {
+        NativeSessionIdentity::parse(id, &Sanitizer::builtin())?;
+    }
     let explicit_selector = has_native_session_selector(harness, &native_args);
     if force_fresh && explicit_selector {
         return Err(anyhow!(
@@ -2230,7 +2516,7 @@ fn store_mismatch_error(
         format!(" with the same {selectors}")
     };
     Some(anyhow!(
-        "linked {} session {} was launched under {} but this launch resolves {}; relaunch{hint} to resume it, or pass --fresh to start a new session",
+        "linked {} session {} was launched under {} but this launch resolves {}; relaunch{hint} (or the same `ai-memory run --profile`) to resume it, or pass --fresh to start a new session",
         harness.as_str(),
         display_session_id(native_session_id),
         super::show::terminal_text(&recorded.to_string_lossy()),
@@ -2729,13 +3015,20 @@ async fn import_batches(
     transcript: ExportedTranscript,
     checkpoint: ai_memory_core::WorkstreamCheckpoint,
     exit_code: Option<i32>,
+    sanitizer: &Sanitizer,
 ) -> Result<usize> {
+    let native_identity = nonempty_session(&transcript.native_session_id)
+        .map(|id| NativeSessionIdentity::parse(&id, sanitizer))
+        .transpose()?;
+    for event in &transcript.events {
+        NativeSessionIdentity::parse(&event.native_session_id, sanitizer)?;
+    }
     let mut imported = 0;
     let mut batches = event_batches(transcript.events).into_iter().peekable();
     while let Some(batch) = batches.next() {
         let complete = batches.peek().is_none();
         let request = FinishManagedRunRequest {
-            native_session_id: nonempty_session(&transcript.native_session_id),
+            native_session_id: native_identity.as_ref().map(|id| id.as_str().to_owned()),
             source_cursor: complete.then(|| transcript.source_cursor.clone()).flatten(),
             events: batch,
             complete,
@@ -2794,6 +3087,50 @@ async fn finish_with_retry(
         .context("persisting the managed transcript; the native process has already exited")
 }
 
+struct PrepareRunOutcome {
+    result: Result<PrepareManagedRunResponse>,
+    manifest_warning: Option<ai_memory_core::repository_identity::ManifestWarning>,
+}
+
+impl PrepareRunOutcome {
+    fn from_result(result: Result<PrepareManagedRunResponse>) -> Self {
+        let manifest_warning = match &result {
+            Ok(response) => response.manifest_warning.clone(),
+            Err(error) => server_manifest_warning(error),
+        };
+        Self {
+            result,
+            manifest_warning,
+        }
+    }
+
+    fn prefer_warning(
+        mut self,
+        first: Option<ai_memory_core::repository_identity::ManifestWarning>,
+    ) -> Self {
+        self.manifest_warning = first.or(self.manifest_warning);
+        self
+    }
+}
+
+fn complete_prepare_run(
+    outcome: PrepareRunOutcome,
+    output: &mut impl io::Write,
+) -> Result<PrepareManagedRunResponse> {
+    match outcome.result {
+        Ok(mut response) => {
+            response.manifest_warning = outcome.manifest_warning.or(response.manifest_warning);
+            Ok(response)
+        }
+        Err(error) => {
+            if let Some(warning) = outcome.manifest_warning {
+                let _ = writeln!(output, "ai-memory: warning: {warning}");
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn prepare_managed_run(
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
@@ -2801,15 +3138,16 @@ async fn prepare_managed_run(
     interrupted: &CancellationToken,
 ) -> Result<PrepareManagedRunResponse> {
     if request.force_unlock {
-        return match post_json(endpoint, "/workstream/runs", request).await {
+        let result = match post_json(endpoint, "/workstream/runs", request).await {
             Err(error) if is_active_workstream_conflict(&error) => Err(error.context(
                 "--force-unlock was refused: the active lease belongs to another operator, or \
                  the server does not support forced lease recovery",
             )),
             other => other,
         };
+        return complete_prepare_run(PrepareRunOutcome::from_result(result), &mut io::stderr());
     }
-    let result = prepare_managed_run_with_retry(
+    let outcome = prepare_managed_run_with_retry(
         endpoint,
         request,
         PREPARE_BUSY_RETRY_WINDOW,
@@ -2817,22 +3155,22 @@ async fn prepare_managed_run(
         true,
     )
     .await;
-    match result {
+    let outcome = if interactive && outcome.result.is_err() {
         // Scripts, hooks, and CI keep the short window: they must never hang
         // silently for up to a full lease.
-        Err(error) if interactive => {
-            wait_out_held_lease(
-                endpoint,
-                request,
-                error,
-                interrupted,
-                HELD_LEASE_EXPIRY_SLACK,
-                PREPARE_BUSY_RETRY_WINDOW,
-            )
-            .await
-        }
-        other => other,
-    }
+        wait_out_held_lease(
+            endpoint,
+            request,
+            outcome,
+            interrupted,
+            HELD_LEASE_EXPIRY_SLACK,
+            PREPARE_BUSY_RETRY_WINDOW,
+        )
+        .await
+    } else {
+        outcome
+    };
+    complete_prepare_run(outcome, &mut io::stderr())
 }
 
 /// After the quick retry window, an interactive launch waits out a lease left
@@ -2844,16 +3182,32 @@ async fn prepare_managed_run(
 async fn wait_out_held_lease(
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
-    error: anyhow::Error,
+    outcome: PrepareRunOutcome,
     interrupted: &CancellationToken,
     slack: Duration,
     retry_window: Duration,
-) -> Result<PrepareManagedRunResponse> {
+) -> PrepareRunOutcome {
+    let PrepareRunOutcome {
+        result,
+        manifest_warning,
+    } = outcome;
+    let Err(error) = result else {
+        return PrepareRunOutcome {
+            result,
+            manifest_warning,
+        };
+    };
     let Some(held) = held_lease(&error) else {
-        return Err(error);
+        return PrepareRunOutcome {
+            result: Err(error),
+            manifest_warning,
+        };
     };
     let Some(wait) = held_lease_wait(held.expires, jiff::Timestamp::now(), slack) else {
-        return Err(error);
+        return PrepareRunOutcome {
+            result: Err(error),
+            manifest_warning,
+        };
     };
     eprintln!(
         "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
@@ -2866,11 +3220,14 @@ async fn wait_out_held_lease(
     tokio::select! {
         biased;
         () = interrupted.cancelled() => {
-            return Err(error.context("interrupted while waiting for the workstream lease to lapse"));
+            return PrepareRunOutcome {
+                result: Err(error.context("interrupted while waiting for the workstream lease to lapse")),
+                manifest_warning,
+            };
         }
         () = tokio::time::sleep(wait) => {}
     }
-    match prepare_managed_run_with_retry(
+    let retry = prepare_managed_run_with_retry(
         endpoint,
         request,
         retry_window,
@@ -2878,12 +3235,19 @@ async fn wait_out_held_lease(
         false,
     )
     .await
-    {
-        Err(retry) if held_lease(&retry).is_some() => Err(retry.context(
-            "the workstream is still held: its owner renewed the lease, so another launcher \
-             is running there; stop it, or pass `--new <name>` for a separate workstream",
-        )),
-        other => other,
+    .prefer_warning(manifest_warning);
+    match retry.result {
+        Err(error) if held_lease(&error).is_some() => PrepareRunOutcome {
+            result: Err(error.context(
+                "the workstream is still held: its owner renewed the lease, so another launcher \
+                 is running there; stop it, or pass `--new <name>` for a separate workstream",
+            )),
+            manifest_warning: retry.manifest_warning,
+        },
+        result => PrepareRunOutcome {
+            result,
+            manifest_warning: retry.manifest_warning,
+        },
     }
 }
 
@@ -2927,16 +3291,23 @@ async fn prepare_managed_run_with_retry(
     retry_window: Duration,
     retry_interval: Duration,
     announce_wait: bool,
-) -> Result<PrepareManagedRunResponse> {
+) -> PrepareRunOutcome {
     let deadline = tokio::time::Instant::now() + retry_window;
     let mut reported_wait = !announce_wait;
+    let mut manifest_warning = None;
     loop {
         match post_json(endpoint, "/workstream/runs", request).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                return PrepareRunOutcome::from_result(Ok(response))
+                    .prefer_warning(manifest_warning);
+            }
             Err(error)
                 if is_active_workstream_conflict(&error)
                     && tokio::time::Instant::now() < deadline =>
             {
+                if manifest_warning.is_none() {
+                    manifest_warning = server_manifest_warning(&error);
+                }
                 if !reported_wait {
                     eprintln!(
                         "ai-memory: another launcher owns this workstream; waiting briefly in case it is finalizing"
@@ -2945,13 +3316,26 @@ async fn prepare_managed_run_with_retry(
                 }
                 tokio::time::sleep(retry_interval).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return PrepareRunOutcome::from_result(Err(error)).prefer_warning(manifest_warning);
+            }
         }
     }
 }
 
 fn is_active_workstream_conflict(error: &anyhow::Error) -> bool {
     active_workstream_conflict_message(error).is_some()
+}
+
+fn server_manifest_warning(
+    error: &anyhow::Error,
+) -> Option<ai_memory_core::repository_identity::ManifestWarning> {
+    let response = error.downcast_ref::<ServerResponseError>()?;
+    serde_json::from_str::<ai_memory_core::repository_identity::ManifestWarningContext>(
+        response.body(),
+    )
+    .ok()?
+    .manifest_warning
 }
 
 fn active_workstream_conflict_message(error: &anyhow::Error) -> Option<String> {
@@ -3168,7 +3552,7 @@ mod tests {
     }
 
     fn parse_run(argv: &[&str]) -> RunArgs {
-        let CliCommand::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+        let CliCommand::Run(args) = crate::cli::try_parse_from(argv).unwrap().command else {
             panic!("expected run command");
         };
         args
@@ -3480,6 +3864,163 @@ mod tests {
         );
         let printed = String::from_utf8(output).unwrap();
         assert!(printed.contains("ai-jail is installed. Re-run this session inside it? [Y/n]"));
+    }
+
+    fn run_args_for_after_run_test() -> RunArgs {
+        RunArgs {
+            workspace: Some("work".into()),
+            project: Some("repo".into()),
+            workstream: None,
+            new_workstream: Some("initial".into()),
+            executable: None,
+            yolo: true,
+            true_yolo: true,
+            jail: None,
+            no_jail: true,
+            fresh: true,
+            force_unlock: false,
+            no_autowire: true,
+            profile: Some("work".into()),
+            env: vec![("MODEL_HOME".into(), "custom".into())],
+            env_file: None,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: vec![OsString::from("--model"), OsString::from("opus")],
+        }
+    }
+
+    #[test]
+    fn post_run_choice_defaults_to_quit_and_lists_same_workstream_actions() {
+        let mut input = Cursor::new(b"\n");
+        let mut output = Vec::new();
+        let action = choose_after_run(
+            ManagedHarness::Claude,
+            "research",
+            &[RunHarnessChoice::Codex],
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(action, AfterRunAction::Quit);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("workstream 'research'"));
+        assert!(output.contains("1) switch to codex"));
+        assert!(output.contains("r) run claude again"));
+        assert!(output.contains("q) quit (default)"));
+    }
+
+    #[test]
+    fn post_run_choice_selects_an_installed_harness_by_number() {
+        let mut input = Cursor::new(b"1\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            choose_after_run(
+                ManagedHarness::Claude,
+                "research",
+                &[RunHarnessChoice::Codex],
+                &mut input,
+                &mut output,
+            )
+            .unwrap(),
+            AfterRunAction::Switch(RunHarnessChoice::Codex)
+        );
+    }
+
+    #[test]
+    fn trailing_wrapper_options_survive_the_post_run_menu() {
+        let mut args = run_args_for_after_run_test();
+        args.yolo = false;
+        args.true_yolo = false;
+        args.jail = None;
+        args.no_jail = false;
+        args.no_autowire = false;
+        args.native_args.extend([
+            OsString::from("--yolo"),
+            OsString::from("--true-yolo"),
+            OsString::from("--jail=github,no-mise"),
+            OsString::from("--no-autowire"),
+        ]);
+
+        preserve_trailing_run_options(&mut args);
+        assert!(args.yolo);
+        assert!(args.true_yolo);
+        assert_eq!(args.jail.as_deref(), Some("github,no-mise"));
+        assert!(!args.no_jail);
+        assert!(args.no_autowire);
+        assert_eq!(
+            args.native_args,
+            [OsString::from("--model"), OsString::from("opus")]
+        );
+    }
+
+    #[test]
+    fn post_run_actions_reuse_the_workstream_without_replaying_native_args() {
+        let mut args = run_args_for_after_run_test();
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+        };
+
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Switch(RunHarnessChoice::Codex)
+        ));
+        assert_eq!(args.harness, Some(RunHarnessChoice::Codex));
+        assert_eq!(args.workstream.as_deref(), Some("research"));
+        assert_eq!(args.new_workstream, None);
+        assert!(!args.fresh);
+        assert!(args.native_args.is_empty());
+        assert!(args.yolo);
+        assert!(args.true_yolo);
+        assert!(args.no_jail);
+        assert!(args.no_autowire);
+        assert_eq!(args.env, [("MODEL_HOME".into(), "custom".into())]);
+    }
+
+    #[test]
+    fn rerunning_kiro_v3_keeps_its_engine_without_replaying_user_args() {
+        let mut args = run_args_for_after_run_test();
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::KiroV3,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+        };
+
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Rerun
+        ));
+        assert_eq!(args.harness, Some(RunHarnessChoice::Kiro));
+        assert_eq!(args.native_args, [OsString::from("--v3")]);
+        assert_eq!(args.workstream.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn post_run_prompt_requires_clean_interactive_managed_session_without_custom_binary() {
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+        };
+        assert!(should_offer_after_run(&outcome, true, false));
+        assert!(!should_offer_after_run(&outcome, false, false));
+        assert!(!should_offer_after_run(&outcome, true, true));
+
+        let mut failed = outcome;
+        failed.exit_code = 1;
+        assert!(!should_offer_after_run(&failed, true, false));
+        failed.exit_code = 0;
+        failed.mode = LaunchMode::Passthrough;
+        assert!(!should_offer_after_run(&failed, true, false));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3865,6 +4406,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                     .into_response()
                 }
@@ -3906,11 +4448,162 @@ mod tests {
             true,
         )
         .await
+        .result
         .unwrap();
 
         assert_eq!(prepared.workstream_name, "default");
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn busy_retry_keeps_first_warning_and_final_error_unchanged() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move || {
+                let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let until = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60);
+                    match attempt {
+                        0 => (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": format!(
+                                    "workstream is already active: owned by first until {until}"
+                                ),
+                                "manifest_warning": "first repair warning"
+                            })),
+                        )
+                            .into_response(),
+                        1 => (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": format!(
+                                    "workstream is already active: owned by second until {until}"
+                                )
+                            })),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({
+                                "error": "final missing workstream",
+                                "manifest_warning": "later repair warning"
+                            })),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let outcome = prepare_managed_run_with_retry(
+            &endpoint,
+            &held_lease_request(),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            false,
+        )
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            outcome.manifest_warning.as_deref(),
+            Some("first repair warning"),
+            "the first warning wins over a later distinct warning"
+        );
+
+        let mut output = Vec::new();
+        let error = complete_prepare_run(outcome, &mut output).expect_err("final 404 is preserved");
+        let response = error.downcast_ref::<ServerResponseError>().unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(response.body().contains("final missing workstream"));
+        assert!(response.body().contains("later repair warning"));
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "ai-memory: warning: first repair warning\n"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn busy_retry_returns_first_warning_with_later_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move || {
+                let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        let until = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60);
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": format!(
+                                    "workstream is already active: owned by first until {until}"
+                                ),
+                                "manifest_warning": "first repair warning"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: Some(AgentKind::Codex),
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                        manifest_warning: None,
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let outcome = prepare_managed_run_with_retry(
+            &endpoint,
+            &held_lease_request(),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            false,
+        )
+        .await;
+        let mut output = Vec::new();
+        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            response.manifest_warning.as_deref(),
+            Some("first repair warning")
+        );
+        assert!(
+            output.is_empty(),
+            "success returns the warning for one caller print"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn managed_run_error_extracts_manifest_warning() {
+        let error = crate::http_client::server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": "managed workstream 'missing' not found",
+                "manifest_warning": "project name promotion committed; repair needed"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            server_manifest_warning(&error).as_deref(),
+            Some("project name promotion committed; repair needed")
+        );
     }
 
     #[test]
@@ -3984,6 +4677,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                     .into_response()
                 }
@@ -4034,12 +4728,13 @@ mod tests {
         let prepared = wait_out_held_lease(
             &endpoint,
             &request,
-            first,
+            PrepareRunOutcome::from_result(Err(first)),
             &CancellationToken::new(),
             Duration::ZERO,
             Duration::from_millis(50),
         )
         .await
+        .result
         .expect("proceeds once the lease lapsed");
         assert_eq!(prepared.workstream_name, "default");
         assert!(
@@ -4047,6 +4742,42 @@ mod tests {
             "it waited for the expiry"
         );
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_out_keeps_the_initial_warning_through_a_successful_retry() {
+        let (app, attempts) = held_lease_server(0, Duration::ZERO);
+        let (endpoint, server) = serve(app).await;
+        let request = held_lease_request();
+        let until = jiff::Timestamp::now() + jiff::SignedDuration::from_millis(10);
+        let first = crate::http_client::server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": format!("workstream is already active: owned by first until {until}"),
+                "manifest_warning": "first repair warning"
+            })
+            .to_string(),
+        );
+        let outcome = wait_out_held_lease(
+            &endpoint,
+            &request,
+            PrepareRunOutcome::from_result(Err(first)),
+            &CancellationToken::new(),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .await;
+        let mut output = Vec::new();
+        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response.manifest_warning.as_deref(),
+            Some("first repair warning")
+        );
+        assert!(output.is_empty());
         server.abort();
     }
 
@@ -4064,12 +4795,13 @@ mod tests {
         let error = wait_out_held_lease(
             &endpoint,
             &request,
-            first,
+            PrepareRunOutcome::from_result(Err(first)),
             &CancellationToken::new(),
             Duration::ZERO,
             Duration::from_millis(50),
         )
         .await
+        .result
         .expect_err("a renewing owner is never displaced");
         assert!(
             format!("{error:#}").contains("renewed the lease"),
@@ -4114,12 +4846,13 @@ mod tests {
         let error = wait_out_held_lease(
             &endpoint,
             &request,
-            first,
+            PrepareRunOutcome::from_result(Err(first)),
             &interrupted,
             Duration::ZERO,
             Duration::from_millis(50),
         )
         .await
+        .result
         .expect_err("interrupted");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
@@ -4696,27 +5429,123 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_env_merges_file_then_overrides_with_cli_pairs() {
+    fn resolve_run_env_merges_profile_file_then_cli_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vars.env");
         std::fs::write(&path, "# a comment\n\n  \nFOO=from-file\nBAR=keep\n").unwrap();
 
+        let profile = crate::config::RunProfile {
+            env: [
+                ("FOO".to_string(), "from-profile".to_string()),
+                ("PROFILE_ONLY".to_string(), "present".to_string()),
+            ]
+            .into(),
+        };
         let cli_pairs = vec![("FOO".to_string(), "from-cli".to_string())];
-        let merged = resolve_run_env(Some(&path), &cli_pairs).unwrap();
+        let merged = resolve_run_env(Some(&profile), Some(&path), &cli_pairs).unwrap();
 
         assert_eq!(
             merged,
             vec![
                 ("FOO".to_string(), "from-cli".to_string()),
+                ("PROFILE_ONLY".to_string(), "present".to_string()),
                 ("BAR".to_string(), "keep".to_string()),
             ]
         );
     }
 
     #[test]
+    fn wrapper_profile_parses_before_harness_without_stealing_native_profile() {
+        let wrapper = parse_run(&[
+            "ai-memory",
+            "run",
+            "--profile",
+            "work",
+            "claude",
+            "--model",
+            "opus",
+        ]);
+        assert_eq!(wrapper.profile.as_deref(), Some("work"));
+        assert_eq!(wrapper.native_args, ["--model", "opus"].map(OsString::from));
+
+        for (harness, native_profile) in [("omp", "omp-work"), ("codex", "codex-work")] {
+            let native = parse_run(&["ai-memory", "run", harness, "--profile", native_profile]);
+            assert_eq!(native.profile, None, "{harness}");
+            assert_eq!(
+                native.native_args,
+                ["--profile", native_profile].map(OsString::from),
+                "{harness}'s own --profile must reach the child"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_run_profile_fails_before_server_or_child_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::load(None, Some(tmp.path().join("data"))).unwrap();
+        config.server_url = "http://127.0.0.1:1".into();
+        let args = RunArgs {
+            workspace: None,
+            project: None,
+            workstream: None,
+            new_workstream: None,
+            executable: Some(PathBuf::from("definitely-not-a-harness")),
+            yolo: false,
+            true_yolo: false,
+            jail: None,
+            no_jail: true,
+            fresh: false,
+            force_unlock: false,
+            no_autowire: true,
+            profile: Some("missing".into()),
+            env: Vec::new(),
+            env_file: None,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: Vec::new(),
+        };
+
+        let error = run_from_with_wiring(
+            &config,
+            args,
+            tmp.path(),
+            &super::super::run_autowire::WireOverrides::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unknown run profile \"missing\"; none are defined. Add to your config.toml:\n\n  \
+             [run.profiles.missing.env]\n  CLAUDE_CONFIG_DIR = \"/absolute/path\""
+        );
+    }
+
+    #[test]
+    fn unknown_run_profile_names_the_defined_profiles_in_sorted_order() {
+        let mut run = crate::config::RunSettings::default();
+        for name in ["work", "personal"] {
+            run.profiles
+                .insert(name.into(), crate::config::RunProfile::default());
+        }
+        assert_eq!(
+            unknown_run_profile(&run, "wrok").to_string(),
+            "unknown run profile \"wrok\"; defined profiles: personal, work"
+        );
+    }
+
+    #[test]
+    fn unknown_run_profile_hint_quotes_a_dotted_name_as_one_toml_key() {
+        let hint =
+            unknown_run_profile(&crate::config::RunSettings::default(), "work.v2").to_string();
+        assert!(
+            hint.contains("[run.profiles.\"work.v2\".env]"),
+            "a bare dotted key would paste as nested tables: {hint}"
+        );
+    }
+
+    #[test]
     fn resolve_run_env_without_a_file_returns_only_cli_pairs() {
         let cli_pairs = vec![("A".to_string(), "1".to_string())];
-        let merged = resolve_run_env(None, &cli_pairs).unwrap();
+        let merged = resolve_run_env(None, None, &cli_pairs).unwrap();
         assert_eq!(merged, vec![("A".to_string(), "1".to_string())]);
     }
 
@@ -4725,7 +5554,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.env");
         std::fs::write(&path, "NOVALUE\n").unwrap();
-        let error = resolve_run_env(Some(&path), &[]).unwrap_err();
+        let error = resolve_run_env(None, Some(&path), &[]).unwrap_err();
         assert!(
             error.to_string().contains("expected KEY=VALUE"),
             "unexpected error: {error}"
@@ -4862,6 +5691,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -4887,7 +5717,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf 'FOO=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
+                "#!/bin/sh\nprintf 'FOO=%s\\nPROFILE_ONLY=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$PROFILE_ONLY\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
                 captured.display()
             ),
         )
@@ -4906,6 +5736,17 @@ mod tests {
         config.home_dir = Some(home.path().to_string_lossy().into_owned());
         config.server_url = format!("http://{address}");
         config.run_autowire = false;
+        config.run.profiles.insert(
+            "work".into(),
+            crate::config::RunProfile {
+                env: [
+                    ("FOO".into(), "from-profile".into()),
+                    ("PROFILE_ONLY".into(), "from-profile".into()),
+                    ("CLAUDE_CONFIG_DIR".into(), "/from/profile".into()),
+                ]
+                .into(),
+            },
+        );
 
         let args = RunArgs {
             workspace: Some("ws".into()),
@@ -4920,6 +5761,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            profile: Some("work".into()),
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
             harness: Some(RunHarnessChoice::Claude),
@@ -4935,7 +5777,11 @@ mod tests {
         let captured_env = std::fs::read_to_string(&captured).unwrap();
         assert!(
             captured_env.contains("FOO=from-file"),
-            "an --env-file entry not overridden by --env must reach the spawned child: {captured_env}"
+            "--env-file must override the profile and reach the spawned child: {captured_env}"
+        );
+        assert!(
+            captured_env.contains("PROFILE_ONLY=from-profile"),
+            "a profile-only entry must reach the spawned child: {captured_env}"
         );
         assert!(
             captured_env.contains("CLAUDE_CONFIG_DIR=/from/cli"),
@@ -4974,6 +5820,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -5040,6 +5887,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            profile: None,
             // Pinned so a contributor's own CLAUDE_CONFIG_DIR cannot leak in.
             env: vec![(
                 "CLAUDE_CONFIG_DIR".to_string(),
@@ -5363,6 +6211,7 @@ mod tests {
                     &cwd,
                     started_at,
                     None,
+                    &Sanitizer::builtin(),
                 )
                 .await
                 .unwrap()
@@ -5432,7 +6281,8 @@ mod tests {
                     ManagedHarness::Codex,
                     temp.path(),
                     &cwd,
-                    Some(&status)
+                    Some(&status),
+                    &Sanitizer::builtin(),
                 )
                 .unwrap()
                 .as_deref(),
@@ -5447,6 +6297,7 @@ mod tests {
                     &cwd,
                     started_at,
                     Some(&status),
+                    &Sanitizer::builtin(),
                 )
                 .await
                 .unwrap()
@@ -5469,6 +6320,7 @@ mod tests {
                     &empty,
                     started_at,
                     Some(&status),
+                    &Sanitizer::builtin(),
                 )
                 .await
                 .unwrap()
@@ -5520,6 +6372,7 @@ mod tests {
                 &cwd,
                 started_at,
                 None,
+                &Sanitizer::builtin(),
             )
             .await
             .unwrap()
@@ -5536,6 +6389,7 @@ mod tests {
                 &cwd,
                 started_at,
                 None,
+                &Sanitizer::builtin(),
             )
             .await
             .unwrap()
@@ -5602,6 +6456,7 @@ mod tests {
                 &cwd,
                 started_at,
                 Some(&status),
+                &Sanitizer::builtin(),
             )
             .await
             .unwrap()
@@ -5665,6 +6520,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -5718,6 +6574,7 @@ mod tests {
             workstream: None,
             new_workstream: None,
             executable: None,
+            profile: None,
             yolo: false,
             true_yolo: false,
             jail: None,
@@ -5792,6 +6649,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -5850,6 +6708,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            profile: None,
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
@@ -5936,6 +6795,7 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        manifest_warning: None,
                     })
                 }),
             )
@@ -5986,6 +6846,7 @@ mod tests {
                             sync_after: 0,
                             sync_through: 0,
                             may_adopt_existing_session: false,
+                            manifest_warning: None,
                         })
                     }),
                 )
@@ -6099,7 +6960,6 @@ mod tests {
         (script, captured)
     }
 
-    #[cfg(unix)]
     fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
         let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
         config.data_dir = data.to_path_buf();
@@ -6129,6 +6989,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            profile: None,
             env,
             env_file: None,
             harness: Some(harness),
@@ -6190,6 +7051,85 @@ mod tests {
             "MCP missing in {}",
             mcp.display()
         );
+
+        server.abort();
+    }
+
+    /// Two accounts of one harness on one machine: each `--profile` must reach
+    /// the child and auto-wire its own config home on its own first launch.
+    /// The autowire sentinel is keyed by install target, so the second
+    /// profile is not skipped as "already wired" by the first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_run_profile_launches_and_autowires_its_own_config_home() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let work_home = data.path().join("claude-work");
+        let personal_home = data.path().join("claude-personal");
+        for dir in [&work_home, &personal_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut config = launch_config(home.path(), data.path(), address);
+        for (name, dir) in [("work", &work_home), ("personal", &personal_home)] {
+            config.run.profiles.insert(
+                name.to_string(),
+                crate::config::RunProfile {
+                    env: [("CLAUDE_CONFIG_DIR".to_string(), dir.display().to_string())].into(),
+                },
+            );
+        }
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(data.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+
+        for (name, dir, other) in [
+            ("work", &work_home, &personal_home),
+            ("personal", &personal_home, &work_home),
+        ] {
+            let mut args = run_args(
+                RunHarnessChoice::Claude,
+                script.clone(),
+                vec![],
+                &["--version"],
+            );
+            args.profile = Some(name.to_string());
+            let other_before = std::fs::read_dir(other).unwrap().count();
+            let exit = run_from_with_wiring(&config, args, repo.path(), &overrides)
+                .await
+                .unwrap_or_else(|error| panic!("profile {name} run fails: {error:#}"));
+            assert_eq!(exit, 0);
+            assert_eq!(
+                std::fs::read_to_string(&captured).unwrap(),
+                dir.display().to_string(),
+                "profile {name} must reach the spawned child"
+            );
+            let settings = dir.join("settings.json");
+            assert!(
+                std::fs::read_to_string(&settings)
+                    .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory")),
+                "profile {name}: hooks missing in {}",
+                settings.display()
+            );
+            let mcp = dir.join(".claude.json");
+            assert!(
+                std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
+                "profile {name}: MCP missing in {}",
+                mcp.display()
+            );
+            assert_eq!(
+                std::fs::read_dir(other).unwrap().count(),
+                other_before,
+                "profile {name} must not wire the other account's config home"
+            );
+        }
 
         server.abort();
     }
@@ -6740,5 +7680,435 @@ mod tests {
         );
         drop(seen);
         server.abort();
+    }
+
+    #[test]
+    fn native_identity_run_preflight_refuses_before_resume_or_private_path() {
+        let home = tempfile::tempdir().unwrap();
+        for id in [
+            "sk-abcdefghijklmnopqrstuvwx",
+            "native\u{202e}tail",
+            "native\u{200b}tail",
+        ] {
+            let result = build_preflighted_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                Vec::new(),
+                Some(id),
+                false,
+                home.path(),
+                home.path(),
+                &EffectiveChildEnv::default(),
+            );
+            assert!(
+                result.is_err(),
+                "dirty server identity must be refused before resume"
+            );
+            assert!(!format!("{:#}", result.unwrap_err()).contains(id));
+        }
+        assert!(
+            build_preflighted_launch_plan(
+                ManagedHarness::Claude,
+                None,
+                Vec::new(),
+                Some("sk-abcdefghijklmnopqrstuvwx"),
+                true,
+                home.path(),
+                home.path(),
+                &EffectiveChildEnv::default(),
+            )
+            .is_err(),
+            "fresh mode must validate the original prepared identity before discarding it"
+        );
+        let (plan, _) = build_preflighted_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            Vec::new(),
+            None,
+            false,
+            home.path(),
+            home.path(),
+            &EffectiveChildEnv::default(),
+        )
+        .unwrap();
+        assert!(uuid::Uuid::parse_str(plan.expected_session_id.as_deref().unwrap()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_run_old_server_refusal_prevents_child_and_transport() {
+        let (address, server) = mock_workstream_server(Some("private-vendor")).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "AI_MEMORY_MANAGED_RUN");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+        config.sanitize.extra_patterns.push("private-vendor".into());
+        let result = run_from(
+            &config,
+            run_args(RunHarnessChoice::Claude, script, Vec::new(), &[]),
+            repo.path(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "old server dirty identity must refuse the actual launch"
+        );
+        assert!(!captured.exists(), "child must not start");
+        assert!(!format!("{:#}", result.unwrap_err()).contains("private-vendor"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn native_identity_finish_transport_refuses_before_request_and_preserves_exact_control() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events: 1,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-vendor".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let transcript = |id: &str| ExportedTranscript {
+            native_session_id: id.into(),
+            source_cursor: Some("cursor".into()),
+            events: Vec::new(),
+            losses: Vec::new(),
+        };
+        for bad in ["sk-abcdefghijklmnopqrstuvwx", "private-vendor"] {
+            assert!(
+                import_batches(
+                    &endpoint,
+                    "/workstream/runs/test",
+                    transcript(bad),
+                    Default::default(),
+                    Some(0),
+                    &sanitizer,
+                )
+                .await
+                .is_err(),
+                "dirty finish identity must not reach transport"
+            );
+            assert!(requests.lock().unwrap().is_empty());
+            let mut with_event = transcript("vendor-界-01");
+            with_event.events.push(ai_memory_core::NewWorkstreamEvent {
+                event_id: "e".into(),
+                agent: AgentKind::Codex,
+                native_session_id: bad.into(),
+                source_record_id: None,
+                kind: ai_memory_core::WorkstreamEventKind::Message,
+                role: None,
+                content: "shared history".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            });
+            assert!(
+                import_batches(
+                    &endpoint,
+                    "/workstream/runs/test",
+                    with_event,
+                    Default::default(),
+                    Some(0),
+                    &sanitizer,
+                )
+                .await
+                .is_err(),
+                "dirty event identity must not reach transport"
+            );
+            assert!(requests.lock().unwrap().is_empty());
+        }
+        assert_eq!(
+            import_batches(
+                &endpoint,
+                "/workstream/runs/test",
+                transcript("vendor-界-01"),
+                Default::default(),
+                Some(0),
+                &sanitizer,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            requests.lock().unwrap()[0].native_session_id.as_deref(),
+            Some("vendor-界-01")
+        );
+        assert_eq!(
+            requests.lock().unwrap()[0].source_cursor.as_deref(),
+            Some("cursor")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_identity_run_status_and_expected_refuse_before_discovery() {
+        let home = tempfile::tempdir().unwrap();
+        let mut plan = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        plan.session_dir = None;
+        let sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-vendor".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        for bad in ["sk-abcdefghijklmnopqrstuvwx", "private-vendor"] {
+            plan.expected_session_id = Some(bad.into());
+            assert!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    None,
+                    &sanitizer
+                )
+                .is_err(),
+                "expected identity must refuse before use"
+            );
+            plan.expected_session_id = None;
+            let status = ManagedRunStatus {
+                run_id: ManagedRunId::new(),
+                workstream_id: WorkstreamId::new(),
+                agent: AgentKind::Codex,
+                native_session_id: Some(bad.into()),
+                native_session_linked: true,
+                context_delivered: false,
+                state: "active".into(),
+            };
+            assert!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    Some(&status),
+                    &sanitizer,
+                )
+                .is_err(),
+                "linked status must refuse before native IO"
+            );
+            assert!(
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    SystemTime::now(),
+                    Some(&status),
+                    &sanitizer,
+                )
+                .await
+                .is_err(),
+                "dirty old-server status must not fall back to discovery"
+            );
+            plan.expected_session_id = Some("vendor-界-01".into());
+            assert_eq!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    home.path(),
+                    home.path(),
+                    None,
+                    &sanitizer
+                )
+                .unwrap()
+                .as_deref(),
+                Some("vendor-界-01")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_run_configured_selector_refuses_before_link_or_child() {
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "AI_MEMORY_MANAGED_RUN");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+        config.sanitize.extra_patterns.push("private-vendor".into());
+        let result = run_from(
+            &config,
+            run_args(
+                RunHarnessChoice::Claude,
+                script,
+                Vec::new(),
+                &["--session-id", "private-vendor"],
+            ),
+            repo.path(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "configured selector must refuse before link and spawn"
+        );
+        assert!(!captured.exists());
+        assert!(!format!("{:#}", result.unwrap_err()).contains("private-vendor"));
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_identity_run_configured_old_status_refuses_before_native_io_and_finish() {
+        for id in ["private-vendor", "vendor-界-01"] {
+            let finishes = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+            let captured_finishes = finishes.clone();
+            let app = Router::new()
+                .route(
+                    "/workstream/runs",
+                    post(|| async {
+                        axum::Json(PrepareManagedRunResponse {
+                            workstream_id: WorkstreamId::new(),
+                            workstream_name: "default".into(),
+                            run_id: ManagedRunId::new(),
+                            resolved_agent: None,
+                            native_session_id: None,
+                            source_cursor: None,
+                            sync_after: 0,
+                            sync_through: 0,
+                            may_adopt_existing_session: false,
+                            manifest_warning: None,
+                        })
+                    }),
+                )
+                .route(
+                    "/workstream/runs/{id}",
+                    axum::routing::get(move || async move {
+                        axum::Json(ManagedRunStatus {
+                            run_id: ManagedRunId::new(),
+                            workstream_id: WorkstreamId::new(),
+                            agent: AgentKind::Codex,
+                            native_session_id: Some(id.into()),
+                            native_session_linked: false,
+                            context_delivered: false,
+                            state: "active".into(),
+                        })
+                    }),
+                )
+                .route(
+                    "/workstream/runs/{id}/finish",
+                    post(
+                        move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                            let captured_finishes = captured_finishes.clone();
+                            async move {
+                                captured_finishes.lock().unwrap().push(request);
+                                axum::Json(FinishManagedRunResponse {
+                                    imported_events: 0,
+                                    latest_sequence: 0,
+                                })
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/workstream/runs/{id}/cancel",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let home = tempfile::tempdir().unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            let (script, child_capture) = capture_env_script(repo.path(), "AI_MEMORY_MANAGED_RUN");
+            let mut config = launch_config(home.path(), home.path(), address);
+            config.run_autowire = false;
+            config.sanitize.extra_patterns.push("private-vendor".into());
+            let result = run_from(
+                &config,
+                run_args(RunHarnessChoice::Codex, script, Vec::new(), &[]),
+                repo.path(),
+            )
+            .await;
+            assert!(
+                child_capture.exists(),
+                "the status is returned after the child exits"
+            );
+            if id == "private-vendor" {
+                assert!(
+                    result.is_err(),
+                    "configured old status must refuse before native IO and finish"
+                );
+                assert!(!format!("{:#}", result.unwrap_err()).contains(id));
+                assert!(finishes.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(result.unwrap(), 0);
+                assert_eq!(
+                    finishes.lock().unwrap()[0].native_session_id.as_deref(),
+                    Some(id)
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_identity_run_configured_discovery_refuses_before_export() {
+        let sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec!["private-vendor".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        for id in ["private-vendor", "vendor-界-01"] {
+            let home = tempfile::tempdir().unwrap();
+            let cwd = home.path().join("repo");
+            let root = home.path().join(".codex/sessions/2026/01/01");
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let started_at = SystemTime::now();
+            std::fs::write(
+                root.join("rollout-current.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "session_meta", "payload": {"id": id, "cwd": cwd}
+                    })
+                ),
+            )
+            .unwrap();
+            let mut plan =
+                build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+            plan.session_dir = None;
+            let result = resolve_native_session_after_run(
+                &plan,
+                ManagedHarness::Codex,
+                home.path(),
+                &cwd,
+                started_at,
+                None,
+                &sanitizer,
+            )
+            .await;
+            if id == "private-vendor" {
+                assert!(
+                    result.is_err(),
+                    "configured discovered identity must refuse before export"
+                );
+                assert!(!format!("{:#}", result.unwrap_err()).contains(id));
+            } else {
+                assert_eq!(result.unwrap().as_deref(), Some(id));
+            }
+        }
     }
 }
