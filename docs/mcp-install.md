@@ -17,7 +17,17 @@
 > --http-stateful` to restore rmcp's session mode.
 
 This page documents how to register ai-memory as an MCP server with
-agent CLIs beyond the README quick start.
+agent CLIs beyond the README quick start. For OpenCode, the generic
+`install-mcp --client opencode` command probes `opencode --version` and writes
+the matching V1 direct `mcp` or V2 nested `mcp.servers` entry. Strict semantic
+major 1 and 2 outputs are accepted; malformed, timed-out, and future-major
+probes fail rather than guessing. During a V1/V2 transition, hook and MCP
+installers reuse an ownership-verified endpoint and bearer from either known
+schema; conflicting generated entries fail for explicit resolution, and custom
+entries are preserved. The `opencode2`, `opencode-v2`, and `open-code2`
+spellings remain force-V2 compatibility aliases. A Docker
+container cannot inspect the host executable; use `setup-agent --agent opencode
+--opencode-dialect v1|v2` there to print the selected plugin and MCP artifacts.
 
 The hook-capable clients in the [README Support Matrix](../README.md#support-matrix)
 have automatic capture integrations (host-native commands for supported local

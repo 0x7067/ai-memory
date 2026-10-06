@@ -252,16 +252,22 @@ checkout themselves.
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
 Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, and both Kiro
-CLI engines. For an empty workstream it resumes
+CLI engines. Before scanning OpenCode sessions, it probes the exact `opencode`
+executable once and uses that resolved major for discovery, launch, auto-wire,
+and transcript import. Executable lookup, the version probe, and the child launch
+share one captured environment with `--env` / `--env-file` overlays, including
+case-insensitive `PATH`/`Path` replacement on Windows. A missing, malformed,
+timed-out, or unsupported OpenCode
+probe skips only OpenCode; discovery continues with every other available
+harness. For an empty workstream it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
 flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
-but are not in the automatic pool. OpenCode 2 is likewise explicit-only
-(`ai-memory run opencode2`): it shares v1's session store, so listing both
-would duplicate every candidate.
+but are not in the automatic pool. OpenCode's resolved major contributes one
+adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 
 OpenCode 2 sessions run inside a shared background service, so its plugin
 cannot see a managed run's environment the way in-process plugins do. Managed
@@ -381,8 +387,8 @@ is labelled completed evidence and must never be replayed as a pending call.
 |---|---|---|---|
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
 | Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
-| OpenCode | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only |
-| OpenCode 2 beta | native default creation | `--session <id>` | same `opencode.db` as v1 (the beta channel keeps v1's filename; the beta adds `session_v2`/`session_message` tables beside v1's); launched via the `opencode2` binary |
+| OpenCode V1 | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only; selected when the exact launch executable reports major 1 |
+| OpenCode V2 | native default creation | `--session <id>` | same `opencode.db` filename, using the `session_v2`/`session_message` tables; selected when the exact launch executable reports major 2 |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
 | Crush | native default creation | `--session <id>` | `<data dir>/crush.db` opened read-only: `options.data_directory` from Crush's JSON configs, else the closest `.crush` up to the git worktree root, else `<cwd>/.crush` |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |

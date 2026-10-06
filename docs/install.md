@@ -1239,26 +1239,28 @@ No first-party `install-mcp` client and no managed workstream
 ### OpenCode
 
 ```bash
-docker run --rm akitaonrails/ai-memory:latest \
-    install-mcp --client opencode \
+# Host-side commands probe the installed executable and select V1/V2.
+ai-memory install-mcp --client opencode --apply \
     --server-url "http://homelab:49374/mcp" \
     --auth-token "$TOKEN"
-
-# Plugin — write to ~/.config/opencode/plugins/ai-memory.ts.
-# If you have the local wrapper installed, prefer `--apply`:
 ai-memory install-hooks --agent opencode --apply \
     --server-url "http://homelab:49374" \
     --auth-token "$TOKEN"
 
-# Docker-only preview path; redirect only if you want to write the file yourself:
+# Docker cannot inspect the host executable. Generate V1 artifacts explicitly:
 docker run --rm akitaonrails/ai-memory:latest \
-    install-hooks --agent opencode \
+    setup-agent --agent opencode --opencode-dialect v1 --to /tmp/unused \
     --server-url "http://homelab:49374" \
     --auth-token "$TOKEN"
 ```
 
 Restart OpenCode after installing or changing the plugin; plugins are
-loaded at startup.
+loaded at startup. The generic `opencode` client/agent spelling runs the installed
+`opencode --version` directly, accepts only major 1 or 2, and selects the matching
+plugin and MCP schema. Under `ai-memory run`, executable lookup, the version probe,
+and launch share the same captured environment plus `--env` / `--env-file`
+overrides. Malformed output, a timeout, or an unsupported future major fails with
+an actionable error instead of guessing.
 
 ### OpenCode 2 (beta)
 
@@ -1278,7 +1280,8 @@ it or publish a baton.
 
 Assistant text stays opt-in, as for Claude Code and Codex: set
 `capture_assistant = true` on the server and install with
-`ai-memory install-hooks --agent opencode2 --capture-assistant --apply`. The
+`ai-memory install-hooks --agent opencode --capture-assistant --apply`; the
+generic spelling verifies that the installed executable is V2 first. The
 plugin hands the last completed text to the native hook, which sanitizes and
 caps it before it reaches the spool or the wire; the excerpt then rides in the
 next session's automatic handoff. A bare re-apply preserves the opt-in.
@@ -1287,34 +1290,32 @@ For a commented `opencode.jsonc`, preview `install-mcp --client opencode2` and
 merge the entry into the existing `mcp.servers` object by hand: the apply path
 writes strict JSON.
 
-The 2.0 beta installs side by side as `opencode2` and shares v1's config
-dir and session store, but its MCP schema and plugin API changed. Wire it
-with the `opencode2` client/agent names:
+The `opencode2`, `opencode-v2`, and `open-code2` spellings remain compatibility
+aliases that force the V2 contracts without probing. They share V1's config dir
+and session store. Prefer the generic `opencode` spelling for normal installs:
 
 ```bash
-docker run --rm akitaonrails/ai-memory:latest \
-    install-mcp --client opencode2 \
-    --server-url "http://homelab:49374/mcp" \
+# Host-side generic commands auto-detect V2; compatibility aliases force it.
+ai-memory install-hooks --agent opencode2 --apply \
+    --server-url "http://homelab:49374" \
     --auth-token "$TOKEN"
 
-# Plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts.
-# If you have the local wrapper installed, prefer `--apply`:
-ai-memory install-hooks --agent opencode2 --apply \
+# Docker cannot inspect the host executable. Generate V2 artifacts explicitly:
+docker run --rm akitaonrails/ai-memory:latest \
+    setup-agent --agent opencode --opencode-dialect v2 --to /tmp/unused \
     --server-url "http://homelab:49374" \
     --auth-token "$TOKEN"
 ```
 
-V2 nests servers under `mcp.servers` (no `enabled` field), so the v1
-(`mcp`) and v2 (`mcp.servers`) entries coexist in the one
-`~/.config/opencode/opencode.json(c)` file — the beta explicitly supports
-this mixed nesting, so keep both entries and do not "convert" the file by
-removing the v1 one
-(see [Migrate from V1](https://opencode.ai/v2/docs/migrate-v1)). `ai-memory run opencode2`
-resumes the same native sessions as `ai-memory run opencode` through the
-`opencode2` binary. Both plugins share the one auto-loaded dir while the
-beta is side-by-side; a host may warn about its sibling's file (the two
-plugin APIs are incompatible) — that warning is benign, and `uninstall`
-removes each file only on its own ownership markers.
+V2 nests servers under `mcp.servers` and uses a different plugin API. A
+successful `--apply` removes the incompatible sibling plugin only when its
+exact ai-memory ownership markers match. It likewise migrates an alternate MCP
+entry only when its endpoint and shape prove ai-memory ownership. Hook and MCP
+installation reuse its endpoint and bearer across a major transition; conflicting
+owned V1/V2 entries fail for explicit resolution, while user-authored entries are
+preserved. Repeating either install is
+byte-idempotent, and `uninstall` continues to recognize both historical files
+and MCP locations.
 
 > **Back up `~/.local/share/opencode` before running the beta against
 > your real data.** The two binaries share the one `opencode.db` file and
