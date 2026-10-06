@@ -1207,9 +1207,18 @@ mod tests {
         let md = "## Context\n\n## Context\n\n## Context 1\n\n## Context";
         let html = render(md, "default", "scratch");
         assert!(html.contains(r#"<h2 id="context">Context</h2>"#), "{html}");
-        assert!(html.contains(r#"<h2 id="context-1">Context</h2>"#), "{html}");
-        assert!(html.contains(r#"<h2 id="context-1-1">Context 1</h2>"#), "{html}");
-        assert!(html.contains(r#"<h2 id="context-2">Context</h2>"#), "{html}");
+        assert!(
+            html.contains(r#"<h2 id="context-1">Context</h2>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="context-1-1">Context 1</h2>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="context-2">Context</h2>"#),
+            "{html}"
+        );
     }
 
     #[test]
