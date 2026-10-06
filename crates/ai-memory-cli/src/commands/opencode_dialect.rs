@@ -284,7 +284,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.dialect, OpenCodeDialect::V2);
-        assert_eq!(resolved.executable, base.with_extension("cmd"));
+        // PATHEXT spells extensions in whatever case the machine defines
+        // (`.CMD` on stock Windows), and Windows paths are case-insensitive.
+        assert_eq!(
+            resolved.executable.to_string_lossy().to_lowercase(),
+            base.with_extension("cmd").to_string_lossy().to_lowercase()
+        );
     }
 
     #[cfg(unix)]
