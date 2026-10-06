@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
+    complete_structured_with_operation_id,
 };
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
@@ -242,6 +243,11 @@ impl Consolidator {
         let existing_titles = self
             .existing_page_titles(ws, proj, &actor, session_id)
             .await;
+        // One LLM operation, one identity: this fresh id (never the agent's
+        // session id) is shared by every attempt of this invocation; a
+        // re-entry after a crash or a new queue claim is a NEW operation
+        // with a new id.
+        let operation_id = LlmOperationId::new();
         let request = build_request(
             session_id,
             &observations,
@@ -259,7 +265,7 @@ impl Consolidator {
         let mut page: ConsolidatedPage = complete_structured_with_retry(
             &*self.llm,
             request,
-            session_id.into(),
+            operation_id,
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
@@ -660,6 +666,11 @@ impl Consolidator {
         let existing_titles = self
             .existing_page_titles(ws, proj, &actor, session_id)
             .await;
+        // One LLM operation, one identity (see `consolidate_session`): the
+        // fresh id is shared by every attempt of this invocation; a
+        // re-entry after a crash or a new queue claim is a new operation
+        // with a new id.
+        let operation_id = LlmOperationId::new();
         let request = build_batch_request_with_slots(
             session_id,
             &observations,
@@ -676,7 +687,7 @@ impl Consolidator {
         let batch: ConsolidatedBatch = complete_structured_with_retry(
             &*self.llm,
             request,
-            session_id.into(),
+            operation_id,
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
@@ -3362,6 +3373,63 @@ mod tests {
         })
     }
 
+    /// Records the operation id of every structured call and answers a
+    /// fixed valid page or batch — the id is the subject under test, not
+    /// the response.
+    struct OpIdCapturingLlm {
+        response: serde_json::Value,
+        ids: std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>,
+    }
+
+    impl OpIdCapturingLlm {
+        /// Build a capturing LLM, keeping a shared handle to the ids it
+        /// records so a test can assert on them after the run.
+        fn new(
+            response: serde_json::Value,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>) {
+            let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    response,
+                    ids: ids.clone(),
+                },
+                ids,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OpIdCapturingLlm {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn model(&self) -> &str {
+            "capturing"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Ok(self.response.clone())
+        }
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
     /// A briefly overloaded provider must not end the consolidation: the
     /// retry absorbs it and the caller still gets the page.
     #[tokio::test]
@@ -3458,6 +3526,151 @@ mod tests {
             page_missing(&wiki, ws, proj, &format!("sessions/{session}.md")),
             "a failed consolidation must not write a page"
         );
+    }
+
+    /// Gateway compatibility of a fresh operation id: the 36-character
+    /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
+    fn assert_fresh_gateway_form(id: LlmOperationId) {
+        let s = id.to_string();
+        assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
+        let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
+        assert_eq!(
+            parsed.get_version_num(),
+            7,
+            "a fresh operation id is UUID v7: {s}"
+        );
+    }
+
+    /// Operation identity: two consolidation invocations of the SAME
+    /// session are two LLM operations — two distinct fresh UUID v7 ids,
+    /// never the session id. Controls use a v7 session (`SessionId::new`)
+    /// and a v4-style session (the random form agents commonly carry), so
+    /// no derivation from the session's own bytes can sneak back in.
+    #[tokio::test]
+    async fn each_invocation_gets_a_fresh_operation_id_independent_of_the_session() {
+        let actor = ai_memory_core::ActorContext::anonymous();
+        // v7 (time-ordered) and v4 (random, agent-style) sessions.
+        let sessions = [SessionId::new(), SessionId(uuid::Uuid::new_v4())];
+        for session in sessions {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+            let ws = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            let proj = store
+                .writer
+                .get_or_create_project(ws, "scratch", None)
+                .await
+                .unwrap();
+            seed_session(store.db_path(), session, ws, proj);
+            let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+            // Two single invocations of the SAME session: two distinct
+            // fresh v7 ids, neither one the session id.
+            let (llm1, ids1) = OpIdCapturingLlm::new(scripted_page());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm1),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let (llm2, ids2) = OpIdCapturingLlm::new(scripted_page());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm2),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let single1 = ids1.lock().unwrap().clone();
+            let single2 = ids2.lock().unwrap().clone();
+            assert_eq!(single1.len(), 1, "one default single call per invocation");
+            assert_eq!(single2.len(), 1, "one default single call per invocation");
+            assert_ne!(
+                single1[0], single2[0],
+                "two single invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(single1[0]);
+            assert_fresh_gateway_form(single2[0]);
+            assert_ne!(
+                single1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
+
+            // Same for the multi default path: two invocations, two ids.
+            let batch = serde_json::json!({
+                "rationale": "test operation identity",
+                "updates": [
+                    {
+                        "path": format!("sessions/{session}.md"),
+                        "tier": "episodic",
+                        "kind": "fact",
+                        "title": "Session narrative",
+                        "body_markdown": "Session body.",
+                        "tags": []
+                    },
+                    {
+                        "path": "concepts/queue.md",
+                        "tier": "semantic",
+                        "kind": "fact",
+                        "title": "Queue",
+                        "body_markdown": "Concept body.",
+                        "tags": []
+                    }
+                ]
+            });
+            let (llm3, ids3) = OpIdCapturingLlm::new(batch.clone());
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm3),
+                ws,
+                proj,
+            )
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let (llm4, ids4) = OpIdCapturingLlm::new(batch);
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(llm4),
+                ws,
+                proj,
+            )
+            .consolidate_session_multi(session, false, actor.clone(), None, None)
+            .await
+            .unwrap();
+            let multi1 = ids3.lock().unwrap().clone();
+            let multi2 = ids4.lock().unwrap().clone();
+            assert_eq!(multi1.len(), 1, "one default multi call per invocation");
+            assert_eq!(multi2.len(), 1, "one default multi call per invocation");
+            assert_ne!(
+                multi1[0], multi2[0],
+                "two multi invocations of one session get distinct operation ids"
+            );
+            assert_fresh_gateway_form(multi1[0]);
+            assert_fresh_gateway_form(multi2[0]);
+            assert_ne!(
+                multi1[0].to_string(),
+                session.to_string(),
+                "the operation id is never the session id"
+            );
+        }
     }
 
     async fn write_slot(wiki: &Wiki, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {
