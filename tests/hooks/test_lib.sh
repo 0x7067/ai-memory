@@ -260,7 +260,7 @@ printf 'project = "acme-api"\naliases = [" former-name ", "legacy_name", "former
 ALIAS_JSON='["former-name","legacy_name"]'
 ALIAS_QS=$(ai_memory_marker_qs "$TMP/aliases")
 assert_eq "marker aliases keep canonical project and forward remote identity" "yes" \
-    "$(case "$ALIAS_QS" in *'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$ALIAS_QS" in *'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; *) printf no ;; esac)"
 
 mkdir -p "$TMP/home-routes/src/api/lib" "$TMP/home-routes/src/api-sibling"
 HOME="$TMP/home-routes"
@@ -382,7 +382,7 @@ if command -v git >/dev/null 2>&1; then
     git -C "$TMP/idrepo" remote add origin "https://someone:tok3n@git.example.test/Acme/API.git"
     ID_CWD=$(ai_memory_url_encode "$TMP/idrepo")
     assert_eq "identity: undeclared checkout sends its remote" \
-        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=path" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     printf 'project = "mine"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: a declared project routes by name" \
@@ -392,10 +392,14 @@ if command -v git >/dev/null 2>&1; then
     assert_eq "identity: an explicit identity outranks the project" \
         "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
-    # #1033: the path style rides along with a remote identity only.
+    # #1033: either explicit style rides along with a remote identity only.
     printf 'identity_style = "path"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: the path style rides along with the remote" \
         "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=path&profile_contribute=1&profile_consume=1" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'identity_style = "host_path"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: the host-path opt-out rides along with the remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=host_path&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     printf 'identity_style = "path"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: a declared identity sends no style" \

@@ -308,6 +308,7 @@ mod tests {
             &workspace,
             &repository,
             ai_memory_core::repository_identity::IdentityStyle::Path,
+            false,
             "api",
             None,
             None,

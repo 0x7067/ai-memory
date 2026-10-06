@@ -176,8 +176,10 @@ Long-term memory for the current project.\n\
 real lifecycle-hook session id should omit `workspace`, `project`, and `cwd` for \
 the current repository. Static MCP clients must pass `workspace` and `project` together \
 on every project-scoped call, including calls about 'this project'; read the exact \
-names from the nearest `.ai-memory.toml` or obtain them from the operator/server, \
-never from a guessed directory name or the server's last active project. For \
+names from the nearest `.ai-memory.toml`; without a marker override, derive the \
+project from normalized `upstream`, then `origin`, using the full repository path \
+without its host, and use the folder basename only without a valid remote. Never \
+rely on the server's last active project. For \
 `memory_query` with `global=true`, omit all project scope arguments. For \
 `memory_write_page` with `scope: \"global\"`, omit `workspace` and `project`.\n\
 \n\
@@ -8047,7 +8049,8 @@ mod tests {
         );
         assert!(
             snippet.contains("nearest\n  `.ai-memory.toml`")
-                && snippet.contains("never rely on the server's last active project"),
+                && snippet.contains("normalized `upstream` remote, then `origin`")
+                && snippet.contains("Never rely on the server's\n  last active project"),
             "snippet must require exact, repository-owned scope names"
         );
         assert!(
@@ -8254,7 +8257,9 @@ mod tests {
             assert!(
                 lower.contains("workspace")
                     && lower.contains("project")
-                    && lower.contains("server's last active project"),
+                    && lower.contains("upstream")
+                    && lower.contains("origin")
+                    && lower.contains("last active project"),
                 "prompt must provide safe explicit-scope guidance"
             );
         }

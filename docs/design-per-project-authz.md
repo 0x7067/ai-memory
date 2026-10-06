@@ -233,8 +233,7 @@ project. #1033 makes a remote-derived key the default name, landing in steps on
 1. **Normaliser and opt-in naming (landed first).** `repository_identity::
    styled_key` spells an identity under `IdentityStyle`: `path` drops a git
    remote's host (`github.com/acme/api` → `acme/api`); `host_path` is the #708
-   identity unchanged and stays the default. A marker's
-   `identity_style = "path"` is forwarded by all four capture clients
+   identity unchanged. A marker's explicit style is forwarded by all four capture clients
    alongside a remote identity, and `resolve_project_by_identity` then names a
    project it **creates** `path_style_name(identity)` (`acme-api`: `/` written
    as `-`, today's split-name character rule). Captures keep routing by the
@@ -247,9 +246,14 @@ project. #1033 makes a remote-derived key the default name, landing in steps on
    `fixtures/remote_identity_cases.json` (core plus shell, PowerShell and
    TypeScript parity), store adversarial tests, and a two-operator
    `multi_session.rs` case. Reporting the fallback in `doctor` is a follow-up.
-2. **Default naming chain** (`upstream` → `origin` → folder) for **new**
-   projects without opting in, with marker `project`/`identity` still
-   outranking remotes and the same collision fallback.
+2. **Default naming chain (landed final).** `upstream` → `origin` supplies the
+   full hostful identity and the canonical hostless path name for new projects;
+   only a checkout with no valid network remote falls back to its folder. Marker
+   `project`/`identity` and operator-home routes still outrank this inference.
+   Phase-5 clients explicitly send `path`; explicit `host_path` is forwarded as
+   the compatibility opt-out. A new server still treats omission as `host_path`
+   because old clients omitted that historical default. Old servers safely
+   accept or ignore the existing style field; no new wire field is required.
 3. **Dual-key resolve and in-place name promotion (landed).** Static callers
    still pass only `workspace` + `project`. Within that workspace, exact stored
    name, the canonical path-style name derived from a stored full hostful git
@@ -299,7 +303,16 @@ project. #1033 makes a remote-derived key the default name, landing in steps on
    provenance, malformed or ambiguous maps fail closed, and old line parsers
    ignore the deliberately prefixed `route_*` child fields. Native callers use
    `AI_MEMORY_HOME` first; portable clients use `HOME`/`USERPROFILE`, and Docker
-   compares the forwarded host cwd. The default remains `IdentityStyle::HostPath`.
+    compares the forwarded host cwd.
+7. **Default flip (landed final).** `Path` is now the explicit client default;
+   the typed server/wire default remains legacy-safe `HostPath`. Authorized
+   captures carrying explicit `path` can claim or promote compatible basename/
+   host-path rows in the same writer transaction and preserve their UUID;
+   handoff/static reads remain no-create/no-rename. Canonical names held by a
+   different hostful identity fail closed and use the existing fallback. The
+   indexed canonical/legacy compatibility keys and marker aliases remain through
+   v3; no schema migration was required for this final slice.
+
 
 
 Paths stay lexically normalised throughout; nothing canonicalises.

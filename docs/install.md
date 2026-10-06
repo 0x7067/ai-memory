@@ -218,8 +218,10 @@ they either create local files or start the server itself.
 
 ### Default project resolution (`--project-strategy`)
 
-By default each session files memory under `basename(cwd)`. Because an agent
-shell keeps its working directory between tool calls, a single
+By default an undeclared checkout with a valid `upstream` or `origin` remote
+uses the canonical repository-path project name; current clients send that
+choice explicitly for upgrade safety. Repositories without a valid remote use
+`basename(cwd)`, including from a git subdirectory. Because an agent shell keeps its working directory between tool calls, a single
 `mkdir sub && cd sub` reparents the rest of the session into a phantom project
 named `sub`. To make every session for an install resolve its project from the
 git repo root instead — collapsing subdirectories and worktrees — bake the

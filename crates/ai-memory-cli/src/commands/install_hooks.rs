@@ -3906,9 +3906,10 @@ function findSettingsMarker(cwd: string | undefined): string | undefined {
 /// integrations.
 ///
 /// An install-time default applies only when no marker pins a
-/// `project_strategy` (#128). A marker's own `project` / `project_strategy`
-/// still take precedence (§3.3), and repo-root is resolved host-side via
-/// `repoRootProject`.
+/// `project_strategy` (#128). A marker's explicit `project` or `identity` and
+/// operator-home routing keep precedence; otherwise a valid remote supplies its
+/// canonical path name even when `repo-root` is configured. `repoRootProject`
+/// handles the host-side fallback only when no valid remote exists.
 ///
 /// Scope/settings resolution walks past a capture-only marker to the nearest
 /// ancestor marker that declares a setting (#668) via `findSettingsMarker`,
@@ -3977,7 +3978,7 @@ pub(crate) fn ts_apply_marker_params(
           if (routeIdentity) {
             url.searchParams.set("identity", routeIdentity);
             url.searchParams.set("identity_src", "git_remote");
-            if (identityStyle === "path") url.searchParams.set("identity_style", "path");
+            url.searchParams.set("identity_style", identityStyleParam(identityStyle));
           }
           marker = undefined;
         } else marker = homeMarker;
@@ -4119,8 +4120,8 @@ function normalizeRemote(raw: string): string | undefined {
   return id && id.includes("/") ? id : undefined;
 }
 
-function identityStyleParam(style: string | undefined): string | undefined {
-  return style?.trim() === "path" ? "path" : undefined;
+function identityStyleParam(style: string | undefined): "path" | "host_path" {
+  return style?.trim() === "host_path" ? "host_path" : "path";
 }
 
 function discoverRemoteIdentity(cwd: string | undefined): string | undefined {
@@ -4163,8 +4164,7 @@ function applyIdentityParams(
   if (identity) {
     url.searchParams.set("identity", identity);
     url.searchParams.set("identity_src", "git_remote");
-    const forwarded = identityStyleParam(style);
-    if (forwarded) url.searchParams.set("identity_style", forwarded);
+    url.searchParams.set("identity_style", identityStyleParam(style));
     return true;
   }
   return false;
@@ -12914,9 +12914,9 @@ mod identity_parity_tests {
             .collect()
     }
 
-    /// The `identity_style` fixture: each marker value and whether a client
-    /// forwards `identity_style=path` for it (#1033).
-    fn style_cases() -> Vec<(String, bool)> {
+    /// The `identity_style` fixture: each marker value and the explicit value
+    /// every client forwards for it (#1033).
+    fn style_cases() -> Vec<(String, Option<String>)> {
         let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
         cases["identity_style"]
             .as_array()
@@ -12925,7 +12925,7 @@ mod identity_parity_tests {
             .map(|case| {
                 (
                     case["value"].as_str().unwrap().to_owned(),
-                    case["style"].as_str() == Some("path"),
+                    Some(case["style"].as_str().unwrap_or("path").to_owned()),
                 )
             })
             .collect()
@@ -13008,17 +13008,15 @@ mod identity_parity_tests {
     /// Compare one port's forwarding decisions, one line per style case.
     fn assert_styles_agree(port: &str, lines: &str) {
         let got: Vec<&str> = lines.split('\n').collect();
-        for (i, (value, forwards)) in style_cases().iter().enumerate() {
+        for (i, (value, style)) in style_cases().iter().enumerate() {
             let got = got
                 .get(i)
                 .copied()
                 .unwrap_or("<missing>")
                 .trim_end_matches('\r');
-            let expected = if *forwards {
-                "&identity_style=path"
-            } else {
-                ""
-            };
+            let expected = style
+                .as_deref()
+                .map_or_else(String::new, |style| format!("&identity_style={style}"));
             assert_eq!(got, expected, "{port} forwarded {value:?} differently");
         }
     }

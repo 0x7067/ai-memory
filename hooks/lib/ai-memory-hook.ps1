@@ -537,14 +537,13 @@ function ConvertTo-AiMemoryRepositoryIdentity {
     return $id
 }
 
-# `&identity_style=path` when the marker's `identity_style` is `path`, else "":
-# `host_path` is the server's default (#1033). Mirrors
-# `forwarded_identity_style` in hook_capture.rs, checked against the shared
-# fixture.
+# Send a style with every valid git-remote identity. Explicit marker/home-route
+# values win; omission or invalid input sends `path`. A server receiving a truly
+# omitted field keeps legacy `host_path` behavior for old clients.
 function Get-AiMemoryIdentityStyleQuery {
     param([string] $Style)
-    if ($Style -and $Style.Trim() -ceq "path") { return "&identity_style=path" }
-    return ""
+    if ($Style -and $Style.Trim() -ceq "host_path") { return "&identity_style=host_path" }
+    return "&identity_style=path"
 }
 
 # `&identity=<v>&identity_src=<rung>` for the checkout at $Cwd, or "".
@@ -637,7 +636,8 @@ function Get-AiMemoryMarkerQuery {
     if (-not $identityQuery) { $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj -Style $identityStyle -Aliases $aliases }
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
-    # pinned one. A marker's explicit project / project_strategy still win.
+    # pins one. Explicit project/identity and home routing win; otherwise a
+    # valid remote identity wins and repo-root is the remote-less fallback.
     if (-not $strategy -and $env:AI_MEMORY_PROJECT_STRATEGY) {
         $strategy = $env:AI_MEMORY_PROJECT_STRATEGY
     }

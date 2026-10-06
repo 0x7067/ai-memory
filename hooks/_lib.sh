@@ -427,13 +427,15 @@ ai_memory_normalize_remote() {
     case "$_ai_rn_id" in */*) printf '%s' "$_ai_rn_id" ;; esac
 }
 
-# Print `&identity_style=path` when the marker's `identity_style` ("$1") is
-# `path`, else nothing: `host_path` is the server's default (#1033). Mirrors
-# `forwarded_identity_style` in hook_capture.rs, checked against the shared
-# fixture.
+# Print the Phase-5 style sent with every valid git-remote identity. Explicit
+# marker/home-route values win; omission or invalid input sends `path`. Servers
+# keep a truly omitted field as legacy `host_path` for old-client compatibility.
 ai_memory_identity_style_qs() {
     _ai_is_value=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    [ "$_ai_is_value" = "path" ] && printf '&identity_style=path'
+    case "$_ai_is_value" in
+        host_path) printf '&identity_style=host_path' ;;
+        *) printf '&identity_style=path' ;;
+    esac
     return 0
 }
 
@@ -719,7 +721,8 @@ ai_memory_marker_qs() {
     [ -n "${iq:-}" ] || iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr" "$isty" "$aliases")
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
-    # pinned one. A marker's explicit project / project_strategy still win.
+    # pins one. Explicit project/identity and home routing win; otherwise a
+    # valid remote identity wins and repo-root is the remote-less fallback.
     if [ -z "$st" ] && [ -n "${AI_MEMORY_PROJECT_STRATEGY:-}" ]; then
         st="$AI_MEMORY_PROJECT_STRATEGY"
     fi

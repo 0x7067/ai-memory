@@ -281,9 +281,9 @@ pub fn url_encode(s: &str) -> String {
 /// `default_strategy` is the install-time default baked into the native hook
 /// command by `install-hooks --project-strategy` (passed via the `hook
 /// --project-strategy` flag). It fills `project_strategy` only when no marker
-/// pinned one — a marker's explicit `project` / `project_strategy` always win
-/// (§3.3). repo-root is resolved here, host-side, because a containerized
-/// server cannot see this checkout.
+/// pins one. A marker's explicit `project` or `identity` and operator-home
+/// routing win; otherwise a valid remote's canonical path wins, and repo-root
+/// is only the host-side no-valid-remote fallback.
 pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
     marker_query_suffix_impl(cwd, default_strategy, true)
 }
@@ -425,13 +425,8 @@ pub(crate) fn inspect_repository_coordinate(
         )
     });
     let identity_style = repository.as_ref().and_then(|identity| {
-        (identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote).then(
-            || {
-                forwarded_identity_style(marker.fields.identity_style.as_deref())
-                    .unwrap_or("host_path")
-                    .to_owned()
-            },
-        )
+        (identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote)
+            .then(|| forwarded_identity_style(marker.fields.identity_style.as_deref()).to_owned())
     });
     RepositoryCoordinateInspection {
         evidence: RepositoryCoordinateEvidence {
@@ -540,12 +535,10 @@ fn hook_scope_from_selection(
     }
     // Only a remote has a host to drop, so the style travels with a remote
     // identity and nothing else (#1033).
-    let identity_style = identity
-        .as_ref()
-        .filter(|identity| {
-            identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote
-        })
-        .and_then(|_| forwarded_identity_style(style.as_deref()));
+    let identity_style = identity.as_ref().and_then(|identity| {
+        (identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote)
+            .then(|| forwarded_identity_style(style.as_deref()))
+    });
     let (identity, identity_src) = match identity {
         Some(identity) => (Some(identity.identity), Some(identity.source.as_str())),
         None => (None, None),
@@ -564,14 +557,14 @@ fn hook_scope_from_selection(
     }
 }
 
-/// The `identity_style` value to forward for a marker's raw setting: `path`
-/// or nothing, since `host_path` is the server's default. Every client makes
-/// this same decision, checked against the shared identity fixture.
-fn forwarded_identity_style(raw: Option<&str>) -> Option<&'static str> {
+/// The `identity_style` every Phase-5 client sends with a valid git remote.
+/// Explicit marker/home-route values win; omission emits `path`. The server
+/// keeps omitted wire input as legacy `host_path` for old-client compatibility.
+fn forwarded_identity_style(raw: Option<&str>) -> &'static str {
     use ai_memory_core::repository_identity::IdentityStyle;
     raw.and_then(IdentityStyle::from_str_opt)
-        .filter(|style| *style == IdentityStyle::Path)
-        .map(IdentityStyle::as_str)
+        .unwrap_or(IdentityStyle::Path)
+        .as_str()
 }
 
 /// A resolved marker's `[profile]` flag as the explicit value the hook
@@ -1284,7 +1277,7 @@ mod tests {
         };
         let qs = marker_query_suffix(repo.path().to_str().unwrap(), None);
         assert!(
-            qs.contains("&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote"),
+            qs.contains("&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path"),
             "{qs}"
         );
         assert!(
@@ -1375,9 +1368,9 @@ mod tests {
         );
     }
 
-    /// #1033: `identity_style = "path"` rides along with a remote identity,
-    /// and only with one — a declared project or identity has no host to drop,
-    /// and the default style sends nothing.
+    /// #1033: every valid remote carries a style. Omission and invalid marker
+    /// values send `path`; explicit `host_path` remains the opt-out. A declared
+    /// project or identity has no inferred remote style.
     #[test]
     fn marker_query_suffix_forwards_the_path_style_with_a_remote_identity() {
         let Some(repo) = repo_with_remotes(&[("origin", "git@git.example.test:acme/api.git")])
@@ -1386,6 +1379,13 @@ mod tests {
         };
         let cwd = repo.path().to_str().unwrap();
         let marker = repo.path().join(".ai-memory.toml");
+
+        std::fs::write(&marker, "").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity_src=git_remote&identity_style=path"),
+            "{qs}"
+        );
 
         std::fs::write(&marker, "identity_style = \"path\"\n").unwrap();
         let qs = marker_query_suffix(cwd, None);
@@ -1396,15 +1396,18 @@ mod tests {
         let scope = serde_json::to_value(hook_scope(cwd, None)).unwrap();
         assert_eq!(scope["identity_style"], "path");
 
+        std::fs::write(&marker, "identity_style = \"host_path\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity_src=git_remote&identity_style=host_path"),
+            "{qs}"
+        );
+
+        std::fs::write(&marker, "identity_style = \"Path\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(qs.contains("&identity_style=path"), "{qs}");
+
         for (body, why) in [
-            (
-                "identity_style = \"host_path\"\n",
-                "the default sends nothing",
-            ),
-            (
-                "identity_style = \"Path\"\n",
-                "an unknown value sends nothing",
-            ),
             (
                 "identity_style = \"path\"\nproject = \"api\"\n",
                 "a declared project routes by name",
@@ -1429,10 +1432,10 @@ mod tests {
         .unwrap();
         for case in cases["identity_style"].as_array().unwrap() {
             let value = case["value"].as_str().unwrap();
-            let expected = (case["style"].as_str() == Some("path")).then_some("path");
+            let expected = case["style"].as_str().unwrap_or("path");
             assert_eq!(forwarded_identity_style(Some(value)), expected, "{value:?}");
         }
-        assert_eq!(forwarded_identity_style(None), None);
+        assert_eq!(forwarded_identity_style(None), "path");
     }
 
     /// No repository, no remote, no declaration: nothing to send, and the
