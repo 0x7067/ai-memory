@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launches when the server is unreachable: the reachability probe still runs,
   and an unreachable server returns the existing "could not reach …"
   diagnosis — including "the agent was not started" — without starting the
-  harness. (#NNN)
+  harness. #1112
 - Added bounded install-wide identity and component-safe path routes in the exact
   operator-home `.ai-memory.toml`. Exact hostful repository identity wins the
   longest lexical path route, local non-home markers stay authoritative, aliases
@@ -271,7 +271,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spool-health account. A server that dies mid-run, after the child exits, no
   longer discards the exit code either: the unimported transcript is
   downgraded to a warning naming the exact `ai-memory finalize-session` repair
-  command, while protocol-level failures still fail hard. (#NNN)
+  command, while protocol-level failures still fail hard. #1112
 - Changed static CLI/MCP project-name resolution to accept an existing
   repository's canonical hostless path name and its v2 basename compatibility
   key. Reads remain find-only; an authorized write through the canonical key
