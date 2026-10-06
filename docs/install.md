@@ -685,6 +685,14 @@ On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is
 eventually pruned rather than unbounded, but old undelivered events can be lost.
+
+Native hook drains drop an event after 8 failed passes by default, including
+passes when the server is unreachable. Set `max_attempts = 0` under
+`[hook_spool]` in `<data_dir>/config.toml` (or set
+`AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0`) to keep
+retrying until the 7-day age limit or 10,000-file spool cap applies. A positive
+value sets the number of failed passes before a drop.
+
 The built-in timings stay short on agent-facing paths, but high-latency or
 large-backlog instances can raise them with whole-minute runtime env vars in the
 agent's environment; no `install-hooks` rerun is needed:
@@ -696,6 +704,11 @@ agent's environment; no `install-hooks` rerun is needed:
 | `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time `session-start` may spend waiting for the drain lock and cleanup draining |
 | `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` | 5 minutes | 60 minutes | total time the detached `hook-drain` helper may spend after a background-drain boundary |
 | `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` | 32 events | positive integer | spool backlog size that triggers a 250 ms `post-tool-use` catch-up drain |
+| `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` | 8 failed passes | non-negative integer | failed drain passes before dropping an event; `0` disables only attempt-count drops |
+
+The retry setting can also be written as `max_attempts` under `[hook_spool]` in
+`<data_dir>/config.toml`; the runtime environment wins when both are set. A zero
+value still leaves the 7-day age limit and 10,000-file spool cap active.
 
 Timing values must be positive whole minutes. Missing, empty, non-numeric, or
 zero values fall back to the built-in defaults; values above 60 are clamped. The

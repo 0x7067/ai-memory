@@ -742,7 +742,7 @@ pub enum PostOutcome {
     /// bumping attempts so saturation never burns the entry's retry budget.
     Saturated,
     /// Any other non-2xx: the server answered and refused. A genuine miss
-    /// that should count against `MAX_ATTEMPTS`.
+    /// that should count against the retry limit.
     Failed,
     /// The request never reached a server — connection refused, DNS failure,
     /// or timeout. Distinguished from [`Self::Failed`] because it says
@@ -757,7 +757,7 @@ pub enum PostOutcome {
     ///
     /// Terminal, and that is the whole point of separating it from
     /// [`Self::Failed`]. A refusal that counts as a failure gets re-sent until
-    /// it exhausts `MAX_ATTEMPTS`, and every one of those attempts is
+    /// it exhausts the retry limit, and every one of those attempts is
     /// guaranteed to be refused for the same reason. Retrying something that
     /// cannot succeed is how a parse failure once cost this project 10.7M
     /// tokens in a day. The entry is dropped on the spot.
@@ -1095,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn post_hook_refused_on_403_is_terminal_not_a_failure() {
         // 403 means the server will never accept this event. Classifying it as
-        // `Failed` would re-send it until it burnt `MAX_ATTEMPTS`, and every
+        // `Failed` would re-send it until it burnt the retry limit, and every
         // attempt would be refused identically — the shape of retry loop that
         // once cost this project 10.7M tokens in a day. It must be its own
         // outcome so the drain can drop it on the spot.
@@ -1107,6 +1107,39 @@ mod tests {
             PostOutcome::Failed,
             "a refusal must never be charged a retry attempt"
         );
+    }
+
+    #[tokio::test]
+    async fn post_hook_408_and_425_are_retryable_failed_not_refused() {
+        // 408 (request timeout) and 425 (too early) say "retry me", not
+        // "never": they must fall through to `Failed` so the spool keeps the
+        // entry queued subject to the attempt limit. Classifying every 4xx as
+        // a terminal refusal deleted such events on the spot (#1092
+        // regression).
+        for status in ["408 Request Timeout", "425 Too Early"] {
+            let url = serve_once(status, "retry later").await;
+            let outcome =
+                post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+            assert_ne!(
+                outcome,
+                PostOutcome::Refused,
+                "{status} is retryable and must not be terminal"
+            );
+            assert_eq!(outcome, PostOutcome::Failed, "{status} is a retryable miss");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_batch_unhandled_4xx_is_retryable_failed() {
+        // Base semantics: only 401/404/405/429 are special-cased for batches;
+        // every other status — 400, and retryable timeouts like 408/425 — is
+        // a `Failed` with an unknown outcome, never a terminal refusal.
+        for status in ["400 Bad Request", "408 Request Timeout", "425 Too Early"] {
+            let url = serve_once(status, "invalid batch").await;
+            let outcome =
+                post_batch(&build_client(), &url, "[]", None, Duration::from_secs(1)).await;
+            assert_eq!(outcome, BatchOutcome::Failed, "{status} is retryable");
+        }
     }
 
     #[tokio::test]

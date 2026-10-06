@@ -245,6 +245,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`github.com/acme/api` → `acme-api`); `host_path` preserves the former naming
   behavior as an explicit opt-out. Captures always route by the full hostful
   identity, and cross-forge path collisions never merge. (#1033)
+- Added `[hook_spool] max_attempts` and
+  `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` to configure failed drain passes before
+  dropping an event; zero disables attempt-based drops while age and spool
+  size limits remain. (#1092)
 
 ### Changed
 - Changed static CLI/MCP project-name resolution to accept an existing
