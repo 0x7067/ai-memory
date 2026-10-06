@@ -481,11 +481,12 @@ fn slugify(text: &str) -> String {
         } else if c == '_' {
             slug.push(c);
             prev_is_dash = false;
-        } else if c == '-' || c == '—' || c == '–' || c.is_whitespace() {
-            if !slug.is_empty() && !prev_is_dash {
-                slug.push('-');
-                prev_is_dash = true;
-            }
+        } else if (c == '-' || c == '—' || c == '–' || c.is_whitespace())
+            && !slug.is_empty()
+            && !prev_is_dash
+        {
+            slug.push('-');
+            prev_is_dash = true;
         }
     }
 
