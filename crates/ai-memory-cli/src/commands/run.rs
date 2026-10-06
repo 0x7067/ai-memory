@@ -36,7 +36,8 @@ use crate::cli::{RunArgs, RunHarnessChoice};
 use crate::commands::{path_util, resolve_scope};
 use crate::config::Config;
 use crate::http_client::{
-    ServerEndpoint, ServerResponseError, get_json, post_empty, post_json, post_json_no_content,
+    ServerEndpoint, ServerProbe, ServerResponseError, augment_connect_error, get_json, post_empty,
+    post_json, post_json_no_content, probe_server,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -266,6 +267,10 @@ struct RunOutcome {
     interactive_session: bool,
     mode: LaunchMode,
     workstream_name: String,
+    /// A degraded launch made without the server: it has no workstream, so
+    /// the post-run switch/rerun menu (which reuses the workstream name)
+    /// must not be offered.
+    degraded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +333,7 @@ fn should_offer_after_run(
     outcome.exit_code == 0
         && outcome.mode == LaunchMode::Session
         && outcome.interactive_session
+        && !outcome.degraded
         && interactive_terminal
         && !custom_executable
 }
@@ -601,6 +607,42 @@ async fn run_once_with_wiring(
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    // Probe before any server work: a homelab down for maintenance must
+    // downgrade (or, with --require-server, fail) in ~2s, not after a
+    // TCP-level timeout on the prepare POST. Any HTTP answer counts as
+    // reachable — including 404/405 from a server older than /healthz.
+    let require_server = args.require_server || config.run.require_server;
+    if let ServerProbe::Unreachable(probe_error) = probe_server(&endpoint).await {
+        if require_server {
+            // Fail closed exactly like the prepare below would: same
+            // augmented diagnosis, same "the agent was not started" context.
+            let url = endpoint.build_url("/workstream/runs");
+            return Err(augment_connect_error(probe_error, &endpoint, &url)
+                .context("opening managed workstream; the agent was not started"));
+        }
+        return run_degraded_offline(
+            config,
+            DegradedLaunch {
+                endpoint: &endpoint,
+                cwd: &repository.cwd,
+                home: &home,
+                harness: provisional_harness,
+                executable: executable.clone(),
+                native_args: &native_args,
+                force_fresh,
+                yolo_modes,
+                jail_plan: &jail_plan,
+                ai_jail: ai_jail.as_deref(),
+                jail_facts: &jail_facts,
+                no_autowire,
+                child_env: &child_env,
+                run_env: &run_env,
+                wire_overrides,
+            },
+            probe_error,
+        )
+        .await;
+    }
     let prepare = PrepareManagedRunRequest {
         workspace: workspace.clone(),
         project: project.clone(),
@@ -723,8 +765,7 @@ async fn run_once_with_wiring(
             &jail_plan,
             ai_jail.as_deref(),
             &jail_facts,
-            &endpoint,
-            &run_path,
+            Some((&endpoint, &run_path)),
             &interrupted_before_spawn,
         )
         .await
@@ -934,6 +975,7 @@ async fn run_once_with_wiring(
             &wire_env,
             &wire_child_env,
             &repository.cwd,
+            false,
         );
     }
     // A Kiro v3 resume that dropped `KIRO_HOME` runs against the default store.
@@ -1197,17 +1239,45 @@ async fn run_once_with_wiring(
     let checkpoint = inspect_repository(&repository.cwd)
         .map(|identity| identity.checkpoint)
         .unwrap_or(repository.checkpoint);
-    let imported = acquired_try!(
-        import_batches(
-            &endpoint,
-            &run_path,
-            transcript,
-            checkpoint,
-            Some(exit_code),
-            &privacy,
-        )
-        .await
-    );
+    let imported = match import_batches(
+        &endpoint,
+        &run_path,
+        transcript,
+        checkpoint,
+        Some(exit_code),
+        &privacy,
+    )
+    .await
+    {
+        Ok(imported) => imported,
+        // The child has already exited; an unreachable server must not turn
+        // its exit code into an error. The transcript is not recorded, so say
+        // how to repair it once the server is back. Protocol-level failures
+        // (a live server's 4xx, an unparsable body) keep the hard fail: they
+        // need an operator, not a server restart.
+        Err(error) if is_unreachable_error(&error) => {
+            eprintln!(
+                "{}",
+                offline_import_warning(
+                    harness,
+                    native_session_id.as_deref(),
+                    &workspace,
+                    &project,
+                    &error,
+                )
+            );
+            interrupt_task.abort();
+            return Ok(RunOutcome {
+                exit_code,
+                harness,
+                interactive_session,
+                mode: plan.mode,
+                workstream_name: prepared.workstream_name,
+                degraded: false,
+            });
+        }
+        Err(error) => acquired_try!(Err(error)),
+    };
 
     // Sessions whose id was unknown at launch (a fresh Codex session, say) are
     // linked by the finish request above, so record their store here.
@@ -1262,18 +1332,255 @@ async fn run_once_with_wiring(
         interactive_session,
         mode: plan.mode,
         workstream_name: prepared.workstream_name,
+        degraded: false,
     })
 }
 
 /// How long finalizing may hold up the harness's exit code.
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Everything the local half of [`run_once_with_wiring`] resolved before the
+/// server probe: the inputs a degraded (server-unreachable) launch still has.
+struct DegradedLaunch<'a> {
+    endpoint: &'a ServerEndpoint,
+    cwd: &'a Path,
+    home: &'a Path,
+    harness: ManagedHarness,
+    executable: Option<OsString>,
+    native_args: &'a [OsString],
+    force_fresh: bool,
+    yolo_modes: YoloModes,
+    jail_plan: &'a JailPlan,
+    ai_jail: Option<&'a Path>,
+    jail_facts: &'a JailHostFacts,
+    no_autowire: bool,
+    child_env: &'a EffectiveChildEnv,
+    run_env: &'a [(String, String)],
+    wire_overrides: &'a super::run_autowire::WireOverrides,
+}
+
+/// Launch the harness without the server: warn loudly, do no server work at
+/// all, and return the child's exit code. See `docs/managed-workstreams.md`
+/// ("Degraded offline launches") for the exact lost/kept contract.
+async fn run_degraded_offline(
+    config: &Config,
+    launch: DegradedLaunch<'_>,
+    probe_error: reqwest::Error,
+) -> Result<RunOutcome> {
+    eprintln!(
+        "{}",
+        offline_launch_warning(
+            launch.endpoint,
+            launch.harness,
+            config.hook_spool.max_attempts,
+            probe_error,
+        )
+    );
+    let interrupted = CancellationToken::new();
+    let interrupt_task = tokio::spawn(capture_interrupts(interrupted.clone()));
+    let outcome = degraded_launch(config, &launch, &interrupted).await;
+    interrupt_task.abort();
+    outcome
+}
+
+async fn degraded_launch(
+    config: &Config,
+    launch: &DegradedLaunch<'_>,
+    interrupted: &CancellationToken,
+) -> Result<RunOutcome> {
+    // No lease exists, so there is no mutual exclusion against another
+    // launcher in this checkout. The launch therefore never adopts or resumes
+    // a session implicitly — only an explicit native session selector
+    // resumes, because the user named the session themselves and no
+    // arbitration is needed. Everything else starts a fresh session.
+    let (mut plan, _) = build_preflighted_launch_plan(
+        launch.harness,
+        launch.executable.clone(),
+        launch.native_args.to_vec(),
+        None,
+        launch.force_fresh,
+        launch.home,
+        launch.cwd,
+        launch.child_env,
+    )?;
+    // The `--yolo` warning and ai-jail offer still apply; a degraded launch
+    // just has no prepared lease for the re-exec to release.
+    confirm_yolo_and_maybe_reexec(
+        launch.jail_plan,
+        launch.ai_jail,
+        launch.jail_facts,
+        None,
+        interrupted,
+    )
+    .await?;
+    if launch.yolo_modes.yolo {
+        // Same Kiro caveat as the online path: v3 has no verified dangerous
+        // mode, so the wrapper maps nothing there and says so.
+        if launch.harness == ManagedHarness::KiroV3
+            || launch.harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
+        {
+            eprintln!(
+                "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
+                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+            );
+        }
+        apply_yolo(launch.harness, &mut plan.args);
+    }
+    if launch.yolo_modes.claude_true_yolo && launch.harness == ManagedHarness::Claude {
+        apply_claude_true_yolo(launch.harness, &mut plan.args);
+    }
+    let launch_env = |name: &str| launch.child_env.get(name).map(OsStr::to_os_string);
+    // Auto-wire keeps the hook install (it is local and idempotent, and
+    // capture must spool offline) but skips the MCP registration — pointing
+    // the harness at a server that just proved unreachable would degrade
+    // every later start for no recall. The unwritten sentinel lets the next
+    // online launch complete the wiring.
+    if config.run_autowire && !launch.no_autowire {
+        let wire_env = autowire_env(launch.harness, launch.run_env, &plan.args, &launch_env);
+        let wire_child_env = launch.child_env.with_additional_overrides(&wire_env);
+        super::run_autowire::ensure_wired_with_env(
+            config,
+            launch.harness,
+            launch.wire_overrides,
+            &wire_env,
+            &wire_child_env,
+            launch.cwd,
+            true,
+        );
+    }
+    let executable_search = launch.child_env.executable_search();
+    let program = resolve_program(&plan.program, executable_search)
+        .unwrap_or_else(|| plan.program.clone().into());
+    let mut command = Command::new(&program);
+    launch.child_env.apply_to_tokio(&mut command);
+    command.args(&plan.args).current_dir(launch.cwd);
+    // No AI_MEMORY_RUN_ID / AI_MEMORY_WORKSTREAM_ID: no run exists on the
+    // server, and the SessionEnd hook appends `managed_run` when the run id
+    // is set — attributing the offline session to a run that never happened.
+    // Removed explicitly: a launcher itself started under a managed run would
+    // otherwise leak its own (now stale) ids into the offline child.
+    // AI_MEMORY_HOOK_URL stays so the hooks spool against the right server.
+    command
+        .env_remove("AI_MEMORY_RUN_ID")
+        .env_remove("AI_MEMORY_WORKSTREAM_ID")
+        .env("AI_MEMORY_HOOK_URL", launch.endpoint.build_url(""))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for name in blank_home_overrides(launch.harness, &launch_env) {
+        command.env_remove(name);
+    }
+    let child = command.spawn().map_err(|spawn_error| {
+        let spawn_message = spawn_error.to_string();
+        anyhow!(spawn_message).context(format!(
+            "starting managed {} executable {}",
+            launch.harness.as_str(),
+            plan.program.to_string_lossy()
+        ))
+    })?;
+    let mut child = child;
+    let status = child.wait().await.context("waiting for managed harness")?;
+    let exit_code = status.code().unwrap_or(1);
+    let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&config.data_dir));
+    eprintln!(
+        "ai-memory: this run was not recorded on the server; {}",
+        spooled_events_note(&spool)
+    );
+    Ok(RunOutcome {
+        exit_code,
+        harness: launch.harness,
+        interactive_session: is_interactive_session_invocation(launch.harness, launch.native_args),
+        mode: plan.mode,
+        workstream_name: "(offline)".to_string(),
+        degraded: true,
+    })
+}
+
+/// The one-line account of what remains in the local hook spool after a
+/// degraded run, mirroring `ai-memory status`'s offline-spool phrasing.
+fn spooled_events_note(spool: &super::hook_spool::SpoolHealth) -> String {
+    match spool.pending {
+        0 => "no hook events remain spooled locally".to_string(),
+        1 => format!(
+            "1 hook event remains spooled locally (oldest {})",
+            super::status::spool_age_line(spool.oldest_age_ms),
+        ),
+        pending => format!(
+            "{pending} hook events remain spooled locally (oldest {})",
+            super::status::spool_age_line(spool.oldest_age_ms),
+        ),
+    }
+}
+
+/// The loud one-time warning a degraded launch prints: what is lost, what
+/// still works, and how the local spool is bounded. Reuses
+/// [`augment_connect_error`]'s diagnosis so the operator sees the same
+/// server-URL explanation a hard failure would print.
+fn offline_launch_warning(
+    endpoint: &ServerEndpoint,
+    harness: ManagedHarness,
+    spool_max_attempts: u32,
+    probe_error: reqwest::Error,
+) -> String {
+    let diagnosis = augment_connect_error(probe_error, endpoint, &endpoint.build_url(""));
+    format!(
+        "ai-memory: WARNING: the ai-memory server at {} is unreachable — launching {} \
+         WITHOUT server support.\n  {diagnosis:#}\n  Lost this run: no workstream lease or \
+         cross-harness context, no transcript import, no handoff delivery.\n  Still works: \
+         lifecycle hooks spool events locally and drain when the server returns; an existing \
+         MCP registration degrades to no-recall rather than blocking the session.\n  Spooled \
+         events are dropped after {} failed drain passes, 7 days, or the 10,000-file spool \
+         cap (set AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0 for a planned outage). Pass \
+         --require-server to fail instead of degrading.",
+        endpoint.url,
+        harness.as_str(),
+        spool_max_attempts,
+    )
+}
+
+/// The warning printed when the server became unreachable after the child
+/// exited, so its transcript could not be imported: the child's exit code is
+/// preserved and the run is repairable by hand once the server returns.
+fn offline_import_warning(
+    harness: ManagedHarness,
+    native_session_id: Option<&str>,
+    workspace: &str,
+    project: &str,
+    error: &anyhow::Error,
+) -> String {
+    let repair = match native_session_id {
+        Some(session) => format!(
+            "ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}",
+            harness.agent_kind().as_str(),
+            SessionId::from_native(session),
+            super::render_shared::shell_quote(workspace),
+            super::render_shared::shell_quote(project),
+        ),
+        None => "ai-memory finalize-session (see --help)".to_string(),
+    };
+    format!(
+        "ai-memory: warning: {error:#}; the transcript was not imported and the orphaned lease \
+         will expire automatically within 90 seconds. The harness exit code is preserved. \
+         Repair it once the server is back with `{repair}`."
+    )
+}
+
+/// Whether a managed-run request failed because the server could not be
+/// reached at all (connect error or timeout) rather than answering with a
+/// protocol-level failure. Only the former may be downgraded to a warning
+/// after the child has exited: an answered error needs an operator, while an
+/// unreachable one only needs the server back.
+fn is_unreachable_error(error: &anyhow::Error) -> bool {
+    let answered = error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some());
+    let transport = error
+        .chain()
+        .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some());
+    !answered && transport
+}
+
 /// Finalizes the run's own session when the harness has no native session-end
-/// hook, which would otherwise leave it open until a manual
-/// `ai-memory finalize-session` (#941). The harness has exited, so the session
-/// is over for this run.
-/// Returns the stored session id and the ids finalized, or `None` when there
-/// is nothing to do.
 async fn finalize_hookless_session(
     config: &Config,
     harness: ManagedHarness,
@@ -1735,12 +2042,13 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
 /// the user declined the ai-jail offer) or, on accepting the offer and the
 /// checklist, cancels this process's already-prepared managed run and re-execs
 /// the original invocation under `ai-jail` — which never returns on success.
+/// `lease` is the prepared run to release before that re-exec; a degraded
+/// offline launch passes `None` (it holds no lease).
 async fn confirm_yolo_and_maybe_reexec(
     plan: &JailPlan,
     ai_jail: Option<&Path>,
     facts: &JailHostFacts,
-    endpoint: &ServerEndpoint,
-    run_path: &str,
+    lease: Option<(&ServerEndpoint, &str)>,
     interrupted: &CancellationToken,
 ) -> Result<()> {
     if !plan.warn {
@@ -1791,8 +2099,10 @@ async fn confirm_yolo_and_maybe_reexec(
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
-    // its own workstream cleanly.
-    cancel_managed_run_after_failure(endpoint, run_path).await;
+    // its own workstream cleanly. A degraded launch holds no lease.
+    if let Some((endpoint, run_path)) = lease {
+        cancel_managed_run_after_failure(endpoint, run_path).await;
+    }
     Err(exec_under_ai_jail(
         ai_jail,
         &support,
@@ -3436,6 +3746,7 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+    use crate::commands::run_autowire::WireOverrides;
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
         JailPlan { warn, mode }
@@ -3880,6 +4191,7 @@ mod tests {
             fresh: true,
             force_unlock: false,
             no_autowire: true,
+            require_server: false,
             profile: Some("work".into()),
             env: vec![("MODEL_HOME".into(), "custom".into())],
             env_file: None,
@@ -3962,6 +4274,7 @@ mod tests {
             interactive_session: true,
             mode: LaunchMode::Session,
             workstream_name: "research".into(),
+            degraded: false,
         };
 
         assert!(apply_after_run_action(
@@ -3990,6 +4303,7 @@ mod tests {
             interactive_session: true,
             mode: LaunchMode::Session,
             workstream_name: "research".into(),
+            degraded: false,
         };
 
         assert!(apply_after_run_action(
@@ -4010,6 +4324,7 @@ mod tests {
             interactive_session: true,
             mode: LaunchMode::Session,
             workstream_name: "research".into(),
+            degraded: false,
         };
         assert!(should_offer_after_run(&outcome, true, false));
         assert!(!should_offer_after_run(&outcome, false, false));
@@ -5497,6 +5812,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            require_server: false,
             profile: Some("missing".into()),
             env: Vec::new(),
             env_file: None,
@@ -5761,6 +6077,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            require_server: false,
             profile: Some("work".into()),
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
@@ -5788,6 +6105,480 @@ mod tests {
             "--env must override a same-key --env-file entry for the spawned child: {captured_env}"
         );
 
+        server.abort();
+    }
+
+    // ----------------------------------------------------------------
+    // Degraded offline launches (server unreachable)
+    // ----------------------------------------------------------------
+
+    /// A loopback address that nothing listens on: bind, capture, release.
+    /// Rebinding races exist but are vanishingly rare under a test load.
+    async fn closed_port_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    fn repo_hooks() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")
+    }
+
+    /// A fake Claude executable: captures its environment and argv, writes
+    /// the (empty-session) transcript the launcher waits for, and exits with
+    /// `code`.
+    #[cfg(unix)]
+    fn capture_env_claude(repo: &Path, home: &Path, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = repo.join("capture-harness");
+        let transcripts = home
+            .join(".claude/projects")
+            .join(repo.to_string_lossy().replace('/', "-"));
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nenv > \"$CAPTURED_ENV\"\nprintf '%s\\n' \"$@\" > \"$CAPTURED_ARGS\"\n\
+                 while [ $# -gt 0 ]; do\n\
+                 if [ \"$1\" = --session-id ]; then\n\
+                 printf '{{\"sessionId\":\"%s\",\"cwd\":\"%s\"}}\\n' \"$2\" '{repo}' > '{dir}'/\"$2\".jsonl\n\
+                 fi\nshift\ndone\nexit {code}\n",
+                repo = repo.display(),
+                dir = transcripts.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// The common offline-launch fixture: temp home/data/repo, a config whose
+    /// server URL points at a closed port, and RunArgs pinned to the fake
+    /// Claude executable.
+    #[cfg(unix)]
+    async fn offline_run_fixture(code: i32) -> (tempfile::TempDir, Config, RunArgs) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let script = capture_env_claude(&repo, &home, code);
+
+        let mut config = Config::load(None, Some(temp.path().join("data"))).unwrap();
+        config.data_dir = temp.path().join("data");
+        config.home_dir = Some(home.to_string_lossy().into_owned());
+        config.server_url = closed_port_url().await;
+        config.run_autowire = false;
+
+        let args = RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(script),
+            yolo: false,
+            true_yolo: false,
+            jail: None,
+            no_jail: true,
+            fresh: false,
+            force_unlock: false,
+            no_autowire: true,
+            require_server: false,
+            profile: None,
+            env: Vec::new(),
+            env_file: None,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: Vec::new(),
+        };
+        (temp, config, args)
+    }
+
+    /// The degraded launch spawns the child without any server, propagates
+    /// its exact exit code, strips the run/workstream attribution ids from
+    /// its environment, and still points its hooks at the configured server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_launch_spawns_the_child_and_propagates_its_exit_code() {
+        let (temp, config, mut args) = offline_run_fixture(7).await;
+        let captured_env = temp.path().join("captured-env");
+        let captured_args = temp.path().join("captured-args");
+        args.env = vec![
+            (
+                "CAPTURED_ENV".to_string(),
+                captured_env.display().to_string(),
+            ),
+            (
+                "CAPTURED_ARGS".to_string(),
+                captured_args.display().to_string(),
+            ),
+        ];
+
+        let exit = run_from_with_wiring(
+            &config,
+            args,
+            &temp.path().join("repo"),
+            &WireOverrides::default(),
+        )
+        .await
+        .expect("a degraded launch still runs the harness");
+
+        assert_eq!(exit, 7, "the child's exit code is returned, not an error");
+        let child_env_text = std::fs::read_to_string(&captured_env).unwrap();
+        assert!(
+            !child_env_text
+                .lines()
+                .any(|line| line.starts_with("AI_MEMORY_RUN_ID=")),
+            "no run id may be attributed offline:\n{child_env_text}"
+        );
+        assert!(
+            !child_env_text
+                .lines()
+                .any(|line| line.starts_with("AI_MEMORY_WORKSTREAM_ID=")),
+            "no workstream id may be attributed offline:\n{child_env_text}"
+        );
+        assert!(
+            child_env_text
+                .lines()
+                .any(|line| line.starts_with("AI_MEMORY_HOOK_URL=")),
+            "the hook URL still points at the configured server:\n{child_env_text}"
+        );
+    }
+
+    /// Without a server there is no lease, so no mutual exclusion: only an
+    /// explicit native session selector resumes; a bare launch starts fresh.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_launch_resumes_only_with_an_explicit_session_selector() {
+        let (temp, config, args) = offline_run_fixture(0).await;
+        let repo = temp.path().join("repo");
+        let captured_args =
+            |name: &str| std::fs::read_to_string(temp.path().join(name)).unwrap_or_default();
+        let run = |native_args: Vec<OsString>| async {
+            let mut args = args.clone();
+            args.native_args = native_args;
+            args.env = vec![
+                (
+                    "CAPTURED_ENV".to_string(),
+                    temp.path()
+                        .join(format!("env-{}", args.native_args.len()))
+                        .display()
+                        .to_string(),
+                ),
+                (
+                    "CAPTURED_ARGS".to_string(),
+                    temp.path()
+                        .join(format!("args-{}", args.native_args.len()))
+                        .display()
+                        .to_string(),
+                ),
+            ];
+            run_from_with_wiring(&config, args, &repo, &WireOverrides::default()).await
+        };
+
+        run(Vec::new()).await.expect("bare offline launch");
+        let bare = captured_args("args-0");
+        assert!(
+            bare.contains("--session-id"),
+            "a bare offline launch starts a fresh session: {bare}"
+        );
+
+        run(vec![
+            OsString::from("--resume"),
+            OsString::from("explicit-session"),
+        ])
+        .await
+        .expect("explicit-selector offline launch");
+        let resumed = captured_args("args-2");
+        assert!(
+            resumed.contains("--resume")
+                && resumed.contains("explicit-session")
+                && !resumed.contains("--session-id"),
+            "an explicit selector still resumes: {resumed}"
+        );
+    }
+
+    /// Offline auto-wire keeps the hook install (capture must spool locally)
+    /// but registers no MCP entry for the dead server and writes no sentinel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_launch_wires_hooks_but_no_mcp_and_no_sentinel() {
+        let (temp, mut config, mut args) = offline_run_fixture(0).await;
+        config.run_autowire = true;
+        let data = temp.path().join("data");
+        let hooks_file = data.join("claude-settings.json");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(&hooks_file, "{}").unwrap();
+        let mcp_file = data.join("claude.json");
+        std::fs::write(&mcp_file, r#"{"existing":"keep"}"#).unwrap();
+        let overrides = crate::commands::run_autowire::WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(hooks_file.clone()),
+            mcp_config_file: Some(mcp_file.clone()),
+            ..Default::default()
+        };
+        args.no_autowire = false;
+        // Keep the capture env names of the fixture off this launch.
+        args.env.clear();
+
+        run_from_with_wiring(&config, args, &temp.path().join("repo"), &overrides)
+            .await
+            .expect("offline launch with wiring");
+
+        let hooks_json = std::fs::read_to_string(&hooks_file).unwrap();
+        assert!(
+            hooks_json.contains("ai-memory") || hooks_json.contains("ai_memory"),
+            "hooks are still wired offline: {hooks_json}"
+        );
+        let mcp_json = std::fs::read_to_string(&mcp_file).unwrap();
+        assert!(
+            !mcp_json.contains("ai-memory"),
+            "no dead-server MCP registration may be written: {mcp_json}"
+        );
+        assert!(
+            std::fs::read_dir(crate::commands::run_autowire::autowire_state_dir(&data))
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+                == 0,
+            "an offline half-wiring must not gate the next online launch"
+        );
+    }
+
+    /// `--require-server` restores the fail-closed behavior with the same
+    /// augmented diagnosis — including "the agent was not started" — and the
+    /// harness never runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn require_server_restores_the_fail_closed_error() {
+        let (temp, config, mut args) = offline_run_fixture(0).await;
+        args.require_server = true;
+
+        let error = run_from_with_wiring(
+            &config,
+            args,
+            &temp.path().join("repo"),
+            &WireOverrides::default(),
+        )
+        .await
+        .expect_err("require-server must fail closed");
+        assert!(
+            error.to_string().contains("the agent was not started"),
+            "outer context matches the prepare failure: {error}"
+        );
+        let full = format!("{error:#}");
+        assert!(
+            full.contains("could not reach")
+                && full.contains("/workstream/runs")
+                && full.contains(&config.server_url),
+            "the augmented connect diagnosis is reused verbatim: {full}"
+        );
+        assert!(
+            !temp.path().join("repo").join("capture-harness").exists()
+                || std::fs::read_to_string(temp.path().join("captured-args")).is_err(),
+            "the harness must not run"
+        );
+    }
+
+    /// A `config.toml`-level `run.require_server` behaves like the flag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_require_server_also_fails_closed() {
+        let (temp, mut config, args) = offline_run_fixture(0).await;
+        config.run.require_server = true;
+
+        let error = run_from_with_wiring(
+            &config,
+            args,
+            &temp.path().join("repo"),
+            &WireOverrides::default(),
+        )
+        .await
+        .expect_err("config require_server must fail closed");
+        assert!(
+            format!("{error:#}").contains("the agent was not started"),
+            "{error:#}"
+        );
+    }
+
+    /// The degraded-launch warning names everything the operator needs: the
+    /// server URL, what is lost, what still works (spool + no-recall MCP),
+    /// the bounded retention, and the opt-outs.
+    #[tokio::test]
+    async fn offline_launch_warning_names_the_tradeoffs() {
+        let url = closed_port_url().await;
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&Config {
+            server_url: url,
+            ..Config::load(None, None).unwrap()
+        })
+        .await;
+        let ServerProbe::Unreachable(error) = probe_server(&endpoint).await else {
+            panic!("closed port is unreachable");
+        };
+        let warning = offline_launch_warning(&endpoint, ManagedHarness::Claude, 8, error);
+
+        assert!(warning.contains(&endpoint.url), "{warning}");
+        assert!(warning.contains("could not reach"), "{warning}");
+        assert!(warning.contains("Lost this run"), "{warning}");
+        assert!(warning.contains("Still works"), "{warning}");
+        assert!(warning.contains("spool"), "{warning}");
+        assert!(warning.contains("no-recall"), "{warning}");
+        assert!(warning.contains("8 failed drain passes"), "{warning}");
+        assert!(
+            warning.contains("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0"),
+            "{warning}"
+        );
+        assert!(warning.contains("--require-server"), "{warning}");
+    }
+
+    #[test]
+    fn spooled_events_note_matches_the_status_phrasing() {
+        use crate::commands::hook_spool::SpoolHealth;
+        assert_eq!(
+            spooled_events_note(&SpoolHealth::default()),
+            "no hook events remain spooled locally"
+        );
+        let note = spooled_events_note(&SpoolHealth {
+            pending: 3,
+            oldest_age_ms: Some(45_000),
+            retries_total: 1,
+        });
+        assert_eq!(note, "3 hook events remain spooled locally (oldest 45s)");
+        let one = spooled_events_note(&SpoolHealth {
+            pending: 1,
+            oldest_age_ms: Some(0),
+            retries_total: 0,
+        });
+        assert_eq!(one, "1 hook event remains spooled locally (oldest 0s)");
+    }
+
+    #[tokio::test]
+    async fn unreachable_errors_are_transport_errors_not_server_answers() {
+        let url = closed_port_url().await;
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&Config {
+            server_url: url,
+            ..Config::load(None, None).unwrap()
+        })
+        .await;
+        let transport =
+            post_json::<_, FinishManagedRunResponse>(&endpoint, "/workstream/runs/x/finish", &())
+                .await
+                .expect_err("closed port");
+        assert!(is_unreachable_error(&transport));
+
+        let answered = crate::http_client::server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs/x/finish",
+            reqwest::StatusCode::BAD_REQUEST,
+            "{\"error\":\"bad\"}".to_owned(),
+        )
+        .context("persisting the managed transcript; the native process has already exited");
+        assert!(!is_unreachable_error(&answered));
+    }
+
+    #[test]
+    fn offline_import_warning_points_at_finalize_session() {
+        let warning = offline_import_warning(
+            ManagedHarness::Claude,
+            Some("session-123"),
+            "ws",
+            "proj",
+            &anyhow!("connection refused"),
+        );
+        assert!(warning.contains("exit code is preserved"), "{warning}");
+        assert!(
+            warning.contains(&format!(
+                "ai-memory finalize-session --agent claude-code --reopen --session-id {}",
+                SessionId::from_native("session-123")
+            )),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("--workspace ws --project proj"),
+            "{warning}"
+        );
+
+        let generic = offline_import_warning(
+            ManagedHarness::Crush,
+            None,
+            "ws",
+            "proj",
+            &anyhow!("timed out"),
+        );
+        assert!(
+            generic.contains("finalize-session (see --help)"),
+            "{generic}"
+        );
+    }
+
+    /// A server that dies between prepare and finish: the child's exit code
+    /// survives, the unrecorded run is reported, and no error propagates.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mid_run_outage_after_the_child_exits_keeps_the_exit_code() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let trigger = shutdown_tx.clone();
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(|| async {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: Some(AgentKind::ClaudeCode),
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                        manifest_warning: None,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/link",
+                post(move || {
+                    let _ = trigger.send(true);
+                    async { StatusCode::NO_CONTENT }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let mut rx = shutdown_rx;
+                    while rx.changed().await.is_ok() {
+                        if *rx.borrow() {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+        });
+
+        let (temp, mut config, args) = offline_run_fixture(5).await;
+        config.server_url = format!("http://{address}");
+        // Give the graceful shutdown time to close the listener before the
+        // child exits and the finish POSTs begin.
+        std::fs::write(
+            args.executable.clone().unwrap(),
+            std::fs::read_to_string(args.executable.clone().unwrap())
+                .unwrap()
+                .replace("exit 5", "sleep 1\nexit 5"),
+        )
+        .unwrap();
+
+        let exit = run_from_with_wiring(
+            &config,
+            args,
+            &temp.path().join("repo"),
+            &WireOverrides::default(),
+        )
+        .await
+        .expect("an outage after the child exits is a warning, not an error");
+        assert_eq!(exit, 5, "the child's exit code is preserved");
         server.abort();
     }
 
@@ -5887,6 +6678,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            require_server: false,
             profile: None,
             // Pinned so a contributor's own CLAUDE_CONFIG_DIR cannot leak in.
             env: vec![(
@@ -6582,6 +7374,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            require_server: false,
             env: vec![
                 ("PATH".into(), executable_dir.display().to_string()),
                 ("OPENCODE_MAJOR".into(), "2".into()),
@@ -6708,6 +7501,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            require_server: false,
             profile: None,
             env: Vec::new(),
             env_file: None,
@@ -6989,6 +7783,7 @@ mod tests {
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            require_server: false,
             profile: None,
             env,
             env_file: None,

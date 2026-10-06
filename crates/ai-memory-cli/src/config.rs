@@ -684,6 +684,7 @@ pub struct RuntimeEnv {
     voyage_api_key: Option<SecretString>,
     opencode_api_key: Option<SecretString>,
     hook_spool_max_attempts: Option<String>,
+    run_require_server: Option<String>,
 }
 
 impl RuntimeEnv {
@@ -741,6 +742,11 @@ impl RuntimeEnv {
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
             opencode_api_key: env_secret("OPENCODE_API_KEY"),
             hook_spool_max_attempts: std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").ok(),
+            // A flat env var (not `AI_MEMORY_RUN__REQUIRE_SERVER`, which
+            // figment's `__` split would map onto `run.require_server`) so it
+            // reads the same way as `AI_MEMORY_RUN_AUTOWIRE`; applied in
+            // `load_with_runtime_env` instead of figment for that reason.
+            run_require_server: std::env::var("AI_MEMORY_RUN_REQUIRE_SERVER").ok(),
         }
     }
 
@@ -803,6 +809,13 @@ impl RuntimeEnv {
     #[must_use]
     pub fn hook_spool_max_attempts(&self) -> Option<&str> {
         self.hook_spool_max_attempts.as_deref()
+    }
+
+    /// Managed-launch fail-closed override captured from the process
+    /// environment.
+    #[must_use]
+    pub fn run_require_server(&self) -> Option<&str> {
+        self.run_require_server.as_deref()
     }
 
     #[cfg(test)]
@@ -1119,6 +1132,12 @@ impl Default for Config {
 pub struct RunSettings {
     /// Persisted env-only launch profiles, selected with `run --profile`.
     pub profiles: BTreeMap<String, RunProfile>,
+    /// Fail a managed launch when the server is unreachable instead of
+    /// degrading to a serverless launch (`docs/managed-workstreams.md`).
+    /// Off by default; the `--require-server` flag and
+    /// `AI_MEMORY_RUN_REQUIRE_SERVER=true` request it per launch or per
+    /// environment.
+    pub require_server: bool,
 }
 
 /// One named managed-launch preset.
@@ -1838,6 +1857,16 @@ fn apply_hook_spool_max_attempts_env(config: &mut Config, raw: Option<&str>) {
         .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS);
 }
 
+/// `AI_MEMORY_RUN_REQUIRE_SERVER` only ever turns the fail-closed behavior
+/// on: an absent, blank, or non-truthy value leaves whatever `config.toml`
+/// selected, and only an explicit truthy spelling overrides it to on.
+fn apply_run_require_server_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    if crate::marker::is_truthy(raw) {
+        config.run.require_server = true;
+    }
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -1921,6 +1950,7 @@ impl Config {
                 .as_deref(),
         );
         apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
+        apply_run_require_server_env(&mut config, runtime_env.run_require_server());
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -3315,6 +3345,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overridden.hook_spool.max_attempts, 0);
+    }
+
+    #[test]
+    fn run_require_server_config_and_runtime_env() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let off = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(!off.run.require_server, "off by default");
+
+        std::fs::write(&config_path, "[run]\nrequire_server = true\n").unwrap();
+        let from_config = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(from_config.run.require_server);
+
+        // The env var only turns it on; it never turns a config-file on back
+        // off, and a non-truthy spelling is inert.
+        for raw in ["", "false", "no", "0"] {
+            let inert = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv {
+                    run_require_server: Some(raw.into()),
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap();
+            assert!(inert.run.require_server, "{raw:?} must stay inert");
+        }
+        let truthy = Config::load_with_runtime_env(
+            Some(&config_path),
+            None,
+            RuntimeEnv {
+                run_require_server: Some("true".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert!(truthy.run.require_server);
     }
 
     #[test]

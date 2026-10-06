@@ -29,6 +29,7 @@ mod removal;
 mod repo_layout;
 mod routing_instructions;
 mod routing_skills;
+mod run_offline;
 mod serve_shutdown;
 mod server_profiles;
 mod shutdown_signals;

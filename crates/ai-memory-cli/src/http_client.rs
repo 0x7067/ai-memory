@@ -15,6 +15,7 @@ use std::io::{BufWriter, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -397,7 +398,7 @@ fn build_url_with_query(
 /// message that surfaces the resolved server URL. The common case is
 /// "Connection refused" — typically because the CLI defaulted to
 /// loopback on a host that has no local server running.
-fn augment_connect_error(
+pub(crate) fn augment_connect_error(
     err: reqwest::Error,
     endpoint: &ServerEndpoint,
     url: &str,
@@ -441,6 +442,46 @@ fn augment_connect_error(
         anyhow::Error::new(err).context(format!("could not reach {url}.{hint}"))
     } else {
         anyhow::Error::new(err).context(format!("HTTP request to {url} failed"))
+    }
+}
+
+/// Outcome of a server reachability probe: did anything answer on the
+/// configured endpoint?
+#[derive(Debug)]
+pub(crate) enum ServerProbe {
+    /// The server answered. Any HTTP status counts — a build older than
+    /// `/healthz` still answers 404/405, and what the probe needs to know is
+    /// that something is listening, not that it is healthy.
+    Reachable,
+    /// Nothing answered (connect error or timeout). Carries the underlying
+    /// reqwest error so callers can reuse [`augment_connect_error`]'s
+    /// diagnosis verbatim.
+    Unreachable(reqwest::Error),
+}
+
+/// How long a reachability probe waits for an answer. Short on purpose: the
+/// probe sits on the launch hot path, so an unresponsive host (a homelab down
+/// for maintenance) must be classified in ~2s rather than the OS-level TCP
+/// timeout a plain request would pay.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// GET `{origin}{base}/healthz` with a short timeout to decide whether a
+/// managed launch may proceed without the server.
+///
+/// Any HTTP response — 200 or 404/405 from a pre-`/healthz` server — means
+/// `Reachable`; only connect errors and timeouts mean `Unreachable`. The
+/// probe never inspects the body, so it cannot be wrong about health vs
+/// absence, only about presence.
+pub(crate) async fn probe_server(endpoint: &ServerEndpoint) -> ServerProbe {
+    probe_server_with_timeout(endpoint, PROBE_TIMEOUT).await
+}
+
+async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration) -> ServerProbe {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url("/healthz");
+    match client.get(&url).timeout(timeout).send().await {
+        Ok(_) => ServerProbe::Reachable,
+        Err(error) => ServerProbe::Unreachable(error),
     }
 }
 
@@ -495,6 +536,8 @@ fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[cfg(unix)]
@@ -790,6 +833,106 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(auth, "Bearer tok123");
+    }
+
+    // ----------------------------------------------------------------
+    // Server reachability probe
+    // ----------------------------------------------------------------
+
+    /// Bind a loopback listener, capture its address, and release it: the
+    /// next connection to that address is refused. Rebinding races exist on
+    /// loopback but are vanishingly rare under a test load.
+    async fn closed_port_endpoint() -> ServerEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        ServerEndpoint::from_pair(Some(format!("http://{address}")), None)
+    }
+
+    #[tokio::test]
+    async fn probe_reports_a_closed_port_as_unreachable_with_the_diagnosis() {
+        let endpoint = closed_port_endpoint().await;
+        let ServerProbe::Unreachable(error) = probe_server(&endpoint).await else {
+            panic!("a closed port must be Unreachable");
+        };
+        let url = endpoint.build_url("/workstream/runs");
+        let augmented = augment_connect_error(error, &endpoint, &url);
+        let message = format!("{augmented:#}");
+        assert!(
+            message.contains("could not reach"),
+            "the probe error must feed augment_connect_error: {message}"
+        );
+        assert!(
+            message.contains(&endpoint.url),
+            "the diagnosis names the resolved server URL: {message}"
+        );
+    }
+
+    /// A server that answers 404 for `/healthz` (older than the route) is
+    /// still reachable: presence, not health, is what the probe decides.
+    #[tokio::test]
+    async fn probe_reports_any_http_answer_as_reachable() {
+        for status in [
+            axum::http::StatusCode::OK,
+            axum::http::StatusCode::NOT_FOUND,
+            axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        ] {
+            let app =
+                axum::Router::new().fallback(axum::routing::get(move || async move { status }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+
+            assert!(matches!(
+                probe_server(&endpoint).await,
+                ServerProbe::Reachable
+            ));
+
+            server.abort();
+        }
+    }
+
+    /// A listener that accepts but never answers must be given up on within
+    /// the probe timeout, not a TCP or default-client timeout.
+    #[tokio::test]
+    async fn probe_gives_up_within_its_own_timeout() {
+        async fn accept_and_hold() -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                // Accept connections, hold them open, and answer nothing —
+                // the streams must outlive the accept so the client's only
+                // way out is its own timeout.
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                }
+            });
+            address
+        }
+        let address = accept_and_hold().await;
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+
+        let started = Instant::now();
+        assert!(matches!(
+            probe_server_with_timeout(&endpoint, Duration::from_millis(150)).await,
+            ServerProbe::Unreachable(_)
+        ));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(150), "gave up too early");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the probe timeout, not a transport default, bounds the wait ({elapsed:?})"
+        );
+    }
+
+    /// The production probe stays bounded by design: a homelab down for
+    /// maintenance must be classified in ~2s, never by an OS TCP timeout.
+    #[test]
+    fn probe_timeout_is_bounded_to_about_two_seconds() {
+        assert!(PROBE_TIMEOUT <= Duration::from_secs(2));
+        assert!(!PROBE_TIMEOUT.is_zero());
     }
 
     #[tokio::test]

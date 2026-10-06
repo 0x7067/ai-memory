@@ -372,7 +372,10 @@ ai-memory hooks + MCP if they are missing (so capture and recall just work —
 no separate `install-hooks`/`install-mcp` step to forget), it wires the right
 project scope by construction, and it adds cross-harness *session* continuity on
 top of shared memory. Everything is idempotent and one-time per harness and
-config home.
+config home. If the server is unreachable, `run` warns and launches anyway
+with local capture spooling (see [Degraded offline
+launches](docs/managed-workstreams.md#degraded-offline-launches)); pass
+`--require-server` to fail closed instead.
 
 ```bash
 ai-memory run claude

@@ -691,7 +691,9 @@ passes when the server is unreachable. Set `max_attempts = 0` under
 `[hook_spool]` in `<data_dir>/config.toml` (or set
 `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0`) to keep
 retrying until the 7-day age limit or 10,000-file spool cap applies. A positive
-value sets the number of failed passes before a drop.
+value sets the number of failed passes before a drop. The same bounds apply to
+`ai-memory run`'s degraded offline launches, which rely on this spool — see
+[Degraded offline launches](managed-workstreams.md#degraded-offline-launches).
 
 The built-in timings stay short on agent-facing paths, but high-latency or
 large-backlog instances can raise them with whole-minute runtime env vars in the

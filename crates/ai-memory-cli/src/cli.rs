@@ -435,6 +435,14 @@ pub struct RunArgs {
     /// `AI_MEMORY_RUN_AUTOWIRE=false`) to launch without touching harness config.
     #[arg(long)]
     pub no_autowire: bool,
+    /// Refuse to launch when the ai-memory server is unreachable, restoring
+    /// the pre-degraded-launch fail-closed behavior. Without this flag an
+    /// unreachable server downgrades the launch: the harness still starts
+    /// (hooks spool locally, no workstream lease or context is delivered) and
+    /// the child's exit code is returned. Also set with `run.require_server
+    /// = true` in config.toml or `AI_MEMORY_RUN_REQUIRE_SERVER=true`.
+    #[arg(long)]
+    pub require_server: bool,
     /// Apply a named env-only launch profile from
     /// `[run.profiles.<name>.env]` in config.toml. Must precede `harness`;
     /// a later `--env-file` or `--env` entry wins on the same key.
