@@ -1013,12 +1013,12 @@ fn push_candidates<'a>(out: &mut Vec<&'a serde_json::Value>, value: &'a serde_js
 
 fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::SessionStart => extract_string(raw, &["model", "title"]),
+        HookEvent::SessionStart => extract_string(raw, &["model", "title"]).and_then(first_line),
         HookEvent::UserPrompt => {
             // Kimi Code sends `prompt` as content blocks
             // (`[{"type":"text","text":...}]`); `extract_content` flattens
             // them and returns identical values for plain-string agents.
-            extract_content(raw, &["prompt", "message", "text"]).map(|s| first_line(&s))
+            extract_content(raw, &["prompt", "message", "text"]).and_then(first_line)
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -1027,15 +1027,15 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
                     extract_scalar_string(raw, &["stepIdx"]).map(|step| format!("step {step}"))
                 })
         }
-        HookEvent::Notification => extract_string(raw, &["message", "text"]),
-        HookEvent::PostCompaction => extract_string(raw, &["summary"]),
+        HookEvent::Notification => extract_string(raw, &["message", "text"]).and_then(first_line),
+        HookEvent::PostCompaction => extract_string(raw, &["summary"]).and_then(first_line),
         _ => None,
     }
 }
 
 fn extension_title_hint(raw: &serde_json::Value, source_event: &str) -> String {
     extract_string(raw, &["title", "summary", "subject", "name"])
-        .map(|s| first_line(&s))
+        .and_then(first_line)
         .unwrap_or_else(|| source_event.to_string())
 }
 
@@ -1128,8 +1128,11 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
     }
 }
 
-/// Reduce a hook-supplied string to its first line, discarding everything
-/// after the first `\n`.
+/// Reduce a hook-supplied string to its first line.
+///
+/// Terminators are LF, CRLF, and a lone CR (`str::lines`). An empty first
+/// line (a payload that starts with a newline) yields `None` so the caller
+/// can fall back instead of storing `""`.
 ///
 /// This is the only shaping `title_hint` gets before it reaches the
 /// sanitizer: the 80-char display cap used to happen here too, but that ran
@@ -1138,8 +1141,13 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
 /// clear text (#980). The length cap now lives in
 /// `ai_memory_core::sanitize::truncate_for_title`, applied by
 /// `Sanitized::new` *after* `Sanitizer::scrub`.
-fn first_line(s: &str) -> String {
-    s.chars().take_while(|c| *c != '\n').collect()
+fn first_line(s: String) -> Option<String> {
+    // `str::lines` treats `\n`, `\r\n`, and a lone `\r` as terminators and
+    // does not keep them. Stopping only at `\n` left a trailing CR on
+    // Windows prompts, which the sanitizer preserves and `truncate_for_title`
+    // does not strip, so the CR was stored in the observation title.
+    let line = s.lines().next().unwrap_or("").to_string();
+    (!line.is_empty()).then_some(line)
 }
 
 fn truncate_excerpt(s: &str) -> String {
@@ -2322,6 +2330,26 @@ mod tests {
         );
         assert_eq!(env.title_hint.as_deref(), Some("first line"));
 
+        let env = HookEnvelope::from_query_and_body(
+            q.clone(),
+            serde_json::json!({ "prompt": "first line\r\nsecond line should be lost" }),
+        );
+        assert_eq!(
+            env.title_hint.as_deref(),
+            Some("first line"),
+            "CRLF must not leave a trailing CR on the title"
+        );
+
+        let env = HookEnvelope::from_query_and_body(
+            q.clone(),
+            serde_json::json!({ "prompt": "\r\nhello" }),
+        );
+        assert!(
+            env.title_hint.is_none(),
+            "empty first line after leading CRLF must not become a CR or empty title, got {:?}",
+            env.title_hint
+        );
+
         // Very long single line → title_hint keeps every character; the
         // 80-char cap now happens later, after sanitization.
         let long = "x".repeat(200);
@@ -2329,6 +2357,42 @@ mod tests {
         let title = env.title_hint.unwrap();
         assert_eq!(title.chars().count(), 200);
         assert!(!title.contains('…'));
+    }
+
+    #[test]
+    fn notification_and_compaction_titles_are_the_first_line() {
+        let start = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            start,
+            serde_json::json!({ "title": "first\r\nsecond" }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("first"));
+
+        let notify = HookQuery {
+            event: "notification".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            notify,
+            serde_json::json!({ "message": "first\r\nsecond" }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("first"));
+
+        let compact = HookQuery {
+            event: "post-compaction".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            compact,
+            serde_json::json!({ "summary": "kept\nlost" }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("kept"));
     }
 
     #[test]

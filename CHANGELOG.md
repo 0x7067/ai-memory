@@ -257,6 +257,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size limits remain. (#1092)
 
 ### Changed
+- Redacted provider response bodies from the error surfaces this change
+  touches: the `memory_consolidate` and `memory_auto_improve` MCP errors, the
+  `memory_explore` degradation reason and warning, the reranker degradation
+  warning, the consolidator's transient-retry warning, the SessionEnd
+  consolidation worker's queue `last_error` and failure logs, the
+  auto-improve scheduler's claim `last_error` and tick warnings, and the hook
+  router's checkpoint-fallback warning now carry a stable `class`/`status`
+  summary (for example `class=provider status=400`) instead of the error's
+  `Display`, which for a provider failure includes the upstream response
+  body. Other error surfaces are unchanged. (#1103)
 - Changed `ai-memory run` to no longer fail closed when the server is
   unreachable: a bounded ~2s reachability probe (any HTTP answer counts as
   reachable, so pre-`/healthz` servers pass) downgrades the launch with one
@@ -271,7 +281,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spool-health account. A server that dies mid-run, after the child exits, no
   longer discards the exit code either: the unimported transcript is
   downgraded to a warning naming the exact `ai-memory finalize-session` repair
-  command, while protocol-level failures still fail hard. #1112
+  command, while protocol-level failures still fail hard. (#1112)
 - Changed static CLI/MCP project-name resolution to accept an existing
   repository's canonical hostless path name and its v2 basename compatibility
   key. Reads remain find-only; an authorized write through the canonical key
@@ -334,14 +344,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before use or persistence. Invalid historical identities were projected as
   unknown (`native_session_id: ""`) in workstream search without rewriting
   stored history; the CLI also protected reads from older servers. (#1079)
+- Ordered the default single-page and batch consolidation prompts for
+  prefix-cache reuse: in the user content, the fixed batch text (header +
+  field schema) and the project instructions now lead, followed by the
+  current body / slot and title state, with the session id and the
+  observation dump last. In the single-page prompt the current body is
+  the session's own page body, so the prefix shared across sessions of
+  one project is the system prompt plus the instructions block when
+  present. The system prompt, budget math, clipping, and observation
+  selection are unchanged — blocks were only permuted — and the input
+  budget remains an approximate character estimate (no tokenizer
+  ceiling, no cache hit guaranteed). (#1102)
 
 ### Fixed
+- Fixed `memory_feedback` storing an unmatched secret prefix when a `reason`
+  straddled the 500-character cap: the reason is now scrubbed before the cap
+  is applied, matching the #980 title-hint order. (#1109)
+- Fixed hook `title_hint` extraction leaving a trailing CR on Windows CRLF
+  payloads and keeping embedded newlines on SessionStart, Notification, and
+  PostCompaction titles. First-line splitting now uses `str::lines`. (#1111)
 - Fixed wiki confinement walks failing on Windows with `PermissionDenied`
   (sharing violation) or `ERROR_DELETE_PENDING` when a concurrent commit or
   the atomic writer held or rename-replaced a file mid-walk; per-entry walk
   probes now skip those as transient churn exactly like the NotFound vanish
   race, while every entry that does stat is still refused when link-like and
   root-level probes keep their strict semantics. (#1107)
+- Fixed `strip_leading_h1` failing to strip setext H1 headings on CRLF line
+  endings. The underline check required every character of the second line
+  to be `=`, which failed when the line contained a trailing carriage return,
+  trailing whitespace or tabs, or when the document ended at the underline
+  without a trailing newline. (#1108)
 - Fixed generic OpenCode commands selecting integration contracts from command
   spelling instead of the executable's major version. `run opencode` now probes
   the exact executable once and carries the resolved V1/V2 dialect through
@@ -370,6 +402,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Confined wiki reads, writes, indexing, recovery, and lifecycle cleanup to real
   project-tree directories by refusing symbolic links and filesystem reparse
   points at namespace roots or descendants. (#1107)
+- Fixed the web page view omitting heading IDs, preventing `#anchor` fragments
+  and section wikilinks from scrolling to target headings. The Markdown renderer
+  now emits unique, slugified `id` attributes on heading elements (`<h1>`–`<h6>`),
+  disambiguating duplicate headings and stripping punctuation. (#1105)
 - Fixed a later hook event carrying a managed-run id linking its native session
   to that run without the checks SessionStart applies. It now links only from
   the run's own project and operator; an event from elsewhere is still captured
