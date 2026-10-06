@@ -63,6 +63,33 @@ mutation broker. Browsers should talk to the companion; the companion should tal
 to ai-memory with an operator token. That keeps CSRF, confirmation, audit, rate
 limits, and UI-specific policy outside the core server.
 
+Read-only companions can start ai-memory with `serve --enable-api` to mount
+`/api/v1` without the browser UI. `--enable-web` still implies the same API.
+Both modes use the normal machine Bearer or browser-session auth boundary;
+writes continue through MCP or authenticated admin routes.
+
+### Proposed team-wiki sync (#986)
+
+A repository-backed team-wiki sync is accepted as a companion shape, not as a
+repo-local storage mode in the core server. A contribution should preserve the
+prototype's three-way comparison and clone-local state, sync only explicitly
+allowed shared page families, default destructive changes to dry-run, report
+divergent edits without choosing a winner, and perform every import through
+the public MCP write/delete tools. It must never open the wiki directory or
+SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
+MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
+
+## `ai-memory-client`: shared private capture privacy
+
+[`ai-memory-client`](../companions/ai-memory-client) supplies four privacy
+functions consumed by both the relay and external-conversation importer. New
+bodies are scrubbed before serialization, hashes and local persistence; native
+identities containing credentials are refused without being renamed. A relay
+item queued before these checks that fails them is never sent: it is dropped
+locally with a `dropped_policy` receipt, so its session keeps flowing. The package has its own workspace and focused tests, with no
+server dependency. Server authorization and capture exclusions remain the
+authoritative boundaries.
+
 ## `ai-memory-relay`: external lifecycle delivery
 
 [`ai-memory-relay`](../companions/ai-memory-relay) delivers events collected by
@@ -172,9 +199,12 @@ Re-home by kind:
 - Never open ai-memory's SQLite database or wiki directory directly.
 - Require an explicit destination workspace/project.
 - Preserve only metadata supported by the public write surface (`title`, `kind`,
-  `tier`, `tags`, `pinned`, and body) unless a future generic core seam adds
-  broader frontmatter support. Do not claim arbitrary frontmatter or author
-  preservation in companion imports.
+  `tier`, `tags`, `pinned`, body, and the bounded `entities`, `abstract`, and
+  `relations` documented in [usage](usage.md#writing-page-metadata)). The current
+  importer preserves the original title/kind/tier/tags/pin subset; broader
+  metadata needs an explicit importer consumer. Do not claim arbitrary
+  frontmatter or author preservation in companion imports. Writes replace the
+  whole page; omitted metadata is cleared.
 - Carry idempotency keys or source fingerprints in companion-side state so failed
   imports can be resumed safely.
 - Validate and sanitize a complete external-conversation envelope before the
@@ -348,6 +378,61 @@ This plan is intentionally parked until the benefit is clearer.
 5. Add confirmed deletes last.
 6. Keep the built-in `/web` UI unchanged unless core ai-memory independently
    needs a small read-only API enhancement.
+
+### Appendix: browser constraints and prerequisites (not approved)
+
+These notes record constraints for a possible future design review. They do not
+approve the editor, an implementation sequence, or any new core interface. The
+undecided status, parked plan, concern about distracting from the automatic loop,
+and preference for a separate repository above remain unchanged.
+
+#### Browser constraints
+
+- Keep core `/web` and `/api/v1` read-only. Browser requests would go through the
+  companion's own backend, with its own login, session expiry/revocation, CSRF
+  protection, rate limits, confirmation state, and audit. Core human-auth cookies
+  do not establish a companion session.
+- Bind each authenticated browser operator to that operator's own DB-user API
+  token, held only on the backend. Refuse missing, mismatched, or revoked
+  credentials; never fall back to a shared credential. The browser receives no
+  upstream bearer. Secure provisioning and storage still need design review.
+- Exclude the shared static root token, `/admin/*` flows, and actor-proxy
+  credentials from this browser design. A DB-user token does not grant admin
+  access, including when the DB user has `role=root`. Do not forward
+  browser-supplied Authorization, actor, or skip-admission headers. These are
+  editor-specific constraints on the broader operator-token wording above.
+- Reads as well as any future writes must retain the operator's identity and
+  current project permissions. Use explicit workspace/project pairs, reauthorize
+  each request, and isolate drafts, caches, and confirmations by operator, server,
+  and target. UI filters cannot authorize a page; shared pages must not become
+  author-only reads. Preserve explicit access refusals rather than showing empty
+  results.
+- Safely render untrusted Markdown, links, and diffs. Any future mutation needs
+  confirmation bound to the operator, exact target, base revision, and proposed
+  change. No LLM response may apply a write automatically.
+
+#### Prerequisites requiring separate evaluation
+
+- A capability contract or shared client would need independent justification
+  from shipped callers, as discussed in PR #1058. This appendix neither requires
+  a particular SDK nor approves speculative endpoints or wire fields. A reported
+  capability would not replace authorization.
+- Conditional editing needs a safe core compare-and-write seam covering body
+  and editable metadata, coordinated with the normal Wiki and writer paths.
+  Re-reading a page and then writing unconditionally is insufficient. Without
+  that seam, applying edits must remain unavailable; stale revisions require a
+  fresh diff and confirmation. Conditional deletion needs its own evaluation.
+- Any retained-version or evidence reads need current access checks and bounded
+  retention semantics; they must not recover expired or purged content from Git.
+  No new history, graph, or procedure interface is approved here.
+- Mutations must retain sanitization, admission, attribution, and disk/SQL
+  recovery. Direct admission follows the configured failure policy; it is not
+  the automatic loop's separate pending-write approval flow. Uncertain delivery
+  must be reconciled before retrying or reporting success.
+- A future implementation would need adversarial browser and integration tests
+  for XSS, CSRF, identity/scope isolation, revoked access, stale revisions,
+  admission failures, and interrupted writes, with legitimate controls. These
+  are prerequisites, not tests or behavior supplied by this documentation.
 
 ## Two kinds of companion: data-seam vs. independent hook consumer
 
