@@ -355,6 +355,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `memory_feedback` storing an unmatched secret prefix when a `reason`
   straddled the 500-character cap: the reason is now scrubbed before the cap
   is applied, matching the #980 title-hint order. (#1109)
+- Fixed wiki link extraction treating `file:` and `vbscript:` as project
+  qualifiers, so `[[file:notes/x.md]]` indexed a cross-project edge to project
+  `file`. Both prefixes now match the `/web` scheme denylist and are not wiki
+  links. (#1110)
 - Fixed hook `title_hint` extraction leaving a trailing CR on Windows CRLF
   payloads and keeping embedded newlines on SessionStart, Notification, and
   PostCompaction titles. First-line splitting now uses `str::lines`. (#1111)
