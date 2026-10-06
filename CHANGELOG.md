@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed hook `title_hint` extraction leaving a trailing CR on Windows CRLF
+  payloads and keeping embedded newlines on SessionStart, Notification, and
+  PostCompaction titles. First-line splitting now uses `str::lines`. (#1111)
 - Fixed wiki confinement walks failing on Windows with `PermissionDenied`
   (sharing violation) or `ERROR_DELETE_PENDING` when a concurrent commit or
   the atomic writer held or rename-replaced a file mid-walk; per-entry walk
