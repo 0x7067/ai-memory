@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use super::hook_capture::{BatchOutcome, PostOutcome, build_client, post_batch, post_hook};
 
-/// Drop a spooled event after this many failed drain passes — bounds retries of
-/// a permanently-undeliverable event (e.g. a server URL that never comes back).
+/// Default number of failed drain passes before dropping an event — bounds
+/// retries of a permanently-undeliverable event (e.g. a dead server URL).
 const MAX_ATTEMPTS: u32 = 8;
 /// Drop a spooled event older than this regardless of attempts (7 days), so a
 /// long-dead instance can't leave the spool growing without bound.
@@ -488,10 +488,10 @@ pub async fn drain_until_quiescent(
 /// drain transparently falls back to per-event `POST /hook`.
 ///
 /// A delivered event is deleted; a failed one is charged a retry attempt
-/// (dropped at `MAX_ATTEMPTS`); a `429` (saturation) deletes any accepted prefix
-/// the server reports, then retries the rest untouched so it never burns the
-/// retry budget. OIDC bearer is resolved + refreshed at most once per drain and
-/// cached.
+/// (dropped at the configured limit, unless it is zero); a `429` (saturation)
+/// deletes any accepted prefix the server reports, then retries the rest
+/// untouched so it never burns the retry budget. OIDC bearer is resolved and
+/// refreshed at most once per drain and cached.
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
@@ -551,6 +551,7 @@ pub async fn drain_with_live_token(
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut profile_tokens = ProfileTokens::new(data_dir);
     let mut result = DrainResult::default();
+    let max_attempts = configured_max_attempts(data_dir);
 
     let mut idx = 0;
     let mut batch_supported = true;
@@ -588,7 +589,7 @@ pub async fn drain_with_live_token(
             continue;
         }
         if body_is_malformed(&entry) {
-            bump_or_drop(&path, &entry, &mut result);
+            bump_or_drop(&path, &entry, max_attempts, &mut result);
             continue;
         }
 
@@ -612,7 +613,7 @@ pub async fn drain_with_live_token(
                     continue;
                 };
                 if body_is_malformed(&next_entry) {
-                    bump_or_drop(&next_path, &next_entry, &mut result);
+                    bump_or_drop(&next_path, &next_entry, max_attempts, &mut result);
                     continue;
                 }
                 // A profile entry never shares a request with another route,
@@ -640,7 +641,7 @@ pub async fn drain_with_live_token(
             }
 
             let Some(payload) = batch_payload(&chunk) else {
-                bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                 result.remaining += chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                 break;
             };
@@ -662,7 +663,7 @@ pub async fn drain_with_live_token(
                         // (fail-fast). Charge it a failed attempt and skip past it
                         // so a single bad event can't wedge the rest — the
                         // per-event loop also advances past a failed entry.
-                        bump_or_drop(&chunk[k].0, &chunk[k].1, &mut result);
+                        bump_or_drop(&chunk[k].0, &chunk[k].1, max_attempts, &mut result);
                         result.remaining +=
                             chunk.len().saturating_sub(k + 1) + files.len().saturating_sub(idx);
                         break;
@@ -675,7 +676,12 @@ pub async fn drain_with_live_token(
                     let sent = delete_accepted_indices(&chunk, &indices);
                     result.sent += sent;
                     if let Some(failed_index) = failed_index.and_then(|i| chunk.get(i).map(|_| i)) {
-                        bump_or_drop(&chunk[failed_index].0, &chunk[failed_index].1, &mut result);
+                        bump_or_drop(
+                            &chunk[failed_index].0,
+                            &chunk[failed_index].1,
+                            max_attempts,
+                            &mut result,
+                        );
                         result.remaining += chunk.len().saturating_sub(sent).saturating_sub(1)
                             + files.len().saturating_sub(idx);
                         break;
@@ -734,7 +740,7 @@ pub async fn drain_with_live_token(
                                 result.remaining += 1;
                             }
                             PostOutcome::Failed => {
-                                bump_or_drop(path, entry, &mut result);
+                                bump_or_drop(path, entry, max_attempts, &mut result);
                             }
                             PostOutcome::Refused => {
                                 // Never retried: see `PostOutcome::Refused`.
@@ -747,7 +753,7 @@ pub async fn drain_with_live_token(
                                 // Same reasoning as the batch arm: the address
                                 // is dead, not the entry. Charge it once, then
                                 // skip its siblings for the rest of the pass.
-                                bump_or_drop(path, entry, &mut result);
+                                bump_or_drop(path, entry, max_attempts, &mut result);
                                 unreachable_endpoints.insert(batch_endpoint(&entry.url));
                             }
                             PostOutcome::Unauthorized => {
@@ -777,7 +783,7 @@ pub async fn drain_with_live_token(
                                     let _ = std::fs::remove_file(path);
                                     result.sent += 1;
                                 } else {
-                                    bump_or_drop(path, entry, &mut result);
+                                    bump_or_drop(path, entry, max_attempts, &mut result);
                                 }
                             }
                         }
@@ -848,7 +854,7 @@ pub async fn drain_with_live_token(
                     // Charge the entry actually tried so a permanently dead
                     // address still ages out, mark the endpoint, and keep
                     // going: entries addressed elsewhere are still deliverable.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                     result.remaining += chunk.len().saturating_sub(1);
                     unreachable_endpoints.insert(base.clone());
                     continue;
@@ -897,7 +903,7 @@ pub async fn drain_with_live_token(
 
                     // Same conservative accounting as `Failed`: the server
                     // refused the whole batch, so nothing in it was processed.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                     result.remaining +=
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
@@ -910,7 +916,7 @@ pub async fn drain_with_live_token(
                     // conservatively and leave the rest queued for a future pass so
                     // a timeout cannot burn attempts for events that may never have
                     // been attempted.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                     result.remaining +=
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
@@ -941,10 +947,10 @@ pub async fn drain_with_live_token(
                     result.dropped += 1;
                 }
                 PostOutcome::Failed => {
-                    bump_or_drop(&path, &entry, &mut result);
+                    bump_or_drop(&path, &entry, max_attempts, &mut result);
                 }
                 PostOutcome::Unreachable => {
-                    bump_or_drop(&path, &entry, &mut result);
+                    bump_or_drop(&path, &entry, max_attempts, &mut result);
                     unreachable_endpoints.insert(batch_endpoint(&entry.url));
                 }
                 PostOutcome::Unauthorized => {
@@ -974,7 +980,7 @@ pub async fn drain_with_live_token(
                         let _ = std::fs::remove_file(&path);
                         result.sent += 1;
                     } else {
-                        bump_or_drop(&path, &entry, &mut result);
+                        bump_or_drop(&path, &entry, max_attempts, &mut result);
                     }
                 }
             }
@@ -1205,6 +1211,27 @@ fn configured_server_url(data_dir: &Path) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// Hook commands bypass `Config::load`; read this store's retry setting once
+/// per drain, with the process environment taking precedence.
+fn configured_max_attempts(data_dir: &Path) -> u32 {
+    configured_max_attempts_from(data_dir, |name| std::env::var(name).ok())
+}
+
+fn configured_max_attempts_from(
+    data_dir: &Path,
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+) -> u32 {
+    if let Some(raw) = env_lookup("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS") {
+        return raw.trim().parse().unwrap_or(MAX_ATTEMPTS);
+    }
+    std::fs::read_to_string(data_dir.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| doc.get("hook_spool")?.get("max_attempts")?.as_integer())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(MAX_ATTEMPTS)
+}
+
 /// The `/hook/batch` URL for a spooled per-event URL: strip the `?…` query and
 /// append `/batch` (a spooled URL ends in `…/hook` before its query). Entries
 /// whose endpoint string matches can ride one batch request.
@@ -1234,12 +1261,12 @@ fn batch_payload(items: &[(PathBuf, SpoolEntry)]) -> Option<String> {
 }
 
 /// Charge a spooled entry a failed delivery attempt: drop it once it reaches
-/// `MAX_ATTEMPTS`, else persist the bumped count for the next boundary. Updates
+/// the configured limit (unless zero), else persist the bumped count. Updates
 /// `result.dropped` / `result.remaining` accordingly.
-fn bump_or_drop(path: &Path, entry: &SpoolEntry, result: &mut DrainResult) {
+fn bump_or_drop(path: &Path, entry: &SpoolEntry, max_attempts: u32, result: &mut DrainResult) {
     let mut bumped = entry.clone();
     bumped.attempts = bumped.attempts.saturating_add(1);
-    if bumped.attempts >= MAX_ATTEMPTS {
+    if max_attempts != 0 && bumped.attempts >= max_attempts {
         let _ = std::fs::remove_file(path);
         result.dropped += 1;
     } else {
@@ -1789,6 +1816,106 @@ mod tests {
         assert!(
             list_entries(&spool).unwrap().0.is_empty(),
             "spool is empty after the drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_max_attempts_keeps_unreachable_event_after_twenty_drains() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[hook_spool]\nmax_attempts = 0\n",
+        )
+        .unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue(
+            &spool,
+            &entry_for(
+                "http://127.0.0.1:1/hook?event=dead".into(),
+                "{}".into(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        for _ in 0..20 {
+            let result = drain(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+            )
+            .await;
+            assert_eq!(result.dropped, 0);
+            assert_eq!(result.remaining, 1);
+        }
+        let files = list_entries(&spool).unwrap().0;
+        assert_eq!(files.len(), 1);
+        let entry: SpoolEntry = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(entry.attempts, 20);
+    }
+
+    #[tokio::test]
+    async fn configured_max_attempts_drops_after_three_drains() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[hook_spool]\nmax_attempts = 3\n",
+        )
+        .unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue(
+            &spool,
+            &entry_for(
+                "http://127.0.0.1:1/hook?event=dead".into(),
+                "{}".into(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        for pass in 1..=3 {
+            let result = drain(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+            )
+            .await;
+            assert_eq!(result.dropped, usize::from(pass == 3));
+            assert_eq!(result.remaining, usize::from(pass < 3));
+        }
+        assert!(list_entries(&spool).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn max_attempts_env_overrides_config_and_invalid_values_use_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(&config, "[hook_spool]\nmax_attempts = 3\n").unwrap();
+        assert_eq!(configured_max_attempts_from(tmp.path(), |_| None), 3);
+        assert_eq!(
+            configured_max_attempts_from(tmp.path(), |name| {
+                assert_eq!(name, "AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS");
+                Some("0".into())
+            }),
+            0
+        );
+        assert_eq!(
+            configured_max_attempts_from(tmp.path(), |_| Some("invalid".into())),
+            MAX_ATTEMPTS
+        );
+        std::fs::write(&config, "[hook_spool]\nmax_attempts = -1\n").unwrap();
+        assert_eq!(
+            configured_max_attempts_from(tmp.path(), |_| None),
+            MAX_ATTEMPTS
+        );
+        std::fs::write(&config, "[hook_spool]\nmax_attempts = \"invalid\"\n").unwrap();
+        assert_eq!(
+            configured_max_attempts_from(tmp.path(), |_| None),
+            MAX_ATTEMPTS
         );
     }
 

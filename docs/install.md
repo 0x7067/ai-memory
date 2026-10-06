@@ -685,6 +685,14 @@ On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is
 eventually pruned rather than unbounded, but old undelivered events can be lost.
+
+Native hook drains drop an event after 8 failed passes by default, including
+passes when the server is unreachable. Set `max_attempts = 0` under
+`[hook_spool]` in `<data_dir>/config.toml` (or set
+`AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0`) to keep
+retrying until the 7-day age limit or 10,000-file spool cap applies. A positive
+value sets the number of failed passes before a drop.
+
 The built-in timings stay short on agent-facing paths, but high-latency or
 large-backlog instances can raise them with whole-minute runtime env vars in the
 agent's environment; no `install-hooks` rerun is needed:

@@ -1023,6 +1023,12 @@ idle_window_secs = 300            # operator must be quiet this long before a ru
 # max_eps = 0.15                  # conservative eps ceiling (cosine distance; 0 ⇒ default)
 # max_clusters_per_run = 8        # bounded fan-out per run (invariant #5; 0 ⇒ default 8)
 # min_cold_pages = 2             # events-accrued gate: skip a run below this many cold pages
+
+[hook_spool]
+max_attempts = 8                  # failed drain passes before dropping an event; 0 disables
+                                  # this limit. Age (7 days) and spool size (10,000 files)
+                                  # still bound retention. Env:
+                                  # AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS
 ```
 
 The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese
