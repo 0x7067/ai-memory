@@ -1086,6 +1086,9 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            content-type, x-api-key, x-goog-api-key,
                            anthropic-version, anthropic-beta, openai-beta,
                            host, content-length) are refused at startup.
+                           `x-request-id` is additionally refused at
+                           initialization for the `openai-compat` provider,
+                           which sends the operation's request id itself.
                            Values are never logged. A header value cannot
                            contain a comma through the env var — use
                            `llm_headers = [...]` in config.toml for that.

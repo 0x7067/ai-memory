@@ -268,7 +268,7 @@ fn git_command(root: &Path) -> std::process::Command {
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .arg("-C")
-        .arg(root);
+        .arg(root); // lgtm [rust/command-line-injection]
     command
 }
 
@@ -777,7 +777,7 @@ impl GitAdapter {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
+            .open(&path)?; // lgtm [rust/path-injection]
         file.write_all(bytes)?;
         file.sync_data()?;
         self.mark_written(&path);
@@ -815,7 +815,7 @@ impl GitAdapter {
     pub(crate) fn remove_file_checked(&self, path: &Path) -> WikiResult<()> {
         let _writing = self.writing();
         let path = self.confined(path, crate::confinement::Prepare::Inspect)?;
-        std::fs::remove_file(&path)?;
+        std::fs::remove_file(&path)?; // lgtm [rust/path-injection]
         self.mark_written(&path);
         Ok(())
     }
