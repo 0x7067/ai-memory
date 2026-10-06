@@ -64,6 +64,36 @@ impl From<serde_json::Error> for ConsolidatorError {
     }
 }
 
+/// Redacted one-line summary of a consolidation failure:
+/// `consolidation failed: class=<class> status=<status-or-none>`.
+///
+/// For typed boundaries where the full error text would leak a provider
+/// response body — the SessionEnd queue's persisted `last_error` and the
+/// `McpError` returned by `memory_consolidate`. It keeps what an operator
+/// needs to diagnose: `class` is a fixed label per `ConsolidatorError`
+/// variant (or [`LlmError::class`] for LLM failures) and `status` is the
+/// HTTP status captured by the failure ([`LlmError::http_status`]), or
+/// `none`. It never carries the cause's `Display`, a response body, URL,
+/// prompt, token, or headers.
+#[must_use]
+pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
+    let (class, status) = match error {
+        ConsolidatorError::Memory(_) => ("memory", None),
+        ConsolidatorError::Store(_) => ("store", None),
+        ConsolidatorError::Wiki(_) => ("wiki", None),
+        ConsolidatorError::Llm(llm) => (llm.class(), llm.http_status()),
+        ConsolidatorError::Serde(_) => ("serde", None),
+        ConsolidatorError::SessionNotFound(_) => ("session-not-found", None),
+        ConsolidatorError::EmptySession(_) => ("empty-session", None),
+    };
+    format!(
+        "consolidation failed: class={class} status={}",
+        status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
 /// Result alias used by the consolidator.
 pub type ConsolidatorResult<T> = Result<T, ConsolidatorError>;
 
@@ -97,10 +127,14 @@ where
         match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
             Ok(value) => return Ok(value),
             Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
+                // Redacted fields only: this log line is on the consolidation
+                // path, and the `Display` of a provider failure carries the
+                // response body while an HTTP error's can carry the URL.
                 warn!(
                     attempt,
                     max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
-                    error = %e,
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
                     "consolidation hit a transient LLM error; retrying shortly",
                 );
                 tokio::time::sleep(retry_delay).await;
@@ -1082,14 +1116,22 @@ fn build_batch_request_with_slots(
     budgets: PromptBudgets,
     existing_titles: &[String],
 ) -> ChatRequest {
-    let mut prefix = String::new();
-    prefix.push_str(
+    // Stable prefix first so prefix-caching providers can reuse it across
+    // sessions of the same project: the fixed batch scaffolding (header +
+    // field schema) and the project instructions lead the message, then the
+    // per-project slot/title state, then the per-session id and the
+    // observation dump at the end. Budget math is unchanged — only the
+    // block order moved.
+    let mut fixed_header = String::new();
+    fixed_header.push_str(
         "You are compiling a Karpathy-style multi-page wiki update. Given the \
          session's observation log, produce a ConsolidatedBatch:\n\n",
     );
-    prefix.push_str("Session id: ");
-    prefix.push_str(&session_id.to_string());
-    prefix.push_str("\n\nObservations:\n");
+
+    let mut observations_header = String::new();
+    observations_header.push_str("Session id: ");
+    observations_header.push_str(&session_id.to_string());
+    observations_header.push_str("\n\nObservations:\n");
 
     let mut mandatory_suffix = String::new();
     mandatory_suffix.push_str(
@@ -1163,21 +1205,24 @@ fn build_batch_request_with_slots(
     let titles_block = render_title_uniqueness_section(existing_titles);
     let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
-        count_chars(&prefix)
+        count_chars(&fixed_header)
             .saturating_add(count_chars(&mandatory_suffix))
+            .saturating_add(count_chars(&observations_header))
             .saturating_add(count_chars(&titles_block)),
     );
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-    let mut suffix = render_slot_snapshots(slots, slots_budget);
-    suffix.push_str(&mandatory_suffix);
-    suffix.push_str(&titles_block);
-    suffix.push_str(&instructions_block);
+    let slots_block = render_slot_snapshots(slots, slots_budget);
 
     let observation_chars = budgets.remaining_input_chars::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
-        count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        count_chars(&fixed_header)
+            .saturating_add(count_chars(&mandatory_suffix))
+            .saturating_add(count_chars(&observations_header))
+            .saturating_add(count_chars(&titles_block))
+            .saturating_add(count_chars(&instructions_block))
+            .saturating_add(count_chars(&slots_block)),
     );
     let projected = project_observations(
         observations,
@@ -1188,9 +1233,14 @@ fn build_batch_request_with_slots(
         )
         .with_context_label("batch consolidation"),
     );
-    let mut buf = prefix;
+    let mut buf = String::new();
+    buf.push_str(&fixed_header);
+    buf.push_str(&mandatory_suffix);
+    buf.push_str(&instructions_block);
+    buf.push_str(&slots_block);
+    buf.push_str(&titles_block);
+    buf.push_str(&observations_header);
     buf.push_str(&projected.text);
-    buf.push_str(&suffix);
 
     ChatRequest {
         system: Some(BATCH_SYSTEM_PROMPT.into()),
@@ -1240,25 +1290,33 @@ fn build_request(
     budgets: PromptBudgets,
     existing_titles: &[String],
 ) -> ChatRequest {
-    let mut prefix = String::new();
-    prefix.push_str("Session id: ");
-    prefix.push_str(&session_id.to_string());
-    prefix.push_str("\nObservations (in order):\n\n");
+    // Stable prefix first so prefix-caching providers can reuse it across
+    // sessions of the same project: the project instructions lead, then the
+    // per-page current body and titles, then the per-session id and the
+    // observation dump at the end. Budget math is unchanged — only the
+    // block order moved.
+    let mut observations_header = String::new();
+    observations_header.push_str("Session id: ");
+    observations_header.push_str(&session_id.to_string());
+    observations_header.push_str("\nObservations (in order):\n\n");
 
-    let optional_budget =
-        budgets.optional_context_budget::<ConsolidatedPage>(SYSTEM_PROMPT, count_chars(&prefix));
+    let optional_budget = budgets.optional_context_budget::<ConsolidatedPage>(
+        SYSTEM_PROMPT,
+        count_chars(&observations_header),
+    );
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
     let titles_block = render_title_uniqueness_section(existing_titles);
     let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
-    let mut suffix = render_current_body_section(current_body, current_body_budget);
-    suffix.push_str(&titles_block);
-    suffix.push_str(&instructions_block);
+    let current_body_block = render_current_body_section(current_body, current_body_budget);
 
     let observation_chars = budgets.remaining_input_chars::<ConsolidatedPage>(
         SYSTEM_PROMPT,
-        count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        count_chars(&observations_header)
+            .saturating_add(count_chars(&instructions_block))
+            .saturating_add(count_chars(&current_body_block))
+            .saturating_add(count_chars(&titles_block)),
     );
     let projected = project_observations(
         observations,
@@ -1269,9 +1327,12 @@ fn build_request(
         )
         .with_context_label("single-page consolidation"),
     );
-    let mut buf = prefix;
+    let mut buf = String::new();
+    buf.push_str(&instructions_block);
+    buf.push_str(&current_body_block);
+    buf.push_str(&titles_block);
+    buf.push_str(&observations_header);
     buf.push_str(&projected.text);
-    buf.push_str(&suffix);
 
     ChatRequest {
         system: Some(SYSTEM_PROMPT.into()),
@@ -1907,6 +1968,64 @@ mod tests {
     use jiff::Timestamp;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Body a fake provider returns in the redaction tests; the summary must
+    /// never contain it.
+    const REDACTION_SENTINEL: &str = "SENTINEL_PRIVATE_BODY";
+
+    /// The summary is the only failure text the SessionEnd queue persists and
+    /// the `memory_consolidate` MCP call returns, so it must expose the
+    /// class/status and drop the provider body.
+    #[test]
+    fn redacted_summary_exposes_class_and_status_without_body() {
+        let error = ConsolidatorError::Llm(LlmError::Provider {
+            status: 400,
+            body: REDACTION_SENTINEL.into(),
+        });
+        let summary = redacted_error_summary(&error);
+        assert_eq!(summary, "consolidation failed: class=provider status=400");
+        assert!(!summary.contains(REDACTION_SENTINEL));
+    }
+
+    /// Switching the variant to `Serde` changes only the allowed fields:
+    /// the stable shape stays, `class`/`status` take the new values, and the
+    /// body still never enters the summary.
+    #[test]
+    fn redacted_summary_variant_switch_changes_only_class_and_status() {
+        let provider = ConsolidatorError::Llm(LlmError::Provider {
+            status: 400,
+            body: REDACTION_SENTINEL.into(),
+        });
+        let serde_error = ConsolidatorError::Serde(REDACTION_SENTINEL.into());
+        let provider_summary = redacted_error_summary(&provider);
+        let serde_summary = redacted_error_summary(&serde_error);
+        assert_eq!(
+            provider_summary,
+            "consolidation failed: class=provider status=400"
+        );
+        assert_eq!(
+            serde_summary,
+            "consolidation failed: class=serde status=none"
+        );
+        for summary in [&provider_summary, &serde_summary] {
+            assert!(summary.starts_with("consolidation failed: class="));
+            assert!(!summary.contains(REDACTION_SENTINEL));
+        }
+    }
+
+    /// Dropping the HTTP status changes only the status field to `none`;
+    /// the class still comes from the LLM error's fixed label.
+    #[test]
+    fn redacted_summary_without_http_status_reports_none() {
+        let without_status =
+            ConsolidatorError::Llm(LlmError::NotConfigured(REDACTION_SENTINEL.into()));
+        let summary = redacted_error_summary(&without_status);
+        assert_eq!(
+            summary,
+            "consolidation failed: class=not-configured status=none"
+        );
+        assert!(!summary.contains(REDACTION_SENTINEL));
+    }
+
     /// Helper for prompt construction tests.
     fn obs_of_size(body_len: usize) -> Observation {
         Observation {
@@ -2057,32 +2176,28 @@ mod tests {
         assert!(prompt.contains("Do not reuse any of these"));
     }
 
-    /// The observation dump is spliced between `prefix` and `suffix`. The
-    /// schema (tier/kind/JSON keys) belongs in `mandatory_suffix` so the
-    /// dump still follows `Observations:` instead of sitting after the
-    /// schema docs.
+    /// The observation dump is spliced after the session-id header and is the
+    /// last block of the user message: the fixed batch schema (tier/kind/JSON
+    /// keys) and the project instructions lead the message so the stable
+    /// prefix is reusable, and the dump still follows `Observations:`.
     fn assert_batch_dump_follows_observations_header(prompt: &str) {
+        let schema = prompt
+            .find("## `tier` field")
+            .expect("batch prompt still carries the schema suffix");
         let header = prompt
             .find("\n\nObservations:\n")
             .expect("batch prompt starts the observation section");
         let dump = prompt
             .find("--- observation")
             .expect("batch prompt projects an observation dump");
-        let schema = prompt
-            .find("## `tier` field")
-            .expect("batch prompt still carries the schema suffix");
         assert!(
-            header < dump && dump < schema,
-            "observation dump must sit between Observations: and the schema suffix; header={header} dump={dump} schema={schema}"
-        );
-        assert!(
-            !prompt[header..dump].contains("## `tier` field"),
-            "schema must not leak into the prefix ahead of the dump"
+            schema < header && header < dump,
+            "observation dump must follow Observations:, after the schema suffix; schema={schema} header={header} dump={dump}"
         );
     }
 
     #[test]
-    fn batch_user_message_places_observation_dump_before_schema() {
+    fn batch_user_message_places_observation_dump_after_schema() {
         let request = build_batch_request_with_slots(
             SessionId::new(),
             &[obs_of_size(10)],
@@ -2092,6 +2207,565 @@ mod tests {
             &[],
         );
         assert_batch_dump_follows_observations_header(&request.messages[0].content);
+    }
+
+    /// The stable prefix (fixed batch text, project instructions, slot and
+    /// title state) leads the batch user message and must be byte-identical
+    /// across sessions of the same project; only the session id and the
+    /// observation dump vary, and both sit at the end.
+    #[test]
+    fn batch_user_message_prefix_is_stable_across_sessions() {
+        let sid_a: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let sid_b: SessionId = "0193e7a2-0000-7000-8000-000000000002"
+            .parse()
+            .expect("fixed session id");
+        let slots = vec![SlotSnapshot {
+            path: "_slots/focus.md".into(),
+            title: "Focus".into(),
+            slot_kind: SlotKind::State,
+            body: "working context".into(),
+        }];
+        let titles = vec!["Existing Title".to_string()];
+
+        let a = build_batch_request_with_slots(
+            sid_a,
+            &[obs_of_size(20)],
+            &slots,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let b = build_batch_request_with_slots(
+            sid_b,
+            &[obs_of_size(30)],
+            &slots,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let user_a = &a.messages[0].content;
+        let user_b = &b.messages[0].content;
+
+        let marker = "Session id: ";
+        let pos_a = user_a.find(marker).expect("session id line");
+        let pos_b = user_b.find(marker).expect("session id line");
+        assert!(
+            pos_a > 0 && pos_b > 0,
+            "the session id belongs to the variable tail, not the stable prefix"
+        );
+        assert_eq!(
+            &user_a[..pos_a],
+            &user_b[..pos_b],
+            "the stable prefix must be byte-identical across sessions"
+        );
+        assert!(
+            user_a.find("## `tier` field").expect("schema suffix") < pos_a,
+            "the fixed batch schema must lead the message"
+        );
+        assert!(
+            user_a.find("## `tier` field").expect("schema suffix")
+                < user_a
+                    .find(PROJECT_INSTRUCTIONS_HEADER)
+                    .expect("project instructions"),
+            "the fixed batch schema must precede the project instructions"
+        );
+        assert!(
+            user_a
+                .find(PROJECT_INSTRUCTIONS_HEADER)
+                .expect("project instructions")
+                < pos_a,
+            "the project instructions must precede the session id"
+        );
+        let dump = user_a.find("--- observation").expect("observation dump");
+        assert!(
+            pos_a < dump,
+            "the session id must precede the observation dump"
+        );
+        let sid_a_str = sid_a.to_string();
+        let sid_b_str = sid_b.to_string();
+        assert!(
+            user_a[pos_a..].contains(&sid_a_str) && user_b[pos_b..].contains(&sid_b_str),
+            "each session id must appear in its own variable tail"
+        );
+    }
+
+    /// The project instructions lead the single-page user message and must
+    /// be byte-identical across sessions of the same project. In production
+    /// the current body is the session's own page body
+    /// (`sessions/<id>.md`), so it varies per session: the shared prefix ends
+    /// at the current-body block header, and the bodies differ right after
+    /// it. The session id and the observation dump sit at the end.
+    #[test]
+    fn single_user_message_prefix_is_stable_across_sessions() {
+        let sid_a: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let sid_b: SessionId = "0193e7a2-0000-7000-8000-000000000002"
+            .parse()
+            .expect("fixed session id");
+        // Per-session page bodies, as in production: the current body varies
+        // between two sessions of the same project.
+        let body_a = "# session\n\nKept decision A from the first run.";
+        let body_b = "# session\n\nCompletely different draft B.";
+        let titles = vec!["Existing Title".to_string()];
+
+        let a = build_request(
+            sid_a,
+            &[obs_of_size(20)],
+            body_a,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let b = build_request(
+            sid_b,
+            &[obs_of_size(30)],
+            body_b,
+            Some("prefer concise notes"),
+            PromptBudgets::default(),
+            &titles,
+        );
+        let user_a = &a.messages[0].content;
+        let user_b = &b.messages[0].content;
+
+        let body_header = "Current (heuristic) page body";
+        let pos_a = user_a.find(body_header).expect("current body section");
+        let pos_b = user_b.find(body_header).expect("current body section");
+        assert!(
+            pos_a > 0,
+            "the shared prefix (the project instructions) must be non-empty"
+        );
+        assert_eq!(
+            &user_a[..pos_a],
+            &user_b[..pos_b],
+            "the prefix before the first variable block (current body) must be byte-identical across sessions"
+        );
+        assert!(
+            user_a
+                .find(PROJECT_INSTRUCTIONS_HEADER)
+                .expect("project instructions")
+                < pos_a,
+            "the shared prefix is the instructions block"
+        );
+        assert!(
+            user_a[pos_a..].contains(body_a) && !user_a[pos_a..].contains(body_b),
+            "session A's current body must sit right after the shared prefix"
+        );
+        assert!(
+            user_b[pos_b..].contains(body_b) && !user_b[pos_b..].contains(body_a),
+            "session B's current body must differ right after the shared prefix"
+        );
+
+        let marker = "Session id: ";
+        let sid_pos_a = user_a.find(marker).expect("session id line");
+        let sid_pos_b = user_b.find(marker).expect("session id line");
+        assert!(
+            sid_pos_a > pos_a && sid_pos_b > pos_b,
+            "the session id belongs to the variable tail, not the stable prefix"
+        );
+        let dump = user_a.find("--- observation").expect("observation dump");
+        assert!(
+            sid_pos_a < dump,
+            "the session id must precede the observation dump"
+        );
+        let sid_a_str = sid_a.to_string();
+        let sid_b_str = sid_b.to_string();
+        assert!(
+            user_a[sid_pos_a..].contains(&sid_a_str) && user_b[sid_pos_b..].contains(&sid_b_str),
+            "each session id must appear in its own variable tail"
+        );
+    }
+
+    /// Reference assembly of the pre-reorder single-page layout (session id
+    /// and observation dump first, then current body, titles, and
+    /// instructions). It shares the exact budget math and rendered blocks of
+    /// the builder so tests can compare accepted content across the reorder.
+    fn old_order_single_content(
+        session_id: SessionId,
+        observations: &[Observation],
+        current_body: &str,
+        instructions: Option<&str>,
+        budgets: PromptBudgets,
+        existing_titles: &[String],
+    ) -> String {
+        let mut prefix = String::new();
+        prefix.push_str("Session id: ");
+        prefix.push_str(&session_id.to_string());
+        prefix.push_str("\nObservations (in order):\n\n");
+
+        let optional_budget = budgets
+            .optional_context_budget::<ConsolidatedPage>(SYSTEM_PROMPT, count_chars(&prefix));
+        let instructions_block =
+            render_instructions_block(instructions, optional_budget.saturating_div(2));
+        let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
+        let titles_block = render_title_uniqueness_section(existing_titles);
+        let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
+        let mut suffix = render_current_body_section(current_body, current_body_budget);
+        suffix.push_str(&titles_block);
+        suffix.push_str(&instructions_block);
+
+        let observation_chars = budgets.remaining_input_chars::<ConsolidatedPage>(
+            SYSTEM_PROMPT,
+            count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        );
+        let projected = project_observations(
+            observations,
+            &ObservationProjectionConfig::new(
+                observation_chars,
+                MAX_PROJECTED_OBSERVATIONS,
+                MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+            )
+            .with_context_label("single-page consolidation"),
+        );
+        let mut buf = prefix;
+        buf.push_str(&projected.text);
+        buf.push_str(&suffix);
+        buf
+    }
+
+    /// Reference assembly of the pre-reorder batch layout (fixed header,
+    /// session id, observation dump, then slots, fixed schema, titles, and
+    /// instructions). The fixed header and schema text are sliced out of the
+    /// rendered message so the reference reuses the exact shipped bytes.
+    fn old_order_batch_content(
+        rendered: &str,
+        session_id: SessionId,
+        observations: &[Observation],
+        slots: &[SlotSnapshot],
+        instructions: Option<&str>,
+        budgets: PromptBudgets,
+        existing_titles: &[String],
+    ) -> String {
+        let mandatory_start = rendered
+            .find("\nProduce up to 5 page updates")
+            .expect("batch prompt carries the fixed schema suffix");
+        let fixed_header = &rendered[..mandatory_start];
+        let mandatory_suffix = &rendered[mandatory_start
+            ..rendered
+                .find(PROJECT_INSTRUCTIONS_HEADER)
+                .expect("batch prompt carries the project instructions")];
+
+        let mut prefix = String::new();
+        prefix.push_str(fixed_header);
+        prefix.push_str("Session id: ");
+        prefix.push_str(&session_id.to_string());
+        prefix.push_str("\n\nObservations:\n");
+
+        let titles_block = render_title_uniqueness_section(existing_titles);
+        let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
+            BATCH_SYSTEM_PROMPT,
+            count_chars(&prefix)
+                .saturating_add(count_chars(mandatory_suffix))
+                .saturating_add(count_chars(&titles_block)),
+        );
+        let instructions_block =
+            render_instructions_block(instructions, optional_budget.saturating_div(2));
+        let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
+        let mut suffix = render_slot_snapshots(slots, slots_budget);
+        suffix.push_str(mandatory_suffix);
+        suffix.push_str(&titles_block);
+        suffix.push_str(&instructions_block);
+
+        let observation_chars = budgets.remaining_input_chars::<ConsolidatedBatch>(
+            BATCH_SYSTEM_PROMPT,
+            count_chars(&prefix).saturating_add(count_chars(&suffix)),
+        );
+        let projected = project_observations(
+            observations,
+            &ObservationProjectionConfig::new(
+                observation_chars,
+                MAX_PROJECTED_OBSERVATIONS,
+                MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+            )
+            .with_context_label("batch consolidation"),
+        );
+        let mut buf = prefix;
+        buf.push_str(&projected.text);
+        buf.push_str(&suffix);
+        buf
+    }
+
+    /// The reordered message must carry exactly the accepted lines of the
+    /// pre-reorder assembly — no content lost, no content duplicated.
+    fn assert_same_accepted_lines(new_content: &str, old_content: &str) {
+        let mut old_lines: Vec<&str> = old_content.lines().collect();
+        let mut new_lines: Vec<&str> = new_content.lines().collect();
+        old_lines.sort_unstable();
+        new_lines.sort_unstable();
+        assert_eq!(
+            old_lines, new_lines,
+            "accepted content must be identical between the old and the new order"
+        );
+    }
+
+    /// Reordering must admit neither more nor less: on a 16k-input/8k-output
+    /// budget large enough to reach clipping, the pre-reorder assembly and
+    /// the reordered single-page builder accept identical content, only
+    /// permuted.
+    #[test]
+    fn reorder_preserves_accepted_content_single() {
+        let budgets = PromptBudgets::from_limits(16_000, 8_000);
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let observations: Vec<Observation> = (0..24).map(|_| obs_of_size(2_000)).collect();
+        let instructions_text = "prefer concise notes; keep \"sentinel-quotes\" verbatim";
+        let instructions = Some(instructions_text);
+        let current_body = format!(
+            "# huge\n\n{}\n\n## Raw observations\n\n- clip-me\n",
+            "x".repeat(30_000)
+        );
+        let titles = vec!["Existing Title".to_string()];
+
+        let request = build_request(
+            sid,
+            &observations,
+            &current_body,
+            instructions,
+            budgets,
+            &titles,
+        );
+        let new_content = &request.messages[0].content;
+        let old_content = old_order_single_content(
+            sid,
+            &observations,
+            &current_body,
+            instructions,
+            budgets,
+            &titles,
+        );
+
+        assert_eq!(
+            count_chars(new_content),
+            count_chars(&old_content),
+            "reordering must not change the total budgeted length"
+        );
+        assert_same_accepted_lines(new_content, &old_content);
+
+        // Nothing lost, nothing duplicated in the stable sections.
+        let encoded_instructions =
+            serde_json::Value::String(instructions_text.to_string()).to_string();
+        assert_eq!(
+            new_content.matches(&encoded_instructions).count(),
+            1,
+            "the escaped project instructions must appear exactly once"
+        );
+        assert_eq!(new_content.matches("Existing Title").count(), 1);
+        assert!(
+            new_content.contains("[current heuristic page body truncated]"),
+            "clipping is reached on the 16k/8k fixture"
+        );
+        assert!(
+            !new_content.contains("clip-me"),
+            "raw-observation elision is preserved"
+        );
+    }
+
+    /// The single-page observation budget must count the titles block: on a
+    /// knife-edge input budget calibrated so all three equal observations do
+    /// not fit, the middle one is pruned (first and last are hard anchors).
+    /// If the titles block were left out of the `remaining_input_chars`
+    /// sum, the budget would grow by the titles' size and all three
+    /// observations would render. This test asserts the production shape
+    /// exactly, with a large deterministic titles block and real pruning,
+    /// so a sum missing the titles block fails it while the correct sum
+    /// passes.
+    #[test]
+    fn single_observation_budget_accounts_for_the_titles_block() {
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        // Three equal-sized observations (same body length and the same
+        // fixed field lengths — v7 UUID ids are always 36 chars) render
+        // blocks of identical length. The first and last are hard anchors
+        // (never pruned), so the middle one is the only prunable block and
+        // the budget sits exactly on the three-block edge.
+        let observations = vec![obs_of_size(400), obs_of_size(400), obs_of_size(400)];
+        // A deterministic titles block well above the calibration gap
+        // (the renderer caps the list at EXISTING_TITLES_PROMPT_LIMIT, so
+        // the block size is stable across runs).
+        let titles: Vec<String> = (0..80)
+            .map(|i| format!("Existing page title {i:02} with a stable suffix"))
+            .collect();
+        let titles_block = render_title_uniqueness_section(&titles);
+        let title_chars = count_chars(&titles_block);
+        assert!(
+            title_chars >= 512,
+            "the fixture needs a titles block well above the calibration gap: {title_chars}"
+        );
+
+        // Measure one rendered block through the exact projection the
+        // builder uses (a generous budget keeps all three, back-to-back).
+        let probe = project_observations(
+            &observations,
+            &ObservationProjectionConfig::new(
+                100_000,
+                MAX_PROJECTED_OBSERVATIONS,
+                MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+            )
+            .with_context_label("single-page consolidation"),
+        );
+        assert_eq!(
+            probe.omitted_count, 0,
+            "the probe budget must keep all three observations"
+        );
+        let probe_chars = count_chars(&probe.text);
+        assert_eq!(
+            probe_chars % 3,
+            0,
+            "the three observations must render equal-length blocks"
+        );
+        let block_chars = probe_chars / 3;
+
+        // Calibrate the input budget so the observation budget lands just
+        // below three blocks: with the titles counted the middle
+        // observation is pruned (the two hard anchors fit); without them
+        // (S2) all three fit. The gap absorbs the CHARS_PER_TOKEN rounding
+        // of `from_limits`.
+        let mut observations_header = String::new();
+        observations_header.push_str("Session id: ");
+        observations_header.push_str(&sid.to_string());
+        observations_header.push_str("\nObservations (in order):\n\n");
+        let header_chars = count_chars(&observations_header);
+        let gap = 4 * CHARS_PER_TOKEN;
+        let required_total = (3 * block_chars)
+            .saturating_sub(gap)
+            .saturating_add(count_chars(SYSTEM_PROMPT))
+            .saturating_add(schema_chars::<ConsolidatedPage>())
+            .saturating_add(PROMPT_ENVELOPE_RESERVE_CHARS)
+            .saturating_add(header_chars)
+            .saturating_add(title_chars);
+        let budgets = PromptBudgets::from_limits(
+            required_total.div_ceil(CHARS_PER_TOKEN),
+            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+        );
+
+        // The calibration must hold — this is the property that makes the
+        // test bite on the S2 mutation.
+        let observation_chars = budgets.remaining_input_chars::<ConsolidatedPage>(
+            SYSTEM_PROMPT,
+            header_chars.saturating_add(title_chars),
+        );
+        let three_blocks = 3 * block_chars;
+        let two_blocks = 2 * block_chars;
+        assert!(
+            three_blocks > observation_chars,
+            "calibration: all three observations must not fit while the titles are counted (three_blocks={three_blocks}, observation_chars={observation_chars})"
+        );
+        assert!(
+            two_blocks <= observation_chars,
+            "calibration: the two hard-anchor observations must fit while the titles are counted (two_blocks={two_blocks}, observation_chars={observation_chars})"
+        );
+        assert!(
+            three_blocks <= observation_chars.saturating_add(title_chars),
+            "calibration: dropping the titles from the sum must admit the third observation (S2)"
+        );
+
+        let request = build_request(sid, &observations, "", None, budgets, &titles);
+        let user = &request.messages[0].content;
+        assert_eq!(
+            user.matches("--- observation").count(),
+            2,
+            "with the titles block counted into the observation budget only the two hard-anchor observations fit and the middle one is pruned; S2 (titles dropped from the sum) would render all three"
+        );
+        assert!(
+            user.contains("1 observations omitted from single-page consolidation projection"),
+            "the pruned observation must leave its visible omission marker"
+        );
+    }
+
+    /// Same guarantee for the batch builder: on a 16k-input/8k-output budget
+    /// large enough to reach clipping, the old and the new order admit the
+    /// same slots, titles, instructions, and selected observations.
+    #[test]
+    fn reorder_preserves_accepted_content_batch() {
+        let budgets = PromptBudgets::from_limits(16_000, 8_000);
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let observations: Vec<Observation> = (0..24).map(|_| obs_of_size(2_000)).collect();
+        let slots = vec![
+            SlotSnapshot {
+                path: "_slots/focus.md".into(),
+                title: "Focus".into(),
+                slot_kind: SlotKind::State,
+                body: "slot body A ".repeat(150),
+            },
+            SlotSnapshot {
+                path: "_slots/draft.md".into(),
+                title: "Draft".into(),
+                slot_kind: SlotKind::State,
+                body: "slot body B ".repeat(150),
+            },
+        ];
+        let instructions_text = "prefer concise notes; keep \"sentinel-quotes\" verbatim";
+        let instructions = Some(instructions_text);
+        let titles = vec!["Existing Title".to_string()];
+
+        let request = build_batch_request_with_slots(
+            sid,
+            &observations,
+            &slots,
+            instructions,
+            budgets,
+            &titles,
+        );
+        let new_content = &request.messages[0].content;
+        let old_content = old_order_batch_content(
+            new_content,
+            sid,
+            &observations,
+            &slots,
+            instructions,
+            budgets,
+            &titles,
+        );
+
+        assert_eq!(
+            count_chars(new_content),
+            count_chars(&old_content),
+            "reordering must not change the total budgeted length"
+        );
+        assert_same_accepted_lines(new_content, &old_content);
+
+        // Nothing lost, nothing duplicated in the stable sections.
+        let encoded_instructions =
+            serde_json::Value::String(instructions_text.to_string()).to_string();
+        assert_eq!(
+            new_content.matches(&encoded_instructions).count(),
+            1,
+            "the escaped project instructions must appear exactly once"
+        );
+        assert_eq!(new_content.matches("Existing Title").count(), 1);
+        assert_eq!(new_content.matches("_slots/focus.md").count(), 1);
+        assert_eq!(new_content.matches("_slots/draft.md").count(), 1);
+    }
+
+    /// The reorder is pure in-memory assembly: even on degenerate inputs the
+    /// builders finish without touching external state and emit a well-formed
+    /// request with the system prompt still separate.
+    #[test]
+    fn default_builders_total_on_empty_and_minimum_budget_inputs() {
+        let budgets = PromptBudgets::from_limits(
+            MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
+            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+        );
+        let single = build_request(SessionId::new(), &[], "", None, budgets, &[]);
+        let batch = build_batch_request_with_slots(SessionId::new(), &[], &[], None, budgets, &[]);
+        for (name, request) in [("single", &single), ("batch", &batch)] {
+            let user = &request.messages[0].content;
+            assert!(!user.is_empty(), "{name}: user message must not be empty");
+            assert!(
+                user.contains("Observations"),
+                "{name}: the observation section must survive degenerate inputs"
+            );
+            assert!(
+                !request.system.as_deref().unwrap_or_default().is_empty(),
+                "{name}: the system prompt stays separate and non-empty"
+            );
+        }
     }
 
     #[test]
