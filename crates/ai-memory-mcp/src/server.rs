@@ -2406,10 +2406,13 @@ impl AiMemoryServer {
         {
             Ok(Ok(scores)) => scores,
             Ok(Err(e)) => {
+                // Redacted fields only: the `Display` of a provider failure
+                // carries the upstream response body.
                 tracing::warn!(
                     reranker = reranker.name(),
                     model = reranker.model(),
-                    error = %e,
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
                     "reranker failed; keeping pre-rerank order"
                 );
                 hits.truncate(limit);
@@ -3779,7 +3782,12 @@ impl AiMemoryServer {
             let outcomes = consolidator
                 .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| {
+                    McpError::internal_error(
+                        ai_memory_consolidate::redacted_error_summary(&e),
+                        None,
+                    )
+                })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
@@ -3788,7 +3796,12 @@ impl AiMemoryServer {
             let outcome = consolidator
                 .consolidate_session(session_id, dry, actor, author_id, instructions)
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| {
+                    McpError::internal_error(
+                        ai_memory_consolidate::redacted_error_summary(&e),
+                        None,
+                    )
+                })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
@@ -4030,7 +4043,12 @@ impl AiMemoryServer {
         let report =
             run_auto_improve_review(&self.reader, &**llm, ws, proj, session_id, cfg.clone())
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| {
+                    McpError::internal_error(
+                        ai_memory_consolidate::redacted_auto_improve_summary(&e),
+                        None,
+                    )
+                })?;
         // Whose suggestion this is; it also scopes the one-pending-per-target
         // rule (V42). Only meaningful where operators are actually told apart:
         // on a single-operator server the caller would otherwise stage into
@@ -6016,10 +6034,23 @@ impl AiMemoryServer {
         let text = match provider.complete(request).await {
             Ok(resp) => resp.text,
             Err(e) => {
-                tracing::warn!(error = %e, "memory_explore LLM call failed; degrading to briefing");
+                // Redacted fields only: the `Display` of a provider failure
+                // carries the upstream response body, and this reason goes
+                // back to the tool caller.
+                tracing::warn!(
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
+                    "memory_explore LLM call failed; degrading to briefing"
+                );
                 return ok_json(&serde_json::json!({
                     "prose": null,
-                    "reason": format!("LLM call failed: {e}"),
+                    "reason": format!(
+                        "LLM call failed: class={} status={}",
+                        e.class(),
+                        e.http_status()
+                            .map(|status| status.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    ),
                     "briefing": snapshot,
                 }));
             }
@@ -7120,8 +7151,8 @@ mod tests {
     }
 
     use ai_memory_core::{
-        ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
-        PagePath, Tier,
+        ActorContext, AgentKind, AuthLevel, NewObservation, NewPage, NewSession, NewUser,
+        ObservationKind, PagePath, SessionId, Tier,
     };
     use ai_memory_store::Store;
     use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -7268,6 +7299,9 @@ mod tests {
         Scores(Vec<ai_memory_llm::RerankScore>),
         Reverse,
         Fail,
+        /// A provider failure with a private body: the degradation warning
+        /// must carry class/status only.
+        ProviderFail,
     }
 
     struct StubReranker {
@@ -7313,6 +7347,10 @@ mod tests {
                 StubRerankOutcome::Fail => Err(ai_memory_llm::LlmError::UnexpectedShape(
                     "stub failure".into(),
                 )),
+                StubRerankOutcome::ProviderFail => Err(ai_memory_llm::LlmError::Provider {
+                    status: 400,
+                    body: "SENTINEL_PRIVATE_BODY".into(),
+                }),
             }
         }
     }
@@ -7494,6 +7532,171 @@ mod tests {
             original_ids
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Captures everything a subscriber writes so a test can assert on it.
+    /// `set_default` is thread-local and each `#[tokio::test]` runs on its
+    /// own thread, so parallel tests do not share (or fight over) a capture.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Installs the per-thread capture subscriber and returns its guard,
+    /// a companion `Dispatch`, and the companion's own capture buffer.
+    /// Keep all three alive until the assertions read the capture.
+    ///
+    /// The companion exists because tracing-core caches each callsite's
+    /// interest process-wide: while exactly one dispatcher is registered,
+    /// the cache is computed from the *registering* thread's default
+    /// dispatcher, so a first registration by a subscriber-less thread —
+    /// a parallel test hitting the same production `warn!` — pins
+    /// `Interest::never` and later emissions are dropped before reaching
+    /// any subscriber. With a second live `Dispatch` the rebuilder reads
+    /// the registered dispatchers instead of the calling thread, so a
+    /// subscriber-less registration can no longer pin `never`; the
+    /// `rebuild_interest_cache()` call heals callsites that were
+    /// registered (and possibly poisoned) before the companion came
+    /// alive. The companion must be a distinct registered `Dispatch` — a
+    /// clone of the capture dispatch is the same entry and does not count
+    /// — and it must outlive the capture: dropping it early reopens the
+    /// single-dispatcher window. Both dispatchers drop with the test, so
+    /// no state outlives it.
+    fn install_capture(
+        captured: CapturedLog,
+    ) -> (
+        tracing::subscriber::DefaultGuard,
+        tracing::Dispatch,
+        CapturedLog,
+    ) {
+        let companion_capture = CapturedLog::default();
+        let companion = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(companion_capture.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish(),
+        );
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        (guard, companion, companion_capture)
+    }
+
+    /// Mutation captured: formatting the `LlmError`'s `Display` into the
+    /// degradation warning copies the provider body into the server log. The
+    /// warning must carry class/status only, the hits keep the pre-rerank
+    /// order and the limit, and the failure must not read as a successful
+    /// rerank (no `rerank_score` stamped).
+    #[tokio::test]
+    async fn reranker_provider_failure_warning_carries_class_status_not_body() {
+        let captured = CapturedLog::default();
+        let (_guard, _companion, companion_log) = install_capture(captured.clone());
+
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let hits = rerank_test_hits(4);
+        let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
+        let (reranker, calls, _) = stub_reranker(StubRerankOutcome::ProviderFail, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+
+        // Adversarial schedule: the window this mechanism produces — a
+        // subscriber-less thread registering the production failure
+        // callsite first (the scheduling class behind the Windows CI
+        // failure; the exact runner order was not instrumented). This
+        // thread performs that first use before the emission below.
+        // `join` fixes the order without any timing dependency, and the
+        // thread runs its own server and reranker so the counters and
+        // assertions below stay exact.
+        let adversarial_hits = hits.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("adversarial first-registration runtime");
+            runtime.block_on(async move {
+                let (_tmp, _store, poison_server, _ws, _proj) = setup_server().await;
+                let (poison_reranker, poison_calls, _) =
+                    stub_reranker(StubRerankOutcome::ProviderFail, Duration::ZERO);
+                let result = poison_server
+                    .with_reranker(poison_reranker)
+                    .rerank_hits("query", adversarial_hits, 2)
+                    .await;
+                assert_eq!(result.len(), 2);
+                assert_eq!(poison_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            });
+        })
+        .join()
+        .expect("adversarial first-registration thread");
+
+        let result = server.rerank_hits("query", hits, 2).await;
+
+        // Degradation, not success: pre-rerank order, truncated to the limit,
+        // and no hit may carry a rerank score.
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids[..2].to_vec()
+        );
+        assert!(
+            result.iter().all(|(_, explain)| explain
+                .as_ref()
+                .and_then(|explain| explain.rerank_score)
+                .is_none()),
+            "a failed rerank must not stamp rerank scores"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let logged = captured.text();
+        assert!(
+            logged.contains("reranker failed; keeping pre-rerank order"),
+            "the degradation warning must still fire; captured log was: {logged:?}"
+        );
+        assert!(
+            logged.contains("error_class=provider"),
+            "the failure class must stay diagnosable: {logged}"
+        );
+        assert!(
+            logged.contains("error_status=Some(400)"),
+            "the status must stay: {logged}"
+        );
+        assert!(
+            !logged.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the reranker log: {logged}"
+        );
+        // The companion dispatch only guards the process-wide interest
+        // cache: nothing may flow through it.
+        assert!(
+            companion_log.text().is_empty(),
+            "the companion dispatch must stay scoped out of the capture: {}",
+            companion_log.text()
+        );
     }
 
     #[tokio::test]
@@ -12873,6 +13076,260 @@ mod tests {
         );
     }
 
+    /// Mutation captured: formatting the `LlmError`'s `Display` into the
+    /// degraded-explore `reason` copies the provider body to the tool
+    /// caller. The failure must degrade with the redacted class/status
+    /// summary only, mirroring the `memory_consolidate` redaction tests.
+    #[tokio::test]
+    async fn memory_explore_degrades_with_redacted_summary_not_provider_body() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let result = server
+            .memory_explore(
+                Parameters(ExploreArgs {
+                    focus: None,
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a provider failure must degrade to the briefing, not error");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("LLM call failed: class=provider status=400"),
+            "the degraded reason must carry only the redacted class/status summary\n{text}"
+        );
+        assert!(
+            !text.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the tool result\n{text}"
+        );
+        assert!(
+            text.contains("\"prose\": null"),
+            "expected null prose\n{text}"
+        );
+        assert!(
+            text.contains("\"briefing\":"),
+            "expected briefing payload\n{text}"
+        );
+    }
+
+    /// Provider failure for the `memory_consolidate` redaction tests: a 400
+    /// whose private body must never reach the MCP error message.
+    struct ConsolidationBodyFailure;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ConsolidationBodyFailure {
+        fn name(&self) -> &'static str {
+            "consolidation-body-failure"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "SENTINEL_PRIVATE_BODY".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "SENTINEL_PRIVATE_BODY".into(),
+            })
+        }
+    }
+
+    /// A completed session with one observation: the minimum a real
+    /// consolidation can reach the LLM with.
+    async fn seeded_completed_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "end the session".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        session_id
+    }
+
+    /// Build a server whose consolidator fails with the private-body 400.
+    async fn consolidating_server_failing_with_private_body(
+        tmp: &TempDir,
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> AiMemoryServer {
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(ConsolidationBodyFailure);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+    }
+
+    // Mutation captured: mapping the consolidator error's `Display` into the
+    // `McpError` copies the bounded provider body to the tool caller in both
+    // consolidation modes; only the redacted class/status summary may go out.
+    #[tokio::test]
+    async fn memory_consolidate_single_redacts_provider_body_from_mcp_error() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let session_id = seeded_completed_session(&store, ws, proj).await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let err = server
+            .memory_consolidate(
+                Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "session_id": session_id.to_string()
+                    }))
+                    .unwrap(),
+                ),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the provider failure must surface as an MCP error");
+        assert_eq!(
+            err.message, "consolidation failed: class=provider status=400",
+            "the MCP error must carry only the redacted class/status summary"
+        );
+        assert!(
+            !err.message.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the MCP error: {}",
+            err.message
+        );
+    }
+
+    // Same leak, multi-page mode: the fan-out shares the single helper, and
+    // the failure must land before any page write.
+    #[tokio::test]
+    async fn memory_consolidate_multi_redacts_provider_body_from_mcp_error() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let session_id = seeded_completed_session(&store, ws, proj).await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let err = server
+            .memory_consolidate(
+                Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "multi_page": true
+                    }))
+                    .unwrap(),
+                ),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the provider failure must surface as an MCP error");
+        assert_eq!(
+            err.message, "consolidation failed: class=provider status=400",
+            "the MCP error must carry only the redacted class/status summary"
+        );
+        assert!(
+            !err.message.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the MCP error: {}",
+            err.message
+        );
+        let path = format!("sessions/{session_id}.md");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, &path)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed consolidation must not write the session page"
+        );
+    }
+
+    // Control: a non-LLM failure (no observations) must report its own class
+    // with `status=none` — the caller can still tell configuration, provider,
+    // and parse failures apart — and carry no body at all.
+    #[tokio::test]
+    async fn memory_consolidate_non_llm_failure_reports_class_without_body() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        // A valid UUID that never had a session row: the consolidator fails
+        // before the LLM with `EmptySession`, so the provider body cannot be
+        // involved at all.
+        let missing = SessionId::new();
+        let err = server
+            .memory_consolidate(
+                Parameters(
+                    serde_json::from_value(serde_json::json!({
+                        "session_id": missing.to_string()
+                    }))
+                    .unwrap(),
+                ),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the missing session must surface as an MCP error");
+        assert_eq!(
+            err.message,
+            "consolidation failed: class=empty-session status=none"
+        );
+        assert!(!err.message.contains("SENTINEL_PRIVATE_BODY"));
+    }
+
     #[test]
     fn explore_gap_bucket_picks_right_label() {
         use ai_memory_store::BriefingSnapshot;
@@ -17488,6 +17945,219 @@ mod tests {
                 "rejected_candidates": []
             }))
         }
+    }
+
+    /// A provider that fails the auto-improve review with a private body:
+    /// the `McpError` must carry only the redacted class/status summary.
+    struct AutoImproveSentinelLlm;
+
+    fn auto_improve_sentinel_error() -> ai_memory_llm::LlmError {
+        ai_memory_llm::LlmError::Provider {
+            status: 400,
+            body: "SENTINEL_PRIVATE_BODY".into(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ai_memory_llm::LlmProvider for AutoImproveSentinelLlm {
+        fn name(&self) -> &'static str {
+            "auto-improve-sentinel"
+        }
+
+        fn model(&self) -> &str {
+            "sentinel-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Err(auto_improve_sentinel_error())
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Err(auto_improve_sentinel_error())
+        }
+    }
+
+    /// A completed-scope session with one observation, enough for a review
+    /// whose minimums are lowered to pass the preflight and reach the LLM.
+    async fn seeded_auto_improve_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson worth capturing".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        session_id
+    }
+
+    /// Build the server fixture the auto-improve tests share: real store and
+    /// wiki, the sentinel provider, and a consolidator so `self.llm`/`self.wiki`
+    /// are set.
+    async fn auto_improve_server_with_sentinel_llm() -> (
+        TempDir,
+        Store,
+        AiMemoryServer,
+        WorkspaceId,
+        ProjectId,
+        SessionId,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session_id = seeded_auto_improve_session(&store, ws, proj).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(AutoImproveSentinelLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+        (tmp, store, server, ws, proj, session_id)
+    }
+
+    /// Mutation captured: mapping the `AutoImproveError`'s `Display` into the
+    /// `McpError` copies the bounded provider body to the tool caller. Only
+    /// the redacted class/status summary may go out, and a failed review must
+    /// stage nothing.
+    #[tokio::test]
+    async fn memory_auto_improve_llm_failure_exposes_class_status_not_body() {
+        let (_tmp, store, server, ws, proj, session_id) =
+            auto_improve_server_with_sentinel_llm().await;
+
+        let err = server
+            .memory_auto_improve(
+                Parameters(AutoImproveArgs {
+                    session_id: Some(session_id.to_string()),
+                    dry_run: None,
+                    stage: None,
+                    mode: None,
+                    project: None,
+                    workspace: None,
+                    min_observations: Some(1),
+                    min_session_duration_secs: Some(0),
+                    min_confidence: Some(0.75),
+                    max_input_tokens: None,
+                    max_proposals: Some(5),
+                    include_raw_fallback: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the provider failure must surface as an MCP error");
+        assert_eq!(
+            err.message, "auto-improve failed: class=provider status=400",
+            "the MCP error must carry only the redacted class/status summary"
+        );
+        assert!(
+            !err.message.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the MCP error: {}",
+            err.message
+        );
+        // The review failed before staging: no proposal row may exist.
+        let proposals = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 100)
+            .await
+            .unwrap();
+        assert!(
+            proposals.is_empty(),
+            "a failed review must not stage proposals: {proposals:?}"
+        );
+    }
+
+    /// Control: a non-LLM failure (a session that does not exist) keeps its
+    /// own class with `status=none`, so configuration, provider, and parse
+    /// failures stay distinguishable, and still stages nothing.
+    #[tokio::test]
+    async fn memory_auto_improve_missing_session_error_keeps_class_without_body() {
+        let (_tmp, store, server, ws, proj, _seeded) =
+            auto_improve_server_with_sentinel_llm().await;
+
+        let missing = SessionId::new();
+        let err = server
+            .memory_auto_improve(
+                Parameters(AutoImproveArgs {
+                    session_id: Some(missing.to_string()),
+                    dry_run: None,
+                    stage: None,
+                    mode: None,
+                    project: None,
+                    workspace: None,
+                    min_observations: Some(1),
+                    min_session_duration_secs: Some(0),
+                    min_confidence: Some(0.75),
+                    max_input_tokens: None,
+                    max_proposals: Some(5),
+                    include_raw_fallback: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the missing session must surface as an MCP error");
+        assert_eq!(
+            err.message,
+            "auto-improve failed: class=session-not-found status=none"
+        );
+        assert!(!err.message.contains("SENTINEL_PRIVATE_BODY"));
+        let proposals = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 100)
+            .await
+            .unwrap();
+        assert!(proposals.is_empty());
     }
 
     /// Stage one pending proposal for `notes/collides.md` into
