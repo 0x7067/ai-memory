@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endings. The underline check required every character of the second line
   to be `=`, which failed when the line contained a trailing carriage return,
   trailing whitespace or tabs, or when the document ended at the underline
-  without a trailing newline.
+  without a trailing newline. (#1108)
 - Fixed generic OpenCode commands selecting integration contracts from command
   spelling instead of the executable's major version. `run opencode` now probes
   the exact executable once and carries the resolved V1/V2 dialect through

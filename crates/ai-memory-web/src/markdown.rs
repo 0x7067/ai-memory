@@ -664,6 +664,11 @@ mod tests {
 
         let out = strip_leading_h1("Title\r\n=====  \r\n\r\nbody\r\n", "Title");
         assert_eq!(out, "body\r\n");
+
+        // Negative control: an underline with inner spaces is not a setext
+        // H1 underline — the heading must survive stripping.
+        let out = strip_leading_h1("Title\r\n== x ==\r\nbody", "Title");
+        assert_eq!(out, "Title\r\n== x ==\r\nbody");
     }
 
     #[test]
