@@ -209,18 +209,22 @@ pub(crate) fn inspect_tree_except(root: &Path, excluded_roots: &[&Path]) -> Wiki
             let entry = match entry {
                 Ok(entry) => entry,
                 // The directory went away mid-listing; the rest of it is
-                // as unobserved as the part already read.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                // as unobserved as the part already read. On Windows the
+                // same churn surfaces as sharing violations or
+                // delete-pending handles instead of NotFound.
+                Err(error) if is_transient_churn(&error) => break,
                 Err(error) => return Err(error.into()),
             };
             let path = entry.path();
-            // Vanish-tolerant, never link-tolerant: an entry gone by the
-            // time it is statted was not observed, so there is nothing to
-            // refuse; every entry that IS stat-able must pass the
-            // link-like check below.
+            // Vanish-tolerant, never link-tolerant: an entry unstatable by
+            // the time it is probed — deleted outright, or held and
+            // rename-replaced by a concurrent commit under Windows sharing
+            // semantics — was not observed, so there is nothing to refuse;
+            // every entry that IS stat-able must pass the link-like check
+            // below.
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if is_transient_churn(&error) => continue,
                 Err(error) => return Err(error.into()),
             };
             if is_link_like(&metadata) {
@@ -250,6 +254,26 @@ pub(crate) fn is_link_like(metadata: &std::fs::Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
+}
+
+/// Whether a walk-probe error is concurrent-writer churn rather than a
+/// verdict about the tree.
+///
+/// Windows rename semantics give the vanish race a second shape: the
+/// atomic writer rename-replaces files and a concurrent commit holds
+/// `.git` lock and temp files, so a stat on an already-listed entry can
+/// fail with a sharing violation (`PermissionDenied`) or
+/// `ERROR_DELETE_PENDING` for a path that exists again — or does not —
+/// an instant later. Like NotFound, neither says anything stable enough
+/// to act on, so the walk skips the entry; any entry that does stat
+/// still faces the link-like refusal.
+fn is_transient_churn(error: &std::io::Error) -> bool {
+    // ERROR_DELETE_PENDING: std maps sharing violations to
+    // PermissionDenied but leaves this one an unmapped raw code.
+    const ERROR_DELETE_PENDING: i32 = 303;
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(ERROR_DELETE_PENDING)
 }
 
 fn inspect_root(root: &Path) -> WikiResult<()> {
@@ -348,7 +372,8 @@ mod tests {
     /// A walk beside create/delete churn (a concurrent commit's `.git`
     /// lock and temp files, an atomic writer's temp renames) must not
     /// fail on an entry that vanishes between read_dir and stat — while
-    /// a link the walk does observe is still refused.
+    /// a link the walk does observe is still refused, and the walk runs
+    /// clean once the churn stops.
     #[test]
     fn tree_walks_skip_entries_that_vanish_but_still_refuse_observed_links() {
         use std::sync::Arc;
@@ -376,6 +401,11 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         racer.join().unwrap();
         let _ = std::fs::remove_file(&scratch);
+
+        // Churn settled: a plain walk over the now-stable tree must
+        // succeed, proving the skip tolerance above leaves no lingering
+        // failure behind on the next walk.
+        inspect_tree_except(&root, &[]).unwrap();
 
         #[cfg(any(unix, windows))]
         {

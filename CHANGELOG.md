@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed wiki confinement walks failing on Windows with `PermissionDenied`
+  (sharing violation) or `ERROR_DELETE_PENDING` when a concurrent commit or
+  the atomic writer held or rename-replaced a file mid-walk; per-entry walk
+  probes now skip those as transient churn exactly like the NotFound vanish
+  race, while every entry that does stat is still refused when link-like and
+  root-level probes keep their strict semantics. (#1107)
 - Fixed generic OpenCode commands selecting integration contracts from command
   spelling instead of the executable's major version. `run opencode` now probes
   the exact executable once and carries the resolved V1/V2 dialect through
