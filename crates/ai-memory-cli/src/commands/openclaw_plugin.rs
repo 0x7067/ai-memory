@@ -210,11 +210,10 @@ pub(crate) fn manifest_json() -> String {
 
 /// Emit OpenClaw's `applyMarkerParams` TypeScript from the shared generator.
 ///
-/// OpenClaw omits managed-run forwarding and preserves its historical rule
-/// that ordinary local markers inspect repository identity only when aliases
-/// require it. Operator-home routes may still inspect identity for selection.
+/// OpenClaw omits managed-run forwarding but otherwise uses the shared
+/// repository-identity/default-path routing generated for TypeScript clients.
 fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
-    super::install_hooks::ts_apply_marker_params(default_strategy, false).replacen(
+    super::install_hooks::ts_apply_marker_params(default_strategy, true).replacen(
         "  const managedRun = process.env.AI_MEMORY_RUN_ID;\n  if (managedRun) url.searchParams.set(\"managed_run\", managedRun);\n",
         "",
         1,
@@ -919,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn openclaw_runtime_gates_local_identity_but_allows_alias_and_home_route_identity() {
+    fn openclaw_runtime_preserves_marker_and_home_identity_precedence() {
         if !std::process::Command::new("node")
             .args(["--experimental-strip-types", "-e", "0"])
             .output()
@@ -960,7 +959,7 @@ mod tests {
             .unwrap()
             .0;
         let source = format!(
-            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync, unlinkSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst repoCwd={};const marker={};const homeMarker={};const run=(body:string)=>{{writeFileSync(marker,body);const url=new URL(\"http://h/hook\");applyMarkerParams(url,repoCwd);return Object.fromEntries(url.searchParams);}};const plain=run('project=\"api\"\\n');const aliases=run('project=\"api\"\\naliases=[\"old-api\"]\\n');unlinkSync(marker);writeFileSync(homeMarker,'[routes.identity.\"github.com/acme/api\"]\\nroute_workspace=\"oss\"\\nroute_project=\"api\"\\n');const routedUrl=new URL(\"http://h/hook\");applyMarkerParams(routedUrl,repoCwd);process.stdout.write(JSON.stringify({{plain,aliases,routed:Object.fromEntries(routedUrl.searchParams)}}));",
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync, unlinkSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst repoCwd={};const marker={};const homeMarker={};const run=(body:string)=>{{writeFileSync(marker,body);const url=new URL(\"http://h/hook\");applyMarkerParams(url,repoCwd);return Object.fromEntries(url.searchParams);}};const noMarkerUrl=new URL(\"http://h/hook\");applyMarkerParams(noMarkerUrl,repoCwd);const noMarker=Object.fromEntries(noMarkerUrl.searchParams);const plain=run('project=\"api\"\\n');const aliases=run('project=\"api\"\\naliases=[\"old-api\"]\\n');unlinkSync(marker);writeFileSync(homeMarker,'[routes.identity.\"github.com/acme/api\"]\\nroute_workspace=\"oss\"\\nroute_project=\"api\"\\n');const routedUrl=new URL(\"http://h/hook\");applyMarkerParams(routedUrl,repoCwd);process.stdout.write(JSON.stringify({{noMarker,plain,aliases,routed:Object.fromEntries(routedUrl.searchParams)}}));",
             helpers,
             serde_json::to_string(&repo.to_string_lossy()).unwrap(),
             serde_json::to_string(&marker.to_string_lossy()).unwrap(),
@@ -980,6 +979,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["noMarker"]["identity_src"], "git_remote", "{result}");
+        assert_eq!(result["noMarker"]["identity_style"], "path", "{result}");
         assert!(result["plain"].get("identity").is_none(), "{result}");
         assert_eq!(result["aliases"]["identity_src"], "git_remote", "{result}");
         assert_eq!(result["aliases"]["aliases"], "[\"old-api\"]", "{result}");

@@ -555,18 +555,20 @@ fn project_name_from(raw: &str) -> String {
 /// How a remote-derived key spells a repository (#1033).
 ///
 /// Chosen by `identity_style` in `.ai-memory.toml`. Either way captures route
-/// by the full #708 identity; the style only decides the name a **new**
-/// remote-backed project is created under. `HostPath` is the default and keeps
-/// today's naming. `Path` names it from the repository path without the host
-/// ([`path_style_name`]), so worktrees and clones agree on a short name. Two
-/// forges hosting the same path must never share a project, so the store
-/// falls back to today's name when the path name is already taken.
+/// by the full #708 identity; the style only decides the canonical name of a
+/// remote-backed project. Phase-5 clients explicitly send `Path` and name it
+/// from the whole repository path without the host ([`path_style_name`]), so
+/// worktrees and clones agree on a short name. The Rust/wire default remains
+/// `HostPath` because pre-Phase-5 clients omitted their implicit host-path
+/// style; preserving omission is the version-skew boundary. Two forges hosting the same path must never
+/// share a project, so the store falls back to the hostful/legacy-safe name when
+/// the path name is already claimed by another full identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityStyle {
     /// `acme/api` — the repository path without its host.
     Path,
-    /// `github.com/acme/api` — the full #708 identity.
+    /// `github.com/acme/api` — the full #708 identity and legacy wire default.
     #[default]
     HostPath,
 }
@@ -1099,9 +1101,8 @@ mod tests {
         );
     }
 
-    /// The marker spellings every client forwards: only `path` asks for
-    /// anything, so a client sends `identity_style=path` exactly when the
-    /// fixture's `style` is `path`.
+    /// The explicit marker spellings every client forwards. Omission is not a
+    /// third spelling; each server applies its own versioned default.
     #[test]
     fn identity_style_values_match_the_shared_fixture() {
         let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();

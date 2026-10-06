@@ -12,8 +12,9 @@ as one server; your agent talks to it over MCP (tools like `memory_query`,
 `memory_write_page`) and over lifecycle hooks that automatically capture what you
 do. Memory is a **markdown wiki in git** (the source of truth, hand-editable) plus
 a derived SQLite index for search. Everything is **scoped per project**
-`(workspace, project)`, resolved from your working directory. It works with no
-LLM at all (capture + full-text search + rule-based summaries); adding a provider
+`(workspace, project)`, resolved from markers/home routes or, by default, the
+normalized repository path (`upstream`, then `origin`; folder basename only
+without a valid remote). It works with no LLM at all (capture + full-text search + rule-based summaries); adding a provider
 enables consolidation and auto-improvement.
 
 ## Recipe: use ai-memory as your tool's memory

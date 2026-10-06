@@ -2530,6 +2530,7 @@ fn cache_key_for(
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
     identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+    identity_style: ai_memory_core::repository_identity::IdentityStyle,
     aliases: &ai_memory_core::repository_identity::MarkerAliases,
     project_source: ProjectSource,
     promote_alias: bool,
@@ -2543,9 +2544,10 @@ fn cache_key_for(
         // the identity in the key, whichever resolved first would answer for
         // both.
         format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             identity.map(|i| i.source.as_str()).unwrap_or_default(),
             identity.map(|i| i.identity.as_str()).unwrap_or_default(),
+            identity_style.as_str(),
             aliases.cache_key(),
             project_source.as_str(),
             if promote_alias { "write" } else { "read" }
@@ -2630,6 +2632,7 @@ async fn resolve_project_ids_inner(
         project_override,
         project_strategy,
         identity,
+        identity_style,
         aliases,
         project_source,
         promote_alias,
@@ -2890,19 +2893,41 @@ async fn resolve_project_ids_inner(
         // name (or the cwd-prefix parent) is only the candidate for a project
         // that has not been claimed yet. One writer transaction, so two
         // captures racing on a new repository cannot both create it.
-        let (proj, resolution) = state
-            .writer
-            .resolve_project_by_identity(
-                ws,
-                identity.clone(),
-                identity_style,
-                project_name,
-                repo_path,
-                parent.map(|(parent_id, _)| parent_id),
-                creator,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("resolve_project_by_identity: {e}"))?;
+        let candidate = parent.map(|(parent_id, _)| parent_id);
+        let resolved = if promote_alias {
+            state
+                .writer
+                .resolve_project_by_identity_for_capture(
+                    ws,
+                    identity.clone(),
+                    identity_style,
+                    project_name,
+                    repo_path,
+                    candidate,
+                    creator,
+                )
+                .await
+        } else {
+            state
+                .writer
+                .resolve_project_by_identity(
+                    ws,
+                    identity.clone(),
+                    identity_style,
+                    project_name,
+                    repo_path,
+                    candidate,
+                    creator,
+                )
+                .await
+        };
+        let (proj, resolution) =
+            resolved.map_err(|e| anyhow::anyhow!("resolve_project_by_identity: {e}"))?;
+        if resolution == ai_memory_store::IdentityResolution::Promoted
+            && let Err(error) = state.wiki.refresh_renamed_scope(ws, proj).await
+        {
+            warn!(error = %error, "repository identity promotion committed but manifest refresh failed");
+        }
         debug!(
             identity = %identity.identity,
             source = identity.source.as_str(),
@@ -3476,6 +3501,7 @@ async fn process_authorized(
         env.project_override.as_deref(),
         env.project_strategy,
         env.identity.as_ref(),
+        env.identity_style,
         &env.aliases,
         env.project_source,
         true,
@@ -5139,6 +5165,18 @@ mod tests {
                 .is_none()
         );
         assert!(HandoffQuery::default().repository_identity().is_none());
+        assert_eq!(
+            HandoffQuery::default().identity_style(),
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
+        assert_eq!(
+            HandoffQuery {
+                identity_style: Some("host_path".into()),
+                ..Default::default()
+            }
+            .identity_style(),
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
     }
 
     #[test]
@@ -5396,6 +5434,7 @@ mod tests {
             Some("acme-api"),
             ProjectStrategy::Basename,
             Some(&identity),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
             &ai_memory_core::repository_identity::MarkerAliases::new(["old-a"]).unwrap(),
             ProjectSource::Marker,
             true,
@@ -5406,6 +5445,7 @@ mod tests {
             Some("acme-api"),
             ProjectStrategy::Basename,
             Some(&identity),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
             &ai_memory_core::repository_identity::MarkerAliases::new(["old-b"]).unwrap(),
             ProjectSource::Marker,
             true,
@@ -5417,6 +5457,7 @@ mod tests {
             Some("acme-api"),
             ProjectStrategy::Basename,
             Some(&identity),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
             &ai_memory_core::repository_identity::MarkerAliases::new(["old-a"]).unwrap(),
             ProjectSource::RepoRoot,
             true,
@@ -5427,12 +5468,25 @@ mod tests {
             Some("acme-api"),
             ProjectStrategy::Basename,
             Some(&identity),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
             &ai_memory_core::repository_identity::MarkerAliases::new(["old-a"]).unwrap(),
             ProjectSource::Marker,
             false,
         );
+        let host_path = cache_key_for(
+            Some("/repo"),
+            Some("default"),
+            Some("acme-api"),
+            ProjectStrategy::Basename,
+            Some(&identity),
+            ai_memory_core::repository_identity::IdentityStyle::HostPath,
+            &ai_memory_core::repository_identity::MarkerAliases::new(["old-a"]).unwrap(),
+            ProjectSource::Marker,
+            true,
+        );
         assert_ne!(first, different_provenance);
         assert_ne!(first, read_mode);
+        assert_ne!(first, host_path);
     }
 
     /// A capture that carries the repository identity its client resolved.
@@ -5448,6 +5502,9 @@ mod tests {
                 agent: Some("claude-code".into()),
                 identity: identity.map(|(identity, _)| identity.to_owned()),
                 identity_src: identity.map(|(_, source)| source.to_owned()),
+                identity_style: identity
+                    .filter(|(_, source)| *source == "git_remote")
+                    .map(|_| "path".to_owned()),
                 ..Default::default()
             },
             serde_json::json!({
@@ -5516,10 +5573,9 @@ mod tests {
             .project_id
     }
 
-    /// #1033 end to end through `/hook`: `identity_style=path` names a new
-    /// repository from its path without the host, so a worktree in another
-    /// folder lands in it too. The same path on another forge keeps its folder
-    /// name instead of joining it, and an unknown style value is the default.
+    /// #1033 end to end through `/hook`: explicit `path` names a new repository
+    /// from its path without the host, while omitted style and explicit
+    /// `host_path` preserve old-client behavior. Another forge never joins it.
     #[tokio::test]
     async fn the_path_style_names_a_new_repository_and_never_merges_another_forge() {
         let tmp = TempDir::new().unwrap();
@@ -5550,12 +5606,22 @@ mod tests {
         );
         assert_eq!(name(mirror).await.as_deref(), Some("api"));
 
-        let fallback = capture_styled(&state, &unknown, "github.com/acme/web", Some("Path")).await;
+        let omitted = capture_styled(&state, &unknown, "github.com/acme/web", None).await;
         assert_eq!(
-            name(fallback).await.as_deref(),
+            name(omitted).await.as_deref(),
             Some("web"),
-            "an unknown style value keeps today's naming"
+            "old-client omission keeps legacy naming"
         );
+        let explicit_dir = tmp.path().join("explicit").join("site");
+        std::fs::create_dir_all(&explicit_dir).unwrap();
+        let explicit = capture_styled(
+            &state,
+            &explicit_dir,
+            "github.com/acme/site",
+            Some("host_path"),
+        )
+        .await;
+        assert_eq!(name(explicit).await.as_deref(), Some("site"));
     }
 
     /// #708's collision, end to end: two unrelated repositories both checked
@@ -5605,16 +5671,20 @@ mod tests {
         .await;
         assert_eq!(again, a, "one repository, one project, whatever the folder");
 
-        // A client that sends nothing, or a rung that routes by name, keeps
-        // today's routing: the folder name.
+        // A client that sends no repository identity falls back to the folder
+        // name. Here that name is already occupied by repository A, so it
+        // resolves there without inventing another project.
         let plain = tmp.path().join("plain").join("api");
         std::fs::create_dir_all(&plain).unwrap();
         let by_name =
             capture_with_identity(&state, &plain, &SessionId::new().to_string(), None).await;
-        assert_eq!(
-            by_name, a,
-            "no identity routes by the folder name, as before"
-        );
+        let plain_name = state
+            .reader
+            .project_name_by_id(state.workspace_id, by_name)
+            .await
+            .unwrap();
+        assert_eq!(plain_name.as_deref(), Some("api"));
+        assert_ne!(by_name, a, "canonical path naming leaves `api` available");
         let declared = capture_with_identity(
             &state,
             &plain,
@@ -5622,7 +5692,10 @@ mod tests {
             Some(("github.com/orgc/api", "manifest")),
         )
         .await;
-        assert_eq!(declared, a, "a manifest identity is ignored on the wire");
+        assert_eq!(
+            declared, by_name,
+            "a manifest identity is ignored on the wire and routes by folder name"
+        );
     }
 
     /// Two machines sharing one server can hold unrelated repositories at the
@@ -9895,7 +9968,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 ProjectStrategy::Basename.as_str().to_string(),
-                ":::unspecified:write".to_string(),
+                "::host_path::unspecified:write".to_string(),
             );
             assert!(
                 cache.contains_key(&key),
@@ -10242,6 +10315,7 @@ mod tests {
             Some("scratch"),
             ProjectStrategy::Basename,
             None,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath,
             &ai_memory_core::repository_identity::MarkerAliases::default(),
             ProjectSource::Unspecified,
             true,
@@ -15489,7 +15563,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 strat.clone(),
-                ":::unspecified:write".to_string(),
+                "::host_path::unspecified:write".to_string(),
             )),
             "cache key must remain case-folded for #806 stickiness"
         );
@@ -15499,7 +15573,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 strat,
-                ":::unspecified:write".to_string(),
+                "::host_path::unspecified:write".to_string(),
             )),
             "cache key must not carry the original-case basename"
         );

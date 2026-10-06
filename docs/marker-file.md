@@ -6,8 +6,10 @@ Declare which workspace (and optionally which project) an agent's
 ## Why
 
 ai-memory namespaces every wiki page by `(workspace, project)`. By
-default, `workspace = "default"` and `project = basename($cwd)`. That
-works for a solo developer in `~/projects/<repo>` but breaks down
+default, `workspace = "default"`; a valid `upstream`/`origin` remote supplies
+the canonical hostless repository-path project name, and only a checkout
+without one uses `project = basename($cwd)`. That works for a solo developer in
+`~/projects/<repo>` but breaks down
 for the cases this marker file is built for:
 
 - **Multi-client consultancies** with `~/projects/<client>/<repo>` —
@@ -25,8 +27,9 @@ Static MCP clients also use the marker as the repository-owned source for
 explicit scope arguments. For safe concurrent use, declare both `workspace` and
 `project`: managed routing tells static clients to pass that pair on every
 project-scoped tool call because they cannot attach the real lifecycle-hook
-session id. If either value is absent, the agent must obtain it from the operator
-or server configuration rather than guessing from the checkout directory.
+session id. Without a marker override, static clients derive the project from normalized
+`upstream`, then `origin`, joining the full hostless path with the standard safe
+name mapping; only no-valid-remote checkouts use their folder basename.
 Session-aware bridges keep automatic current-project routing.
 
 ## Where to put it
@@ -36,9 +39,9 @@ walk up from `cwd` toward `$HOME` (or `/` if `$HOME` is unset) and use the
 **first** marker found. When cwd is outside `$HOME`, the walk stops at the
 nearest checkout root (`.git` file or directory); outside a checkout, only cwd
 itself is checked. Closer markers override outer ones. When a marker is found,
-hook scripts also forward the current `cwd` so
-workspace-only markers can still resolve `project = basename(cwd)` for
-handoff lookups.
+hook scripts also forward the current `cwd` and normalized remote identity so
+workspace-only markers resolve the canonical repository-path project, with
+`basename(cwd)` retained only when no valid remote exists.
 
 A marker whose only content is a `[capture]` section (see
 [Capture exclusions](#capture-exclusions) below) is **transparent** to this
@@ -60,7 +63,9 @@ handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
 `identity` / `identity_src` when the checkout has a repository identity (see
 [Repository identity](#repository-identity)), with or without a marker, and
-`identity_style=path` alongside a remote identity when the marker opts in.
+an explicit `identity_style=path|host_path` alongside every remote identity.
+Current clients send `path` when no marker/home route overrides it; server-side
+omission stays legacy `host_path` for old-client compatibility.
 A marker `project` remains the canonical requested name. Its validated `aliases`
 travel as one percent-encoded JSON-array `aliases` query value on both hook and
 handoff requests, and are ignored unless the checkout supplies a normalized
@@ -73,12 +78,12 @@ hostful git-remote identity.
 workspace = "movvia"
 
 # Optional. When present, forces project = "pe-portais" for every
-# cwd inside this marker's tree. Omit it to let basename(cwd) drive
-# the project name.
+# cwd inside this marker's tree. Omit it to use the canonical remote path,
+# falling back to basename(cwd) when no valid remote exists.
 project = "pe-portais"
 
-# Optional. Omit it to preserve project = basename(cwd). Set it to
-# "repo-root" to derive project from the main git repository root, so
+# Optional. Set it to "repo-root" to derive a remote-less project's name
+# from the main git repository root, so
 # linked worktrees and subdirectories share one project. Ignored when
 # `project` is present.
 project_strategy = "repo-root"
@@ -92,12 +97,12 @@ project_strategy = "repo-root"
 # identity" below.
 identity = "acme/platform"
 
-# Optional. "path" names a NEW remote-backed project from its repository
-# path without the host ("acme-api" for github.com/acme/api) instead of the
-# folder name. Default "host_path". Existing identity-backed projects can be
-# promoted in place only by an authorized write through that canonical name.
-# See "Naming new projects by repository path" below.
-identity_style = "path"
+# Optional. The default "path" names a remote-backed project from its whole
+# repository path without the host ("acme-api" for github.com/acme/api).
+# Set "host_path" to preserve the pre-v3 folder/split naming behavior.
+# Existing identity-backed projects can be promoted in place only by an
+# authorized capture/write. See "Naming projects by repository path" below.
+identity_style = "host_path"
 
 # Optional. Former names for this same repository in this workspace. At most
 # 16 entries, each at most 128 UTF-8 bytes and matching
@@ -224,8 +229,8 @@ example `~/a/../b`) but is rejected if any `..` would escape above HOME;
 absolute selectors retain lexical root clamping. The longest path match wins, while an exact identity
 match wins over every path match. A reachable non-home local settings marker
 wins over all home routes. When no route matches, existing root-level settings
-in the home marker remain the fallback, followed by the installed strategy and
-existing cwd fallbacks; explicit CLI scope always wins. A matched route replaces
+in the home marker remain the fallback, followed by the default remote-path
+identity and then the installed/cwd fallback; explicit CLI scope always wins. A matched route replaces
 only the root `workspace`, `project`, `identity`, `identity_style`, `aliases`, and
 `project_strategy` routing fields. Root `server`, `drop_subagent_captures`,
 `[recall]`, `[briefing]`, and `[profile]` settings still apply.
@@ -649,8 +654,9 @@ If the marker lives inside the main checkout instead (for example
 out-of-tree worktree, or place a shared marker above the worktree parent
 directory as shown here.
 
-Without `project_strategy = "repo-root"`, those same paths keep the
-default behavior and resolve by their current directory basename.
+Without `project_strategy = "repo-root"`, a valid remote still gives every
+worktree the default canonical repository-path name. Only remote-less paths
+resolve by their current directory basename.
 
 Resolution is host-side: lifecycle hooks and generated TypeScript
 plugins follow the worktree's commondir pointer (`git rev-parse
@@ -665,8 +671,9 @@ a single `~/.ai-memory.toml` — to select the strategy.
 
 ### Repository identity
 
-A project's name comes from its folder, and folder names collide: two
-unrelated repositories both checked out as `api/` would otherwise share one
+A remote-backed project's default name now comes from its normalized repository
+path, while remote-less folders still use their basename. Folder names collide:
+two unrelated repositories both checked out as `api/` would otherwise share one
 project. On a server with per-project grants (#708) that means one grant, so
 every client resolves a **repository identity** for the checkout and sends it
 with each event. The first rung that yields one wins:
@@ -699,17 +706,16 @@ URL never leave the machine. Other remote names (`fork`, `mine`) are
 ignored on purpose: they differ per person, and would give one repository a
 different identity for each of them.
 
-#### Naming new projects by repository path (`identity_style`)
+#### Naming projects by repository path (`identity_style`)
 
-By default a new repository's project takes its folder name, so the first
-checkout to capture decides it (`main`, `fix-1025`, …). Opt in to naming it
-from the remote's repository path instead (#1033):
+By default, an undeclared checkout with a valid `upstream` or `origin` remote is
+named from the remote's whole repository path without its host (#1033):
 
 ```toml
-identity_style = "path"   # default: "host_path"
+identity_style = "host_path"   # explicit pre-v3 compatibility opt-out
 ```
 
-With `path`, a **new** project created from a remote is named from the whole
+With the default `path` style, a project created from a remote is named from the whole
 repository path without the host, with `/` written as `-`
 (`git@github.com:acme/api.git` → `acme-api`,
 `https://gitlab.com/acme/group/api.git` → `acme-group-api`), so every
@@ -719,20 +725,23 @@ only with a remote identity — a declared `project` or `identity` keeps its
 own name.
 
 - **Existing projects keep their UUID.** Reads by the canonical path name or
-  the v2 basename are find-only and never rename. An authorized write that
-  explicitly uses the canonical path name promotes only `projects.name` in one
-  transaction; pages, sessions, grants, handoffs and every other dependent row
-  remain attached to the same UUID. The v2 basename remains readable after
-  promotion.
+  the v2 basename are find-only and never rename. An authorized default-style
+  capture or explicit write through the canonical path name promotes only
+  `projects.name` in one transaction; pages, sessions, grants, handoffs and
+  every other dependent row remain attached to the same UUID. The v2 basename
+  remains readable through v3.
 - **Another forge is never merged in.** When the path name is already held by
   a different repository — typically the same path on another forge
   (`gitlab.com/acme/api` after `github.com/acme/api`) — the newcomer falls
   back to the name it would get without the style.
-- `aliases` in this phase are supported only by a local marker reachable from
-  the checkout. Identity/path-keyed home configuration is a later rollout
-  phase; a single inherited `~/.ai-memory.toml` can still supply ordinary
-  settings, but it cannot yet map several repository identities independently.
-- Static CLI/MCP clients still pass only `workspace` + `project`. They may use
+- Local marker aliases and operator-home identity/path routes keep their
+  documented precedence over the default and remain available for migration or
+  deliberate remapping.
+- Static CLI/MCP clients still pass only `workspace` + `project`. The thin CLI
+  derives the canonical path name when no marker/home route overrides it; other
+  static clients should use the same name from `upstream`, then `origin`. A valid
+  remote wins `project_strategy = "repo-root"`; the strategy applies only when
+  no valid remote exists. They may use
   the canonical path name (`acme-api`) or the v2 basename (`api`) while it is
   unambiguous. A hostless key shared by multiple forges fails closed.
 - `ai-memory doctor` combines the effective local marker and normalized
@@ -757,8 +766,9 @@ own name.
 ~/.ai-memory.toml → workspace = "home"
 ```
 
-Every cwd under `$HOME` lands in workspace `home` with
-`project = basename(cwd)`. Useful when you just want to opt out of
+Every cwd under `$HOME` lands in workspace `home`; a valid remote uses its
+canonical path name, while a repository without one uses `project = basename(cwd)`.
+Useful when you just want to opt out of
 the `default` bucket entirely.
 
 ## Migrating existing projects
@@ -880,9 +890,12 @@ split.
 Each field is resolved independently:
 
 1. The explicit flag (`--workspace` / `--project`).
-2. The nearest marker: `workspace`, and `project` — or the main repo root's
-   basename when only `project_strategy = "repo-root"` is set.
-3. The previous fallbacks: `default`, and the cwd-derived project name.
+2. The nearest marker: explicit `workspace`/`project`/`identity`; otherwise a
+   valid `upstream`/`origin` remote's canonical path name wins, even when
+   `project_strategy = "repo-root"` is set. The strategy selects the main repo
+   root only when no valid remote exists.
+3. The fallbacks: workspace `default` and the current cwd basename. A git
+   subdirectory does not imply repo-root without an explicit strategy.
 
 When rung 2 decides a field, the command prints one line to stderr naming
 the resolved scope, which half (or halves) the marker decided, and the

@@ -2879,11 +2879,11 @@ pub struct LlmTestArgs {
 
 /// Project-resolution strategy to bake into installed hooks.
 ///
-/// `basename` (the default) bakes nothing — generated hooks behave
-/// exactly as before. `repo-root` bakes a default so every session
-/// resolves its project from the main git repo root (collapsing
-/// subdirectories and worktrees) without a per-repo `.ai-memory.toml`
-/// marker. A marker's own `project_strategy` still wins.
+/// `basename` (the default) bakes nothing. `repo-root` bakes a remote-less
+/// fallback that resolves from the main git repo root (collapsing subdirectories
+/// and worktrees) without a per-repo `.ai-memory.toml` marker. A valid remote's
+/// canonical path name wins while the project remains unpinned; a marker's
+/// explicit `project` or `identity` and operator-home routing still win.
 /// Which way capture fails when a repository has no `.ai-memory.toml`
 /// marker (#446).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]

@@ -42,9 +42,11 @@ for cross-session continuity.
   connecting that hook session id to MCP requests) must pass `workspace` and
   `project` together on every project-scoped call, including requests about "this
   project", "here", or "our work". Read the exact names from the nearest
-  `.ai-memory.toml` when it declares both. If it does not, obtain the names from
-  the operator or server configuration; never guess them from a directory name
-  and never rely on the server's last active project.
+  `.ai-memory.toml` when it declares both. Without a marker override, derive the
+  project from the normalized `upstream` remote, then `origin`, using the full
+  repository path without its host (`github.com/acme/api` → `acme-api`); use the
+  folder basename only when no valid remote exists. Never rely on the server's
+  last active project.
 
 This rule applies only to project-scoped calls. For cross-project retrieval,
 `global=true` must omit `workspace`, `project`, and `scopes`. For a standing
@@ -146,7 +148,7 @@ This project uses [ai-memory](https://github.com/akitaonrails/ai-memory) for cro
 Choose project scope according to the MCP client's session-identity support:
 
 - **Session-aware clients**: for the current project, omit `workspace`, `project`, and `cwd`; pass explicit scope only when the user names a different project.
-- **Static clients**: pass `workspace` and `project` together on every project-scoped call. Prefer the nearest `.ai-memory.toml` when it declares both; otherwise use operator or server configuration. Never guess scope from a directory name or rely on another session's active-project state.
+- **Static clients**: pass `workspace` and `project` together on every project-scoped call. Prefer the nearest `.ai-memory.toml` when it declares both. Without a marker override, derive the project from normalized `upstream`, then `origin`, using the full repository path without its host (`github.com/acme/api` → `acme-api`); use the folder basename only without a valid remote. Never rely on another session's active-project state.
 - For cross-project retrieval with `global=true`, omit `workspace`, `project`, and `scopes`. For durable preferences written with `scope: "global"`, omit `workspace` and `project`.
 
 ### Capture and durable memory
@@ -303,7 +305,9 @@ mod tests {
         assert!(SNIPPET_BODY.contains("must pass `workspace` and"));
         assert!(SNIPPET_BODY.contains("`project` together on every project-scoped call"));
         assert!(SNIPPET_BODY.contains("nearest\n  `.ai-memory.toml`"));
-        assert!(SNIPPET_BODY.contains("never rely on the server's last active project"));
+        assert!(SNIPPET_BODY.contains("normalized `upstream` remote, then `origin`"));
+        assert!(SNIPPET_BODY.contains("folder basename only when no valid remote exists"));
+        assert!(SNIPPET_BODY.contains("Never rely on the server's\n  last active project"));
         assert!(SNIPPET_BODY.contains("`global=true` must omit"));
         assert!(SNIPPET_BODY.contains("`scope: \"global\"`"));
     }

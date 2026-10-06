@@ -110,11 +110,12 @@ pub mod write_page;
 /// Each field is resolved independently, in this order:
 ///
 /// 1. The explicit flag (`--workspace` / `--project`) when non-empty.
-/// 2. The nearest `.ai-memory.toml` marker: `workspace`, and `project` —
-///    or the hook-compatible derived project when the marker leaves it
-///    unpinned (`basename(cwd)` by default, main repo root for `repo-root`).
-/// 3. Today's fallbacks: [`crate::config::DEFAULT_WORKSPACE`] and
-///    [`resolve_project_name`]'s cwd chain.
+/// 2. The nearest `.ai-memory.toml` marker: `workspace` and an explicit
+///    `project`/`identity`; otherwise a valid remote supplies its canonical path
+///    name even when the unpinned strategy is `repo-root`.
+/// 3. Without a valid remote, an explicit marker `repo-root` strategy derives
+///    the main repo root; otherwise use [`crate::config::DEFAULT_WORKSPACE`] and
+///    [`resolve_project_name`]'s cwd-basename fallback.
 ///
 /// Rung 2 is why this function exists. Before it, only the lifecycle hooks
 /// read the marker, so a checkout declaring `workspace = "acme"` still had
@@ -200,22 +201,26 @@ pub(crate) fn resolve_scope_with_marker(
         Some(explicit) => explicit.to_string(),
         None => {
             // A marker's explicit `project` pins the name for its whole tree.
-            // Otherwise derive exactly as the hook does: basename(cwd) by
-            // default, or the main repository root for `repo-root`.
+            // Otherwise a valid remote supplies the canonical path name; only
+            // the no-valid-remote fallback consults basename/repo-root.
             let declared = marker
                 .as_ref()
                 .and_then(|(scope, identity_cwd, lookup_cwd)| {
-                    scope.project.clone().or_else(|| {
-                        if scope.is_repo_root() {
-                            crate::marker::repo_root_project(lookup_cwd)
-                        } else {
-                            ai_memory_consolidate::derive_project_name(
-                                std::path::Path::new(identity_cwd),
-                                ai_memory_consolidate::ProjectNameStrategy::Basename,
-                            )
-                            .map(|(name, _)| name)
-                        }
-                    })
+                    scope
+                        .project
+                        .clone()
+                        .or_else(|| scope.canonical_remote_project())
+                        .or_else(|| {
+                            if scope.is_repo_root() {
+                                crate::marker::repo_root_project(lookup_cwd)
+                            } else {
+                                ai_memory_consolidate::derive_project_name(
+                                    std::path::Path::new(identity_cwd),
+                                    ai_memory_consolidate::ProjectNameStrategy::Basename,
+                                )
+                                .map(|(name, _)| name)
+                            }
+                        })
                 });
             match declared {
                 Some(name) => {
@@ -243,9 +248,10 @@ pub(crate) fn resolve_scope_with_marker(
 /// changing the process working directory, resolving symlinks, or consulting
 /// wrapper cwd overrides.
 ///
-/// The policy matches [`resolve_scope`]: a marker may pin either half, an
-/// unpinned project under a marker follows that marker's strategy, and a tree
-/// without a scope marker falls back to the main repository root.
+/// The policy matches [`resolve_scope`]: a marker may pin either half, a valid
+/// remote's canonical path wins an unpinned marker strategy, an explicit
+/// `repo-root` strategy handles only the no-valid-remote case, and a tree
+/// without a scope marker otherwise uses the cwd basename.
 pub(crate) fn resolve_scope_for_path(
     config: &Config,
     cwd: &std::path::Path,
@@ -267,6 +273,7 @@ pub(crate) fn resolve_scope_for_path(
         Some(scope) => scope
             .project
             .clone()
+            .or_else(|| scope.canonical_remote_project())
             .or_else(|| {
                 if scope.is_repo_root() {
                     crate::marker::repo_root_project(&identity)
@@ -279,12 +286,18 @@ pub(crate) fn resolve_scope_for_path(
                 }
             })
             .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
-        None => ai_memory_consolidate::derive_project_name(
-            &cwd,
-            ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
-        )
-        .map(|(name, _)| name)
-        .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+        None => crate::marker::discover_remote_identity(&identity)
+            .and_then(|repository| {
+                ai_memory_core::repository_identity::path_style_name(&repository)
+            })
+            .or_else(|| {
+                ai_memory_consolidate::derive_project_name(
+                    &cwd,
+                    ai_memory_consolidate::ProjectNameStrategy::Basename,
+                )
+                .map(|(name, _)| name)
+            })
+            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
     };
     Ok((workspace, project))
 }
@@ -365,17 +378,14 @@ fn scope_cwd(config: &Config) -> Option<String> {
 ///
 /// Precedence:
 /// 1. `explicit` (the user's `--project` flag) when non-empty.
-/// 2. `AI_MEMORY_HOST_CWD` env var. The docker wrapper sets this
-///    to the host's `$PWD` because inside the container the workdir
-///    is always `/work` (a bind mount), so the container's own
-///    `current_dir()` returns "work" for every invocation. Without
-///    this env var, every dockerised bootstrap would land in project
-///    `default/work` regardless of which host dir it was actually
-///    run from. Honoured here as a basename, same heuristic as the
-///    other fallbacks.
-/// 3. Basename of the git repo root walked up from CWD (handles
-///    running from any subdir of the project).
-/// 4. Basename of the bare CWD (covers non-git directories).
+/// 2. Canonical path-style name from the valid `upstream` remote, then
+///    `origin`, when the checkout has no marker identity/name override.
+///    `AI_MEMORY_HOST_CWD` selects the host checkout before the remote is
+///    inspected; if that path is unavailable in a container it remains the
+///    basename fallback rather than borrowing `/work`'s identity.
+/// 3. Basename of the current directory, including a git-repository
+///    subdirectory or a non-git directory. `repo-root` is used only when a
+///    marker/install strategy explicitly selects it.
 ///
 /// Mirrors the heuristic the hook router uses in
 /// `ai-memory-hooks::router::resolve_project_ids`, so commands
@@ -386,13 +396,19 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
     if let Some(p) = explicit.filter(|s| !s.is_empty()) {
         return Ok(p.to_string());
     }
-    if let Some(host_cwd) = config.runtime_env.host_cwd()
-        && let Some(name) = std::path::Path::new(host_cwd)
+    if let Some(host_cwd) = config.runtime_env.host_cwd() {
+        if let Some(repository) = crate::marker::discover_remote_identity(host_cwd)
+            && let Some(name) = ai_memory_core::repository_identity::path_style_name(&repository)
+        {
+            return Ok(name);
+        }
+        if let Some(name) = std::path::Path::new(host_cwd)
             .file_name()
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty())
-    {
-        return Ok(name.to_string());
+        {
+            return Ok(name.to_string());
+        }
     }
 
     // Safety net: when running inside the docker wrapper, the
@@ -416,17 +432,17 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
         );
     }
 
-    // Shared with the hook router via `derive_project_name` so the CLI
-    // and hooks agree on what "the project for this cwd" means. The
-    // `MainRepoRoot` strategy walks worktrees back to the main repo
-    // — a session in `~/repo-worktrees/feature-x/` and one in the
-    // main checkout resolve to the same project name (the main repo's
-    // basename), instead of fragmenting into separate projects.
-    // Aligned change from the earlier CLI behaviour (which used the
-    // worktree-local `discover_repo_root`).
+    // Shared with the hook router via `derive_project_name`: with no valid
+    // remote and no explicit repo-root strategy, both use the current cwd's
+    // basename, including repository subdirectories.
+    if let Some(repository) = crate::marker::discover_remote_identity(&cwd.to_string_lossy())
+        && let Some(name) = ai_memory_core::repository_identity::path_style_name(&repository)
+    {
+        return Ok(name);
+    }
     if let Some((name, _)) = ai_memory_consolidate::derive_project_name(
         &cwd,
-        ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
+        ai_memory_consolidate::ProjectNameStrategy::Basename,
     ) {
         return Ok(name);
     }
@@ -473,6 +489,173 @@ mod tests {
         assert_eq!(
             resolve_project_name(&config, Some("explicit-project")).unwrap(),
             "explicit-project"
+        );
+    }
+
+    fn git(command: &[&str], cwd: &std::path::Path) -> bool {
+        std::process::Command::new("git")
+            .args(command)
+            .current_dir(cwd)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn resolve_project_name_uses_canonical_remote_path_and_upstream_priority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        if !git(&["init", "-q"], tmp.path()) {
+            return;
+        }
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://token@example.test/wrong/origin.git"
+            ],
+            tmp.path()
+        ));
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:Acme/Group/API.git"
+            ],
+            tmp.path()
+        ));
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(tmp.path().to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_project_name(&config, None).unwrap(),
+            "acme-group-api"
+        );
+    }
+
+    #[test]
+    fn static_scope_uses_path_default_and_respects_marker_opt_out_and_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("checkout");
+        std::fs::create_dir(&repo).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return;
+        }
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Acme/Group/API.git"
+            ],
+            &repo
+        ));
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(repo.to_str().unwrap()),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("default".into(), "acme-group-api".into())
+        );
+
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nidentity_style = \"host_path\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "checkout".into())
+        );
+
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nproject = \"pinned\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "pinned".into())
+        );
+    }
+
+    #[test]
+    fn remote_path_wins_explicit_repo_root_strategy_without_project_or_identity_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("checkout");
+        let subdir = repo.join("crates/cli");
+        std::fs::create_dir_all(&subdir).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return;
+        }
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Acme/Group/API.git"
+            ],
+            &repo
+        ));
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(subdir.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "acme-group-api".into())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&Config::default(), &subdir).unwrap(),
+            ("oss".into(), "acme-group-api".into())
+        );
+    }
+
+    #[test]
+    fn remote_less_git_subdirectory_uses_basename_unless_repo_root_is_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("checkout");
+        let subdir = repo.join("crates/cli");
+        std::fs::create_dir_all(&subdir).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return;
+        }
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(subdir.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(resolve_project_name(&config, None).unwrap(), "cli");
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("default".into(), "cli".into())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&Config::default(), &subdir).unwrap(),
+            ("default".into(), "cli".into())
+        );
+
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "project_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("default".into(), "checkout".into())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&Config::default(), &subdir).unwrap(),
+            ("default".into(), "checkout".into())
         );
     }
 
@@ -605,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_only_marker_uses_hook_basename_from_a_subdirectory() {
+    fn workspace_only_marker_without_remote_uses_hook_basename_from_a_subdirectory() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".ai-memory.toml"), "workspace = \"acme\"\n").unwrap();
         let subdir = tmp.path().join("crates").join("cli");
@@ -671,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_only_marker_uses_linked_worktree_directory_name() {
+    fn remote_less_workspace_marker_uses_linked_worktree_directory_name() {
         let tmp = tempfile::TempDir::new().unwrap();
         let worktree = tmp.path().join("feature-worktree");
         std::fs::create_dir_all(&worktree).unwrap();

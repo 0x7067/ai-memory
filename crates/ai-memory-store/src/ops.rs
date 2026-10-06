@@ -398,6 +398,9 @@ pub enum IdentityResolution {
     /// refuse — never split, which would let the first outsider after an
     /// upgrade take the identity away from the team whose project it is.
     Unclaimed,
+    /// An existing identity-backed project was renamed to its canonical path
+    /// name after write authorization, preserving the project UUID.
+    Promoted,
     /// No project existed under the name; one was created with the identity.
     Created,
     /// The name belonged to a project with a different identity, so a new one
@@ -616,11 +619,11 @@ fn insert_project_with_identityless_name(
 /// a project this call creates is named
 /// [`path_style_name`](ai_memory_core::repository_identity::path_style_name)
 /// instead (#1033), but only while no project in the workspace holds that
-/// name. A holder is necessarily a different repository — the identity match
-/// above already returned the same one — typically the same path on another
-/// forge, so the newcomer falls back to the name it would otherwise get and is
-/// never merged in. The style never renames, claims or splits an existing
-/// project: it only changes what a creation is called.
+/// name or canonical key. A holder with another full identity — typically the
+/// same path on another forge — makes the newcomer fall back to the name it
+/// would otherwise get and is never merged in. Capture resolution may claim or
+/// promote a compatible existing row only after write authorization in this
+/// transaction; read-only and non-capture callers never rename.
 ///
 /// An identity already on a project is never overwritten. A created project
 /// records its creator in `created_by`, as [`get_or_create_project_as`] does. A
@@ -637,6 +640,7 @@ pub fn resolve_project_by_identity(
     workspace_id: &ai_memory_core::WorkspaceId,
     identity: &ai_memory_core::repository_identity::RepositoryIdentity,
     style: ai_memory_core::repository_identity::IdentityStyle,
+    promote: bool,
     name: &str,
     repo_path: Option<&str>,
     candidate: Option<ai_memory_core::ProjectId>,
@@ -656,6 +660,31 @@ pub fn resolve_project_by_identity(
             .optional()?
             .is_none())
     };
+    let canonical_name_available =
+        |tx: &rusqlite::Transaction<'_>, name: &str| -> StoreResult<bool> {
+            for (column, index) in [
+                ("name", "sqlite_autoindex_projects_2"),
+                ("canonical_name", "idx_projects_canonical_name"),
+            ] {
+                let sql = format!(
+                    "SELECT 1 FROM projects INDEXED BY {index} \
+                     WHERE workspace_id = ?1 AND {column} = ?2 \
+                       AND {column} <> '' AND identity <> ?3 LIMIT 1"
+                );
+                if tx
+                    .query_row(
+                        &sql,
+                        params![workspace_id.as_bytes(), name, identity.identity],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
     let path_name = match style {
         ai_memory_core::repository_identity::IdentityStyle::Path => {
             ai_memory_core::repository_identity::path_style_name(identity)
@@ -663,36 +692,63 @@ pub fn resolve_project_by_identity(
         ai_memory_core::repository_identity::IdentityStyle::HostPath => None,
     };
     let path_name = match path_name {
-        Some(path_name) if name_is_free(&tx, &path_name)? => Some(path_name),
+        Some(path_name) if canonical_name_available(&tx, &path_name)? => Some(path_name),
         _ => None,
     };
 
-    let matched: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT id FROM projects WHERE workspace_id = ?1 AND identity = ?2",
-            params![workspace_id.as_bytes(), identity.identity],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let (id, resolution) = if let Some(bytes) = matched {
-        (
-            ai_memory_core::ProjectId::from_slice(&bytes)?,
-            IdentityResolution::Matched,
-        )
+    let matched = crate::project_coordinates::matches(&tx, *workspace_id, name, Some(identity))?
+        .into_iter()
+        .find(|candidate| candidate.provenance.identity);
+    let (id, resolution) = if let Some(matched) = matched {
+        let promote_to = (promote
+            && style == ai_memory_core::repository_identity::IdentityStyle::Path)
+            .then(|| crate::project_coordinates::promotion_target(&matched, path_name.as_deref()?))
+            .flatten()
+            .map(str::to_owned);
+        if let Some(canonical) = promote_to {
+            let may_write = match creator {
+                None => true,
+                Some(user) => crate::project_authz::resolve_project_authz(
+                    &tx,
+                    *workspace_id,
+                    matched.id,
+                    &crate::ProjectPrincipal::user(user),
+                    true,
+                )?
+                .authorize(crate::ProjectAccess::Write)
+                .is_ok(),
+            };
+            if may_write {
+                rename_project_in_tx(
+                    &tx,
+                    workspace_id,
+                    &matched.id,
+                    Some(&matched.current_name),
+                    &canonical,
+                    creator,
+                    "promote_project_name",
+                )?;
+                (matched.id, IdentityResolution::Promoted)
+            } else {
+                (matched.id, IdentityResolution::Matched)
+            }
+        } else {
+            (matched.id, IdentityResolution::Matched)
+        }
     } else {
-        let candidate_row: Option<(Vec<u8>, String)> = match candidate {
+        let candidate_row: Option<(Vec<u8>, String, String)> = match candidate {
             Some(candidate) => tx
                 .query_row(
-                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND id = ?2",
+                    "SELECT id, identity, name FROM projects WHERE workspace_id = ?1 AND id = ?2",
                     params![workspace_id.as_bytes(), candidate.as_bytes()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?,
             None => tx
                 .query_row(
-                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    "SELECT id, identity, name FROM projects WHERE workspace_id = ?1 AND name = ?2",
                     params![workspace_id.as_bytes(), name],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?,
         };
@@ -711,7 +767,7 @@ pub fn resolve_project_by_identity(
                 )?;
                 (id, IdentityResolution::Created)
             }
-            Some((bytes, held)) if held.is_empty() => {
+            Some((bytes, held, current_name)) if held.is_empty() => {
                 let id = ai_memory_core::ProjectId::from_slice(&bytes)?;
                 // The same decision the choke point makes, on this
                 // transaction, so the claim cannot race a grant change.
@@ -745,7 +801,25 @@ pub fn resolve_project_by_identity(
                             id.as_bytes()
                         ],
                     )?;
-                    (id, IdentityResolution::Claimed)
+                    let promote_to = (promote
+                        && style == ai_memory_core::repository_identity::IdentityStyle::Path)
+                        .then_some(path_name.as_deref())
+                        .flatten()
+                        .filter(|canonical| *canonical != current_name);
+                    if let Some(canonical) = promote_to {
+                        rename_project_in_tx(
+                            &tx,
+                            workspace_id,
+                            &id,
+                            Some(&current_name),
+                            canonical,
+                            creator,
+                            "promote_project_name",
+                        )?;
+                        (id, IdentityResolution::Promoted)
+                    } else {
+                        (id, IdentityResolution::Claimed)
+                    }
                 } else {
                     (id, IdentityResolution::Unclaimed)
                 }

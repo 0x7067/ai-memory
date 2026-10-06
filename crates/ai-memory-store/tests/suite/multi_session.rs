@@ -88,8 +88,8 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
 }
 
 /// #1033 under invariant #16: two operators on two clones of one repository,
-/// in folders named differently, opt into the `path` style and capture at the
-/// same time. They must land in one project — the same name and the same row —
+/// in folders named differently, use the default `path` style and capture at
+/// the same time. They must land in one project — the same name and the same row —
 /// so each reads what the other writes; a race must not split the repository.
 #[tokio::test]
 async fn two_operators_on_two_clones_of_one_repository_share_its_path_named_project() {
@@ -111,7 +111,7 @@ async fn two_operators_on_two_clones_of_one_repository_share_its_path_named_proj
         let repo = repo.clone();
         async move {
             writer
-                .resolve_project_by_identity(
+                .resolve_project_by_identity_for_capture(
                     ws,
                     repo,
                     IdentityStyle::Path,

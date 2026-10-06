@@ -103,6 +103,7 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         identity: ai_memory_core::repository_identity::RepositoryIdentity,
         style: ai_memory_core::repository_identity::IdentityStyle,
+        promote: bool,
         name: String,
         repo_path: Option<String>,
         candidate: Option<ProjectId>,
@@ -1075,11 +1076,37 @@ impl WriterHandle {
         candidate: Option<ProjectId>,
         creator: Option<ai_memory_core::UserId>,
     ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        self.resolve_project_by_identity_inner(
+            workspace_id,
+            identity,
+            style,
+            false,
+            name,
+            repo_path,
+            candidate,
+            creator,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_project_by_identity_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        promote: bool,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ResolveProjectByIdentity {
             workspace_id,
             identity,
             style,
+            promote,
             name: name.into(),
             repo_path,
             candidate,
@@ -1088,6 +1115,32 @@ impl WriterHandle {
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Resolve repository identity for capture and allow transactional
+    /// canonical-name promotion after authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_project_by_identity_for_capture(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        style: ai_memory_core::repository_identity::IdentityStyle,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        self.resolve_project_by_identity_inner(
+            workspace_id,
+            identity,
+            style,
+            true,
+            name,
+            repo_path,
+            candidate,
+            creator,
+        )
+        .await
     }
 
     /// Resolve marker aliases inside one workspace and atomically authorize any
@@ -3539,6 +3592,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 workspace_id,
                 identity,
                 style,
+                promote,
                 name,
                 repo_path,
                 candidate,
@@ -3550,6 +3604,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &workspace_id,
                     &identity,
                     style,
+                    promote,
                     &name,
                     repo_path.as_deref(),
                     candidate,

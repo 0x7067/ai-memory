@@ -616,7 +616,10 @@ fn render_project_coordinate(coordinate: &ProjectCoordinateReport) -> String {
         let _ = writeln!(
             output,
             "    repository: source {source}, style {}",
-            local.identity_style.as_deref().unwrap_or("host_path")
+            local
+                .identity_style
+                .as_deref()
+                .unwrap_or(ai_memory_core::repository_identity::IdentityStyle::Path.as_str())
         );
     }
     if let Some(canonical) = &local.canonical_candidate {

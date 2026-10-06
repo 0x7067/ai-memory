@@ -96,6 +96,29 @@ async fn resolve_styled(
         .unwrap()
 }
 
+async fn resolve_capture(
+    store: &Store,
+    ws: WorkspaceId,
+    identity: &RepositoryIdentity,
+    style: IdentityStyle,
+    name: &str,
+    creator: Option<UserId>,
+) -> (ProjectId, IdentityResolution) {
+    store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            identity.clone(),
+            style,
+            name,
+            Some("/work/api".to_owned()),
+            None,
+            creator,
+        )
+        .await
+        .unwrap()
+}
+
 /// The collision the feature exists for: two unrelated `api` checkouts land
 /// in two projects, the second named after its owner — and the same
 /// repository, wherever it is checked out and whatever the folder is called,
@@ -499,6 +522,142 @@ async fn opting_in_leaves_existing_projects_where_they_are() {
             .is_none(),
         "no path-named twin split off the legacy project"
     );
+}
+
+#[tokio::test]
+async fn old_client_omitted_style_stays_host_path_and_does_not_promote() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "api", None).await.0;
+
+    let (resolved, how) = resolve_capture(
+        &store,
+        ws,
+        &repository,
+        IdentityStyle::default(),
+        "api-clone",
+        None,
+    )
+    .await;
+
+    assert_eq!(resolved, project);
+    assert_eq!(how, IdentityResolution::Matched);
+    assert_eq!(row(&store, project).0, "api");
+}
+
+#[tokio::test]
+async fn explicit_path_capture_claims_and_promotes_an_identityless_legacy_name_in_one_transaction()
+{
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let legacy = store
+        .writer
+        .get_or_create_project(ws, "api", None)
+        .await
+        .unwrap();
+
+    let (project, how) = resolve_capture(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+
+    assert_eq!(project, legacy);
+    assert_eq!(how, IdentityResolution::Promoted);
+    assert_eq!(row(&store, project).0, "acme-api");
+    assert_eq!(row(&store, project).1, "github.com/acme/api");
+}
+
+#[tokio::test]
+async fn explicit_path_capture_promotes_an_authorized_legacy_name_without_changing_uuid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "api", None).await.0;
+
+    let (promoted, how) = resolve_capture(
+        &store,
+        ws,
+        &repository,
+        IdentityStyle::Path,
+        "api-clone",
+        None,
+    )
+    .await;
+
+    assert_eq!(promoted, project);
+    assert_eq!(how, IdentityResolution::Promoted);
+    assert_eq!(row(&store, project).0, "acme-api");
+}
+
+#[tokio::test]
+async fn unauthorized_capture_cannot_claim_or_promote_an_identityless_legacy_name() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = store
+        .writer
+        .get_or_create_project(ws, "api", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let outsider = user(&store, "claim-promotion-outsider", 32).await;
+
+    let (resolved, how) = resolve_capture(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        Some(outsider),
+    )
+    .await;
+
+    assert_eq!(resolved, project);
+    assert_eq!(how, IdentityResolution::Unclaimed);
+    assert_eq!(row(&store, project).0, "api");
+    assert_eq!(row(&store, project).1, "");
+}
+
+#[tokio::test]
+async fn unauthorized_capture_resolves_but_cannot_promote_a_legacy_name() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "api", None).await.0;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let outsider = user(&store, "promotion-outsider", 33).await;
+
+    let (resolved, how) = resolve_capture(
+        &store,
+        ws,
+        &repository,
+        IdentityStyle::Path,
+        "api-clone",
+        Some(outsider),
+    )
+    .await;
+
+    assert_eq!(resolved, project);
+    assert_eq!(how, IdentityResolution::Matched);
+    assert_eq!(row(&store, project).0, "api");
 }
 
 /// The style only renames what has a host to drop: a declared identity keeps
@@ -1241,6 +1400,25 @@ async fn read_only_user_cannot_promote_a_legacy_name() {
         .is_forbidden()
     );
     assert_eq!(row(&store, project).0, "api");
+}
+
+#[tokio::test]
+async fn explicit_path_capture_falls_back_when_another_identity_claims_the_canonical_key() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let github = remote("github.com/acme/api");
+    let gitlab = remote("gitlab.com/acme/api");
+    let existing = resolve(&store, ws, &github, "api", None).await.0;
+    let conflicting = resolve(&store, ws, &gitlab, "acme-api", None).await.0;
+
+    let (resolved, how) =
+        resolve_capture(&store, ws, &github, IdentityStyle::Path, "api-clone", None).await;
+
+    assert_eq!(resolved, existing);
+    assert_eq!(how, IdentityResolution::Matched);
+    assert_eq!(row(&store, existing).0, "api");
+    assert_eq!(row(&store, conflicting).0, "acme-api");
 }
 
 #[tokio::test]

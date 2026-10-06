@@ -240,13 +240,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `consolidated`, plus `consolidated_by: agent`), defaults the tier to
   `episodic`, applies the same duplicate-title suffix, and marks the session's
   queued SessionEnd consolidation job completed. (#1038)
-- Added the opt-in `identity_style = "path"` marker key: a new project created
-  from a git remote is named from its repository path without the host
-  (`github.com/acme/api` → `acme-api`), so worktrees and clones in differently
-  named folders share one project. Captures still route by the full repository
-  identity, existing projects are never renamed, and when another repository
-  (such as the same path on another forge) already holds the name the newcomer
-  keeps the name it would otherwise get. The default stays `host_path`. (#1033)
+- Added `identity_style = "path" | "host_path"` marker control for remote-backed
+  project naming. `path` names from the full repository path without the host
+  (`github.com/acme/api` → `acme-api`); `host_path` preserves the former naming
+  behavior as an explicit opt-out. Captures always route by the full hostful
+  identity, and cross-forge path collisions never merge. (#1033)
 
 ### Changed
 - Changed static CLI/MCP project-name resolution to accept an existing
@@ -260,8 +258,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-commit refresh failure for startup repair on both success and any later
   operation error, retaining the first warning across busy retries and lease
   wait-out; managed-run caller validation happens before promotion.
-  Ambiguous cross-forge keys and target-name conflicts fail
-  closed, and the default identity style remains `host_path`. (#1033)
+  Ambiguous cross-forge keys and target-name conflicts fail closed. Current
+  clients now explicitly send `path` for a valid remote and send explicit
+  `host_path` for the opt-out; a new server deliberately interprets an omitted
+  field as legacy `host_path` so old clients cannot be silently renamed. Existing compatible projects are
+  promoted only by authorized capture/write and keep their UUID; read-only
+  handoff/static lookups never rename. (#1033)
 - Changed the documented precedence between rules and memory: the user's
   instructions, then the repository's rules file, then the project's memory,
   then the cross-project profile. Where no hard rule exists, agents now use

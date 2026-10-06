@@ -123,6 +123,16 @@ pub(crate) struct MarkerScope {
     pub(crate) project: Option<String>,
     /// `project_strategy = "…"`, or the install-wide env default.
     pub(crate) project_strategy: Option<String>,
+    /// Explicit repository identity, which keeps name derivation on the legacy
+    /// local path because it is already an operator-chosen coordinate.
+    pub(crate) identity: Option<String>,
+    /// Explicit remote naming style from marker/home routing. When absent, current
+    /// static CLI clients choose and send [`IdentityStyle::Path`]; only omission
+    /// at the server/wire boundary defaults to legacy [`IdentityStyle::HostPath`]
+    /// for old-client compatibility.
+    pub(crate) identity_style: Option<IdentityStyle>,
+    /// Normalized remote discovered for the selected checkout, when any.
+    pub(crate) remote_identity: Option<RepositoryIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -686,6 +696,12 @@ pub(crate) fn inspect_scope_for(
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_owned)
         }),
+        identity: fields.identity.clone(),
+        identity_style: fields
+            .identity_style
+            .as_deref()
+            .and_then(IdentityStyle::from_str_opt),
+        remote_identity: route_identity.clone(),
     };
     MarkerInspection {
         status: match selection.source {
@@ -703,7 +719,22 @@ impl MarkerScope {
     /// Whether this marker declares anything that changes scope resolution.
     /// A marker that only carries `[capture]` rules does not.
     pub(crate) fn declares_scope(&self) -> bool {
-        self.workspace.is_some() || self.project.is_some() || self.is_repo_root()
+        self.workspace.is_some()
+            || self.project.is_some()
+            || self.identity.is_some()
+            || self.identity_style.is_some()
+            || self.remote_identity.is_some()
+            || self.is_repo_root()
+    }
+
+    pub(crate) fn canonical_remote_project(&self) -> Option<String> {
+        if self.project.is_some() || self.identity.is_some() {
+            return None;
+        }
+        let repository = self.remote_identity.as_ref()?;
+        (self.identity_style.unwrap_or(IdentityStyle::Path) == IdentityStyle::Path)
+            .then(|| ai_memory_core::repository_identity::path_style_name(repository))
+            .flatten()
     }
 
     /// Whether the effective strategy asks for repo-root project naming.
@@ -752,6 +783,20 @@ pub(crate) fn read_scope_for(
         workspace: selection.fields.workspace,
         project: selection.fields.project,
         project_strategy: selection.fields.project_strategy,
+        identity: selection.fields.identity,
+        identity_style: selection
+            .fields
+            .identity_style
+            .as_deref()
+            .and_then(IdentityStyle::from_str_opt),
+        remote_identity: selection
+            .remote_identity
+            .or_else(|| discover_remote_identity(identity_cwd))
+            .or_else(|| {
+                (lookup_cwd != identity_cwd)
+                    .then(|| discover_remote_identity(lookup_cwd))
+                    .flatten()
+            }),
         path: selection.path,
     };
     if scope.project_strategy.is_none() {
@@ -864,11 +909,11 @@ pub(crate) fn routing_selection_with_home(
         path,
         fields,
         source: RoutingSource::HomeRoot,
-        remote_identity: None,
+        remote_identity,
     }))
 }
 
-fn discover_remote_identity(cwd: &str) -> Option<RepositoryIdentity> {
+pub(crate) fn discover_remote_identity(cwd: &str) -> Option<RepositoryIdentity> {
     let (upstream, origin) = ai_memory_consolidate::read_identity_remotes(Path::new(cwd));
     [upstream.as_deref(), origin.as_deref()]
         .into_iter()
@@ -1900,6 +1945,9 @@ project = "infra" # this is fine
             workspace: None,
             project: None,
             project_strategy: None,
+            identity: None,
+            identity_style: None,
+            remote_identity: None,
         };
 
         for spelling in ["repo-root", "repo_root"] {
@@ -1946,8 +1994,8 @@ project = "infra" # this is fine
     }
 
     /// When every marker in the ancestor chain is capture-only (or none
-    /// exist), behavior is unchanged from before #668: `read_scope` returns
-    /// `None` so the caller falls back to `DEFAULT_WORKSPACE` + repo-root.
+    /// exist), `read_scope` returns `None` so the caller uses the normal
+    /// remote-path identity, or the cwd basename when no valid remote exists.
     #[test]
     fn read_scope_still_none_when_only_capture_only_markers_exist() {
         let tmp = TempDir::new().unwrap();

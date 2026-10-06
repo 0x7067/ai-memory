@@ -536,6 +536,7 @@ mod slow {
                     ("project", project_name),
                     ("identity", identity),
                     ("identity_src", "git_remote"),
+                    ("identity_style", "host_path"),
                 ])
                 .json(&json!({
                     "session_id": format!("00000000-0000-4000-8000-0000000001{index:02x}"),

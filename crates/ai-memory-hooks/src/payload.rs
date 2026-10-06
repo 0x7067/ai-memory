@@ -97,9 +97,9 @@ pub struct HookQuery {
     /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
     /// else, or a malformed identity, is ignored and the event routes by name.
     pub identity_src: Option<String>,
-    /// The marker's `identity_style` (#1033). `path` names a new remote-backed
-    /// project from its repository path without the host; anything else keeps
-    /// the default. Never changes routing, only what a creation is called.
+    /// An explicit marker `identity_style` (#1033). `path` names a
+    /// remote-backed project from its repository path without the host;
+    /// `host_path` preserves legacy naming. Omission uses the server default.
     pub identity_style: Option<String>,
     /// Compact JSON array of validated former project names from the local
     /// marker. Accepted only with a full git-remote identity.
@@ -1323,6 +1323,36 @@ mod tests {
         assert!(ProjectSource::RepoRoot.yields_to_session());
         assert!(!ProjectSource::Marker.yields_to_session());
         assert!(!ProjectSource::Unspecified.yields_to_session());
+    }
+
+    #[test]
+    fn omitted_style_stays_legacy_host_path_while_new_clients_send_path() {
+        let envelope = |identity_style: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    identity_style: identity_style.map(str::to_owned),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": "s" }),
+            )
+        };
+        assert_eq!(
+            envelope(None).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
+        assert_eq!(
+            envelope(Some("path")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::Path
+        );
+        assert_eq!(
+            envelope(Some("host_path")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
+        assert_eq!(
+            envelope(Some("unknown")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
     }
 
     #[test]
