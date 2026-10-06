@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
+- Ordered the default single-page and batch consolidation prompts for
+  prefix-cache reuse: in the user content, the fixed batch text (header +
+  field schema) and the project instructions now lead, followed by the
+  current body / slot and title state, with the session id and the
+  observation dump last. In the single-page prompt the current body is
+  the session's own page body, so the prefix shared across sessions of
+  one project is the system prompt plus the instructions block when
+  present. The system prompt, budget math, clipping, and observation
+  selection are unchanged — blocks were only permuted — and the input
+  budget remains an approximate character estimate (no tokenizer
+  ceiling, no cache hit guaranteed). (#PRNUM)
 
 ### Fixed
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
