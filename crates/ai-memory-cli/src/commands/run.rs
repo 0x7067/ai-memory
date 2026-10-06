@@ -3746,6 +3746,7 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+    #[cfg(unix)]
     use crate::commands::run_autowire::WireOverrides;
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
@@ -6121,6 +6122,7 @@ mod tests {
         format!("http://{address}")
     }
 
+    #[cfg(unix)]
     fn repo_hooks() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")
     }
