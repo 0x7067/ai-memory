@@ -5311,10 +5311,23 @@ impl AiMemoryServer {
         let text = match provider.complete(request).await {
             Ok(resp) => resp.text,
             Err(e) => {
-                tracing::warn!(error = %e, "memory_explore LLM call failed; degrading to briefing");
+                // Redacted fields only: the `Display` of a provider failure
+                // carries the upstream response body, and this reason goes
+                // back to the tool caller.
+                tracing::warn!(
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
+                    "memory_explore LLM call failed; degrading to briefing"
+                );
                 return ok_json(&serde_json::json!({
                     "prose": null,
-                    "reason": format!("LLM call failed: {e}"),
+                    "reason": format!(
+                        "LLM call failed: class={} status={}",
+                        e.class(),
+                        e.http_status()
+                            .map(|status| status.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    ),
                     "briefing": snapshot,
                 }));
             }
@@ -11623,6 +11636,52 @@ mod tests {
         assert!(
             text.contains("no LLM provider configured"),
             "expected fallback reason\n{text}"
+        );
+        assert!(
+            text.contains("\"briefing\":"),
+            "expected briefing payload\n{text}"
+        );
+    }
+
+    /// Mutation captured: formatting the `LlmError`'s `Display` into the
+    /// degraded-explore `reason` copies the provider body to the tool
+    /// caller. The failure must degrade with the redacted class/status
+    /// summary only, mirroring the `memory_consolidate` redaction tests.
+    #[tokio::test]
+    async fn memory_explore_degrades_with_redacted_summary_not_provider_body() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let result = server
+            .memory_explore(
+                Parameters(ExploreArgs {
+                    focus: None,
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a provider failure must degrade to the briefing, not error");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("LLM call failed: class=provider status=400"),
+            "the degraded reason must carry only the redacted class/status summary\n{text}"
+        );
+        assert!(
+            !text.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the tool result\n{text}"
+        );
+        assert!(
+            text.contains("\"prose\": null"),
+            "expected null prose\n{text}"
         );
         assert!(
             text.contains("\"briefing\":"),

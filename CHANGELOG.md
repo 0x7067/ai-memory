@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Redacted provider response bodies from the error surfaces this change
   touches: the `memory_consolidate` and `memory_auto_improve` MCP errors, the
-  reranker degradation warning, the consolidator's transient-retry warning,
-  the SessionEnd consolidation worker's queue `last_error` and failure logs,
-  the auto-improve scheduler's claim `last_error` and tick warnings, and the
-  hook router's checkpoint-fallback warning now carry a stable `class`/`status`
+  `memory_explore` degradation reason and warning, the reranker degradation
+  warning, the consolidator's transient-retry warning, the SessionEnd
+  consolidation worker's queue `last_error` and failure logs, the
+  auto-improve scheduler's claim `last_error` and tick warnings, and the hook
+  router's checkpoint-fallback warning now carry a stable `class`/`status`
   summary (for example `class=provider status=400`) instead of the error's
   `Display`, which for a provider failure includes the upstream response
   body. Other error surfaces are unchanged. (#1103)
