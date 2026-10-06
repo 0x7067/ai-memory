@@ -741,8 +741,8 @@ pub enum PostOutcome {
     /// backpressure, the event was never processed. Keep it queued WITHOUT
     /// bumping attempts so saturation never burns the entry's retry budget.
     Saturated,
-    /// A server error or unexpected response that may succeed on retry and
-    /// should count against the configured attempt limit.
+    /// Any other non-2xx: the server answered and refused. A genuine miss
+    /// that should count against the retry limit.
     Failed,
     /// The request never reached a server — connection refused, DNS failure,
     /// or timeout. Distinguished from [`Self::Failed`] because it says
@@ -751,12 +751,13 @@ pub enum PostOutcome {
     /// so the drain can skip past them instead of stopping at the first one
     /// (#493).
     Unreachable,
-    /// A permanent client error — the server understood the request and will
-    /// never accept it unchanged. `401` and `429` have their own outcomes.
+    /// `403` — the server understood the request and will never accept it.
+    /// Today that means the author may not write the project
+    /// the event belongs to.
     ///
     /// Terminal, and that is the whole point of separating it from
     /// [`Self::Failed`]. A refusal that counts as a failure gets re-sent until
-    /// it exhausts `MAX_ATTEMPTS`, and every one of those attempts is
+    /// it exhausts the retry limit, and every one of those attempts is
     /// guaranteed to be refused for the same reason. Retrying something that
     /// cannot succeed is how a parse failure once cost this project 10.7M
     /// tokens in a day. The entry is dropped on the spot.
@@ -796,7 +797,7 @@ pub async fn post_hook(
             PostOutcome::Saturated
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => PostOutcome::Unauthorized,
-        Ok(resp) if resp.status().is_client_error() => PostOutcome::Refused,
+        Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => PostOutcome::Refused,
         Ok(_) => PostOutcome::Failed,
         Err(_) => PostOutcome::Unreachable,
     }
@@ -839,9 +840,6 @@ pub enum BatchOutcome {
     /// [`PostOutcome::Unauthorized`]; the whole batch shares one identity, so
     /// a rejected credential fails all of it and none of it was processed.
     Unauthorized,
-    /// A permanent client error other than the explicitly handled `401`, `404`,
-    /// `405`, and `429`; none of the batch was accepted.
-    Refused,
     /// Transport error or any other non-2xx: the batch outcome is unknown. The
     /// drain charges conservatively so trailing events that may never have been
     /// attempted do not burn retry budget.
@@ -909,8 +907,6 @@ pub async fn post_batch(
                 BatchOutcome::Unsupported
             } else if status == reqwest::StatusCode::UNAUTHORIZED {
                 BatchOutcome::Unauthorized
-            } else if status.is_client_error() {
-                BatchOutcome::Refused
             } else {
                 BatchOutcome::Failed
             }
@@ -1097,29 +1093,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_hook_permanent_4xx_is_terminal_not_a_failure() {
-        for (status, body) in [
-            ("400 Bad Request", "invalid event"),
-            ("403 Forbidden", "capture not authorized"),
-        ] {
-            let url = serve_once(status, body).await;
+    async fn post_hook_refused_on_403_is_terminal_not_a_failure() {
+        // 403 means the server will never accept this event. Classifying it as
+        // `Failed` would re-send it until it burnt the retry limit, and every
+        // attempt would be refused identically — the shape of retry loop that
+        // once cost this project 10.7M tokens in a day. It must be its own
+        // outcome so the drain can drop it on the spot.
+        let url = serve_once("403 Forbidden", "capture not authorized").await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Refused);
+        assert_ne!(
+            outcome,
+            PostOutcome::Failed,
+            "a refusal must never be charged a retry attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_hook_408_and_425_are_retryable_failed_not_refused() {
+        // 408 (request timeout) and 425 (too early) say "retry me", not
+        // "never": they must fall through to `Failed` so the spool keeps the
+        // entry queued subject to the attempt limit. Classifying every 4xx as
+        // a terminal refusal deleted such events on the spot (#1092
+        // regression).
+        for status in ["408 Request Timeout", "425 Too Early"] {
+            let url = serve_once(status, "retry later").await;
             let outcome =
                 post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
-            assert_eq!(outcome, PostOutcome::Refused);
             assert_ne!(
                 outcome,
-                PostOutcome::Failed,
-                "a refusal must never be charged a retry attempt"
+                PostOutcome::Refused,
+                "{status} is retryable and must not be terminal"
             );
+            assert_eq!(outcome, PostOutcome::Failed, "{status} is a retryable miss");
         }
     }
 
     #[tokio::test]
-    async fn post_batch_permanent_4xx_is_terminal_not_a_failure() {
-        let url = serve_once("400 Bad Request", "invalid batch").await;
-        let outcome = post_batch(&build_client(), &url, "[]", None, Duration::from_secs(1)).await;
-        assert_eq!(outcome, BatchOutcome::Refused);
-        assert_ne!(outcome, BatchOutcome::Failed);
+    async fn post_batch_unhandled_4xx_is_retryable_failed() {
+        // Base semantics: only 401/404/405/429 are special-cased for batches;
+        // every other status — 400, and retryable timeouts like 408/425 — is
+        // a `Failed` with an unknown outcome, never a terminal refusal.
+        for status in ["400 Bad Request", "408 Request Timeout", "425 Too Early"] {
+            let url = serve_once(status, "invalid batch").await;
+            let outcome =
+                post_batch(&build_client(), &url, "[]", None, Duration::from_secs(1)).await;
+            assert_eq!(outcome, BatchOutcome::Failed, "{status} is retryable");
+        }
     }
 
     #[tokio::test]

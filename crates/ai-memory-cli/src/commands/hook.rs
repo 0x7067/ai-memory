@@ -332,8 +332,16 @@ fn after_background_drain_event_enqueue(
 }
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
-pub async fn run_drain(config: &Config) -> anyhow::Result<()> {
-    let dd = config.data_dir.clone();
+pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let runtime_env = RuntimeEnv::from_process();
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+    // The hook path never runs a full `Config::load` (see the fast-path
+    // contract in `lib.rs`): an invalid config section elsewhere must not
+    // fail the drainer. Only the spool retry policy is needed, loaded
+    // tolerantly — any load error falls back to defaults.
+    let config =
+        Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd.clone()), runtime_env)
+            .unwrap_or_default();
     let max_attempts = hook_spool::MaxAttempts::new(config.hook_spool.max_attempts);
     let spool = hook_spool::spool_dir(&dd);
     match hook_spool::drain_until_quiescent(
@@ -558,23 +566,29 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
 ///
 /// `data_dir` is the resolved global `--data-dir` (if any); used to locate the
 /// spool and the stored OIDC token.
-pub async fn run(config: &Config, args: HookArgs) -> anyhow::Result<()> {
+pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()> {
     let mut payload = String::new();
     std::io::stdin().read_to_string(&mut payload).ok();
     let mut stdout = std::io::stdout();
-    run_with_payload_and_settings(
-        Some(config.data_dir.clone()),
+    run_with_payload(
+        data_dir,
         args,
         payload,
         &mut stdout,
         spawn_background_drainer,
-        config.runtime_env.clone(),
-        hook_spool::MaxAttempts::new(config.hook_spool.max_attempts),
     )
     .await
 }
 
-#[cfg(test)]
+/// [`run`] with the payload and output sink injected, so tests drive the hook
+/// implementation directly without stdin/stdout.
+///
+/// Hooks deliberately bypass the full `Config::load` (the fast-path contract
+/// in `lib.rs`): an unrelated invalid config section must never fail the hook
+/// or add stdout noise. The spool retry policy is the only config needed, and
+/// it is loaded tolerantly — a malformed config falls back to defaults rather
+/// than erroring. The process environment is captured once, here, and
+/// threaded down as data.
 async fn run_with_payload<W, S>(
     data_dir: Option<PathBuf>,
     args: HookArgs,
@@ -588,38 +602,14 @@ where
 {
     let runtime_env = RuntimeEnv::from_process();
     let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
-    let config =
+    let spool_policy =
         Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd), runtime_env.clone())
             .unwrap_or_default();
-    run_with_payload_and_settings(
-        data_dir,
-        args,
-        payload,
-        stdout,
-        spawn_background_drainer,
-        runtime_env,
-        hook_spool::MaxAttempts::new(config.hook_spool.max_attempts),
-    )
-    .await
-}
-
-async fn run_with_payload_and_settings<W, S>(
-    data_dir: Option<PathBuf>,
-    args: HookArgs,
-    payload: String,
-    stdout: &mut W,
-    spawn_background_drainer: S,
-    runtime_env: RuntimeEnv,
-    max_attempts: hook_spool::MaxAttempts,
-) -> anyhow::Result<()>
-where
-    W: std::io::Write,
-    S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
-{
+    let max_attempts = hook_spool::MaxAttempts::new(spool_policy.hook_spool.max_attempts);
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
-    // than server configuration.
+    // than server configuration. Hooks deliberately bypass Config::load.
     let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())

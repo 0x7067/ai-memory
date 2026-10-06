@@ -974,12 +974,6 @@ pub async fn drain_with_live_token(
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
                 }
-                BatchOutcome::Refused => {
-                    for (path, _) in &chunk {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    result.dropped += chunk.len();
-                }
                 BatchOutcome::Failed => {
                     // The batch didn't land (server answered with an unexpected
                     // status, or the body did not parse).
@@ -1643,6 +1637,60 @@ mod tests {
         assert_eq!(r.remaining, 2);
         // Files survive for the next boundary.
         assert_eq!(list_entries(&spool).unwrap().0.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_entry_when_first_response_is_408() {
+        // A 408 from the server is retryable, not a terminal refusal: the
+        // drain must keep the entry queued (charged one attempt) so a later
+        // pass can still deliver it, subject to the retry limit. Treating
+        // every 4xx as permanent deleted such events on the spot (#1092
+        // regression).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Answer every request (batch first) with 408 until the drain
+            // gives up on this pass.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue(
+            &spool,
+            &entry_for(
+                format!("http://{addr}/hook?event=e0"),
+                "{}".into(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let r = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(r.dropped, 0, "a 408 first response must not drop the entry");
+        let (files, _) = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1, "the entry stays queued for the next pass");
+        let entry: SpoolEntry = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(
+            entry.attempts, 1,
+            "the retryable miss is charged one attempt"
+        );
     }
 
     /// #493: an unreadable spool must not read as an idle pass.
