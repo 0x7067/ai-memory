@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt of the same operation with the engine's own logs. A static
   `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at startup for
   this provider; the official `openai` and `opencode` providers are
-  unchanged (`opencode` keeps its `x-opencode-session` contract). (#PRNUM)
+  unchanged (`opencode` keeps its `x-opencode-session` contract). (#1104)
 
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crash-resumed or re-claimed run of the durable consolidation queue) are
   distinct operations to the gateway. Crash re-entry is exactly one new
   operation: a process restart or a queue re-claim mints a new id for the
-  calls it makes. (#PRNUM)
+  calls it makes. (#1104)
 
 ### Fixed
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
