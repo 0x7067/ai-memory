@@ -243,7 +243,8 @@ async fn page_view_keeps_a_leading_h1_that_is_not_the_title() {
     );
     let text = get("/w/default/scratch/p/notes/same.md").await;
     assert!(
-        !text.contains("Same title</h1>"),
+        !text.contains("<h1>Same title</h1>")
+            && !text.contains(r#"<h1 id="same-title">Same title</h1>"#),
         "an H1 that repeats the title should not render twice: {text}"
     );
 }

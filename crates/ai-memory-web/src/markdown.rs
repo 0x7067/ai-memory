@@ -1198,7 +1198,9 @@ mod tests {
         let md = "## Hello **bold** and `code` span";
         let html = render(md, "default", "scratch");
         assert!(
-            html.contains(r#"<h2 id="hello-bold-and-code">Hello <strong>bold</strong> and <code>code</code> span</h2>"#),
+            html.contains(
+                r#"<h2 id="hello-bold-and-code-span">Hello <strong>bold</strong> and <code>code</code> span</h2>"#
+            ),
             "inline formatting: {html}"
         );
     }
