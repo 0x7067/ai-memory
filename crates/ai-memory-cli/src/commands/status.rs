@@ -437,7 +437,7 @@ fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String
 /// Render a spool age (ms) as a compact human duration, or `-` when the spool
 /// holds no events. Allowed to saturate: an operator reading a stuck-spool
 /// diagnosis wants the magnitude, not sub-second precision.
-fn spool_age_line(age_ms: Option<u64>) -> String {
+pub(super) fn spool_age_line(age_ms: Option<u64>) -> String {
     let Some(ms) = age_ms else {
         return "-".to_string();
     };

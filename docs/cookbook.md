@@ -378,6 +378,21 @@ ai-memory serve                      # run the server
 
 ## When it isn't doing what you expect
 
+- **Server/homelab down**: `ai-memory run` does not need the server to start a
+  harness. When the server is unreachable it prints one loud warning and
+  launches anyway — hooks keep capturing to the local spool (drained
+  automatically when the server returns), an existing MCP registration
+  degrades to no-recall for the session, and the child's exit code is
+  returned. What you lose for that run is the workstream lease/context,
+  transcript import, and handoff delivery; sessions resume only through an
+  explicit native selector because no lease means no mutual exclusion. See
+  [Degraded offline
+  launches](managed-workstreams.md#degraded-offline-launches). To fail instead
+  of degrading, pass `--require-server` (or set `run.require_server = true` /
+  `AI_MEMORY_RUN_REQUIRE_SERVER=true`). For a planned outage, consider
+  `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0` so spooled events are never dropped
+  for retry-attempt count.
+
 - **Nothing is being remembered**: hooks may not be installed. `ai-memory run
   <harness>` installs its hooks + MCP on the first launch per harness,
   ai-memory version and config home, and again after `ai-memory uninstall`. If that harness

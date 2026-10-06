@@ -133,7 +133,7 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh] [--force-unlock] [--profile NAME]
-              [--env KEY=VALUE]... [--env-file PATH]
+              [--env KEY=VALUE]... [--env-file PATH] [--require-server]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
@@ -218,8 +218,9 @@ the same marker and repository rules as `run`. `--no-scan` uses saved links
 only, while `--workspace NAME` filters both sources. Stale, retargeted, or
 scope-mismatched links are skipped and a successful later `run` repairs the
 entry. If the server is temporarily unavailable, saved links and scan results
-remain selectable, but managed `run` still fails closed if it cannot prepare a
-workstream before launching the agent.
+remain selectable and a launch from the picker degrades exactly like any other
+`run` (see [Degraded offline launches](#degraded-offline-launches)) rather
+than failing closed; pass `--require-server` to refuse the launch instead.
 
 Interactive mode begins with `+ New project`. The launcher accepts a portable
 lowercase ASCII directory name, builds the marker, instruction routing, and
@@ -502,6 +503,58 @@ Client event ids beginning with `managed-run:` are refused before raw storage,
 including on retries of a finished run. This namespace belongs to the server's
 checkpoint and extraction-loss events, which it appends when completing an
 active run.
+
+## Degraded offline launches
+
+When the ai-memory server is unreachable — a remote homelab down for
+maintenance, a VPN that is not up — `ai-memory run` does not abort. It probes
+the server first (any HTTP answer counts as reachable, so an older build
+without `/healthz` still passes), prints one loud warning naming the server
+URL and what the degraded run means, and launches the harness anyway:
+
+- **Lost this run**: no workstream lease or cross-harness context packet, no
+  transcript import into the ledger, and no cross-harness handoff delivery.
+  Nothing that needs the server runs: no prepare, lease, link, heartbeat,
+  context fetch, status check, finish, or import.
+- **Still works**: the harness's ai-memory lifecycle hooks (if installed) keep
+  capturing — events spool locally and drain automatically when the server
+  returns. An existing MCP registration degrades to no-recall for the session
+  rather than blocking it (the same principle as `docs/mcp-install.md`'s
+  optional-mode entries: an unreachable memory server costs you recall, not
+  the session).
+- **Sessions**: because no lease exists there is no mutual exclusion against
+  another launcher in the same checkout, so a degraded launch never adopts or
+  resumes a session implicitly. An explicit native session selector
+  (`claude --resume <id>`, `codex continue`, …) still resumes — you named the
+  session — and everything else starts a fresh session.
+- **Auto-wire**: the first-launch hook install still happens (it is local and
+  idempotent, and capture must spool offline), but no MCP entry is registered
+  for the now-unreachable server and no completion sentinel is written, so the
+  next online launch finishes the wiring. Existing registrations are never
+  touched.
+- **Attribution**: the child is launched without `AI_MEMORY_RUN_ID` /
+  `AI_MEMORY_WORKSTREAM_ID`, so its SessionEnd hook cannot attribute the
+  session to a server run that never happened.
+- **Exit code**: the child's own exit code is returned; the launch itself is
+  not an error.
+
+When the child exits, the launcher prints that the run was not recorded on the
+server and how many hook events remain spooled locally (oldest first by age).
+Spooled events are bounded: they are dropped after the configured number of
+failed drain passes (8 by default), 7 days of age, or the 10,000-file spool
+cap. For a planned outage set `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0` to disable
+only the attempt-count drops (see `docs/install.md`).
+
+If the server dies *during* a run — after the lease was acquired — the exit
+code is still preserved: the unimported transcript is reported as a warning
+with the exact `ai-memory finalize-session` command that repairs the record
+once the server is back, and the orphaned lease expires on its own within 90
+seconds.
+
+To restore the strict behavior (fail with the usual "could not reach …"
+diagnosis and never start the agent), pass `--require-server`, set
+`run.require_server = true` in `config.toml`, or export
+`AI_MEMORY_RUN_REQUIRE_SERVER=true`.
 
 ## Native identity privacy
 

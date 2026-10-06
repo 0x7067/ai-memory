@@ -428,6 +428,13 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
 /// `launch_cwd` is the directory the harness is launched in — a `resume` may
 /// launch into a checkout other than the shell's — and is where a
 /// `--scope project` Claude Code install is looked for.
+///
+/// `skip_mcp` serves degraded offline launches: the hook install is local and
+/// idempotent, so it still runs (capture must spool offline), but registering
+/// an MCP entry pointing at a server that just proved unreachable would bake a
+/// dead endpoint into the harness config. The MCP install is skipped and the
+/// sentinel is NOT written, so the next online launch completes the wiring
+/// instead of the sentinel suppressing it forever.
 #[cfg(test)]
 pub(crate) fn ensure_wired_with(
     config: &Config,
@@ -444,6 +451,7 @@ pub(crate) fn ensure_wired_with(
         run_env,
         &effective_env,
         launch_cwd,
+        false,
     );
 }
 
@@ -454,6 +462,7 @@ pub(crate) fn ensure_wired_with_env(
     run_env: &[(String, String)],
     effective_env: &super::run::EffectiveChildEnv,
     launch_cwd: &Path,
+    skip_mcp: bool,
 ) {
     let Some(targets) = wire_targets_with_env(
         config,
@@ -472,11 +481,21 @@ pub(crate) fn ensure_wired_with_env(
     let sentinel = targets.sentinel.clone();
     let project_hooks = targets.project_hooks.clone();
 
-    eprintln!(
-        "ai-memory: first managed launch of {} here — wiring its ai-memory hooks + MCP so \
-         capture and recall work (disable with --no-autowire or AI_MEMORY_RUN_AUTOWIRE=false).",
-        harness.as_str()
-    );
+    if skip_mcp {
+        eprintln!(
+            "ai-memory: first managed launch of {} here while the server is unreachable — \
+             wiring its ai-memory hooks (capture spools locally); the MCP registration waits \
+             for the next online launch (disable with --no-autowire or \
+             AI_MEMORY_RUN_AUTOWIRE=false).",
+            harness.as_str()
+        );
+    } else {
+        eprintln!(
+            "ai-memory: first managed launch of {} here — wiring its ai-memory hooks + MCP so \
+             capture and recall work (disable with --no-autowire or AI_MEMORY_RUN_AUTOWIRE=false).",
+            harness.as_str()
+        );
+    }
 
     let mut installs = wire_installs(config, targets, overrides);
     if let Some(project_file) = project_hooks {
@@ -503,33 +522,43 @@ pub(crate) fn ensure_wired_with_env(
         .mcp
         .as_ref()
         .and_then(|args| args.config_file.clone());
-    let mcp_failure = match installs.mcp.take() {
-        // The sentinel is version-keyed, so this whole step re-runs on every
-        // upgrade. install-mcp replaces the `ai-memory` entry wholesale, so a
-        // plain re-run would overwrite a session-aware Claude Code bridge the
-        // user installed with `install-mcp --session-aware` back to static HTTP,
-        // silently disabling per_session for their MCP calls. Preserve it, in
-        // the file this launch would write.
-        Some(args)
-            if install_mcp::existing_entry_is_session_aware(
-                args.client,
-                args.config_file.as_deref(),
-                &args.name,
-            ) =>
-        {
-            eprintln!(
-                "ai-memory: keeping the existing session-aware {} MCP bridge; not \
-                 overwriting it with the static HTTP registration.",
-                harness.as_str()
-            );
-            None
+    let mcp_failure = if skip_mcp {
+        // Degraded offline launch: a registration pointing at the unreachable
+        // server would cost the harness its recall until the config was
+        // edited by hand. Existing registrations are untouched and degrade to
+        // no-recall for this run instead; nothing is planned, so nothing can
+        // fail or escape a confinement guard.
+        installs.mcp = None;
+        None
+    } else {
+        match installs.mcp.take() {
+            // The sentinel is version-keyed, so this whole step re-runs on every
+            // upgrade. install-mcp replaces the `ai-memory` entry wholesale, so a
+            // plain re-run would overwrite a session-aware Claude Code bridge the
+            // user installed with `install-mcp --session-aware` back to static HTTP,
+            // silently disabling per_session for their MCP calls. Preserve it, in
+            // the file this launch would write.
+            Some(args)
+                if install_mcp::existing_entry_is_session_aware(
+                    args.client,
+                    args.config_file.as_deref(),
+                    &args.name,
+                ) =>
+            {
+                eprintln!(
+                    "ai-memory: keeping the existing session-aware {} MCP bridge; not \
+                     overwriting it with the static HTTP registration.",
+                    harness.as_str()
+                );
+                None
+            }
+            Some(args) => {
+                install_mcp::run_with_opencode_dialect(config, args, installs.opencode_dialect)
+                    .err()
+                    .map(|error| format!("{error:#}"))
+            }
+            None => installs.mcp_skipped,
         }
-        Some(args) => {
-            install_mcp::run_with_opencode_dialect(config, args, installs.opencode_dialect)
-                .err()
-                .map(|error| format!("{error:#}"))
-        }
-        None => installs.mcp_skipped,
     };
     if let Some(reason) = &mcp_failure {
         eprintln!(
@@ -567,8 +596,12 @@ pub(crate) fn ensure_wired_with_env(
     // install on every launch would nag and churn config. A user who wants a
     // retry can re-run install-hooks manually or delete this sentinel under
     // `<data_dir>/autowire-state/`; `ai-memory uninstall` clears them all when
-    // it removes hooks or MCP.
-    write_sentinel(&sentinel);
+    // it removes hooks or MCP. A degraded offline launch (skip_mcp) is the one
+    // exception: its wiring is deliberately half-done, so the sentinel stays
+    // unwritten and the next online launch completes the MCP half.
+    if !skip_mcp {
+        write_sentinel(&sentinel);
+    }
 }
 
 /// The `--scope project` Claude Code install covering `launch_cwd`, if any.
@@ -1539,6 +1572,83 @@ mod tests {
 
     fn repo_hooks() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")
+    }
+
+    /// The degraded offline wiring contract: hooks are installed (capture must
+    /// spool locally), the MCP registration is left alone (a dead endpoint
+    /// would be baked into harness config otherwise), and no sentinel is
+    /// written, so the next online launch completes the MCP half.
+    #[test]
+    fn skip_mcp_wires_hooks_only_and_writes_no_sentinel() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let mcp = data.path().join("claude.json");
+        std::fs::write(&mcp, r#"{"existingMcpKey":"keep me too"}"#).unwrap();
+
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+        let effective_env =
+            super::super::run::EffectiveChildEnv::with_overrides(&config.runtime_env, &[]);
+        ensure_wired_with_env(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &effective_env,
+            &config.data_dir,
+            true,
+        );
+
+        let hooks_json = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            hooks_json.contains("ai-memory") || hooks_json.contains("ai_memory"),
+            "the ai-memory hook must be installed offline: {hooks_json}"
+        );
+        let mcp_json = std::fs::read_to_string(&mcp).unwrap();
+        assert!(
+            !mcp_json.contains("ai-memory"),
+            "no MCP registration may be written for an unreachable server: {mcp_json}"
+        );
+        assert!(
+            mcp_json.contains("existingMcpKey"),
+            "the MCP file must be untouched: {mcp_json}"
+        );
+        let sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        )
+        .unwrap()
+        .sentinel;
+        assert!(
+            !sentinel.exists(),
+            "an offline half-wiring must not gate the next online launch"
+        );
+
+        // The next online launch completes the wiring and records the attempt.
+        ensure_wired_with_env(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &effective_env,
+            &config.data_dir,
+            false,
+        );
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("ai-memory"),
+            "the online completion installs the MCP entry"
+        );
+        assert!(sentinel.exists(), "the completed wiring is recorded");
     }
 
     /// The load-bearing "won't mess up any harness" guarantee: auto-wire installs

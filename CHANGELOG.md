@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at startup for
   this provider; the official `openai` and `opencode` providers are
   unchanged (`opencode` keeps its `x-opencode-session` contract). (#1104)
+- Added `--require-server` to `ai-memory run` (plus `run.require_server` in
+  config.toml and `AI_MEMORY_RUN_REQUIRE_SERVER=true`) to restore fail-closed
+  launches when the server is unreachable: the reachability probe still runs,
+  and an unreachable server returns the existing "could not reach …"
+  diagnosis — including "the agent was not started" — without starting the
+  harness. (#1112)
 - Added bounded install-wide identity and component-safe path routes in the exact
   operator-home `.ai-memory.toml`. Exact hostful repository identity wins the
   longest lexical path route, local non-home markers stay authoritative, aliases
@@ -269,6 +275,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   summary (for example `class=provider status=400`) instead of the error's
   `Display`, which for a provider failure includes the upstream response
   body. Other error surfaces are unchanged. (#1103)
+- Changed `ai-memory run` to no longer fail closed when the server is
+  unreachable: a bounded ~2s reachability probe (any HTTP answer counts as
+  reachable, so pre-`/healthz` servers pass) downgrades the launch with one
+  loud warning instead of aborting it. The harness starts with no server work
+  at all (no lease, link, context, heartbeat, status, finish, or import),
+  lifecycle hooks keep spooling locally with the bounded retention surfaced in
+  the warning, auto-wire installs hooks but defers the MCP registration to the
+  next online launch, sessions resume only through an explicit native selector
+  (no lease means no mutual exclusion), the child runs without
+  `AI_MEMORY_RUN_ID`/`AI_MEMORY_WORKSTREAM_ID` so its session cannot be
+  misattributed, and the child's exit code is returned with a local
+  spool-health account. A server that dies mid-run, after the child exits, no
+  longer discards the exit code either: the unimported transcript is
+  downgraded to a warning naming the exact `ai-memory finalize-session` repair
+  command, while protocol-level failures still fail hard. (#1112)
 - Changed static CLI/MCP project-name resolution to accept an existing
   repository's canonical hostless path name and its v2 basename compatibility
   key. Reads remain find-only; an authorized write through the canonical key
