@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed `memory_feedback` storing an unmatched secret prefix when a `reason`
+  straddled the 500-character cap: the reason is now scrubbed before the cap
+  is applied, matching the #980 title-hint order. (#1109)
 - Fixed wiki confinement walks failing on Windows with `PermissionDenied`
   (sharing violation) or `ERROR_DELETE_PENDING` when a concurrent commit or
   the atomic writer held or rename-replaced a file mid-walk; per-entry walk
