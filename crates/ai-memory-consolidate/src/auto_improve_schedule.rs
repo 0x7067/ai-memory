@@ -517,6 +517,7 @@ async fn stage_and_apply(
                     "max_rule_page_tokens": cfg.max_rule_page_tokens,
                     "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
                     "eval": cfg.eval,
+                    "eval_results": report.eval_results(),
                     "require_approval": ctx.settings.require_approval,
                 }),
                 proposal_actor: ActorContext {
@@ -608,8 +609,7 @@ async fn scheduled_auto_improve_new_proposals(
             title: p.title.clone(),
             confidence: f64::from(p.confidence),
             rationale: p.rationale.clone(),
-            evidence_json: serde_json::to_value(&p.evidence)
-                .unwrap_or_else(|_| serde_json::json!([])),
+            evidence_json: report.proposal_evidence_json(p)?,
             body_markdown: p.body_markdown.clone(),
             artifact_sha256: None,
             edit_mode: Some(p.edit_mode.clone()),
