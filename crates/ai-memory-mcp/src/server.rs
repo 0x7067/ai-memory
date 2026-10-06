@@ -1036,15 +1036,14 @@ fn is_bidi_control(c: char) -> bool {
 const MAX_FEEDBACK_REASON_CHARS: usize = 500;
 
 fn sanitize_feedback_reason(sanitizer: &Sanitizer, raw: Option<&str>) -> Option<String> {
-    let bounded: String = raw?
-        .trim()
-        .chars()
-        .take(MAX_FEEDBACK_REASON_CHARS)
-        .collect();
-    if bounded.is_empty() {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let scrubbed = sanitizer.scrub(&bounded);
+    // Scrub before the 500-char cap. Truncating first (the previous order)
+    // can cut a secret in half so the stored prefix is too short to match a
+    // pattern, the same #980 title-hint leak.
+    let scrubbed = sanitizer.scrub(trimmed);
     let single_line = scrubbed.split_whitespace().collect::<Vec<_>>().join(" ");
     let final_reason: String = single_line
         .chars()
@@ -8089,6 +8088,30 @@ mod tests {
             sanitize_feedback_reason(&Sanitizer::builtin(), Some("  \n\t")),
             None
         );
+    }
+
+    #[test]
+    fn feedback_reason_is_scrubbed_before_the_500_char_cap() {
+        // Token starts 12 characters before the cap. Truncating first leaves
+        // `Bearer` plus 12 token chars (under the `{16,}` floor), so the
+        // unmatched prefix would be stored. Scrubbing first redacts it.
+        // The marker itself may be clipped by the same 500-char cap
+        // (`truncate_for_title` documents that cosmetic gap); the secret
+        // must still be gone.
+        let raw = format!(
+            "{} Bearer abcdef0123456789ABCDEF0123456789",
+            "x".repeat(480)
+        );
+        let reason = sanitize_feedback_reason(&Sanitizer::builtin(), Some(&raw)).unwrap();
+        assert!(
+            reason.contains("[REDACTED:"),
+            "straddling secret must be redacted, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("abcdef"),
+            "token prefix must not survive the cap, got {reason:?}"
+        );
+        assert!(reason.chars().count() <= MAX_FEEDBACK_REASON_CHARS);
     }
 
     #[tokio::test]
