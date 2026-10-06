@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed wiki link extraction treating `file:` and `vbscript:` as project
+  qualifiers, so `[[file:notes/x.md]]` indexed a cross-project edge to project
+  `file`. Both prefixes now match the `/web` scheme denylist and are not wiki
+  links. (#1110)
 - Fixed wiki confinement walks failing on Windows with `PermissionDenied`
   (sharing violation) or `ERROR_DELETE_PENDING` when a concurrent commit or
   the atomic writer held or rename-replaced a file mid-walk; per-entry walk
