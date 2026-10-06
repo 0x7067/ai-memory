@@ -7,15 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- The CLI's "could not reach …" reachability diagnosis now fires for
-  connect timeouts and generic connect failures, not only an explicit
-  "Connection refused": on Windows a firewall-dropped loopback connect is
-  reported as "operation timed out", which previously fell through to the
-  generic "HTTP request to … failed" message and hid the resolved server
-  URL and `AI_MEMORY_SERVER_URL` guidance. The hint now says "nothing
-  answered (refused or timed out)". (#1112)
-
 ### Added
 - The `openai-compat` provider now sends `X-Request-Id` with every chat
   attempt, carrying the logical operation id shared by all attempts of one
@@ -382,6 +373,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls it makes. (#1104)
 
 ### Fixed
+
+- The CLI's "could not reach …" reachability diagnosis now fires for
+  connect timeouts and generic connect failures, not only an explicit
+  "Connection refused": on Windows a firewall-dropped loopback connect is
+  reported as "operation timed out", which previously fell through to the
+  generic "HTTP request to … failed" message and hid the resolved server
+  URL and `AI_MEMORY_SERVER_URL` guidance. The hint now says "nothing
+  answered (refused or timed out)". (#1112)
 - Fixed `memory_feedback` storing an unmatched secret prefix when a `reason`
   straddled the 500-character cap: the reason is now scrubbed before the cap
   is applied, matching the #980 title-hint order. (#1109)
