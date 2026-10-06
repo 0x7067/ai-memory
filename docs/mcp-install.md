@@ -152,7 +152,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed / muse
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse
 > ```
 
 ---
@@ -280,10 +280,11 @@ run without `--server-url` reads the URL and token back from this entry.
 
 The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
 with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
-payload; native installs spool events locally and enforce capture exclusions.
-Copilot reads a top-level `additionalContext` from `SessionStart` stdout, not
-the `hookSpecificOutput` envelope ai-memory prints, so the prior session's
-handoff is recovered with `memory_handoff_list` and `memory_handoff_accept`.
+payload; native installs spool events locally and enforce capture exclusions. The
+`SessionStart` hook delivers the prior session's handoff: Copilot reads a
+top-level `additionalContext` from `SessionStart` stdout (not Claude Code's
+`hookSpecificOutput` envelope), and the hook prints exactly that, or `{}` when
+nothing is pending.
 
 - Sources: <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers>,
   <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>,

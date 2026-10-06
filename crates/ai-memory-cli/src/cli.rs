@@ -2368,9 +2368,9 @@ pub enum AgentChoice {
     /// existing key-based extraction applies (#1040). No bare `copilot`
     /// alias: that word is already `install-mcp --client copilot`'s alias for
     /// the unrelated VS Code MCP client. NOTE: Copilot CLI reads a top-level
-    /// `additionalContext` on `SessionStart`, not Claude Code's envelope, so
-    /// capture works but handoff injection does not yet — recover the prior
-    /// session's handoff via the MCP `memory_handoff_accept` tool.
+    /// `additionalContext` on `SessionStart`, not Claude Code's envelope, and
+    /// the hook prints exactly that, so both capture and handoff injection
+    /// work.
     #[value(name = "copilot-cli")]
     CopilotCli,
 }
@@ -2607,7 +2607,9 @@ pub enum McpClient {
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
-    /// `install-hooks --agent copilot-cli` for lifecycle capture. Not to be
+    /// `install-hooks --agent copilot-cli` for lifecycle capture and
+    /// `SessionStart` handoff delivery via Copilot's top-level
+    /// `additionalContext`. Not to be
     /// confused with `vscode-copilot` (alias `copilot`), the VS Code agent
     /// mode client.
     #[value(name = "copilot-cli")]

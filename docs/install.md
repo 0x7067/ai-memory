@@ -709,7 +709,10 @@ agent's environment; no `install-hooks` rerun is needed:
 | `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` | 8 failed passes | non-negative integer | failed drain passes before dropping an event; `0` disables only attempt-count drops |
 
 The retry setting can also be written as `max_attempts` under `[hook_spool]` in
-`<data_dir>/config.toml`; the runtime environment wins when both are set. A zero
+`<data_dir>/config.toml`; the runtime environment wins when both are set. A set
+but invalid `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` value (non-numeric) falls back to
+the built-in default of 8, overriding any `config.toml` value — same convention
+as the timing vars. A zero
 value still leaves the 7-day age limit and 10,000-file spool cap active.
 
 Timing values must be positive whole minutes. Missing, empty, non-numeric, or
