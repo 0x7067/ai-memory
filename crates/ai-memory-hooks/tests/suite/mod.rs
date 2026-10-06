@@ -3,5 +3,6 @@
 //! no extra binary; a new file must be declared below.
 
 mod powershell_home;
+mod powershell_marker_aliases;
 mod powershell_server_routed;
 mod powershell_utf8;

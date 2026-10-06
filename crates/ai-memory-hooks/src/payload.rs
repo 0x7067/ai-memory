@@ -97,6 +97,13 @@ pub struct HookQuery {
     /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
     /// else, or a malformed identity, is ignored and the event routes by name.
     pub identity_src: Option<String>,
+    /// An explicit marker `identity_style` (#1033). `path` names a
+    /// remote-backed project from its repository path without the host;
+    /// `host_path` preserves legacy naming. Omission uses the server default.
+    pub identity_style: Option<String>,
+    /// Compact JSON array of validated former project names from the local
+    /// marker. Accepted only with a full git-remote identity.
+    pub aliases: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -129,6 +136,13 @@ pub struct HookEnvelope {
     /// [`ai_memory_core::repository_identity::accept_wire_identity`]. `None`
     /// routes by project name, as every event did before identities existed.
     pub identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+    /// How a project this event creates is named; see
+    /// [`ai_memory_core::repository_identity::IdentityStyle`].
+    pub identity_style: ai_memory_core::repository_identity::IdentityStyle,
+    /// Validated, normalized former project names supplied by the local marker.
+    pub aliases: ai_memory_core::repository_identity::MarkerAliases,
+    /// Whether an alias query was malformed or lacked a git-remote identity.
+    pub aliases_invalid: bool,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -183,6 +197,8 @@ impl std::fmt::Debug for HookEnvelope {
             .field("project_override", &self.project_override)
             .field("project_strategy", &self.project_strategy)
             .field("identity", &self.identity)
+            .field("alias_count", &self.aliases.as_slice().len())
+            .field("aliases_invalid", &self.aliases_invalid)
             .field("drop_subagent_requested", &self.drop_subagent_requested)
             .field(
                 "recall_default_global_requested",
@@ -248,6 +264,38 @@ pub(crate) fn query_flag_truthy(value: Option<&str>) -> bool {
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+/// Whether a forwarded flag was explicitly turned off (`0` / `false` / `no` /
+/// `off`, any case). An absent flag is not falsy: settings that default on,
+/// like `[profile] contribute`, stay on unless a marker says otherwise.
+pub(crate) fn query_flag_falsy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+pub(crate) fn marker_aliases_from_wire(
+    project: Option<&str>,
+    project_source: ProjectSource,
+    identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+    raw: Option<&str>,
+) -> Result<
+    ai_memory_core::repository_identity::MarkerAliases,
+    ai_memory_core::repository_identity::MarkerAliasError,
+> {
+    let aliases = ai_memory_core::repository_identity::accept_wire_aliases(raw)?;
+    if raw.is_some()
+        && (project.is_none_or(|project| project.trim().is_empty())
+            || project_source != ProjectSource::Marker
+            || !identity.is_some_and(|identity| {
+                identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote
+            }))
+    {
+        return Err(ai_memory_core::repository_identity::MarkerAliasError::InvalidWire);
+    }
+    Ok(aliases)
 }
 
 /// How the hook router derives a project name when no explicit
@@ -539,6 +587,23 @@ impl HookEnvelope {
             }
             _ => None,
         };
+        let identity_style = query
+            .identity_style
+            .as_deref()
+            .and_then(ai_memory_core::repository_identity::IdentityStyle::from_str_opt)
+            .unwrap_or_default();
+        let aliases = marker_aliases_from_wire(
+            project_override.as_deref(),
+            project_source,
+            identity.as_ref(),
+            query.aliases.as_deref(),
+        );
+        let aliases_invalid = aliases.is_err();
+        let aliases = if aliases_invalid {
+            ai_memory_core::repository_identity::MarkerAliases::default()
+        } else {
+            aliases.unwrap_or_default()
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
@@ -623,6 +688,9 @@ impl HookEnvelope {
             project_strategy,
             project_source,
             identity,
+            identity_style,
+            aliases,
+            aliases_invalid,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,
@@ -726,6 +794,8 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Hermes
             | AgentKind::Pool
             | AgentKind::Zcode
+            | AgentKind::CopilotCli
+            | AgentKind::Grizzybot
     )
 }
 
@@ -800,6 +870,14 @@ fn safe_tool_body(
                 // Codex's native schema has one top-level JSON response.
                 // Do not promote unrelated aliases or nested payloads to output.
                 raw.get("tool_response").and_then(value_to_text)
+            } else if agent == AgentKind::CopilotCli {
+                // Copilot CLI's VS-Code-compatible `PostToolUse` nests the
+                // model-facing text at `tool_result.text_result_for_llm`
+                // (#1040); read only that documented field so `result_type`
+                // never leaks in through an object-stringify fallback.
+                raw.pointer("/tool_result/text_result_for_llm")
+                    .and_then(value_to_text)
+                    .or_else(|| extract_content(raw, &["error"]))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -1245,6 +1323,36 @@ mod tests {
         assert!(ProjectSource::RepoRoot.yields_to_session());
         assert!(!ProjectSource::Marker.yields_to_session());
         assert!(!ProjectSource::Unspecified.yields_to_session());
+    }
+
+    #[test]
+    fn omitted_style_stays_legacy_host_path_while_new_clients_send_path() {
+        let envelope = |identity_style: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    identity_style: identity_style.map(str::to_owned),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": "s" }),
+            )
+        };
+        assert_eq!(
+            envelope(None).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
+        assert_eq!(
+            envelope(Some("path")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::Path
+        );
+        assert_eq!(
+            envelope(Some("host_path")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
+        assert_eq!(
+            envelope(Some("unknown")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
     }
 
     #[test]
@@ -2113,6 +2221,30 @@ mod tests {
         assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
     }
 
+    #[test]
+    fn grizzybot_tool_title_is_a_closed_family() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write_file",
+            "tool_input": {"path": "notes.md", "content": "untrusted"},
+            "tool_response": "ok",
+            "session_id": "gb-session",
+            "cwd": "/bot/home"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("grizzybot".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Grizzybot);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("gb-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
+    }
+
     /// Body is well-formed JSON but the expected `session_id` /
     /// `cwd` keys are missing — extraction returns None per key.
     #[test]
@@ -2409,6 +2541,40 @@ mod tests {
             body.contains("MARKER_GROK_931"),
             "grok tool_response should be serialized into the body: {body:?}"
         );
+    }
+
+    /// Copilot CLI's VS-Code-compatible `PostToolUse` nests the output at
+    /// `tool_result.text_result_for_llm` (#1040). Without Copilot in
+    /// `closed_tool_agent` the observation would be stored with an empty body,
+    /// the #931 failure mode Grok had; without the dedicated path the
+    /// `result_type` envelope would leak into the excerpt.
+    #[test]
+    fn copilot_cli_post_tool_excerpt_reads_text_result_for_llm() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("copilot-cli".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "copilot-session",
+                "cwd": "/repo",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "tool_result": {
+                    "result_type": "success",
+                    "text_result_for_llm": "MARKER_COPILOT_1040",
+                },
+            }),
+        );
+        let body = env
+            .body_excerpt
+            .expect("copilot-cli post-tool body should not be empty");
+        assert!(body.contains("MARKER_COPILOT_1040"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(!body.contains("result_type"), "{body:?}");
     }
 
     /// End-to-end: a native-hook user prompt (`event=user-prompt-submit`,
