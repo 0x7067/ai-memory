@@ -6060,7 +6060,30 @@ mod tests {
             );
         }
 
-        let logged = captured.text();
+        // The fmt subscriber writes synchronously, but the write lands on
+        // whatever thread polls the `warn!`. Under the current-thread test
+        // runtime that is this thread and the first read is already
+        // complete; a cross-thread or late write (seen on windows-latest,
+        // where the capture read back empty) gets a bounded window to land
+        // before the assertions snapshot the buffer. The assertions
+        // themselves are unchanged.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let logged = loop {
+            let logged = captured.text();
+            let complete = ["pre-compact", "post-compaction"]
+                .into_iter()
+                .all(|checkpoint_label| {
+                    logged.contains(&format!(
+                        "{checkpoint_label}: LLM consolidation unavailable; falling back to \
+                         rule-based checkpoint"
+                    ))
+                })
+                && logged.contains("class=provider status=400");
+            if complete || std::time::Instant::now() >= deadline {
+                break logged;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         for checkpoint_label in ["pre-compact", "post-compaction"] {
             assert!(
                 logged.contains(&format!(
