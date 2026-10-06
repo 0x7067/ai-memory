@@ -496,7 +496,7 @@ ai_memory_home_route() {
                 if (selector == identity) { identity_found = 1; identity_ws = route_workspace; identity_pr = route_project; identity_style = route_identity_style; identity_aliases = route_aliases }
             } else {
                 normalized = cleanpath(selector)
-                if (!normalized || normalized == "posix" || normalized ~ /^drive:[^/]+$/ || normalized ~ /^unc:[^/]+\/[^/]+$/ || path_seen[normalized]++) invalid()
+                if (!normalized || normalized == "posix" || normalized ~ /^drive:[^\/]+$/ || normalized ~ /^unc:[^\/]+\/[^\/]+$/ || path_seen[normalized]++) invalid()
                 target = cleanpath(cwd)
                 if (normalized == target || index(target, normalized "/") == 1) {
                     n = split(normalized, parts, "/")

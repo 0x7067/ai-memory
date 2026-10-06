@@ -534,7 +534,7 @@ mod tests {
             home.join(".ai-memory.toml"),
             format!(
                 "[routes.path.\"{}\"]\nroute_workspace=\"oss\"\nroute_project=\"acme-api\"\n",
-                repo.display()
+                repo.to_string_lossy().replace('\\', "/")
             ),
         )
         .unwrap();

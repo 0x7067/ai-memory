@@ -335,6 +335,19 @@ assert_eq "malformed home routes fail closed instead of root fallback" "&ai_memo
 printf 'workspace = wrong\n' >"$HOME/.ai-memory.toml"
 assert_eq "malformed root-only home marker keeps legacy parser behavior" "yes" \
     "$(case "$(ai_memory_marker_qs "$HOME/src/api")" in *'&ai_memory_invalid_home_routes=1'*) printf no ;; *) printf yes ;; esac)"
+ai_memory_home
+ROUTE_FS=$(printf '\034')
+printf '[routes.path."C:/Work/API"]\nroute_workspace="windows"\nroute_project="drive"\n[routes.path."//Server/Share/API"]\nroute_workspace="windows"\nroute_project="unc"\n' >"$HOME/.ai-memory.toml"
+assert_eq "home drive route matches components" "windows${ROUTE_FS}drive${ROUTE_FS}${ROUTE_FS}" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'c:/work/api/lib' '')"
+assert_eq "home UNC route matches components" "windows${ROUTE_FS}unc${ROUTE_FS}${ROUTE_FS}" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" '//server/share/api/lib' '')"
+printf '[routes.path."C:/"]\nroute_workspace="windows"\nroute_project="drive"\n' >"$HOME/.ai-memory.toml"
+assert_eq "home drive root route is rejected" "invalid" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'C:/child' '')"
+printf '[routes.path."//server/share"]\nroute_workspace="windows"\nroute_project="unc"\n' >"$HOME/.ai-memory.toml"
+assert_eq "home UNC root route is rejected" "invalid" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" '//server/share/child' '')"
 HOME="$TMP"
 export HOME
 

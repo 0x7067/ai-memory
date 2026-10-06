@@ -496,10 +496,10 @@ fn recognizable_malformed_root_line(line: &str) -> bool {
             | "identity"
             | "identity_style"
             | "server"
-    ) && !value
+    ) && value
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'))
-        .is_some_and(|inner| !inner.contains('"'))
+        .is_none_or(|inner| inner.contains('"'))
 }
 
 fn parse_route_header(line: &str) -> Option<(RouteKind, String)> {
@@ -1632,7 +1632,7 @@ route_project = "unc"
             &home,
             &format!(
                 "workspace = \"fallback\"\nproject = \"fallback\"\n[routes.path.\"{}\"]\nroute_workspace = \"routed\"\nroute_project = \"outside\"\n",
-                outside.display()
+                outside.to_string_lossy().replace('\\', "/")
             ),
         );
         let selected = routing_selection_with_home(

@@ -697,6 +697,7 @@ mod tests {
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .output()
             .unwrap();
         assert!(
@@ -830,6 +831,7 @@ mod tests {
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .output()
             .unwrap();
         assert!(
@@ -969,6 +971,7 @@ mod tests {
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .output()
             .unwrap();
         assert!(

@@ -13201,8 +13201,13 @@ mod identity_parity_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
+        let route_home = if cfg!(windows) {
+            std::path::Path::new("C:/Users/ai-memory-test")
+        } else {
+            home.as_path()
+        };
         for case in home_route_cases() {
-            let (text, cwd) = expanded_route_case(&case, &home);
+            let (text, cwd) = expanded_route_case(&case, route_home);
             let marker = home.join(".ai-memory.toml");
             std::fs::write(&marker, text).unwrap();
             let output = Command::new("sh")
@@ -13210,10 +13215,11 @@ mod identity_parity_tests {
                 .arg(r#". "$1"; _amhome="$2"; ai_memory_home_route "$3" "$4" "$5""#)
                 .arg("sh")
                 .arg(repo_file("hooks/_lib.sh"))
-                .arg(&home)
+                .arg(route_home)
                 .arg(&marker)
                 .arg(&cwd)
                 .arg(case["identity"].as_str().unwrap_or(""))
+                .env("MSYS2_ARG_CONV_EXCL", "*")
                 .output()
                 .unwrap();
             assert!(
@@ -13280,6 +13286,7 @@ mod identity_parity_tests {
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .output()
             .unwrap();
         assert!(
@@ -13350,6 +13357,7 @@ mod identity_parity_tests {
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .output()
             .unwrap();
         assert!(
@@ -13399,6 +13407,7 @@ mod identity_parity_tests {
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .output()
             .unwrap();
         assert!(
@@ -13447,6 +13456,7 @@ mod identity_parity_tests {
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .output()
             .unwrap();
         assert!(
@@ -13543,6 +13553,7 @@ mod identity_parity_tests {
                 .args(["--experimental-strip-types", "--no-warnings"])
                 .arg(&module)
                 .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
                 .output()
                 .unwrap();
             assert!(
