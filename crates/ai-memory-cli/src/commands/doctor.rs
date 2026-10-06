@@ -442,7 +442,31 @@ async fn project_coordinate_report(
 pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     let (identity_cwd, lookup_cwd) = super::scope_directories(config)
         .ok_or_else(|| anyhow::anyhow!("resolving the current working directory"))?;
-    let marker = crate::marker::inspect_scope(&lookup_cwd, &config.runtime_env);
+    let explicit_scope = args
+        .workspace
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .is_some()
+        && args
+            .project
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .is_some();
+    let marker = if explicit_scope {
+        crate::marker::MarkerInspection {
+            status: "bypassed_explicit_scope",
+            fields: crate::marker::RoutingFields::default(),
+            scope: None,
+            route_identity: None,
+        }
+    } else {
+        let marker =
+            crate::marker::inspect_scope_for(&lookup_cwd, &identity_cwd, &config.runtime_env);
+        if marker.status == "invalid_home_routes" {
+            anyhow::bail!("invalid home route map; doctor did not query a fallback server scope");
+        }
+        marker
+    };
     let scope_marker = marker
         .scope
         .clone()

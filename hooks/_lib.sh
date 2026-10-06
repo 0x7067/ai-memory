@@ -193,9 +193,15 @@ ai_memory_find_settings_marker() {
         esac
     fi
     while [ -n "$dir" ] && [ "$dir" != "/" ]; do
-        if [ -f "$dir/.ai-memory.toml" ] && ai_memory_marker_declares_settings "$dir/.ai-memory.toml"; then
-            printf '%s\n' "$dir/.ai-memory.toml"
-            return 0
+        if [ -f "$dir/.ai-memory.toml" ]; then
+            if [ -n "$_amhome" ] && [ "$dir" = "$_amhome" ]; then
+                printf '%s\n' "$dir/.ai-memory.toml"
+                return 0
+            fi
+            if ai_memory_marker_declares_settings "$dir/.ai-memory.toml"; then
+                printf '%s\n' "$dir/.ai-memory.toml"
+                return 0
+            fi
         fi
         if [ -n "$boundary" ] && [ "$dir" = "$boundary" ]; then
             return 0
@@ -431,6 +437,114 @@ ai_memory_identity_style_qs() {
     return 0
 }
 
+ai_memory_home_route() {
+    _ai_hr_file="$1"; _ai_hr_cwd="$2"; _ai_hr_identity="$3"
+    [ -f "$_ai_hr_file" ] || return 0
+    [ "$(wc -c <"$_ai_hr_file")" -le 65536 ] || { printf 'invalid'; return 0; }
+    LC_ALL=C awk -v cwd="$_ai_hr_cwd" -v home="$_amhome" -v identity="$_ai_hr_identity" '
+        function invalid() { bad = 1 }
+        function cleanpath(value,    n, raw, out, i, root, home_relative, rel_depth, j) {
+            gsub(/\\/, "/", value)
+            home_relative = substr(value,1,2) == "~/"
+            if (home_relative) {
+                raw = substr(value,3); n = split(raw,relative_parts,"/"); rel_depth = 0
+                for (j=1; j<=n; j++) if (relative_parts[j] != "" && relative_parts[j] != ".") {
+                    if (relative_parts[j] == "..") { if (!rel_depth) return ""; rel_depth-- }
+                    else rel_depth++
+                }
+                value = home "/" raw
+            }
+            if (substr(value,1,2) == "//") {
+                raw = substr(value,3); n = split(raw,a,"/")
+                if (n < 2 || a[1] == "" || a[2] == "") return ""
+                root = "unc:" tolower(a[1]) "/" tolower(a[2]); i = 3
+            } else if (value ~ /^[A-Za-z]:\//) {
+                root = "drive:" tolower(substr(value,1,1)); raw = substr(value,4); n = split(raw,a,"/"); i = 1
+            } else if (substr(value,1,1) == "/") {
+                root = "posix"; raw = substr(value,2); n = split(raw,a,"/"); i = 1
+            } else return ""
+            depth = 0; delete stack
+            for (; i <= n; i++) if (a[i] != "" && a[i] != ".") { if (a[i] == "..") { if (depth) depth-- } else stack[++depth] = a[i] }
+            out = root
+            for (i=1; i<=depth; i++) out = out "/" (root == "posix" ? stack[i] : tolower(stack[i]))
+            return out
+        }
+        function aliases_valid(value,    body,n,i,item) {
+            if (length(value) > 512 || value ~ /\\/ || value !~ /^\[[^]]*\][[:space:]]*$/) return 0
+            body=value; sub(/^\[/,"",body); sub(/\][[:space:]]*$/,"",body)
+            if (body ~ /^[[:space:]]*$/) return 1
+            if (body ~ /,[[:space:]]*$/) return 0
+            n=split(body,items,","); if (n > 16) return 0
+            for (i=1;i<=n;i++) {
+                item=items[i]
+                if (item !~ /^[[:space:]]*"[A-Za-z0-9][A-Za-z0-9._-]*"[[:space:]]*$/) return 0
+                sub(/^[[:space:]]*"/,"",item); sub(/"[[:space:]]*$/,"",item)
+                if (length(item) > 128) return 0
+            }
+            return 1
+        }
+        function finish(    normalized,n) {
+            if (!kind) return
+            count++
+            if (count > 64 || length(selector) > 512 || raw_seen[selector]++) invalid()
+            if (!route_workspace || !route_project || length(route_workspace) > 512 || length(route_project) > 512 || route_workspace !~ /^[a-z0-9][a-z0-9._-]*$/ || route_project !~ /^[a-z0-9][a-z0-9._-]*$/) invalid()
+            if (route_identity_style && route_identity_style != "path" && route_identity_style != "host_path") invalid()
+            if (route_aliases && !aliases_valid(route_aliases)) invalid()
+            if (kind == "identity") {
+                host=selector; sub(/\/.*/,"",host)
+                if (selector != tolower(selector) || selector !~ /^[a-z0-9.-]+(\/[a-z0-9._-]+)+$/ || host ~ /^\./ || host ~ /\.$/ || identity_seen[selector]++) invalid()
+                if (selector == identity) { identity_found = 1; identity_ws = route_workspace; identity_pr = route_project; identity_style = route_identity_style; identity_aliases = route_aliases }
+            } else {
+                normalized = cleanpath(selector)
+                if (!normalized || normalized == "posix" || normalized ~ /^drive:[^/]+$/ || normalized ~ /^unc:[^/]+\/[^/]+$/ || path_seen[normalized]++) invalid()
+                target = cleanpath(cwd)
+                if (normalized == target || index(target, normalized "/") == 1) {
+                    n = split(normalized, parts, "/")
+                    if (n > best_depth) { best_depth=n; best_ws=route_workspace; best_pr=route_project; best_style=route_identity_style; best_aliases=route_aliases; tie=0 }
+                    else if (n == best_depth) tie=1
+                }
+            }
+            kind=""; selector=""; route_workspace=""; route_project=""; route_identity_style=""; route_aliases=""; delete field_seen
+        }
+        BEGIN { count=0; bad=0; best_depth=0; tie=0 }
+        {
+            line=$0; sub(/\r$/, "", line)
+            if (match(line, /^[[:space:]]*\[routes\.(identity|path)\."[^"\\]+"\][[:space:]]*$/)) {
+                saw_route=1; finish(); header=line; sub(/^[[:space:]]*\[routes\./,"",header); kind=substr(header,1,index(header,".")-1); selector=header; sub(/^[^.]+\."/,"",selector); sub(/"\][[:space:]]*$/,"",selector); next
+            }
+            if (line ~ /^[[:space:]]*\[routes/ || line ~ /^[[:space:]]*routes[[:space:]]*=/ || line ~ /^[[:space:]]*routes\./ || line ~ /^[[:space:]]*route_[A-Za-z0-9_]+[[:space:]]*=/) {
+                saw_route=1
+                if (!kind || line ~ /^[[:space:]]*\[/) { finish(); invalid(); next }
+                key=line; sub(/^[[:space:]]*/,"",key); sub(/[[:space:]]*=.*/,"",key)
+                if (field_seen[key]++) { invalid(); next }
+                value=line; sub(/^[^=]*=[[:space:]]*/,"",value)
+                if (key == "route_aliases") { if (!aliases_valid(value)) invalid(); route_aliases=value }
+                else {
+                    if (length(value) > 514 || value ~ /\\/ || value !~ /^"[^"]+"[[:space:]]*$/) { invalid(); next }
+                    sub(/^"/,"",value); sub(/"[[:space:]]*$/,"",value)
+                    if (length(value) > 512) { invalid(); next }
+                    if (key == "route_workspace") route_workspace=value
+                    else if (key == "route_project") route_project=value
+                    else if (key == "route_identity_style") route_identity_style=value
+                    else invalid()
+                }
+                next
+            }
+            if (line ~ /^[[:space:]]*\[/) { finish(); next }
+            if (kind && line !~ /^[[:space:]]*(#|$)/) invalid()
+            if (!kind && line ~ /^[[:space:]]*(workspace|project|project_strategy|drop_subagent_captures|identity|identity_style|server)[[:space:]]*=/ && line !~ /^[[:space:]]*[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*"[^"]*"[[:space:]]*$/) root_bad=1
+        }
+        END { finish(); if (saw_route && (bad || root_bad || tie)) print "invalid"; else if (identity_found) print identity_ws "\034" identity_pr "\034" identity_style "\034" identity_aliases; else if (best_depth) print best_ws "\034" best_pr "\034" best_style "\034" best_aliases }
+    ' "$_ai_hr_file" | tail -n 1
+}
+
+ai_memory_aliases_json_value() {
+    _ai_alias_tmp=$(mktemp "${TMPDIR:-/tmp}/ai-memory-aliases.XXXXXX") || return 0
+    printf 'aliases = %s\n' "$1" >"$_ai_alias_tmp"
+    ai_memory_aliases_json "$_ai_alias_tmp"
+    rm -f "$_ai_alias_tmp"
+}
+
 ai_memory_aliases_json() {
     [ -f "$1" ] || return 0
     _ai_alias_body=$(LC_ALL=C awk '
@@ -495,6 +609,16 @@ ai_memory_aliases_json() {
     printf '%s]' "$_ai_alias_json"
 }
 
+ai_memory_git_remote_identity() {
+    [ -n "$1" ] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+    for _ai_gri_remote in upstream origin; do
+        _ai_gri_url=$(git -C "$1" config --get "remote.$_ai_gri_remote.url" 2>/dev/null) || continue
+        _ai_gri_value=$(ai_memory_normalize_remote "$_ai_gri_url")
+        [ -n "$_ai_gri_value" ] && { printf '%s' "$_ai_gri_value"; return 0; }
+    done
+}
+
 # Print `&identity=<v>&identity_src=<rung>` for the checkout at "$1", or
 # nothing. "$2" is the marker's `identity`, "$3" its declared `project`, "$4"
 # its `identity_style`, forwarded only with a remote identity.
@@ -510,17 +634,11 @@ ai_memory_identity_qs() {
         return 0
     fi
     [ -z "$_ai_id_aliases" ] && [ -n "$(printf '%s' "$_ai_id_project" | tr -d '[:space:]')" ] && return 0
-    [ -n "$_ai_id_cwd" ] || return 0
-    command -v git >/dev/null 2>&1 || return 0
-    for _ai_id_remote in upstream origin; do
-        _ai_id_url=$(git -C "$_ai_id_cwd" config --get "remote.$_ai_id_remote.url" 2>/dev/null) || continue
-        _ai_id_value=$(ai_memory_normalize_remote "$_ai_id_url")
-        if [ -n "$_ai_id_value" ]; then
-            printf '&identity=%s&identity_src=git_remote' "$(ai_memory_url_encode "$_ai_id_value")"
-            ai_memory_identity_style_qs "$_ai_id_style"
-            return 0
-        fi
-    done
+    _ai_id_value=$(ai_memory_git_remote_identity "$_ai_id_cwd")
+    if [ -n "$_ai_id_value" ]; then
+        printf '&identity=%s&identity_src=git_remote' "$(ai_memory_url_encode "$_ai_id_value")"
+        ai_memory_identity_style_qs "$_ai_id_style"
+    fi
 }
 
 # Build a query-string suffix from "$1" plus any marker file walked up from
@@ -542,6 +660,7 @@ ai_memory_marker_qs() {
     pr=""
     st=""
     ds=""
+    dg=""
     # Provenance of `pr`, forwarded as `project_src` so the server can tell a
     # deliberate marker rescope from a host-derived repo-root name. Only the
     # latter may yield to session-sticky attribution (#394).
@@ -551,18 +670,42 @@ ai_memory_marker_qs() {
     pcon=""
     pcons=""
     aliases=""
+    routed=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
     # capture-only marker (e.g. one that only sets ignore_paths) must not
     # shadow an outer marker's workspace/project/etc.
     marker=$(ai_memory_find_settings_marker "$cwd")
+    ai_memory_home
+    home_marker=""
+    [ -n "$_amhome" ] && [ -f "$_amhome/.ai-memory.toml" ] && home_marker="$_amhome/.ai-memory.toml"
+    if [ -z "$marker" ] || [ "$marker" = "$home_marker" ]; then
+        route_identity=$(ai_memory_git_remote_identity "$cwd")
+        route=$(ai_memory_home_route "$home_marker" "$cwd" "$route_identity")
+        if [ "$route" = "invalid" ]; then
+            printf '%s' '&ai_memory_invalid_home_routes=1'
+            return 0
+        fi
+        if [ -n "$route" ]; then
+            old_ifs=$IFS; IFS=$(printf '\034')
+            set -- $route
+            IFS=$old_ifs
+            ws=$1; pr=$2; isty=${3:-}; route_aliases=${4:-}; ps=marker; routed=1
+            [ -n "$route_aliases" ] && aliases=$(ai_memory_aliases_json_value "$route_aliases")
+            marker="$home_marker"
+            if [ -n "$route_identity" ]; then
+                iq="&identity=$(ai_memory_url_encode "$route_identity")&identity_src=git_remote$(ai_memory_identity_style_qs "$isty")"
+            fi
+        fi
+    fi
     if [ -n "$marker" ]; then
-        ws=$(ai_memory_parse_toml_key "$marker" workspace)
-        pr=$(ai_memory_parse_toml_key "$marker" project)
-        st=$(ai_memory_parse_toml_key "$marker" project_strategy)
+        [ -n "$routed" ] || ws=$(ai_memory_parse_toml_key "$marker" workspace)
+        [ -n "$routed" ] || pr=$(ai_memory_parse_toml_key "$marker" project)
+        [ -n "$routed" ] || st=$(ai_memory_parse_toml_key "$marker" project_strategy)
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
-        idn=$(ai_memory_parse_toml_key "$marker" identity)
-        isty=$(ai_memory_parse_toml_key "$marker" identity_style)
-        aliases=$(ai_memory_aliases_json "$marker")
+        dg=$(ai_memory_parse_toml_flag "$marker" default_global)
+        [ -n "$routed" ] || idn=$(ai_memory_parse_toml_key "$marker" identity)
+        [ -n "$routed" ] || isty=$(ai_memory_parse_toml_key "$marker" identity_style)
+        [ -n "$routed" ] || aliases=$(ai_memory_aliases_json "$marker")
         # `[profile] contribute` / `consume`, quoted or bare, always sent
         # explicitly once a marker resolved (0 when falsy, else 1): removing
         # the key re-enables; no marker sends nothing and the server keeps
@@ -573,7 +716,7 @@ ai_memory_marker_qs() {
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
     # the identity chain's declared-project rung means a name in the marker.
-    iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr" "$isty" "$aliases")
+    [ -n "${iq:-}" ] || iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr" "$isty" "$aliases")
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.
@@ -603,13 +746,14 @@ ai_memory_marker_qs() {
         case "$iq" in *'identity_src=git_remote'*)
             [ -n "$pr" ] || aliases=invalid
             ;;
-            *) aliases=invalid ;;
+            *) [ -n "$routed" ] && aliases="" || aliases=invalid ;;
         esac
-        qs="${qs}&aliases=$(ai_memory_url_encode "$aliases")"
+        [ -n "$aliases" ] && qs="${qs}&aliases=$(ai_memory_url_encode "$aliases")"
     fi
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     [ -n "$ds" ] && qs="${qs}&drop_subagent=$(ai_memory_url_encode "$ds")"
+    [ -n "$dg" ] && qs="${qs}&default_global=$(ai_memory_url_encode "$dg")"
     [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
     [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
     qs="${qs}$(ai_memory_managed_qs)"
@@ -770,7 +914,9 @@ ai_memory_post_hook() {
         cat >/dev/null 2>&1 || true
         return 0
     fi
-    case "$1" in *"$AI_MEMORY_SERVER_ROUTED_QS"*) cat >/dev/null; return 0 ;; esac
+    case "$1" in
+        *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) cat >/dev/null; return 0 ;;
+    esac
     _amurl=$(ai_memory_url_with_ingest_key "$1")
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')
@@ -809,7 +955,9 @@ ai_memory_post_hook() {
 # stdout (and prepended to the agent's context), so we want to avoid
 # truncating a handoff that was almost ready.
 ai_memory_get_handoff() {
-    case "$1" in *"$AI_MEMORY_SERVER_ROUTED_QS"*) return 0 ;; esac
+    case "$1" in
+        *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) return 0 ;;
+    esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
         curl -s --max-time 1.0 "$1" \

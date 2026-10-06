@@ -196,6 +196,62 @@ fails closed. Alias lookup never searches another workspace, and capture may
 rename only when `project` equals the canonical path-style name derived from
 that exact remote identity.
 
+### Operator-home routes
+
+The exact operator-home marker (`$AI_MEMORY_HOME/.ai-memory.toml`, otherwise
+`$HOME/.ai-memory.toml`, with `%USERPROFILE%` as the portable Windows fallback)
+may route many unrelated checkouts without placing a marker in each repository:
+
+```toml
+[routes.identity."github.com/acme/api"]
+route_workspace = "oss"
+route_project = "acme-api"
+route_identity_style = "path"
+route_aliases = ["main"]
+
+[routes.path."~/src/api"]
+route_workspace = "oss"
+route_project = "acme-api"
+route_aliases = ["old-api"]
+```
+
+Identity selectors must be exact normalized hostful remote identities; a
+hostless `acme/api` selector is invalid. Path selectors must be absolute or
+`~/`-relative. They are normalized lexically without resolving symlinks, support
+POSIX, Windows drive, and UNC roots, and match by path components: `/team-b`
+does not match `/team-bb`. A `~/` selector may normalize within HOME (for
+example `~/a/../b`) but is rejected if any `..` would escape above HOME;
+absolute selectors retain lexical root clamping. The longest path match wins, while an exact identity
+match wins over every path match. A reachable non-home local settings marker
+wins over all home routes. When no route matches, existing root-level settings
+in the home marker remain the fallback, followed by the installed strategy and
+existing cwd fallbacks; explicit CLI scope always wins. A matched route replaces
+only the root `workspace`, `project`, `identity`, `identity_style`, `aliases`, and
+`project_strategy` routing fields. Root `server`, `drop_subagent_captures`,
+`[recall]`, `[briefing]`, and `[profile]` settings still apply.
+
+A home route map is bounded to 64 routes, a 64 KiB file, 512 UTF-8 bytes per
+selector, and 512 UTF-8 bytes per scalar value. Its portable grammar permits
+only exact `[routes.identity."selector"]` and `[routes.path."selector"]` table
+headers followed by one declaration of each supported `route_*` field. Workspace
+and project are required; style and aliases are optional. Aliases must be a
+one-line JSON-compatible string array under the normal `MarkerAliases` limits.
+Duplicate raw selectors across either route kind, normalized duplicate paths,
+equal normalized identities, duplicate fields, multiline arrays, trailing
+commas, escapes, malformed selectors or fields, unknown route keys, invalid
+styles, and invalid aliases invalidate the whole route map rather than choosing
+a project. Recognizable route syntax includes `[routes`, `routes =`, `routes.`,
+and orphan `route_*` declarations; malformed root-only settings with none of
+those forms retain the historical line parser behavior. An invalid or oversized map never falls back to root-home scope:
+commands without a complete explicit workspace/project pair fail, while hooks
+accept the lifecycle call but drop it before spool or network. Route aliases use the same bounds and grammar as local
+marker aliases and are forwarded only with a discovered hostful git remote and
+`project_src=marker`. The `route_*` child names are deliberate: older line-based
+clients ignore them instead of treating route fields as root settings. Portable clients use `HOME`, then `USERPROFILE`; native CLI/hooks honor
+`AI_MEMORY_HOME` first. The Docker wrapper passes the host cwd, so path routes
+compare in the host namespace rather than `/work` while remote discovery may
+fall back to the mounted checkout.
+
 `project_strategy` accepts `repo-root` (or `repo_root`) only. Unknown
 values are ignored and behave like the default `basename(cwd)` strategy.
 

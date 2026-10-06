@@ -773,6 +773,18 @@ impl RuntimeEnv {
     }
 
     #[cfg(test)]
+    pub fn with_host_cwd_and_home_for_tests(
+        host_cwd: impl Into<String>,
+        home_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            host_cwd: Some(host_cwd.into()),
+            home_dir: Some(home_dir.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub fn with_openai_api_key_for_tests(api_key: impl Into<String>) -> Self {
         Self {
             openai_api_key: Some(SecretString::from(api_key.into())),
