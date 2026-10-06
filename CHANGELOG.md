@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook router's checkpoint-fallback warning now carry a stable `class`/`status`
   summary (for example `class=provider status=400`) instead of the error's
   `Display`, which for a provider failure includes the upstream response
-  body. Other error surfaces are unchanged. (#PRNUM)
+  body. Other error surfaces are unchanged. (#1103)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 
