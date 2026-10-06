@@ -373,6 +373,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Confined wiki reads, writes, indexing, recovery, and lifecycle cleanup to real
   project-tree directories by refusing symbolic links and filesystem reparse
   points at namespace roots or descendants. (#1107)
+- Fixed the web page view omitting heading IDs, preventing `#anchor` fragments
+  and section wikilinks from scrolling to target headings. The Markdown renderer
+  now emits unique, slugified `id` attributes on heading elements (`<h1>`–`<h6>`),
+  disambiguating duplicate headings and stripping punctuation. (#1105)
 - Fixed a later hook event carrying a managed-run id linking its native session
   to that run without the checks SessionStart applies. It now links only from
   the run's own project and operator; an event from elsewhere is still captured
