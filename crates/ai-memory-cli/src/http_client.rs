@@ -395,47 +395,34 @@ fn build_url_with_query(
 }
 
 /// Turn a low-level reqwest connect/timeout error into a friendlier
-/// message that surfaces the resolved server URL. The common case is
-/// "Connection refused" — typically because the CLI defaulted to
-/// loopback on a host that has no local server running.
+/// message that surfaces the resolved server URL. The common cases are
+/// "Connection refused" and a connect that never completes: on Windows a
+/// closed loopback port is routinely dropped (timed out) by the firewall
+/// instead of being refused, and both mean the same operator problem —
+/// the CLI defaulted to (or was pointed at) an endpoint where nothing
+/// answered.
 pub(crate) fn augment_connect_error(
     err: reqwest::Error,
     endpoint: &ServerEndpoint,
     url: &str,
 ) -> anyhow::Error {
-    // Walk the source chain to see if there's a Connection-refused
-    // io::Error buried somewhere. reqwest wraps its errors deeply.
-    let chain_contains_refused = {
-        let mut src: Option<&dyn std::error::Error> = Some(&err);
-        let mut found = false;
-        while let Some(e) = src {
-            if e.to_string().contains("Connection refused")
-                || e.to_string().contains("connection refused")
-            {
-                found = true;
-                break;
-            }
-            src = e.source();
-        }
-        found
-    };
-
-    if chain_contains_refused {
+    if error_chain_indicates_no_answer(&err) {
         let hint = if endpoint.url_configured {
             format!(
-                "\nAI_MEMORY_SERVER_URL is set to {} but nothing answered. \
-                 Check the server is running, the port is reachable from \
-                 this host, and (if remote) any firewall + bearer-token \
-                 config matches.",
+                "\nAI_MEMORY_SERVER_URL is set to {} but nothing answered \
+                 (refused or timed out). Check the server is running, the \
+                 port is reachable from this host, and (if remote) any \
+                 firewall + bearer-token config matches.",
                 endpoint.url
             )
         } else {
             format!(
                 "\nAI_MEMORY_SERVER_URL is NOT set; the CLI defaulted to \
-                 {} and nothing answered. If your server lives on another \
-                 machine (e.g. a homelab), `export AI_MEMORY_SERVER_URL=\
-                 http://<server>:49374` and (if auth is on) \
-                 `export AI_MEMORY_AUTH_TOKEN=<token>` before re-running.",
+                 {} and nothing answered (refused or timed out). If your \
+                 server lives on another machine (e.g. a homelab), `export \
+                 AI_MEMORY_SERVER_URL=http://<server>:49374` and (if auth \
+                 is on) `export AI_MEMORY_AUTH_TOKEN=<token>` before \
+                 re-running.",
                 endpoint.url
             )
         };
@@ -443,6 +430,38 @@ pub(crate) fn augment_connect_error(
     } else {
         anyhow::Error::new(err).context(format!("HTTP request to {url} failed"))
     }
+}
+
+/// Whether an error chain means "nothing answered at the transport
+/// layer": reqwest classified it as a connect-phase or timeout failure,
+/// or a `ConnectionRefused`/`TimedOut` io::Error — or its platform
+/// wording — is buried in the source chain. reqwest wraps its errors
+/// deeply, and matching only an explicit RST would hide the diagnosis
+/// from exactly the hosts (windows-latest among them) whose firewalls
+/// turn a refused loopback connect into a silent timeout.
+fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(req) = err.downcast_ref::<reqwest::Error>()
+        && (req.is_connect() || req.is_timeout())
+    {
+        return true;
+    }
+    let mut src: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = src {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            )
+        {
+            return true;
+        }
+        let wording = e.to_string().to_ascii_lowercase();
+        if wording.contains("connection refused") || wording.contains("timed out") {
+            return true;
+        }
+        src = e.source();
+    }
+    false
 }
 
 /// Outcome of a server reachability probe: did anything answer on the
@@ -866,6 +885,84 @@ mod tests {
             message.contains(&endpoint.url),
             "the diagnosis names the resolved server URL: {message}"
         );
+    }
+
+    /// A connect that is accepted but never answered ends as a reqwest
+    /// timeout — the variant windows-latest produces when its firewall
+    /// drops a loopback connect instead of refusing it. The operator
+    /// problem ("nothing at this URL") is identical to a refusal, so the
+    /// diagnosis must be too.
+    #[tokio::test]
+    async fn probe_timeout_error_carries_the_same_reachability_diagnosis() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept connections and hold them open without answering: the
+            // client's only way out is its own timeout.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+
+        let ServerProbe::Unreachable(error) =
+            probe_server_with_timeout(&endpoint, Duration::from_millis(150)).await
+        else {
+            panic!("an accept-and-hold socket must end Unreachable via the probe timeout");
+        };
+        assert!(
+            error.is_timeout(),
+            "accept-and-hold must produce the timeout variant, got: {error}"
+        );
+        let url = endpoint.build_url("/workstream/runs");
+        let augmented = augment_connect_error(error, &endpoint, &url);
+        let message = format!("{augmented:#}");
+        assert!(
+            message.contains("could not reach"),
+            "the timeout variant must keep the reachability diagnosis: {message}"
+        );
+        assert!(
+            message.contains(&endpoint.url),
+            "the diagnosis names the resolved server URL: {message}"
+        );
+    }
+
+    /// The no-answer detection must recognize every platform's wording of
+    /// "nothing answered": the typed io kinds, and the free-text variants
+    /// hyper buries below reqwest on each OS. windows-latest says
+    /// "operation timed out (os error 10060)" where Linux says
+    /// "Connection refused (os error 111)".
+    #[test]
+    fn no_answer_detection_covers_refused_and_timeout_wording() {
+        #[derive(Debug)]
+        struct Wrapped(&'static str);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Wrapped {}
+
+        assert!(error_chain_indicates_no_answer(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(error_chain_indicates_no_answer(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(error_chain_indicates_no_answer(&Wrapped(
+            "error sending request for url (http://127.0.0.1:49374/healthz): operation timed \
+             out (os error 10060)"
+        )));
+        assert!(error_chain_indicates_no_answer(&Wrapped(
+            "error sending request for url (http://127.0.0.1:49374/healthz): Connection refused \
+             (os error 111)"
+        )));
+        // Unrelated transport failures keep the generic HTTP-failure
+        // message: a decode error answered, it did not go unanswered.
+        assert!(!error_chain_indicates_no_answer(&Wrapped(
+            "error decoding response body"
+        )));
     }
 
     /// A server that answers 404 for `/healthz` (older than the route) is
