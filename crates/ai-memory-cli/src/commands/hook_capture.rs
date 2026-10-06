@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::commands::path_util::home_dir;
 use crate::marker::{
-    find_marker, find_settings_marker, is_truthy, parse_toml_flag, parse_toml_key,
-    repo_root_project,
+    RoutingSelection, RoutingSource, find_marker, find_settings_marker, is_truthy, parse_toml_flag,
+    parse_toml_key, repo_root_project, routing_selection,
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{
@@ -403,8 +403,7 @@ impl HookScope {
 /// Inspect the same marker, worktree and repository identity as hook routing.
 #[must_use]
 pub fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
-    let marker = find_settings_marker(cwd);
-    hook_scope_from_marker(cwd, default_strategy, marker.as_deref())
+    hook_scope_from_selection(cwd, default_strategy, routing_selection(cwd).ok().flatten())
 }
 
 pub(crate) fn inspect_repository_coordinate(
@@ -418,11 +417,13 @@ pub(crate) fn inspect_repository_coordinate(
     } else {
         marker.fields.project.as_deref()
     };
-    let repository = repository_identity(
-        identity_cwd,
-        marker.fields.identity.as_deref(),
-        declared_project,
-    );
+    let repository = marker.route_identity.clone().or_else(|| {
+        repository_identity(
+            identity_cwd,
+            marker.fields.identity.as_deref(),
+            declared_project,
+        )
+    });
     let identity_style = repository.as_ref().and_then(|identity| {
         (identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote).then(
             || {
@@ -456,6 +457,9 @@ pub(crate) fn inspect_repository_coordinate(
                 .as_ref()
                 .and_then(ai_memory_core::repository_identity::legacy_basename_name),
             messages: match marker.status {
+                "invalid_home_routes" => {
+                    vec!["invalid home route map; marker routing was refused".to_owned()]
+                }
                 "invalid" => vec!["invalid marker TOML; marker routing was ignored".to_owned()],
                 "unreadable" => vec!["unreadable marker; marker routing was ignored".to_owned()],
                 "conflicting" => {
@@ -469,32 +473,45 @@ pub(crate) fn inspect_repository_coordinate(
     }
 }
 
-fn hook_scope_from_marker(
+fn hook_scope_from_selection(
     cwd: &str,
     default_strategy: Option<&str>,
-    marker: Option<&Path>,
+    selection: Option<RoutingSelection>,
 ) -> HookScope {
-    let mut workspace = None;
-    let mut project = None;
-    let mut strategy = None;
-    let mut explicit_identity = None;
-    let mut style = None;
-    let mut aliases = None;
-    if let Some(marker) = marker {
-        workspace = parse_toml_key(marker, "workspace");
-        project = parse_toml_key(marker, "project");
-        strategy = parse_toml_key(marker, "project_strategy");
-        explicit_identity = parse_toml_key(marker, "identity");
-        style = parse_toml_key(marker, "identity_style");
-        aliases = match crate::marker::parse_toml_aliases(marker) {
-            Ok(Some(aliases)) if !aliases.is_empty() => serde_json::to_string(&aliases).ok(),
-            Ok(_) => None,
-            Err(_) => Some("invalid".to_owned()),
-        };
-    }
+    let workspace = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.workspace.clone());
+    let mut project = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.project.clone());
+    let mut strategy = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.project_strategy.clone());
+    let explicit_identity = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.identity.clone());
+    let style = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.identity_style.clone());
+    let mut aliases =
+        selection
+            .as_ref()
+            .and_then(|selection| match selection.fields.aliases.clone() {
+                Ok(Some(aliases)) if !aliases.is_empty() => serde_json::to_string(&aliases).ok(),
+                Ok(_) => None,
+                Err(_) => Some("invalid".to_owned()),
+            });
     let canonical_project = project.clone();
+    let routed = selection.as_ref().is_some_and(|selection| {
+        matches!(
+            selection.source,
+            RoutingSource::HomeIdentityRoute | RoutingSource::HomePathRoute
+        )
+    });
     let mut project_src = project.as_ref().map(|_| "marker");
-    let identity = if aliases.is_none() {
+    let identity = if routed {
+        selection.and_then(|selection| selection.remote_identity)
+    } else if aliases.is_none() {
         repository_identity(cwd, explicit_identity.as_deref(), project.as_deref())
     } else {
         repository_identity(cwd, None, None).filter(|identity| {
@@ -502,11 +519,16 @@ fn hook_scope_from_marker(
         })
     };
     if aliases.is_some()
-        && (canonical_project.is_none()
-            || identity.as_ref().is_none_or(|identity| {
-                identity.source != ai_memory_core::repository_identity::IdentitySource::GitRemote
-            }))
+        && identity.as_ref().is_none_or(|identity| {
+            identity.source != ai_memory_core::repository_identity::IdentitySource::GitRemote
+        })
     {
+        aliases = if routed {
+            None
+        } else {
+            Some("invalid".to_owned())
+        };
+    } else if aliases.is_some() && canonical_project.is_none() {
         aliases = Some("invalid".to_owned());
     }
     if strategy.is_none() {
@@ -568,9 +590,22 @@ fn marker_query_suffix_impl(
     default_strategy: Option<&str>,
     include_briefing: bool,
 ) -> String {
+    let selection = match routing_selection(cwd) {
+        Ok(selection) => selection,
+        Err(_) => return String::new(),
+    };
+    marker_query_suffix_impl_from_selection(cwd, default_strategy, include_briefing, selection)
+}
+
+fn marker_query_suffix_impl_from_selection(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    include_briefing: bool,
+    selection: Option<RoutingSelection>,
+) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
-    let marker = find_settings_marker(cwd);
-    let scope = hook_scope_from_marker(cwd, default_strategy, marker.as_deref());
+    let marker = selection.as_ref().map(|selection| selection.path.clone());
+    let scope = hook_scope_from_selection(cwd, default_strategy, selection);
     let (mut drop_subagent, mut default_global) = (None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
     let (mut profile_contribute, mut profile_consume) = (None, None);
@@ -1407,6 +1442,87 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
         assert!(!qs.contains("identity"), "{qs}");
+    }
+
+    #[test]
+    fn matched_home_route_keeps_root_behavior_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("src/api/lib");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "workspace=\"wrong\"\nproject=\"wrong\"\nproject_strategy=\"repo-root\"\ndrop_subagent_captures=\"true\"\n[recall]\ndefault_global=true\n[briefing]\ninject_on_session_start=true\nmax_chars=3210\n[profile]\ncontribute=true\nconsume=false\n[routes.path.\"~/src/api\"]\nroute_workspace=\"right\"\nroute_project=\"api\"\n",
+        )
+        .unwrap();
+        let selection = super::super::super::marker::routing_selection_with_home(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap();
+        let query =
+            marker_query_suffix_impl_from_selection(repo.to_str().unwrap(), None, true, selection);
+        for expected in [
+            "&workspace=right",
+            "&project=api",
+            "&drop_subagent=true",
+            "&default_global=true",
+            "&briefing=true",
+            "&briefing_budget=3210",
+            "&profile_contribute=1",
+            "&profile_consume=0",
+        ] {
+            assert!(query.contains(expected), "{expected}: {query}");
+        }
+        assert!(!query.contains("project_strategy="), "{query}");
+        assert!(!query.contains("workspace=wrong"), "{query}");
+    }
+
+    #[test]
+    fn non_git_home_path_route_omits_aliases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("src/api");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "[routes.path.\"~/src/api\"]\nroute_workspace=\"path\"\nroute_project=\"api\"\nroute_aliases=[\"old-api\"]\n",
+        )
+        .unwrap();
+        let selection = super::super::super::marker::routing_selection_with_home(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap();
+        let query =
+            marker_query_suffix_impl_from_selection(repo.to_str().unwrap(), None, false, selection);
+        assert!(query.contains("&workspace=path&project=api"), "{query}");
+        assert!(!query.contains("aliases="), "{query}");
+        assert!(!query.contains("identity_src="), "{query}");
+    }
+
+    #[test]
+    fn invalid_home_routes_produce_no_hook_scope_or_query() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "workspace=\"wrong\"\nproject=\"wrong\"\n[routes.path.\"relative\"]\nroute_workspace=\"route\"\nroute_project=\"route\"\n",
+        )
+        .unwrap();
+        let result = super::super::super::marker::routing_selection_with_home(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            Some(&home),
+            false,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

@@ -153,7 +153,7 @@ mod slow {
         );
         assert_eq!(
             report["project_coordinate"]["local"]["marker_status"],
-            "absent"
+            "bypassed_explicit_scope"
         );
         assert_eq!(report["identity"]["version"], env!("CARGO_PKG_VERSION"));
 
@@ -369,6 +369,96 @@ mod slow {
         );
 
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn invalid_home_routes_refuse_before_any_server_request_but_explicit_pair_bypasses() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project cwd");
+        fs::write(
+            home.path().join(".ai-memory.toml"),
+            "workspace=\"fallback\"\nproject=\"fallback\"\n[routes.path.\"~/..\"]\nroute_workspace=\"bad\"\nroute_project=\"bad\"\n",
+        )
+        .unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "unexpected request",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let first_data_dir = data_dir.path().to_path_buf();
+        let first_home = home.path().to_path_buf();
+        let first_cwd = project.path().to_path_buf();
+        let first_base = base.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            hermetic(BIN)
+                .args(["doctor", "--json"])
+                .env("AI_MEMORY_DATA_DIR", first_data_dir)
+                .env("AI_MEMORY_HOME", first_home)
+                .env("AI_MEMORY_SERVER_URL", first_base)
+                .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+                .current_dir(first_cwd)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid home route map"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let second_data_dir = data_dir.path().to_path_buf();
+        let second_home = home.path().to_path_buf();
+        let second_cwd = project.path().to_path_buf();
+        let explicit = tokio::task::spawn_blocking(move || {
+            hermetic(BIN)
+                .args([
+                    "doctor",
+                    "--workspace",
+                    WORKSPACE,
+                    "--project",
+                    PROJECT,
+                    "--json",
+                ])
+                .env("AI_MEMORY_DATA_DIR", second_data_dir)
+                .env("AI_MEMORY_HOME", second_home)
+                .env("AI_MEMORY_SERVER_URL", base)
+                .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+                .current_dir(second_cwd)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            requests.load(Ordering::SeqCst) > 0,
+            "explicit scope must reach the server"
+        );
+        assert!(
+            !explicit.status.success(),
+            "the deliberately failing server remains observable"
+        );
+        server.abort();
     }
 
     #[tokio::test]

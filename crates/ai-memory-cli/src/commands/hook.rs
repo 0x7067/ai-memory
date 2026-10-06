@@ -701,6 +701,9 @@ where
     let marker_present = policy_cwd
         .as_deref()
         .is_some_and(|cwd| crate::marker::find_marker(cwd).is_some());
+    let routing_valid = policy_cwd
+        .as_deref()
+        .is_none_or(|cwd| crate::marker::routing_selection(cwd).is_ok());
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
@@ -719,6 +722,7 @@ where
             Some(_) => "server-derived",
         };
         let policy_admits_capture = admits_capture
+            && routing_valid
             && event_admits_capture
             && !matches!(route, HookRoute::Rejected { .. })
             && scope_resolution != "partial"
@@ -771,7 +775,7 @@ where
     // is `None` for UserPromptSubmit, SessionStart/End and Stop, so gating via
     // `CaptureDisposition` alone would still spool prompt text from an
     // opted-out repository while reporting it as excluded.
-    if !admits_capture {
+    if !admits_capture || !routing_valid {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }

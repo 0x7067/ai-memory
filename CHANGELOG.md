@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added bounded install-wide identity and component-safe path routes in the exact
+  operator-home `.ai-memory.toml`. Exact hostful repository identity wins the
+  longest lexical path route, local non-home markers stay authoritative, aliases
+  reuse the existing identity-bound marker wire, and malformed or ambiguous route
+  maps fail closed across native, shell, PowerShell, generated TypeScript, and
+  OpenClaw clients. Recognizable malformed route syntax is rejected before
+  fallback, while malformed root-only settings retain legacy parsing. Generated
+  clients preserve marker versus repo-root provenance, and OpenClaw keeps local
+  git identity discovery alias-gated. The default identity style remains
+  unchanged. (#1033)
 - Added bounded local `.ai-memory.toml` `aliases = ["former-name"]` routing for
   existing project-coordinate compatibility. Native, POSIX shell, PowerShell,
   and generated TypeScript hook clients forward the same validated aliases for

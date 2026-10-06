@@ -291,7 +291,15 @@ project. #1033 makes a remote-derived key the default name, landing in steps on
    identity to match the stored row; reads do not rename, while capture may use
    only the Phase 1 write-authorized canonical promotion. Alias lists are
    transient routing hints, not persisted rows, and stay supported after v3.
-6. Identity- or path-keyed blocks in `~/.ai-memory.toml` remain a later phase.
+6. **Operator-home routes (landed).** The exact operator-home
+   `.ai-memory.toml` accepts bounded namespaced identity and path tables. Exact
+   normalized hostful identity wins the longest component-safe lexical path;
+   local non-home settings markers win both. Route project names are canonical,
+   route aliases reuse the Phase 3 wire only with remote identity plus marker
+   provenance, malformed or ambiguous maps fail closed, and old line parsers
+   ignore the deliberately prefixed `route_*` child fields. Native callers use
+   `AI_MEMORY_HOME` first; portable clients use `HOME`/`USERPROFILE`, and Docker
+   compares the forwarded host cwd. The default remains `IdentityStyle::HostPath`.
 
 
 Paths stay lexically normalised throughout; nothing canonicalises.

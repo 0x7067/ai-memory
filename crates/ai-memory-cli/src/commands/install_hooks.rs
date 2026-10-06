@@ -3888,8 +3888,12 @@ function findSettingsMarker(cwd: string | undefined): string | undefined {
     const marker = join(dir, ".ai-memory.toml");
     if (existsSync(marker)) {
       try {
-        if (declaresSettings(readFileSync(marker, "utf8"))) return marker;
+        const text = marker === join(home, ".ai-memory.toml")
+          ? readHomeRouteText(marker)
+          : readFileSync(marker, "utf8");
+        if (declaresSettings(text)) return marker;
       } catch (_e) {
+        return marker;
       }
     }
     if (boundary && dir === boundary) return undefined;
@@ -3898,69 +3902,42 @@ function findSettingsMarker(cwd: string | undefined): string | undefined {
   return undefined;
 }"#;
 
-/// Emit the `applyMarkerParams` TypeScript function shared verbatim by the
-/// OpenCode plugin and the OMP extension.
+/// Emit the `applyMarkerParams` TypeScript function shared by generated
+/// integrations.
 ///
-/// `None` reproduces the historical marker-only function byte-for-byte, so
-/// existing generated files and golden tests are unchanged. `Some(default)`
-/// prepends a `DEFAULT_PROJECT_STRATEGY` const and emits a variant that applies
-/// that install-time default when no marker pins a `project_strategy` (#128).
-/// A marker's own `project` / `project_strategy` still take precedence (§3.3),
-/// and repo-root is resolved host-side via `repoRootProject`.
+/// An install-time default applies only when no marker pins a
+/// `project_strategy` (#128). A marker's own `project` / `project_strategy`
+/// still take precedence (§3.3), and repo-root is resolved host-side via
+/// `repoRootProject`.
 ///
 /// Scope/settings resolution walks past a capture-only marker to the nearest
 /// ancestor marker that declares a setting (#668) via `findSettingsMarker`,
-/// emitted alongside this function.
-fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
-    let Some(default) = default_strategy else {
-        return format!(
-            "{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{TS_IDENTITY}\n{}",
-            r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
-  const managedRun = process.env.AI_MEMORY_RUN_ID;
-  if (managedRun) url.searchParams.set("managed_run", managedRun);
-  const marker = findSettingsMarker(cwd);
-  if (!marker || !cwd) {
-    applyIdentityParams(url, cwd, undefined, undefined, undefined, undefined);
-    return;
-  }
-  url.searchParams.set("cwd", cwd);
-  try {
-    const body = readFileSync(marker, "utf8");
-    const workspace = tomlKey(body, "workspace");
-    const project = tomlKey(body, "project");
-    const aliases = markerAliases(body);
-    const remoteIdentity = applyIdentityParams(url, cwd, tomlKey(body, "identity"), project, tomlKey(body, "identity_style"), aliases);
-    if (aliases) url.searchParams.set("aliases", project && remoteIdentity ? aliases : "invalid");
-    const projectStrategy = tomlKey(body, "project_strategy");
-    const dropSubagent = tomlKey(body, "drop_subagent_captures");
-    const defaultGlobal = tomlFlag(body, "default_global");
-    const briefing = tomlFlag(body, "inject_on_session_start");
-    const briefingBudget = tomlFlag(body, "max_chars");
-    const profileContribute = profileFlag(tomlFlag(body, "contribute"));
-    const profileConsume = profileFlag(tomlFlag(body, "consume"));
-    if (workspace) url.searchParams.set("workspace", workspace);
-    if (project) url.searchParams.set("project", project);
-    if (project) url.searchParams.set("project_src", "marker");
-    if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
-    if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
-    if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
-    if (briefing) url.searchParams.set("briefing", briefing);
-    if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
-    if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
-    if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
-    if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
-      const repoProject = repoRootProject(cwd);
-      if (repoProject) url.searchParams.set("project", repoProject);
-    }
-  } catch (_e) {
-  }
-}"#
-        );
+/// emitted alongside this function. `discover_local_identity` controls whether
+/// an ordinary local marker may inspect git identity; aliases still request it,
+/// and operator-home routes always discover identity for route matching.
+pub(crate) fn ts_apply_marker_params(
+    default_strategy: Option<&str>,
+    discover_local_identity: bool,
+) -> String {
+    let default_line = default_strategy.map_or_else(String::new, |default| {
+        format!(
+            "const DEFAULT_PROJECT_STRATEGY = {};\n",
+            ts_string_literal(default)
+        )
+    });
+    let apply_default = default_strategy.map_or(
+        "",
+        |_| "if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;",
+    );
+    let apply_identity = if discover_local_identity {
+        "const remoteIdentity = applyIdentityParams(url, cwd, explicitIdentity, project, identityStyle, aliases);"
+    } else {
+        "const remoteIdentity = aliases ? applyIdentityParams(url, cwd, undefined, project, identityStyle, aliases) : false;"
     };
-    let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
+    let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): boolean {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
-  if (!cwd) return;
+  if (!cwd) return true;
   url.searchParams.set("cwd", cwd);
   let workspace: string | undefined;
   let project: string | undefined;
@@ -3974,12 +3951,47 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let explicitIdentity: string | undefined;
   let identityStyle: string | undefined;
   let aliases: string | undefined;
-  const marker = findSettingsMarker(cwd);
+  let projectSource: "marker" | "repo-root" | undefined;
+  let routed = false;
+  let marker = findSettingsMarker(cwd);
+  if (!marker || marker === join(homedir(), ".ai-memory.toml")) {
+    const homeMarker = join(homedir(), ".ai-memory.toml");
+    if (existsSync(homeMarker)) {
+      try {
+        const body = readHomeRouteText(homeMarker);
+        const routeIdentity = discoverRemoteIdentity(cwd);
+        const route = homeRoute(body, cwd, routeIdentity);
+        dropSubagent = tomlKey(body, "drop_subagent_captures");
+        defaultGlobal = tomlFlag(body, "default_global");
+        briefing = tomlFlag(body, "inject_on_session_start");
+        briefingBudget = tomlFlag(body, "max_chars");
+        profileContribute = profileFlag(tomlFlag(body, "contribute"));
+        profileConsume = profileFlag(tomlFlag(body, "consume"));
+        if (route) {
+          routed = true;
+          workspace = route.workspace;
+          project = route.project;
+          projectSource = "marker";
+          identityStyle = route.style;
+          aliases = routeIdentity ? route.aliases : undefined;
+          if (routeIdentity) {
+            url.searchParams.set("identity", routeIdentity);
+            url.searchParams.set("identity_src", "git_remote");
+            if (identityStyle === "path") url.searchParams.set("identity_style", "path");
+          }
+          marker = undefined;
+        } else marker = homeMarker;
+      } catch (_e) {
+        return false;
+      }
+    }
+  }
   if (marker) {
     try {
       const body = readFileSync(marker, "utf8");
       workspace = tomlKey(body, "workspace");
       project = tomlKey(body, "project");
+      if (project) projectSource = "marker";
       projectStrategy = tomlKey(body, "project_strategy");
       dropSubagent = tomlKey(body, "drop_subagent_captures");
       defaultGlobal = tomlFlag(body, "default_global");
@@ -3991,19 +4003,26 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       identityStyle = tomlKey(body, "identity_style");
       aliases = markerAliases(body);
     } catch (_e) {
+      return false;
     }
   }
-  // Before repo-root can fill `project`: a repo-root name is an inference.
-  const remoteIdentity = applyIdentityParams(url, cwd, explicitIdentity, project, identityStyle, aliases);
-  if (aliases) url.searchParams.set("aliases", project && remoteIdentity ? aliases : "invalid");
-  if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;
+  if (!routed) {
+    __APPLY_IDENTITY__
+    if (aliases) url.searchParams.set("aliases", project && remoteIdentity ? aliases : "invalid");
+  } else if (aliases) {
+    url.searchParams.set("aliases", aliases);
+  }
+  __DEFAULT_LINE__
   if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
     const repoProject = repoRootProject(cwd);
-    if (repoProject) project = repoProject;
+    if (repoProject) {
+      project = repoProject;
+      projectSource = "repo-root";
+    }
   }
   if (workspace) url.searchParams.set("workspace", workspace);
   if (project) url.searchParams.set("project", project);
-  if (project) url.searchParams.set("project_src", "marker");
+  if (projectSource) url.searchParams.set("project_src", projectSource);
   if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
   if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
   if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
@@ -4011,10 +4030,12 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
   if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
   if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
-}"#;
+  return true;
+}"#
+    .replace("__DEFAULT_LINE__", apply_default)
+    .replace("__APPLY_IDENTITY__", apply_identity);
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{TS_IDENTITY}\n{body}",
-        ts_string_literal(default)
+        "{default_line}{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{TS_IDENTITY}\n{TS_HOME_ROUTES}\n{body}"
     )
 }
 
@@ -4102,6 +4123,27 @@ function identityStyleParam(style: string | undefined): string | undefined {
   return style?.trim() === "path" ? "path" : undefined;
 }
 
+function discoverRemoteIdentity(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  for (const name of ["upstream", "origin"]) {
+    try {
+      const remote = execFileSync("git", ["-C", cwd, "config", "--get", `remote.${name}.url`], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const identity = normalizeRemote(remote);
+      if (identity) return identity;
+    } catch (_e) {
+    }
+  }
+  return undefined;
+}
+
+function validNormalizedIdentity(value: string): boolean {
+  const host = value.split("/", 1)[0];
+  return /^[a-z0-9.-]+(?:\/[a-z0-9._-]+)+$/.test(value) && value === value.toLowerCase() && !host.startsWith(".") && !host.endsWith(".");
+}
+
 function applyIdentityParams(
   url: URL,
   cwd: string | undefined,
@@ -4117,22 +4159,13 @@ function applyIdentityParams(
     return false;
   }
   if ((project?.trim() && !aliases) || !cwd) return false;
-  for (const name of ["upstream", "origin"]) {
-    try {
-      const remote = execFileSync("git", ["-C", cwd, "config", "--get", `remote.${name}.url`], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      const identity = normalizeRemote(remote);
-      if (identity) {
-        url.searchParams.set("identity", identity);
-        url.searchParams.set("identity_src", "git_remote");
-        const forwarded = identityStyleParam(style);
-        if (forwarded) url.searchParams.set("identity_style", forwarded);
-        return true;
-      }
-    } catch (_e) {
-    }
+  const identity = discoverRemoteIdentity(cwd);
+  if (identity) {
+    url.searchParams.set("identity", identity);
+    url.searchParams.set("identity_src", "git_remote");
+    const forwarded = identityStyleParam(style);
+    if (forwarded) url.searchParams.set("identity_style", forwarded);
+    return true;
   }
   return false;
 }"#;
@@ -4142,6 +4175,126 @@ function applyIdentityParams(
 /// true`, `max_chars = 4000`), so section-style marker keys work whether or
 /// not the operator quotes the value. Emitted next to `applyMarkerParams`
 /// in every generated TypeScript integration.
+pub(crate) const TS_HOME_ROUTES: &str = r##"type HomeRoute = { workspace: string; project: string; style?: string; aliases?: string };
+type RoutePath = { root: string; parts: string[] };
+
+function readHomeRouteText(file: string): string {
+  const expected = statSync(file).size;
+  if (expected > 65536) throw new Error("invalid home routes");
+  const fd = openSync(file, "r");
+  try {
+    const bytes = Buffer.allocUnsafe(expected + 1);
+    let count = 0;
+    while (count < bytes.length) {
+      const read = readSync(fd, bytes, count, bytes.length - count, count);
+      if (read === 0) break;
+      count += read;
+    }
+    if (count !== expected || count > 65536 || statSync(file).size !== expected) throw new Error("invalid home routes");
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, count));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function routePathParts(raw: string, home: string, bounded = true): RoutePath | undefined {
+  if (!raw || (bounded && Buffer.byteLength(raw, "utf8") > 512)) return undefined;
+  const homeRelative = raw.startsWith("~/");
+  if (homeRelative) {
+    let depth = 0;
+    for (const part of raw.slice(2).replace(/\\/g, "/").split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") { if (depth === 0) return undefined; depth--; } else depth++;
+    }
+  }
+  let value = homeRelative ? home.replace(/[\\/]+$/, "") + "/" + raw.slice(2) : raw;
+  value = value.replace(/\\/g, "/");
+  let root = "";
+  let rest = "";
+  if (value.startsWith("//")) {
+    const parts = value.slice(2).split("/").filter(Boolean);
+    if (parts.length < 2) return undefined;
+    root = `unc:${parts.shift()!.toLowerCase()}/${parts.shift()!.toLowerCase()}`;
+    rest = parts.join("/");
+  } else if (/^[A-Za-z]:\//.test(value)) {
+    root = `drive:${value[0].toLowerCase()}`;
+    rest = value.slice(3);
+  } else if (value.startsWith("/")) {
+    root = "posix";
+    rest = value.slice(1);
+  } else return undefined;
+  const parts: string[] = [];
+  for (const part of rest.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") parts.pop(); else parts.push(root === "posix" ? part : part.toLowerCase());
+  }
+  return parts.length ? { root, parts } : undefined;
+}
+
+function homeRoute(text: string, cwd: string, identity: string | undefined): HomeRoute | undefined {
+  if (Buffer.byteLength(text, "utf8") > 65536) throw new Error("invalid home routes");
+  if (!/^\s*(?:\[routes|routes\s*=|routes\.|route_)/m.test(text)) return undefined;
+  const entries: Array<{ kind: string; selector: string; fields: Record<string, string> }> = [];
+  const rawSeen = new Set<string>();
+  let current: typeof entries[number] | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const header = /^\[routes\.(identity|path)\."([^"\\]+)"\]$/.exec(trimmed);
+    if (header) {
+      if (entries.length >= 64 || Buffer.byteLength(header[2], "utf8") > 512 || rawSeen.has(header[2])) throw new Error("invalid home routes");
+      rawSeen.add(header[2]);
+      current = { kind: header[1], selector: header[2], fields: {} };
+      entries.push(current);
+      continue;
+    }
+    if (trimmed.startsWith("[routes") || trimmed.startsWith("routes.") || /^routes\s*=/.test(trimmed) || (!current && trimmed.startsWith("route_"))) throw new Error("invalid home routes");
+    if (trimmed.startsWith("[")) { current = undefined; continue; }
+    if (!current) {
+      if (/^(workspace|project|project_strategy|drop_subagent_captures|identity|identity_style|server)\s*=/.test(trimmed) && !/^[A-Za-z0-9_]+\s*=\s*"[^"]*"$/.test(trimmed)) throw new Error("invalid home routes");
+      continue;
+    }
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const field = /^(route_workspace|route_project|route_identity_style|route_aliases)\s*=\s*(.*)$/.exec(trimmed);
+    if (!field || current.fields[field[1]] !== undefined || field[2].includes("\\")) throw new Error("invalid home routes");
+    current.fields[field[1]] = field[2];
+  }
+  const parsed: Array<{ kind: string; selector: string; route: HomeRoute; path?: RoutePath }> = [];
+  const normalizedPaths = new Set<string>();
+  for (const entry of entries) {
+    const str = (name: string) => {
+      const value = /^"([^"\\]+)"$/.exec(entry.fields[name] ?? "")?.[1];
+      return value && Buffer.byteLength(value, "utf8") <= 512 ? value : undefined;
+    };
+    const workspace = str("route_workspace");
+    const project = str("route_project");
+    if (!workspace || !project || Buffer.byteLength(workspace, "utf8") > 512 || Buffer.byteLength(project, "utf8") > 512 || !/^[a-z0-9][a-z0-9._-]*$/.test(workspace) || !/^[a-z0-9][a-z0-9._-]*$/.test(project)) throw new Error("invalid home routes");
+    const style = entry.fields.route_identity_style === undefined ? undefined : str("route_identity_style");
+    if (style !== undefined && style !== "path" && style !== "host_path") throw new Error("invalid home routes");
+    let aliases: string | undefined;
+    if (entry.fields.route_aliases !== undefined) {
+      if (!/^\[[^\]]*\]$/.test(entry.fields.route_aliases) || Buffer.byteLength(entry.fields.route_aliases, "utf8") > 512) throw new Error("invalid home routes");
+      aliases = markerAliases(`aliases = ${entry.fields.route_aliases}`);
+      if (aliases === "invalid") throw new Error("invalid home routes");
+    }
+    if (entry.kind === "identity" && !validNormalizedIdentity(entry.selector)) throw new Error("invalid home routes");
+    const path = entry.kind === "path" ? routePathParts(entry.selector, homedir()) : undefined;
+    if (entry.kind === "path") {
+      if (!path) throw new Error("invalid home routes");
+      const key = `${path.root}/${path.parts.join("/")}`;
+      if (normalizedPaths.has(key)) throw new Error("invalid home routes");
+      normalizedPaths.add(key);
+    }
+    parsed.push({ kind: entry.kind, selector: entry.selector, route: { workspace, project, style, aliases }, path });
+  }
+  const exact = parsed.find((entry) => entry.kind === "identity" && entry.selector === identity);
+  if (exact) return exact.route;
+  const target = routePathParts(cwd, homedir(), false);
+  if (!target) return undefined;
+  const matches = parsed.filter((entry) => entry.kind === "path" && entry.path?.root === target.root && entry.path.parts.length <= target.parts.length && entry.path.parts.every((part, index) => part === target.parts[index]));
+  matches.sort((a, b) => b.path!.parts.length - a.path!.parts.length);
+  return matches[0]?.route;
+}"##;
+
 pub(crate) const TS_TOML_FLAG: &str = r#"function tomlFlag(text: string, key: string): string | undefined {
   const re = new RegExp(`^\\s*${key}\\s*=\\s*(?:"([^"]*)"|([^#\\s]+))`);
   for (const line of text.split(/\r?\n/)) {
@@ -4274,13 +4427,13 @@ fn add_hook_spooling(source: String) -> Result<String> {
         "async function drainHookQueue(): Promise<void> {\n  if (hookDraining) return;\n  requestSpoolDrain();",
         1,
     );
-    let import_anchor = "import { closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync } from \"node:fs\";";
+    let import_anchor = "import { closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync } from \"node:fs\";";
     if out.matches(import_anchor).count() != 1 {
         anyhow::bail!("TS integration template drifted: node:fs import anchor not unique");
     }
     out = out.replacen(
         import_anchor,
-        "import { closeSync, existsSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, unlinkSync, writeFileSync } from \"node:fs\";",
+        "import { closeSync, existsSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from \"node:fs\";",
         1,
     );
     Ok(out)
@@ -4295,7 +4448,7 @@ fn build_opencode_plugin(
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
-    let apply_marker_params = ts_apply_marker_params(project_strategy);
+    let apply_marker_params = ts_apply_marker_params(project_strategy, true);
     let capture_policy = ts_capture_policy_v1(capture_mode);
     let timeout_signal = ts_timeout_signal();
     let body = format!(
@@ -4306,7 +4459,7 @@ fn build_opencode_plugin(
 
 import type {{ Plugin }} from "@opencode-ai/plugin";
 import {{ execFileSync }} from "node:child_process";
-import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
+import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync }} from "node:fs";
 import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -4514,7 +4667,7 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   const url = new URL(`${{SERVER}}/hook`);
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
-  applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (!applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined)) return;
   const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
   if (policy.disposition === "drop") return;
   try {{
@@ -4530,7 +4683,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
   if (id) url.searchParams.set("session_id", id);
-  applyMarkerParams(url, cwd);
+  if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     const response = await fetch(url, {{
       headers: authHeaders(),
@@ -5030,7 +5183,7 @@ fn build_omp_extension(
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
-    let apply_marker_params = ts_apply_marker_params(project_strategy);
+    let apply_marker_params = ts_apply_marker_params(project_strategy, true);
     let capture_policy = ts_capture_policy_v1(capture_mode);
     let timeout_signal = ts_timeout_signal();
     let body = format!(
@@ -5040,7 +5193,7 @@ fn build_omp_extension(
 // re-run.
 
 import {{ execFileSync }} from "node:child_process";
-import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
+import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync, statSync }} from "node:fs";
 import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -5254,7 +5407,7 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   const url = new URL(`${{SERVER}}/hook`);
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
-  applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  if (!applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined)) return;
   const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
   if (policy.disposition === "drop") return;
   try {{
@@ -5270,7 +5423,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
   if (id) url.searchParams.set("session_id", id);
-  applyMarkerParams(url, cwd);
+  if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     const response = await fetch(url, {{
       headers: authHeaders(),
@@ -9575,7 +9728,7 @@ model = "gpt-5"
         // capture-only marker does not shadow an outer marker's scope.
         assert!(plugin.contains("function findSettingsMarker"));
         assert!(plugin.contains("function declaresSettings"));
-        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(plugin.contains("let marker = findSettingsMarker(cwd);"));
         assert!(plugin.contains(
             "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\", \"identity\", \"identity_style\"])"
         ));
@@ -9583,13 +9736,11 @@ model = "gpt-5"
         assert!(plugin.contains(
             "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\", \"contribute\", \"consume\"])"
         ));
-        assert!(
-            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
-        );
+        assert!(plugin.contains("if (declaresSettings(text)) return marker;"));
         assert!(plugin.contains(
-            "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
+            "if (!applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined)) return;"
         ));
-        assert!(plugin.contains("applyMarkerParams(url, cwd);"));
+        assert!(plugin.contains("if (!applyMarkerParams(url, cwd)) return undefined;"));
         assert!(plugin.contains("postPreCompact"));
         assert!(plugin.contains("dispose: async () =>"));
         assert!(plugin.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
@@ -9632,7 +9783,8 @@ model = "gpt-5"
             plugin
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
-        assert!(plugin.contains("url.searchParams.set(\"project\", repoProject)"));
+        assert!(plugin.contains("project = repoProject;"));
+        assert!(plugin.contains("projectSource = \"repo-root\";"));
     }
 
     #[test]
@@ -9909,11 +10061,12 @@ model = "gpt-5"
             "must apply the default when a marker pins no strategy: {plugin}"
         );
         assert!(
-            plugin.contains("if (repoProject) project = repoProject;"),
+            plugin.contains("project = repoProject;")
+                && plugin.contains("projectSource = \"repo-root\";"),
             "{plugin}"
         );
         assert!(
-            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            plugin.contains("let marker = findSettingsMarker(cwd);"),
             "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
         );
     }
@@ -10038,15 +10191,12 @@ model = "gpt-5"
         // not shadow an outer marker's scope for the OMP/pi extensions.
         assert!(extension.contains("function findSettingsMarker"));
         assert!(extension.contains("function declaresSettings"));
-        assert!(extension.contains("const marker = findSettingsMarker(cwd);"));
-        assert!(
-            extension
-                .contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
-        );
+        assert!(extension.contains("let marker = findSettingsMarker(cwd);"));
+        assert!(extension.contains("if (declaresSettings(text)) return marker;"));
         assert!(extension.contains(
-            "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
+            "if (!applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined)) return;"
         ));
-        assert!(extension.contains("applyMarkerParams(url, cwd);"));
+        assert!(extension.contains("if (!applyMarkerParams(url, cwd)) return undefined;"));
         assert!(extension.contains("Bearer ${token}"));
         assert!(extension.contains("tok"));
         assert!(
@@ -10064,7 +10214,8 @@ model = "gpt-5"
             extension
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
-        assert!(extension.contains("url.searchParams.set(\"project\", repoProject)"));
+        assert!(extension.contains("project = repoProject;"));
+        assert!(extension.contains("projectSource = \"repo-root\";"));
         // #676: pi/omp await session_shutdown's dispose flush instead of
         // returning immediately, so the runtime teardown that follows a sync
         // handler no longer kills the in-flight session-end fetch.
@@ -10100,7 +10251,7 @@ model = "gpt-5"
             "{extension}"
         );
         assert!(
-            extension.contains("const marker = findSettingsMarker(cwd);"),
+            extension.contains("let marker = findSettingsMarker(cwd);"),
             "the default-strategy variant must also walk past a capture-only marker (#668): {extension}"
         );
     }
@@ -12780,6 +12931,46 @@ mod identity_parity_tests {
             .collect()
     }
 
+    fn home_route_cases() -> Vec<serde_json::Value> {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../ai-memory-core/fixtures/home_route_cases.json"
+        ))
+        .unwrap();
+        cases["cases"].as_array().unwrap().clone()
+    }
+
+    fn expanded_route_case(case: &serde_json::Value, home: &std::path::Path) -> (String, String) {
+        let text = match case["generate"].as_str() {
+            Some("65_routes") => (0..65)
+                .map(|index| format!("[routes.path.\"/route/{index}\"]\nroute_workspace=\"ws\"\nroute_project=\"p{index}\"\n"))
+                .collect(),
+            Some("selector_512") => format!(
+                "[routes.path.\"/{}\"]\nroute_workspace=\"bounds\"\nroute_project=\"valid\"\n",
+                "a".repeat(511)
+            ),
+            Some("selector_513") => format!(
+                "[routes.path.\"/{}\"]\nroute_workspace=\"bounds\"\nroute_project=\"invalid\"\n",
+                "a".repeat(512)
+            ),
+            Some("oversized_file") => format!("#{}\n", "x".repeat(65_536)),
+            Some(other) => panic!("unknown route fixture generator {other}"),
+            None => case["toml"]
+                .as_str()
+                .unwrap()
+                .replace("{{HOME}}", home.to_str().unwrap())
+                .replace("{{LONG_513}}", &"a".repeat(513)),
+        };
+        let cwd = match case["cwd_generate"].as_str() {
+            Some("selector_512_child") => format!("/{}/child", "a".repeat(511)),
+            Some(other) => panic!("unknown cwd fixture generator {other}"),
+            None => case["cwd"]
+                .as_str()
+                .unwrap()
+                .replace("{{HOME}}", home.to_str().unwrap()),
+        };
+        (text, cwd)
+    }
+
     fn alias_cases() -> Vec<(String, Option<String>)> {
         let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
         cases["marker_aliases"]
@@ -13006,6 +13197,296 @@ mod identity_parity_tests {
     }
 
     #[test]
+    fn shell_home_route_runtime_fixture_agrees() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let route_home = if cfg!(windows) {
+            std::path::Path::new("C:/Users/ai-memory-test")
+        } else {
+            home.as_path()
+        };
+        for case in home_route_cases() {
+            let (text, cwd) = expanded_route_case(&case, route_home);
+            let marker = home.join(".ai-memory.toml");
+            std::fs::write(&marker, text).unwrap();
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(r#". "$1"; _amhome="$2"; ai_memory_home_route "$3" "$4" "$5""#)
+                .arg("sh")
+                .arg(repo_file("hooks/_lib.sh"))
+                .arg(route_home)
+                .arg(&marker)
+                .arg(&cwd)
+                .arg(case["identity"].as_str().unwrap_or(""))
+                .env("MSYS2_ARG_CONV_EXCL", "*")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result = String::from_utf8(output.stdout).unwrap();
+            let status = case["status"].as_str().unwrap();
+            let expected = match status {
+                "valid" => format!(
+                    "{}\u{1c}{}",
+                    case["workspace"].as_str().unwrap(),
+                    case["project"].as_str().unwrap()
+                ),
+                "invalid" => "invalid".to_owned(),
+                "none" => String::new(),
+                status => panic!("unknown fixture status {status}"),
+            };
+            assert!(
+                result.starts_with(&expected),
+                "{}: {result:?}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn portable_home_route_runtime_fixture_agrees() {
+        let strips_types = Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !strips_types {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let cases = home_route_cases();
+        let input = cases
+            .iter()
+            .map(|case| {
+                let (text, cwd) = expanded_route_case(case, &home);
+                serde_json::json!({
+                    "name": case["name"],
+                    "text": text,
+                    "cwd": cwd,
+                    "identity": case["identity"],
+                    "status": case["status"],
+                    "workspace": case["workspace"],
+                    "project": case["project"]
+                })
+            })
+            .collect::<Vec<_>>();
+        let module = tmp.path().join("home-route-fixture.ts");
+        let source = format!(
+            "import {{ closeSync, openSync, readSync, statSync }} from \"node:fs\";\nimport {{ homedir }} from \"node:os\";\nfunction markerAliases(text:string):string|undefined{{const m=/^aliases\\s*=\\s*\\[([^\\]]*)\\]\\s*$/.exec(text);if(!m)return \"invalid\";if(!m[1].trim())return undefined;const out:string[]=[];const p=m[1].split(\",\");if(p.length>16)return \"invalid\";for(const r of p){{if(r.includes(\"\\\\\"))return \"invalid\";const x=/^\\s*\"([^\"]*)\"\\s*$/.exec(r);if(!x)return \"invalid\";const v=x[1].trim();if(!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(v)||Buffer.byteLength(v)>128)return \"invalid\";if(!out.includes(v))out.push(v);}}return JSON.stringify(out);}}\nfunction validNormalizedIdentity(value:string):boolean{{const host=value.split(\"/\",1)[0];return /^[a-z0-9.-]+(?:\\/[a-z0-9._-]+)+$/.test(value)&&value===value.toLowerCase()&&!host.startsWith(\".\")&&!host.endsWith(\".\");}}\n{}\nconst cases={} as any[];for(const c of cases){{try{{const r=homeRoute(c.text,c.cwd,c.identity);process.stdout.write(`${{c.name}}:${{r?r.workspace+\"/\"+r.project:\"none\"}}\\n`);}}catch{{process.stdout.write(`${{c.name}}:invalid\\n`);}}}}",
+            super::TS_HOME_ROUTES,
+            serde_json::to_string(&input).unwrap()
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lines = String::from_utf8(output.stdout).unwrap();
+        for case in &input {
+            let expected = match case["status"].as_str().unwrap() {
+                "valid" => format!(
+                    "{}/{}",
+                    case["workspace"].as_str().unwrap(),
+                    case["project"].as_str().unwrap()
+                ),
+                status => status.to_owned(),
+            };
+            assert!(
+                lines
+                    .lines()
+                    .any(|line| line == format!("{}:{expected}", case["name"].as_str().unwrap())),
+                "{}: {lines}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn generated_typescript_applies_home_identity_route_with_alias_provenance() {
+        let strips_types = Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !strips_types {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("outside/repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["remote", "add", "origin", "git@github.com:acme/api.git"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(home.join(".ai-memory.toml"), "[routes.identity.\"github.com/acme/api\"]\nroute_workspace=\"oss\"\nroute_project=\"acme-api\"\nroute_identity_style=\"path\"\nroute_aliases=[\"main\"]\n[routes.path.\"/outside\"]\nroute_workspace=\"wrong\"\nroute_project=\"wrong\"\n").unwrap();
+        let module = tmp.path().join("home-route.ts");
+        let source = format!(
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync, readSync, statSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\n{}\n{}\nconst url=new URL(\"http://h/hook\"); applyMarkerParams(url, {}); process.stdout.write(url.search);",
+            super::TS_REPO_ROOT_PROJECT,
+            super::ts_apply_marker_params(None, true),
+            serde_json::to_string(&repo.to_string_lossy()).unwrap(),
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let query = String::from_utf8(output.stdout).unwrap();
+        assert!(query.contains("workspace=oss"), "{query}");
+        assert!(query.contains("project=acme-api"), "{query}");
+        assert!(query.contains("project_src=marker"), "{query}");
+        assert!(
+            query.contains("identity=github.com%2Facme%2Fapi"),
+            "{query}"
+        );
+        assert!(query.contains("identity_style=path"), "{query}");
+        assert!(query.contains("aliases=%5B%22main%22%5D"), "{query}");
+    }
+
+    #[test]
+    fn generated_typescript_non_git_home_path_route_omits_aliases() {
+        if !Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|out| out.status.success())
+        {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("src/api");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "[routes.path.\"~/src/api\"]\nroute_workspace=\"path\"\nroute_project=\"api\"\nroute_aliases=[\"old-api\"]\n",
+        )
+        .unwrap();
+        let module = tmp.path().join("home-route-no-remote.ts");
+        let source = format!(
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync, readSync, statSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\n{}\n{}\nconst url=new URL(\"http://h/hook\");applyMarkerParams(url,{});process.stdout.write(url.search);",
+            super::TS_REPO_ROOT_PROJECT,
+            super::ts_apply_marker_params(None, true),
+            serde_json::to_string(&repo.to_string_lossy()).unwrap(),
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let query = String::from_utf8(output.stdout).unwrap();
+        assert!(query.contains("workspace=path"), "{query}");
+        assert!(query.contains("project=api"), "{query}");
+        assert!(!query.contains("aliases="), "{query}");
+        assert!(!query.contains("identity_src="), "{query}");
+    }
+
+    #[test]
+    fn generated_typescript_default_repo_root_sets_derived_provenance() {
+        if !Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|out| out.status.success())
+        {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("derived-project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let module = tmp.path().join("repo-root-provenance.ts");
+        let source = format!(
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, openSync, readFileSync, readSync, statSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\n{}\n{}\nconst url=new URL(\"http://h/hook\");applyMarkerParams(url,{});process.stdout.write(url.search);",
+            super::TS_REPO_ROOT_PROJECT,
+            super::ts_apply_marker_params(Some("repo-root"), true),
+            serde_json::to_string(&repo.to_string_lossy()).unwrap(),
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let params = reqwest::Url::parse(&format!(
+            "http://h/hook{}",
+            String::from_utf8(output.stdout).unwrap()
+        ))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            params.get("project").map(String::as_str),
+            Some("derived-project")
+        );
+        assert_eq!(
+            params.get("project_src").map(String::as_str),
+            Some("repo-root")
+        );
+        assert_eq!(
+            params.get("project_strategy").map(String::as_str),
+            Some("repo-root")
+        );
+    }
+
+    #[test]
     fn generated_typescript_applies_marker_alias_params_together() {
         let strips_types = Command::new("node")
             .args(["--experimental-strip-types", "-e", "0"])
@@ -13047,7 +13528,7 @@ mod identity_parity_tests {
             let module = tmp.path().join("apply-marker.ts");
             let source = format!(
                 "import {{ execFileSync }} from \"node:child_process\";\n\
-                 import {{ existsSync, readFileSync }} from \"node:fs\";\n\
+                 import {{ closeSync, existsSync, openSync, readFileSync, readSync, statSync }} from \"node:fs\";\n\
                  import {{ basename, dirname, join, resolve, sep }} from \"node:path\";\n\
                  import {{ homedir }} from \"node:os\";\n\
                  function tomlKey(text: string, key: string): string | undefined {{\n\
@@ -13064,7 +13545,7 @@ mod identity_parity_tests {
                  applyMarkerParams(url, {});\n\
                  process.stdout.write(url.search);\n",
                 super::TS_REPO_ROOT_PROJECT,
-                super::ts_apply_marker_params(default_strategy),
+                super::ts_apply_marker_params(default_strategy, true),
                 serde_json::to_string(&repo.to_string_lossy()).unwrap(),
             );
             std::fs::write(&module, source).unwrap();
@@ -13072,6 +13553,7 @@ mod identity_parity_tests {
                 .args(["--experimental-strip-types", "--no-warnings"])
                 .arg(&module)
                 .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
                 .output()
                 .unwrap();
             assert!(

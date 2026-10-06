@@ -166,7 +166,7 @@ pub(crate) fn resolve_scope(
         config,
         explicit_ws,
         explicit_proj,
-        marker_scope(config),
+        marker_scope(config)?,
         true,
     )
 }
@@ -240,7 +240,8 @@ pub(crate) fn resolve_scope_with_marker(
 }
 
 /// Resolve `(workspace, project)` for an explicit local directory without
-/// changing the process working directory or consulting wrapper cwd overrides.
+/// changing the process working directory, resolving symlinks, or consulting
+/// wrapper cwd overrides.
 ///
 /// The policy matches [`resolve_scope`]: a marker may pin either half, an
 /// unpinned project under a marker follows that marker's strategy, and a tree
@@ -249,11 +250,15 @@ pub(crate) fn resolve_scope_for_path(
     config: &Config,
     cwd: &std::path::Path,
 ) -> Result<(String, String)> {
-    let cwd = cwd
-        .canonicalize()
-        .with_context(|| format!("canonicalizing project candidate {}", cwd.display()))?;
+    if !cwd.exists() {
+        return Err(anyhow!(
+            "project candidate does not exist: {}",
+            cwd.display()
+        ));
+    }
+    let cwd = crate::marker::absolute_normalized(cwd);
     let identity = cwd.to_string_lossy().into_owned();
-    let marker = crate::marker::read_scope(&identity, &config.runtime_env);
+    let marker = crate::marker::read_scope(&identity, &config.runtime_env)?;
     let workspace = marker
         .as_ref()
         .and_then(|scope| scope.workspace.clone())
@@ -288,11 +293,11 @@ pub(crate) fn resolve_scope_for_path(
 /// deliberately absent (`embed --force` fans out across every project in the
 /// workspace). Resolving the pair there would make the command fail on the
 /// cwd-derived project name it is about to throw away.
-pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> String {
+pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> Result<String> {
     if let Some(explicit) = explicit_ws.filter(|s| !s.is_empty()) {
-        return explicit.to_string();
+        return Ok(explicit.to_string());
     }
-    match marker_scope(config) {
+    Ok(match marker_scope(config)? {
         Some((scope, _, _)) => match scope.workspace {
             Some(declared) => {
                 eprintln!(
@@ -304,14 +309,20 @@ pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> S
             None => crate::config::DEFAULT_WORKSPACE.to_string(),
         },
         None => crate::config::DEFAULT_WORKSPACE.to_string(),
-    }
+    })
 }
 
 /// The nearest scope-declaring marker plus the cwd the walk started from.
-fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String, String)> {
-    let (identity_cwd, lookup_cwd) = scope_directories(config)?;
-    let scope = crate::marker::read_scope(&lookup_cwd, &config.runtime_env)?;
-    Some((scope, identity_cwd, lookup_cwd))
+fn marker_scope(config: &Config) -> Result<Option<(crate::marker::MarkerScope, String, String)>> {
+    let Some((identity_cwd, lookup_cwd)) = scope_directories(config) else {
+        return Ok(None);
+    };
+    let Some(scope) =
+        crate::marker::read_scope_for(&lookup_cwd, &identity_cwd, &config.runtime_env)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((scope, identity_cwd, lookup_cwd)))
 }
 
 pub(crate) fn scope_directories(config: &Config) -> Option<(String, String)> {
@@ -512,6 +523,72 @@ mod tests {
     /// workspace used to resolve into `default` for every CLI command, while
     /// the lifecycle hooks — the only marker reader at the time — sent that
     /// same checkout's captures to the declared workspace.
+    #[test]
+    fn explicit_scope_wins_over_home_route_and_home_route_beats_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("outside/repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            format!(
+                "[routes.path.\"{}\"]\nroute_workspace=\"oss\"\nroute_project=\"acme-api\"\n",
+                repo.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_and_home_for_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+            ),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "acme-api".into())
+        );
+        assert_eq!(
+            resolve_scope(&config, Some("cli"), Some("explicit")).unwrap(),
+            ("cli".into(), "explicit".into())
+        );
+    }
+
+    #[test]
+    fn invalid_home_routes_refuse_unscoped_and_partial_cli_but_explicit_pair_bypasses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("outside/repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "workspace=\"wrong\"\nproject=\"wrong\"\n[routes.path.\"relative\"]\nroute_workspace=\"route\"\nroute_project=\"route\"\n",
+        )
+        .unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_and_home_for_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+            ),
+            ..Config::default()
+        };
+        assert!(resolve_scope(&config, None, None).is_err());
+        assert!(resolve_scope(&config, Some("explicit"), None).is_err());
+        assert!(resolve_scope(&config, None, Some("explicit")).is_err());
+        assert_eq!(
+            resolve_scope(&config, Some("cli"), Some("explicit")).unwrap(),
+            ("cli".into(), "explicit".into())
+        );
+        std::fs::write(home.join(".ai-memory.toml"), "x".repeat(65_537)).unwrap();
+        assert!(resolve_scope(&config, None, None).is_err());
+        assert_eq!(
+            resolve_scope(&config, Some("cli"), Some("explicit")).unwrap(),
+            ("cli".into(), "explicit".into())
+        );
+    }
+
     #[test]
     fn resolve_scope_takes_the_workspace_from_the_marker() {
         let tmp = tempfile::TempDir::new().unwrap();
