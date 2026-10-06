@@ -147,6 +147,7 @@ fn read_bounded(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use ai_memory_workstream::ManagedHarness;
 
     use super::*;
