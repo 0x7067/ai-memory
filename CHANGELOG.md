@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   present. The system prompt, budget math, clipping, and observation
   selection are unchanged — blocks were only permuted — and the input
   budget remains an approximate character estimate (no tokenizer
-  ceiling, no cache hit guaranteed). (#PRNUM)
+  ceiling, no cache hit guaranteed). (#1102)
 
 ### Fixed
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
