@@ -854,6 +854,9 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
 }
 
 async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::fs::File> {
+    let wiki_dir = state.data_dir.join("wiki");
+    ai_memory_wiki::validate_wiki_tree(&wiki_dir)
+        .map_err(|error| anyhow::anyhow!("validating wiki tree: {error}"))?;
     let staging = tempfile::tempdir()?;
     let snapshot_path = staging.path().join("memory.sqlite");
     info!(snapshot = %snapshot_path.display(), "snapshotting SQLite for backup");
@@ -870,7 +873,8 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
         tar.mode(tar::HeaderMode::Deterministic);
         tar.follow_symlinks(false);
 
-        let wiki_dir = state.data_dir.join("wiki");
+        ai_memory_wiki::validate_wiki_tree(&wiki_dir)
+            .map_err(|error| anyhow::anyhow!("validating wiki tree before archive: {error}"))?;
         if wiki_dir.is_dir() {
             tar.append_dir_all("wiki", &wiki_dir)
                 .map_err(|e| anyhow::anyhow!("archiving wiki/: {e}"))?;
@@ -947,11 +951,8 @@ async fn build_okf_bundle_file(
     proj: ai_memory_core::ProjectId,
     project_name: &str,
 ) -> anyhow::Result<tokio::fs::File> {
-    let bundle_dir = state
-        .data_dir
-        .join("wiki")
-        .join(ws.to_string())
-        .join(proj.to_string());
+    state.wiki.validate_project_tree(ws, proj)?;
+    let bundle_dir = state.wiki.project_root(ws, proj);
     if !bundle_dir.is_dir() {
         anyhow::bail!("project has no wiki directory yet");
     }
@@ -5389,6 +5390,9 @@ async fn delete_workspace_core(
         actor,
         ..Default::default()
     };
+    if let Err(error) = state.wiki.validate_workspace_tree(ws_id) {
+        return Err(internal_err(error.to_string()));
+    }
     let resolved_purge_ctx = match state
         .wiki
         .admit_purge_workspace(ws_id, Some(purge_ctx))
@@ -5826,6 +5830,14 @@ async fn true_move_project(
     // A true move targets a FRESH destination, so its dir must not already
     // exist. Wiki::move_project_workspace repeats this check under the
     // exclusive mutation guard before it renames anything.
+    state
+        .wiki
+        .validate_project_tree(src_ws, src_proj)
+        .map_err(|error| internal_err(error.to_string()))?;
+    state
+        .wiki
+        .validate_project_tree(dst_ws, src_proj)
+        .map_err(|error| internal_err(error.to_string()))?;
     let dst_dir = state.wiki.project_root(dst_ws, src_proj);
     if dst_dir.exists() {
         return Err((
@@ -6668,6 +6680,10 @@ async fn move_planned_session(
         }
     }
 
+    state
+        .wiki
+        .validate_project_tree(plan.from.0, plan.from.1)
+        .map_err(move_session_wiki_err)?;
     let cwd_warning = move_session_cwd_warning(plan.cwd.as_deref(), &plan.to_label.project);
     let file_name = format!("{sid}.md");
     let src_file = state
@@ -6712,6 +6728,10 @@ async fn move_planned_session(
     // too so the dry run predicts what the wiki re-checks under its lock. When
     // the source scope IS the destination (single-form re-home) there is no
     // file to move and the wiki skips the file step too.
+    state
+        .wiki
+        .validate_project_tree(to.0, to.1)
+        .map_err(move_session_wiki_err)?;
     let dst_file = state
         .wiki
         .project_root(to.0, to.1)
