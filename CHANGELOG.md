@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#/$defs/*` reference and drops the emptied `$defs` table; nested
   combinators (which Moonshot accepts) and runtime validation are unchanged.
   `?flavor=bedrock` and `?flavor=gemini` keep serving `$defs`/`$ref` as
-  before.
+  before. (#1093)
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
   `client_activity`: the read-only inspection tool is now classified as a read
   in `tool_call_is_write`. (#1088)
