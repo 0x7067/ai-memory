@@ -14,6 +14,7 @@
 //! (sessions/observations/handoffs) are dropped by the purge.
 
 use super::common::{post, spawn_capture_hook};
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, Sanitized,
     Sanitizer, SessionId, Tier,
@@ -318,6 +319,63 @@ async fn move_project_true_move_into_fresh_dest() {
     assert!(!src_dir.exists(), "source dir must be removed after move");
 }
 
+#[tokio::test]
+async fn move_project_merge_surfaces_destination_promotion_manifest_warning() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "src",
+        "acme-api",
+        "notes/a.md",
+        "body a",
+    )
+    .await;
+    let dst_ws = store.writer.get_or_create_workspace("dst").await.unwrap();
+    let (dst_project, _) = store
+        .writer
+        .resolve_project_by_identity(
+            dst_ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(dst_ws.to_string())
+        .join(dst_project.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "acme-api", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["merged_into_existing"], true, "{body}");
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("committed")),
+        "{body}"
+    );
+}
+
 /// Without `confirm: true` the server returns 400 and leaves the source intact.
 #[tokio::test]
 async fn move_project_requires_confirm() {
@@ -430,6 +488,28 @@ async fn move_project_same_workspace_rejected() {
         state,
         "/admin/move-project",
         json!({ "from_workspace": "w", "project": "proj", "to_workspace": "w", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// A private profile (`default/_profile.<user id>`) cannot be moved out of
+/// the default workspace: its owner finds it there, so a move would orphan it.
+/// The refusal comes before any lookup, so nothing is touched.
+#[tokio::test]
+async fn move_project_refuses_a_private_profile() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project": "_profile.00000000000000000000000000000001",
+            "to_workspace": "elsewhere",
+            "confirm": true
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);

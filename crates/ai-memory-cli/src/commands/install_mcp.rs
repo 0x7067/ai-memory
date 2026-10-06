@@ -130,6 +130,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::CommandCode => render_command_code(&args)?,
+        McpClient::CopilotCli => render_copilot_cli(&args)?,
         McpClient::Swival => render_swival(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
@@ -210,7 +211,7 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
 }
 
 /// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
-/// `CODEX_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`, and OMP's
+/// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`, and OMP's
 /// `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR`) read
 /// through `env`,
 /// so `ai-memory run --env` can point auto-wire at the same config home
@@ -251,9 +252,18 @@ pub(crate) fn mcp_config_path_with(
             }
             #[cfg(target_os = "windows")]
             {
-                let local_data_dir = dirs::data_local_dir()
+                // The variables come first, through `env`, so a relocated
+                // profile (`run --env`, a hermetic test) is honoured; the
+                // Known Folder API ignores them.
+                let known_dir = |name: &str, fallback: fn() -> Option<PathBuf>| {
+                    env(name)
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(fallback)
+                };
+                let local_data_dir = known_dir("LOCALAPPDATA", dirs::data_local_dir)
                     .context("could not locate %LOCALAPPDATA% for Claude Desktop config")?;
-                let roaming_config_dir = dirs::config_dir()
+                let roaming_config_dir = known_dir("APPDATA", dirs::config_dir)
                     .context("could not locate %APPDATA% for Claude Desktop config")?;
                 claude_desktop_config_path_in(&local_data_dir, &roaming_config_dir)?
             }
@@ -296,6 +306,11 @@ pub(crate) fn mcp_config_path_with(
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
+        // Copilot CLI keeps its whole config dir at $COPILOT_HOME when set,
+        // falling back to ~/.copilot; user-level MCP servers live in
+        // mcp-config.json there (project `.mcp.json` / `.github/mcp.json`
+        // files are left to `--config-file`).
+        McpClient::CopilotCli => copilot_home_in(env("COPILOT_HOME"))?.join("mcp-config.json"),
         McpClient::Swival => {
             let cwd = std::env::current_dir()
                 .context("could not resolve current dir for .swival/mcp.json default")?;
@@ -489,6 +504,20 @@ fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
         .join(".kiro"))
 }
 
+/// GitHub Copilot CLI's configuration directory: `$COPILOT_HOME` when set and
+/// not blank, otherwise `~/.copilot`. It holds both `mcp-config.json` and the
+/// user-level `hooks/` directory, so `install-hooks --agent copilot-cli`
+/// resolves through here too. The override is injected to keep tests
+/// process-local.
+pub(crate) fn copilot_home_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for Copilot CLI configuration")?
+        .join(".copilot"))
+}
+
 /// Resolve Grok Build CLI's user configuration root. Grok honours
 /// `GROK_HOME`; otherwise it uses `~/.grok`.
 pub(crate) fn grok_home() -> Result<PathBuf> {
@@ -639,6 +668,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::CopilotCli
         | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
@@ -1182,6 +1212,19 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
+        }
+        McpClient::CopilotCli => {
+            // Copilot CLI's `mcp-config.json` remote entry: `type: "http"` +
+            // `url`, optional `headers`, and `tools`, written as `["*"]` (all
+            // tools — Copilot's documented default and its own example).
+            // Verified against
+            // https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers.
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+            entry.insert("tools".into(), json!(["*"]));
         }
         _ => bail!("internal: build_mcp_entry called for unsupported client"),
     }
@@ -1768,6 +1811,23 @@ fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_copilot_cli(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# GitHub Copilot CLI — merge into $COPILOT_HOME/mcp-config.json\n\
+         # (default ~/.copilot/mcp-config.json), or re-run with --apply to merge\n\
+         # it in place preserving other servers. Project-level `.mcp.json` and\n\
+         # `.github/mcp.json` also work: pass that path via --config-file.\n\
+         #\n\
+         # The equivalent CLI registration is:\n\
+         #   copilot mcp add --transport http {name} {url}\n\
+         # Pair with `ai-memory install-hooks --agent copilot-cli` for capture.\n\
+         {snippet}\n",
+        name = args.name,
+        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_swival(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Swival CLI — merge into .swival/mcp.json in the project root
@@ -2314,6 +2374,7 @@ mod tests {
         for (client, var, relative) in [
             (McpClient::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude.json"),
             (McpClient::Codex, "CODEX_HOME", "config.toml"),
+            (McpClient::CopilotCli, "COPILOT_HOME", "mcp-config.json"),
             (McpClient::Grok, "GROK_HOME", "config.toml"),
             (McpClient::KimiCode, "KIMI_CODE_HOME", "mcp.json"),
             (McpClient::KiroCli, "KIRO_HOME", "settings/mcp.json"),
@@ -2326,6 +2387,26 @@ mod tests {
                 "{client:?} must follow {var}"
             );
         }
+    }
+
+    /// A relocated Windows profile (`run --env`, a hermetic backup test)
+    /// moves Claude Desktop's config with it; the Known Folder API alone
+    /// would keep pointing at the real profile.
+    #[cfg(windows)]
+    #[test]
+    fn claude_desktop_config_follows_the_supplied_appdata() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("Local");
+        let roaming = root.path().join("Roaming");
+        let env = |name: &str| match name {
+            "LOCALAPPDATA" => Some(local.clone().into_os_string()),
+            "APPDATA" => Some(roaming.clone().into_os_string()),
+            _ => None,
+        };
+        assert_eq!(
+            mcp_config_path_with(McpClient::ClaudeDesktop, &env).unwrap(),
+            roaming.join("Claude").join("claude_desktop_config.json")
+        );
     }
 
     /// OMP's MCP file lives in the same agent dir as its extensions: a named
@@ -2480,6 +2561,45 @@ mod tests {
         assert!(rendered.contains("~/.commandcode/mcp.json"));
         assert!(rendered.contains("cmd mcp add --transport http --scope user"));
         assert!(rendered.contains("`cmdc` is the native Windows executable"));
+    }
+
+    /// Copilot CLI's documented remote entry (#1040): root `mcpServers`,
+    /// `type: "http"` + `url` + `headers`, and `tools: ["*"]`.
+    #[test]
+    fn copilot_cli_renderer_uses_documented_http_schema() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::CopilotCli)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "headers": {
+                            "Authorization": "Bearer test-token-deadbeef"
+                        },
+                        "tools": ["*"]
+                    }
+                }
+            })
+        );
+        let rendered = render_copilot_cli(&args_for(McpClient::CopilotCli)).unwrap();
+        assert!(rendered.contains("mcp-config.json"));
+        assert!(rendered.contains("copilot mcp add --transport http ai-memory"));
+        assert!(rendered.contains("install-hooks --agent copilot-cli"));
+    }
+
+    #[test]
+    fn copilot_home_honours_env_override() {
+        assert_eq!(
+            copilot_home_in(Some("/tmp/custom-copilot-home".into())).unwrap(),
+            PathBuf::from("/tmp/custom-copilot-home")
+        );
+        let default = home_dir().unwrap().join(".copilot");
+        assert_eq!(copilot_home_in(Some("".into())).unwrap(), default);
+        assert_eq!(copilot_home_in(None).unwrap(), default);
     }
 
     #[test]
@@ -2735,6 +2855,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
@@ -2764,6 +2885,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::CopilotCli,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
@@ -2806,6 +2928,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::CopilotCli,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
@@ -2842,6 +2965,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
@@ -3318,6 +3442,41 @@ mod tests {
         args.server_url = Some("http://192.168.0.90:49374/mcp".into());
         let error = validate_args(&args).unwrap_err();
         assert!(error.to_string().contains("requires HTTPS"), "{error:#}");
+    }
+
+    #[test]
+    fn copilot_cli_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("mcp-config.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::CopilotCli);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(
+            value["mcpServers"]["github"]["url"],
+            "https://api.githubcopilot.com/mcp/"
+        );
+        let ours = &value["mcpServers"]["ai-memory"];
+        assert_eq!(ours["type"], "http");
+        // No default flavor: Copilot CLI fronts several model vendors.
+        assert_eq!(ours["url"], "https://memory.example/mcp");
+        assert_eq!(
+            ours["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert_eq!(ours["tools"], json!(["*"]));
     }
 
     #[test]

@@ -199,7 +199,7 @@ Every project's data lives under an isolated, UUID-keyed root on disk:
 │       ├── gotchas/
 │       ├── sessions/
 │       ├── _rules/
-│       ├── _meta.md             # project name + repo_path for rebuilds
+│       ├── _meta.md             # project name, path, optional identity keys
 │       ├── log-YYYY-MM.md      # rolling event log, one file per month
 │       └── bootstrap.md
 └── <other_workspace_id>/
@@ -351,7 +351,9 @@ What happens:
    whitespace. 422 on bad input.
 3. `UPDATE projects SET name = ? WHERE id = ?`. UNIQUE-violation on
    the `(workspace_id, name)` index → 422 with "name taken".
-4. Return `{workspace, from, to, pages}`.
+4. Refresh the UUID-keyed project's `_meta.md` and checkpoint the wiki.
+5. Return `{workspace, from, to, pages, checkpoint}` plus
+   `manifest_warning` when the post-commit refresh failed.
 
 Zero files move on disk because the disk path is keyed by
 `project_id`, not name. The web UI URL `/web/w/<ws>/<proj-name>/…`
@@ -370,6 +372,15 @@ Failure modes:
 - **`to` name already exists in this workspace** → 422.
 - **`to` invalid (empty, slash, whitespace)** → 422.
 - **Source `from` not found** → 404.
+- **Manifest refresh/checkpoint failed after commit** → 200 with
+  `manifest_warning`; the SQL rename remains committed and startup manifest
+  backfill can repair the disk metadata. The bootstrap, write-page,
+  move-project merge, move-session create, and managed-run responses surface
+  the same warning shape when their scope resolution performed the promotion.
+  The warning is retained if the promoted operation later fails: MCP puts it at
+  `error.data.manifest_warning`, while HTTP admin/managed-run errors keep the
+  top-level `manifest_warning`. Their CLI commands print it to stderr; API
+  callers receive it in JSON.
 
 ### `/admin/rename-workspace`
 
@@ -565,7 +576,10 @@ at the same path):
 Every conflict (overwrite/duplicate) is listed in the response `conflicts`
 array (`path` → `moved_to`). Set the policy via `--on-conflict` on the CLI
 or `"on_conflict": "block" | "overwrite" | "duplicate"` in the JSON body
-for direct `/admin/move-project` callers.
+for direct `/admin/move-project` callers. If resolving an existing identity-backed
+destination promotes its legacy name first, the response includes
+`manifest_warning` when that committed promotion's manifest refresh/checkpoint
+fails; the CLI prints it.
 
 **What does NOT migrate (merge case only):** in the `copy-purge` path the
 source's `sessions`, `observations`, and `handoffs` (the raw episodic
@@ -712,9 +726,11 @@ Response (`MoveSessionReport`): `session_id`, `dry_run`, `session_moved`
 sit in the destination | `none` when the session has no page anywhere),
 `cwd`, `cwd_warning`, `would_create_project` (dry run with `create` only),
 `pre_checkpoint` (only when the wiki tree had uncommitted changes before the
-move), `checkpoint` (only when the move changed the tree). The batch wraps
-them in `{dry_run, would_create_project?, from, to, total, moved, sessions:
-[...]}`.
+move), `checkpoint` (only when the move changed the tree), and
+`manifest_warning` when `--create --confirm` resolves an identity-backed legacy
+destination, commits its promotion, but cannot refresh/checkpoint `_meta.md`.
+The batch surfaces the same warning and wraps reports in `{dry_run,
+would_create_project?, from, to, total, moved, sessions: [...]}`.
 
 Failure modes:
 
@@ -1046,7 +1062,10 @@ SQLite migration lineage:
 What is rebuilt:
 
 - Workspaces and projects from `_meta.md`, preserving the UUIDs encoded in the
-  wiki directory names.
+  wiki directory names. Project manifests optionally carry the full hostful
+  repository identity and its source; the manifest also records
+  `canonical_name` and `legacy_name` as consistency assertions. Reindex validates the pair and
+  assertions, then derives the indexed compatibility keys from the identity.
 - Latest page rows, page links, and FTS from markdown files.
 
 What is not rebuilt:
@@ -1055,11 +1074,14 @@ What is not rebuilt:
   and embeddings. Those are DB-only state; keep a backup if you need them.
 
 Every scope directory carries the `_meta.md` manifest `reindex` reads its
-workspace/project name from. The manifest is written with the scope's first
-page, so a project that first appears while the server is running is
-rebuildable from that moment on — no restart required. The startup backfill
-still runs on every boot and repairs a tree written by an older release, or one
-whose manifests were removed by hand. If `reindex` reports a missing manifest,
+workspace/project name from. Identity-backed project manifests also carry
+optional typed `identity`, `identity_source`, `canonical_name`, and
+`legacy_name` fields. Older manifests without those
+fields remain valid and rebuild identity-less projects. The manifest is written
+with the scope's first page, so a project that first appears while the server is
+running is rebuildable from that moment on — no restart required. The startup
+backfill still runs on every boot and repairs a tree written by an older release,
+or one whose manifests were removed by hand. If `reindex` reports a missing manifest,
 start the server once against that data directory and let the backfill write
 it, then stop the server and reindex again.
 

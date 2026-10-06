@@ -7,15 +7,321 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added bounded install-wide identity and component-safe path routes in the exact
+  operator-home `.ai-memory.toml`. Exact hostful repository identity wins the
+  longest lexical path route, local non-home markers stay authoritative, aliases
+  reuse the existing identity-bound marker wire, and malformed or ambiguous route
+  maps fail closed across native, shell, PowerShell, generated TypeScript, and
+  OpenClaw clients. Recognizable malformed route syntax is rejected before
+  fallback, while malformed root-only settings retain legacy parsing. Generated
+  clients preserve marker versus repo-root provenance, and OpenClaw keeps local
+  git identity discovery alias-gated. The default identity style remains
+  unchanged. (#1033)
+- Added bounded local `.ai-memory.toml` `aliases = ["former-name"]` routing for
+  existing project-coordinate compatibility. Native, POSIX shell, PowerShell,
+  and generated TypeScript hook clients forward the same validated aliases for
+  capture and SessionStart handoff lookup; resolution remains workspace-local,
+  requires the checkout's matching hostful git-remote identity, preserves the
+  existing UUID, and permits only write-authorized canonical-name promotion.
+  Aliases are not persisted, and the default naming style is unchanged. (#1033)
+- Added read-only project-coordinate diagnostics to `ai-memory doctor` and the
+  root-gated `GET /admin/project-coordinate` endpoint. The report classifies
+  exact, canonical-compatibility, legacy-compatibility, missing, and ambiguous
+  names; shows safe local marker/repository evidence and rename eligibility;
+  and reports collisions without creating, claiming, renaming, or exposing
+  remote credentials or marker paths. Ambiguous results keep local session
+  evidence and mark server capture counts unavailable; any returned preferred
+  project is contextual only, never a unique resolution. (#1033)
+- Added the cross-project profile (`docs/cross-project-profile.md`, design in
+  `docs/design-cross-project-profile.md`): a small set of `profile/` pages
+  recording how the user usually works, delivered to every project and every
+  harness at session start as a fenced, byte-budgeted digest of defaults that
+  rank below the user's instructions, the repository's rules file and the
+  project's own memory. It is on by default for a single-operator server,
+  shared across every workspace, and off on a multi-user server until
+  `[profile] enabled = true`, which gives each operator a private, restricted
+  profile; `share = "global"` or `"workspace"` makes a team profile that is
+  read-open and write-gated like `_global`, admits a habit only on evidence
+  from at least two operators, and is presented as team defaults. The digest filters entries by the
+  stack the project's activity shows, stays byte-identical between sessions,
+  and gives a project with no memory yet a larger baseline. `memory_write_page`
+  and `memory_delete_page` accept `scope: "profile"`, `memory_query` returns
+  profile entries in `global_scope_hits`, a marker's `[profile] contribute` /
+  `consume` keys opt a project out of contributing or receiving (an opt-out
+  stays recorded until a marker says otherwise), and
+  `ai-memory profile status | list | show | forget | review | rebuild`
+  inspects and curates it, while `ai-memory profile apply` writes the entries
+  that fit a repository into a managed block of its rules file (`--remove`
+  takes it out), never touching anything outside the block. Entries are
+  learned on their own: a server pass, run after each session ends and
+  hourly, harvests the user's own
+  preference-shaped prompts (never tool output), the project's curated pages
+  and its stack signals, and converges them across projects into entries once
+  the user states a choice as general or it appears in `min_projects`
+  projects, the newest ruling winning. With an LLM provider the pass
+  classifies and restates entries through JSON-schema calls and falls back to
+  the zero-LLM path on any error. It never rewrites an entry edited by hand,
+  and an entry removed with `profile forget` stays removed until the user
+  states it again. (#1000)
+- Added `ai-memory resume --search` with immediate type-to-filter name search,
+  and `resume --all`, which keeps the previous cross-checkout picker: every
+  linked checkout, the current one first, each listed with its own fully
+  paginated query. (#1039)
+- Added `install-hooks --agent claude-code --scope project`, which writes the
+  hook configuration to the checkout's gitignored `.claude/settings.local.json`
+  (where Claude Code reads it: the git root, or the launch directory on
+  Windows and when the repository root is the home directory) instead of the
+  user-level `settings.json`, so capture is opted in per repository. The
+  installer warns when that file is not ignored by git, refuses the
+  inline-token fallback for it, notes when the other scope also carries
+  ai-memory hooks, and keeps its backups under the data dir instead of the
+  checkout; `uninstall` run inside the checkout sweeps it and reminds you to
+  do the same in other project-scoped checkouts; `upgrade` and the
+  `ai-memory run` auto-wire no longer add user-level Claude Code hooks on top
+  of a project-scoped install. (#1034)
+- Added explicit MCP behavior annotations (title, read-only, destructive,
+  idempotent, and open-world hints) to all 23 tools. Reordered the MCP server
+  instructions so scope selection, untrusted-memory handling, deliberate
+  cross-project broadening, capture policy, and handoff safety remain complete
+  within the first 2,048 characters used by truncating clients. The longer
+  per-tool routing reference remains available to clients that accept it.
+  (#920)
+- Added env-only named launch profiles for `ai-memory run --profile NAME` via
+  `[run.profiles.<name>.env]` in `config.toml`. Profile values feed the same
+  native-session, auto-wire, and child-process environment path as `--env`;
+  precedence is profile, then `--env-file`, then repeated `--env`. Unknown or
+  invalid profiles fail before a workstream lease or child process; an unknown
+  name lists the defined profiles or prints a table to paste. (#922; error
+  message, tests and docs from #1031 by @geeksilva97)
+- Added cross-project attribution for native lifecycle file-tool events whose
+  harness keeps reporting the parent session's cwd. A bounded, recognized
+  absolute target reroutes only when every path proves the same repository or
+  marker boundary; destination capture exclusions and server profiles are
+  resolved before the event is spooled. Relative, mixed-project, unsupported,
+  and arbitrary non-project paths keep the original route. (#932)
+- Added `serve --enable-api` / `AI_MEMORY_ENABLE_API=true` to mount the
+  authenticated read-only `/api/v1` surface without the browser UI. Existing
+  `--enable-web` behavior is unchanged and still includes the API. Documented
+  the acceptance and safety boundary for a repository-backed team-wiki sync
+  companion. (#986)
+- Added `[handoff].claim_on_session_start` (default `true` - unchanged
+  behavior). When set to `false`, `SessionStart` no longer claims a pending
+  handoff automatically; it renders a non-consuming notice naming the exact
+  `handoff_id`, `from_agent`, and age instead (mirroring the existing inbox
+  notice: metadata only, never the stored summary/open-questions/next-steps
+  text), and the agent or operator picks it up explicitly with
+  `memory_handoff_accept`. Fixes an unrelated next session, a different
+  harness, or a non-interactive launch silently consuming a baton meant for
+  a specific session. Server-wide for now; a per-project override is left for
+  a follow-up change. (#1030)
+- Added a default-quit prompt after a successful interactive managed run so the
+  operator can re-run the current harness or switch to another installed
+  harness in the same workstream. Utility, failed, interrupted,
+  non-interactive, and custom-`--executable` runs keep their existing exit
+  behavior. Resolves #909. (#975)
+- Added `ai-memory backup-agents` and dry-run-by-default
+  `ai-memory restore-agents` commands for host agent configurations, skills,
+  plugins, and project instructions. Archives are written atomically with
+  private Unix permissions, MCP config text is sanitized by default, and
+  restore bounds archive input, verifies manifest checksums and completeness,
+  refuses duplicate or symlink-escaping targets, and keeps overwritten files
+  as timestamped backups. Other asset types are copied verbatim and may contain
+  secrets or active instructions/code. (#962)
+- Added a NixOS module (`nix/nixos-module.nix`, exposed as
+  `nixosModules.default`) with a dedicated non-login system user and a hardened
+  NixOS systemd sandbox. A minimal typed set plus `freeformType` renders
+  declarative `config.toml`; values land in a world-readable store path, so
+  secrets (including `llm_headers`) use `ageSecret`, `sopsSecret`, or
+  `environmentFile`. Non-loopback binds require a secret source. The module
+  includes opt-in web, firewall, and resource settings plus eval and privileged
+  container checks. Flake packages are exported for x86_64 Linux, aarch64
+  Linux, and Apple Silicon macOS; Intel macOS remains available through the
+  release tarball and Homebrew rather than the pinned Nixpkgs revision. (#989)
+- Added `ai-memory doctor` reporting for Claude Code's default native
+  `memory/` store for the current repository: location, file count, and whether
+  the nearest marker's `ignore_paths` would exclude a read. Repository-root
+  resolution keeps worktrees and subdirectories on the same report, and the
+  output warns that shell/PowerShell compatibility hooks do not enforce the
+  exclusion. Resolves #1003. (#1005)
+- Added per-event outcomes to `/hook/batch` acknowledgements and process-lifetime
+  ingest counters for stored events, replays, recovery, ignored endings,
+  collisions and failures. Legacy acknowledgement fields were preserved. (#1015)
+- Added receipt outcomes and delivery counts to the companion relay. Opening a
+  schema 1 queue now upgrades it atomically to schema 2; older relay binaries
+  refuse schema 2, so downgrade requires a pre-upgrade backup with all queue
+  users stopped. Pending order and existing delivery metadata were preserved.
+  Receipts now retain their first known outcome. (#1015)
+- Added `ai-memory list-projects [--workspace] [--json]`: a plain, scriptable
+  listing of every workspace/project pair the server knows about, sorted by
+  workspace then project. Previously the only way to see this from outside
+  an interactive `show` session was to call `GET /api/v1/projects` directly.
+  (#1022)
+- Added scope and policy preflight to `ai-memory hook --check-capture`, including
+  event eligibility, sanitized routing hints and server-remapping information.
+  Partial scope, excluded events, rejected profiles and oversized hints refuse
+  capture. Inspection neither ingests events nor claims handoffs. (#1019)
+- Added the latest scoped consolidation job's state and attempt count to HTTP
+  session summaries and MCP `memory_read_session_observations`. The field is
+  `null` when no job exists; provider errors remain private and existing session
+  ownership filters are preserved. (#1018)
+- Added incremental paging to scoped HTTP `recent` reads with `updated_since`
+  and an opaque, scope-bound cursor. Queries preserve equal-time ordering,
+  exclude expired and superseded pages and recheck authorization on each
+  request. Calls without incremental arguments retain their existing array
+  response. Added a generic MCP/HTTP integration guide. (#1017)
+- Added machine-authenticated `GET /identity`, available with the web UI
+  disabled, and `ai-memory doctor` diagnostics for caller identity, external
+  capture ownership and sessions with multiple capture sources (native events
+  or distinct extensions, including backfill).
+  Mixed-source counts preserve scope, session ownership and time-window filters;
+  older servers leave unsupported fields unknown. (#1016)
+- Added shared capture privacy checks to the relay and the conversation importer,
+  run before an event is hashed, persisted, previewed or delivered: they refuse
+  credential-shaped native identities, scrub nested credentials while keeping
+  numeric token counts, and drop locally a relay item queued before them that
+  fails them, so it no longer holds its session. (#1072)
+- Added `[handoff].create_on_session_end` (default `true` - unchanged
+  behavior). When set to `false`, unmanaged session ends write the session
+  summary page and enqueue consolidation as usual, but skip creating an
+  automatic open handoff for the next session; OpenCode turn checkpoints
+  refresh the page without a baton too. Explicit handoffs created via
+  `memory_handoff_begin` and managed workstream runs remain unaffected.
+  Server-wide: applies to every operator on this server. (#1043)
+- Added bounded, sanitized native-record and adapter correlation provenance to
+  managed-workstream search/tail results and the CLI's text/JSON output, with
+  compatible optional fields and sanitization of legacy provenance on reads. (#1057)
+- Added Portuguese history phrases to the existing opt-in session-recall
+  router (`[retrieval] query_intent`), including accented and unaccented spellings of
+  "última sessão", "onde paramos ontem", and "decisão anterior". Word
+  boundaries and explicit history phrases keep technical session queries
+  unchanged; routing remains off by default. (#1056)
+- Added shared, typed and bounded `entities`, `abstract`, and `relations`
+  metadata to MCP `memory_write_page` and admin `/admin/write-page`, plus bounded
+  MCP `kind` while preserving the admin's legacy `kind` adapter. Kept existing
+  request shapes, entity normalization, authenticated attribution and the wiki
+  write pipeline. Documented whole-page replacement, raw-input metadata bounds
+  and trimmed relation scope components. (#1055)
+- Added structured results for the existing auto-improvement eval execution in
+  review reports, staged run metadata, and accepted proposal sidecars, with
+  server-generated eval IDs, evaluated request/body digests, checker invocation
+  identity, observed success/rejection/failure/timeout, and sanitized bounded
+  reasons. Report deserialization discarded supplied eval observations. (#1053)
+- Added `grizzybot` as a recognised agent (wire value `grizzybot`, alias
+  `grizzy-bot`), so GrizzyBot's lifecycle events are attributed to it instead
+  of `other` and its tool calls are captured as closed-schema tool families,
+  like other Claude Code-shaped agents. GrizzyBot posts to `/hook` and
+  `/mcp` itself, so there is nothing to install. Adds migration V72 to extend
+  the `sessions.agent_kind` CHECK constraint. (#1036)
+- Added GitHub Copilot CLI as a hooked agent: `install-hooks --agent
+  copilot-cli` writes `$COPILOT_HOME/hooks/ai-memory.json` (default
+  `~/.copilot/hooks/ai-memory.json`) with Copilot's flat, matcher-less entries
+  and PascalCase event names, so Copilot sends its VS Code/Claude-compatible
+  payload. Ten events — Claude Code's nine plus `PostToolUseFailure` — with
+  native commands enforcing capture exclusions; tool output is read from
+  `tool_result.text_result_for_llm` and the outcome from
+  `tool_result.result_type`. The `SessionStart` hook delivers the prior
+  session's handoff through Copilot's top-level `additionalContext` (ported
+  from #1069). There is deliberately no `--scope project`. The bare
+  `install-mcp --client copilot` alias keeps meaning VS Code Copilot;
+  `ai-memory run copilot` follows separately. (#1040)
+- Added `install-mcp --client copilot-cli`, which merges ai-memory's remote
+  entry (`type: "http"`, `url`, bearer `headers`, `tools: ["*"]`) into the root
+  `mcpServers` map of `$COPILOT_HOME/mcp-config.json` (default
+  `~/.copilot/mcp-config.json`), preserving other servers. `install-hooks
+  --agent copilot-cli` without `--server-url` now reads the server URL and
+  bearer back from that entry, and `uninstall` removes it. (#1040)
+- Added an optional `session_id` to `memory_write_page`, so an agent can
+  write a session's page with its own model and keep it traceable to the
+  session. The session must belong to the project the page is written to, and
+  the page records it as session evidence. A page that cites a session does
+  not overwrite a pinned page. Writing `sessions/<id>.md` also stamps the
+  frontmatter `memory_consolidate` writes there (`session_id`, `agent`,
+  `consolidated`, plus `consolidated_by: agent`), defaults the tier to
+  `episodic`, applies the same duplicate-title suffix, and marks the session's
+  queued SessionEnd consolidation job completed. (#1038)
+- Added `identity_style = "path" | "host_path"` marker control for remote-backed
+  project naming. `path` names from the full repository path without the host
+  (`github.com/acme/api` → `acme-api`); `host_path` preserves the former naming
+  behavior as an explicit opt-out. Captures always route by the full hostful
+  identity, and cross-forge path collisions never merge. (#1033)
+- Added `[hook_spool] max_attempts` and
+  `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` to configure failed drain passes before
+  dropping an event; zero disables attempt-based drops while age and spool
+  size limits remain. (#1092)
+
 ### Changed
+- Changed static CLI/MCP project-name resolution to accept an existing
+  repository's canonical hostless path name and its v2 basename compatibility
+  key. Reads remain find-only; an authorized write through the canonical key
+  promotes only `projects.name` in place, preserving the project UUID and all
+  dependent rows. Project scope manifests preserve the optional full hostful
+  identity/source and derived keys so clean reindex reconstructs the same UUID
+  and lookup behavior; older manifests remain valid. MCP, admin, and
+  managed-workstream writes refresh the manifest after promotion and disclose a
+  post-commit refresh failure for startup repair on both success and any later
+  operation error, retaining the first warning across busy retries and lease
+  wait-out; managed-run caller validation happens before promotion.
+  Ambiguous cross-forge keys and target-name conflicts fail closed. Current
+  clients now explicitly send `path` for a valid remote and send explicit
+  `host_path` for the opt-out; a new server deliberately interprets an omitted
+  field as legacy `host_path` so old clients cannot be silently renamed. Existing compatible projects are
+  promoted only by authorized capture/write and keep their UUID; read-only
+  handoff/static lookups never rename. (#1033)
+- Changed the documented precedence between rules and memory: the user's
+  instructions, then the repository's rules file, then the project's memory,
+  then the cross-project profile. Where no hard rule exists, agents now use
+  what memory already knows instead of asking again; the routing snippet,
+  MCP instructions and durable-pages skill send standing cross-project
+  preferences to the profile (`scope: "profile"`). (#1000)
+- Scoped `ai-memory resume` to the current checkout by default instead of every
+  linked project (`--all` restores the old view) and removed its default result
+  cutoff with bounded server pagination, preserving Left/Right harness
+  selection. Explicit limits now apply after the initial search; against an
+  older server that ignores paging, the picker warns and shows the first page.
+  `continue` retained its cross-directory behavior. (#1039)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
+- `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
+  filtered PRs and pushes (package smoke + NixOS module eval /
+  sandbox-parity). The `aarch64-darwin` package smoke and the privileged
+  NixOS container smoke run only on schedule, `workflow_dispatch`, or a PR
+  labelled `nix` / `full-ci`. (#989)
+- Restricted managed-workstream provenance to scrubbed source labels and an
+  explicit scalar metadata allowlist, with 512-byte string bounds. Client event
+  ids beginning with `managed-run:` are reserved for server checkpoints and
+  extraction-loss annotations. Active-run retries reject changes to an existing
+  event's agent, native session or kind, and retain its first indexed content
+  and provenance across sanitizer changes. (#1057)
+- The SessionEnd consolidation worker leaves a session page alone when the
+  agent wrote it through `memory_write_page` and no observation arrived after
+  it: the page records the session's observation count as
+  `observation_generation`, and the worker completes a job whose generation
+  that count reaches instead of replacing the page with the server's
+  provider. A page written before the session's last observation is
+  consolidated as before. (#1038)
+- Required managed-run finish imports and finished retries, and the cancel,
+  heartbeat, native-session link and context-acceptance routes, to pass an
+  authenticated owner check and current project access checks (repeated in
+  finish's writer transaction), so another operator cannot release or rebind a
+  run. Database users required current Write access; trusted
+  proxy operators retained their existing project policy. Active API keys
+  remained valid after human login was disabled. Shared, unattributed runs and
+  late finishes of still-active runs retained their existing behavior. (#1075)
+- Required new managed native-session bindings and imports to preserve the
+  exact original identity within 512 UTF-8 bytes and pass privacy validation
+  before use or persistence. Invalid historical identities were projected as
+  unknown (`native_session_id: ""`) in workstream search without rewriting
+  stored history; the CLI also protected reads from older servers. (#1079)
 
 ### Fixed
 - Fixed wiki link extraction treating `file:` and `vbscript:` as project
   qualifiers, so `[[file:notes/x.md]]` indexed a cross-project edge to project
   `file`. Both prefixes now match the `/web` scheme denylist and are not wiki
   links. (#1110)
+- Fixed hook `title_hint` extraction leaving a trailing CR on Windows CRLF
+  payloads and keeping embedded newlines on SessionStart, Notification, and
+  PostCompaction titles. First-line splitting now uses `str::lines`. (#1111)
 - Fixed wiki confinement walks failing on Windows with `PermissionDenied`
   (sharing violation) or `ERROR_DELETE_PENDING` when a concurrent commit or
   the atomic writer held or rename-replaced a file mid-walk; per-entry walk
@@ -50,38 +356,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Confined wiki reads, writes, indexing, recovery, and lifecycle cleanup to real
   project-tree directories by refusing symbolic links and filesystem reparse
   points at namespace roots or descendants. (#1107)
-- Fixed `memory_handoff_list` MCP tool calls being counted under writes in
-  `client_activity`: the read-only inspection tool is now classified as a read
-  in `tool_call_is_write`. (#1088)
-- Fixed a store write sent while the writer was shutting down occasionally
-  waiting forever instead of failing with `WriterClosed`: the writer now
-  closes its queue and drains in-flight commands before it stops.
-- Fixed `resume` and `workstreams` running `git status` on every linked checkout
-  before listing anything: listing now reads only the checkout's stable
-  fingerprints, so a large working tree or a slow filesystem-monitor hook no
-  longer blocks the picker before its first frame. (#1039)
-- Fixed the generated OpenCode 2 plugin ending every tracked session when
-  OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
-  host and its sessions stay alive, so each eviction froze a live session
-  (`SessionStart` cannot reopen an ended OpenCode session), fabricated a
-  spurious summary page and open handoff, and made the next baton fetch fail
-  with `invalid state: an ended session cannot accept a handoff`. Plugin
-  unload no longer posts `session-end`; deletion (`session.deleted`) remains
-  the end signal and a completed root turn already publishes its continuation
-  checkpoint and baton. Regenerate the plugin with
-  `ai-memory install-hooks --agent opencode2 --apply`. (#1074)
-- Fixed watcher reindexing racing with writes and batches to the same page by
-  sharing their per-page mutex from disk read through SQLite upsert. Both
-  mutation guards are released before embedding; external editors remain
-  outside this coordination. (#1059)
-- Fixed a managed Claude Code run losing its conversation after `/resume` on a
-  Claude Code background session. The run used to finish on the foreground
-  session it started with, which held none of the conversation, so the next
-  `ai-memory run claude` or `continue` resumed it and Claude opened an empty
-  session. A Claude run now finishes on the background session its own
-  session attached to in this checkout, found from that transcript's
-  `sessionKind: "bg"` records; another launch's background session is never
-  taken. (#1050)
+- Fixed a later hook event carrying a managed-run id linking its native session
+  to that run without the checks SessionStart applies. It now links only from
+  the run's own project and operator; an event from elsewhere is still captured
+  but no longer repoints the run. (#1082)
+- Fixed completed retries and no-op session endings advancing
+  `last_persisted_ms` without a durable write. Recovery still advances the
+  timestamp when it commits a new page or terminal effect. (#1015)
 - Fixed interrupted launchers blocking an immediate managed-workstream restart
   by adding explicit `ai-memory run --force-unlock` recovery. The server
   atomically expires and replaces only a lease attributed to the same
@@ -143,6 +424,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+- Concurrent relay queue opens no longer report a locked queue as foreign:
+  journal setup now retries SQLite BUSY/LOCKED within one 10-second budget,
+  rechecking the queue's identity and schema version before each attempt.
+  (#1060)
+- Fixed watcher reindexing racing with writes and batches to the same page by
+  sharing their per-page mutex from disk read through SQLite upsert. Both
+  mutation guards are released before embedding; external editors remain
+  outside this coordination. (#1059)
+- Fixed a managed Claude Code run losing its conversation after `/resume` on a
+  Claude Code background session. The run used to finish on the foreground
+  session it started with, which held none of the conversation, so the next
+  `ai-memory run claude` or `continue` resumed it and Claude opened an empty
+  session. A Claude run now finishes on the background session its own
+  session attached to in this checkout, found from that transcript's
+  `sessionKind: "bg"` records; another launch's background session is never
+  taken. (#1050)
 - Fixed `continue`, `resume` and bare `ai-memory run` losing sessions launched
   under a custom native store, such as a second Claude Code config home set
   with `CLAUDE_CONFIG_DIR`. Automatic harness selection now scans the store the
@@ -176,6 +473,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subagent under its parent's session id, so a subagent's events no longer
   mark that session as a subagent: the parent's Stop, SessionEnd, summary and
   handoff are kept. (#1041, #1048)
+- Fixed the generated OpenCode 2 plugin ending every tracked session when
+  OpenCode unloads it on idle-location eviction. Unload is not shutdown: the
+  host and its sessions stay alive, so each eviction froze a live session
+  (`SessionStart` cannot reopen an ended OpenCode session), fabricated a
+  spurious summary page and open handoff, and made the next baton fetch fail
+  with `invalid state: an ended session cannot accept a handoff`. Plugin
+  unload no longer posts `session-end`; deletion (`session.deleted`) remains
+  the end signal and a completed root turn already publishes its continuation
+  checkpoint and baton. Regenerate the plugin with
+  `ai-memory install-hooks --agent opencode2 --apply`. (#1074)
 - Corrected the `[auto_scope]` default in doc comments (`Config`,
   `AutoScopeSettings`, the `ActiveProjectMode` module docs, `serve`) and the
   README docs index: they still named `single` as the default or called
@@ -216,6 +523,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Documented the observed attach-hook behavior, early-exit import boundary and
   fallback validation limits.
   (#1052)
+- Fixed `resume` and `workstreams` running `git status` on every linked checkout
+  before listing anything: listing now reads only the checkout's stable
+  fingerprints, so a large working tree or a slow filesystem-monitor hook no
+  longer blocks the picker before its first frame. (#1039)
+- Fixed a store write sent while the writer was shutting down occasionally
+  waiting forever instead of failing with `WriterClosed`: the writer now
+  closes its queue and drains in-flight commands before it stops.
+- Fixed `memory_handoff_list` MCP tool calls being counted under writes in
+  `client_activity`: the read-only inspection tool is now classified as a read
+  in `tool_call_is_write`. (#1088)
 - Fixed the provider-health wrapper dropping the caller's operation id: its
   `complete_with_operation_id` and `complete_structured_raw_with_operation_id`
   fell to the trait defaults, so every retry of one logical operation got a
