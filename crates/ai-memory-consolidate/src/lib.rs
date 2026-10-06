@@ -40,7 +40,7 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS, DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS,
     DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES, DEFAULT_AUTO_IMPROVE_PENDING_PATH,
     DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR, DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS,
-    default_auto_improve_eval_targets, run_auto_improve_review,
+    default_auto_improve_eval_targets, redacted_auto_improve_summary, run_auto_improve_review,
 };
 pub use auto_improve_schedule::{
     ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
@@ -64,7 +64,7 @@ pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
     DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
     DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
-    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request,
+    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request, redacted_error_summary,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,

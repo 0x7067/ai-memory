@@ -845,7 +845,11 @@ async fn run_session_consolidation_worker(
                 };
                 let terminal = retry_at.is_none();
                 if let Err(store_error) = writer
-                    .fail_session_consolidation(job, error.to_string(), retry_at)
+                    .fail_session_consolidation(
+                        job,
+                        ai_memory_consolidate::redacted_error_summary(&error),
+                        retry_at,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -856,7 +860,7 @@ async fn run_session_consolidation_worker(
                     );
                 } else if terminal {
                     tracing::error!(
-                        %error,
+                        error_summary = %ai_memory_consolidate::redacted_error_summary(&error),
                         session = %session_id,
                         generation,
                         attempts,
@@ -864,7 +868,7 @@ async fn run_session_consolidation_worker(
                     );
                 } else {
                     tracing::warn!(
-                        %error,
+                        error_summary = %ai_memory_consolidate::redacted_error_summary(&error),
                         session = %session_id,
                         generation,
                         attempts,
@@ -3777,6 +3781,53 @@ mod tests {
         }
     }
 
+    /// A provider that answers HTTP 400 with a private body; the persisted
+    /// `last_error` must stay a redacted class/status summary.
+    struct Provider400ConsolidationLlm;
+
+    impl LlmProvider for Provider400ConsolidationLlm {
+        fn name(&self) -> &'static str {
+            "provider-400-consolidation"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Err(ai_memory_llm::LlmError::Provider {
+                    status: 400,
+                    body: "SENTINEL_PRIVATE_BODY".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Err(ai_memory_llm::LlmError::Provider {
+                    status: 400,
+                    body: "SENTINEL_PRIVATE_BODY".into(),
+                })
+            })
+        }
+    }
+
     /// #678: the pointer is process memory, so `systemctl restart` mid-session
     /// drops it. An unscoped read then resolved through the baked default scope
     /// and reported zero counts for a project holding thousands of observations,
@@ -4056,6 +4107,140 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "completed work must not be claimed again"
+        );
+    }
+
+    // Mutation captured: persisting the error's `Display` writes the private
+    // provider body into the queue row; the worker must persist only the
+    // redacted class/status summary, and a failed first attempt keeps the
+    // queue's scheduled retry instead of flipping terminal.
+    #[tokio::test]
+    async fn session_end_worker_persists_redacted_summary_not_provider_body() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "end the session".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
+            Arc::new(Provider400ConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        // Read the queue row through a read-only connection (WAL readers do
+        // not block the writer): the row exists from enqueue, is `running`
+        // while claimed, and settles with a `last_error` once the failure
+        // lands.
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (state, last_error, next_attempt_at) = loop {
+            let row = db
+                .query_row(
+                    "SELECT state, last_error, next_attempt_at \
+                     FROM session_consolidation_jobs WHERE session_id = ?1",
+                    rusqlite::params![session_id.as_bytes()],
+                    |r| {
+                        Ok::<(String, Option<String>, Option<i64>), _>((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                        ))
+                    },
+                )
+                .ok();
+            if let Some(row) = &row
+                && &row.0 != "running"
+                && row.1.is_some()
+            {
+                break row.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failure row never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        cancel.cancel();
+        task.await.unwrap();
+
+        assert_eq!(
+            last_error.as_deref(),
+            Some("consolidation failed: class=provider status=400"),
+            "only the redacted class/status summary may be persisted"
+        );
+        let last_error = last_error.expect("checked above");
+        assert!(
+            !last_error.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the queue row: {last_error}"
+        );
+        assert_eq!(
+            state, "pending",
+            "a failed first attempt must keep the queue's retry"
+        );
+        assert!(
+            next_attempt_at.is_some(),
+            "the retryable failure must keep a scheduled retry"
         );
     }
 
