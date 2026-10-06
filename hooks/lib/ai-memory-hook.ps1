@@ -249,7 +249,7 @@ function ConvertTo-AiMemoryRoutePath {
                 $relativeDepth++
             }
         }
-        $value = $HomePath.TrimEnd([char[]]@('/', '\')) + "/" + $value.Substring(2)
+        $value = $HomePath.Replace('\', '/').TrimEnd([char[]]@('/')) + "/" + $value.Substring(2)
     }
     $root = $null
     $rest = $null
@@ -284,6 +284,35 @@ function ConvertTo-AiMemoryRoutePath {
     return [pscustomobject]@{ Key=$key; Depth=$stack.Count }
 }
 
+function Add-AiMemoryHomeRouteEntry {
+    param([object] $Entry, [object] $Entries, [hashtable] $PathSeen, [string] $HomePath)
+    if ($null -eq $Entry) { return $true }
+    $workspace = $Entry.Fields["route_workspace"]
+    $project = $Entry.Fields["route_project"]
+    $style = $Entry.Fields["route_identity_style"]
+    if (-not $workspace -or -not $project -or [Text.Encoding]::UTF8.GetByteCount($workspace) -gt 512 -or [Text.Encoding]::UTF8.GetByteCount($project) -gt 512 -or $workspace -cnotmatch '^[a-z0-9][a-z0-9._-]*$' -or $project -cnotmatch '^[a-z0-9][a-z0-9._-]*$') { return $false }
+    if ($style -and @("path", "host_path") -cnotcontains $style) { return $false }
+    $aliases = if ($Entry.Fields.ContainsKey("route_aliases")) { ConvertTo-AiMemoryRouteAliases $Entry.Fields["route_aliases"] } else { $null }
+    if ($aliases -eq "invalid") { return $false }
+    if ($Entry.Kind -eq "identity") {
+        $hostName = $Entry.Selector.Split('/')[0]
+        if ($Entry.Selector -cne $Entry.Selector.ToLowerInvariant() -or $Entry.Selector -cnotmatch '^[a-z0-9.-]+(/[a-z0-9._-]+)+$' -or $hostName.StartsWith('.') -or $hostName.EndsWith('.')) { return $false }
+    }
+    if ($Entry.Kind -eq "path") {
+        $normalized = ConvertTo-AiMemoryRoutePath -Raw $Entry.Selector -HomePath $HomePath
+        if ($null -eq $normalized -or $PathSeen.ContainsKey($normalized.Key)) { return $false }
+        $PathSeen[$normalized.Key] = $true
+        $Entry | Add-Member -NotePropertyName NormalizedPath -NotePropertyValue $normalized.Key -Force
+        $Entry | Add-Member -NotePropertyName PathDepth -NotePropertyValue $normalized.Depth -Force
+    }
+    $Entry | Add-Member -NotePropertyName Workspace -NotePropertyValue $workspace -Force
+    $Entry | Add-Member -NotePropertyName Project -NotePropertyValue $project -Force
+    $Entry | Add-Member -NotePropertyName Style -NotePropertyValue $style -Force
+    $Entry | Add-Member -NotePropertyName Aliases -NotePropertyValue $aliases -Force
+    $null = $Entries.Add($Entry)
+    return $true
+}
+
 function Get-AiMemoryHomeRoute {
     param([string] $File, [string] $Cwd, [string] $Identity)
     if (-not (Test-Path $File -PathType Leaf)) { return $null }
@@ -308,38 +337,12 @@ function Get-AiMemoryHomeRoute {
         $rawSeen = @{}
         $pathSeen = @{}
         $current = $null
-        $finish = {
-            if ($null -eq $current) { return $true }
-            $workspace = $current.Fields["route_workspace"]
-            $project = $current.Fields["route_project"]
-            $style = $current.Fields["route_identity_style"]
-            if (-not $workspace -or -not $project -or [Text.Encoding]::UTF8.GetByteCount($workspace) -gt 512 -or [Text.Encoding]::UTF8.GetByteCount($project) -gt 512 -or $workspace -cnotmatch '^[a-z0-9][a-z0-9._-]*$' -or $project -cnotmatch '^[a-z0-9][a-z0-9._-]*$') { return $false }
-            if ($style -and @("path", "host_path") -cnotcontains $style) { return $false }
-            $aliases = if ($current.Fields.ContainsKey("route_aliases")) { ConvertTo-AiMemoryRouteAliases $current.Fields["route_aliases"] } else { $null }
-            if ($aliases -eq "invalid") { return $false }
-                if ($current.Kind -eq "identity") {
-                $hostName = $current.Selector.Split('/')[0]
-                if ($current.Selector -cne $current.Selector.ToLowerInvariant() -or $current.Selector -cnotmatch '^[a-z0-9.-]+(/[a-z0-9._-]+)+$' -or $hostName.StartsWith('.') -or $hostName.EndsWith('.')) { return $false }
-            }
-            if ($current.Kind -eq "path") {
-                $normalized = ConvertTo-AiMemoryRoutePath -Raw $current.Selector -HomePath (Get-AiMemoryUserHome)
-                if ($null -eq $normalized -or $pathSeen.ContainsKey($normalized.Key)) { return $false }
-                $pathSeen[$normalized.Key] = $true
-                $current | Add-Member -NotePropertyName NormalizedPath -NotePropertyValue $normalized.Key -Force
-                $current | Add-Member -NotePropertyName PathDepth -NotePropertyValue $normalized.Depth -Force
-            }
-            $current | Add-Member -NotePropertyName Workspace -NotePropertyValue $workspace -Force
-            $current | Add-Member -NotePropertyName Project -NotePropertyValue $project -Force
-            $current | Add-Member -NotePropertyName Style -NotePropertyValue $style -Force
-            $current | Add-Member -NotePropertyName Aliases -NotePropertyValue $aliases -Force
-            $entries.Add($current)
-            return $true
-        }
+        $userHome = Get-AiMemoryUserHome
         foreach ($line in ($text -split "`r?`n")) {
             $trimmed = $line.Trim()
             $header = [regex]::Match($trimmed, '^\[routes\.(identity|path)\."([^"\\]+)"\]$')
             if ($header.Success) {
-                if (-not (& $finish)) { return "invalid" }
+                if (-not (Add-AiMemoryHomeRouteEntry -Entry $current -Entries $entries -PathSeen $pathSeen -HomePath $userHome)) { return "invalid" }
                 $selector = $header.Groups[2].Value
                 if ($entries.Count -ge 64 -or [Text.Encoding]::UTF8.GetByteCount($selector) -gt 512 -or $rawSeen.ContainsKey($selector)) { return "invalid" }
                 $rawSeen[$selector] = $true
@@ -348,7 +351,7 @@ function Get-AiMemoryHomeRoute {
             }
             if ($trimmed.StartsWith("[routes") -or $trimmed.StartsWith("routes.") -or $trimmed -match '^routes\s*=' -or ($trimmed.StartsWith("route_") -and $null -eq $current)) { return "invalid" }
             if ($trimmed.StartsWith("[")) {
-                if (-not (& $finish)) { return "invalid" }
+                if (-not (Add-AiMemoryHomeRouteEntry -Entry $current -Entries $entries -PathSeen $pathSeen -HomePath $userHome)) { return "invalid" }
                 $current = $null
                 continue
             }
@@ -371,17 +374,20 @@ function Get-AiMemoryHomeRoute {
                 $current.Fields[$name] = $value.Groups[1].Value
             }
         }
-        if (-not (& $finish)) { return "invalid" }
+        if (-not (Add-AiMemoryHomeRouteEntry -Entry $current -Entries $entries -PathSeen $pathSeen -HomePath $userHome)) { return "invalid" }
         $exact = @($entries | Where-Object { $_.Kind -eq "identity" -and $_.Selector -ceq $Identity })
         if ($exact.Count -eq 1) { return $exact[0] }
         $target = ConvertTo-AiMemoryRoutePath -Raw $Cwd -HomePath (Get-AiMemoryUserHome) -Bounded $false
         if ($null -eq $target) { return "invalid" }
-        $routeMatches = @($entries | Where-Object {
-            if ($_.Kind -ne "path") { return $false }
-            $_ | Add-Member -NotePropertyName MatchLength -NotePropertyValue $_.PathDepth -Force
-            return $target.Key -eq $_.NormalizedPath -or $target.Key.StartsWith($_.NormalizedPath + "/", [StringComparison]::Ordinal)
-        } | Sort-Object MatchLength -Descending)
-        if ($routeMatches.Count) { return $routeMatches[0] }
+        $routeMatches = [Collections.Generic.List[object]]::new()
+        foreach ($entry in $entries) {
+            if ($entry.Kind -ne "path") { continue }
+            if ($target.Key -eq $entry.NormalizedPath -or $target.Key.StartsWith($entry.NormalizedPath + "/", [StringComparison]::Ordinal)) {
+                $entry | Add-Member -NotePropertyName MatchLength -NotePropertyValue $entry.PathDepth -Force
+                $null = $routeMatches.Add($entry)
+            }
+        }
+        if ($routeMatches.Count) { return @($routeMatches | Sort-Object MatchLength -Descending)[0] }
     } catch {
         return "invalid"
     }
