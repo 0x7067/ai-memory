@@ -1233,6 +1233,34 @@ mod tests {
     }
 
     #[test]
+    fn heading_with_raw_html_and_quotes_escapes_markup_and_keeps_id_slug_safe() {
+        let md = "## <img src=x onerror=alert(1)> \"q\"";
+        let html = render(md, "default", "scratch");
+        assert!(
+            !html.contains("<img"),
+            "raw heading HTML must not survive as markup: {html}"
+        );
+        // Smart punctuation renders the quotes as “q”; the HTML payload must
+        // stay escaped text inside the heading.
+        assert!(
+            html.contains(r#"<h2 id="q">&lt;img src=x onerror=alert(1)&gt; “q”</h2>"#),
+            "the heading must render escaped text with a slug id: {html}"
+        );
+        let id = html
+            .split("id=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("no heading id emitted: {html}"));
+        assert!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+            "heading id must match ^[a-z0-9_-]+$, got: {id}"
+        );
+    }
+
+    #[test]
     fn wikilink_anchor_matches_generated_heading_id() {
         let md = "Jump to [[notes/foo#my-section|My Section]]\n\n## My Section";
         let html = render(md, "default", "scratch");

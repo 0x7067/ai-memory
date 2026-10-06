@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the web page view omitting heading IDs, preventing `#anchor` fragments
   and section wikilinks from scrolling to target headings. The Markdown renderer
   now emits unique, slugified `id` attributes on heading elements (`<h1>`–`<h6>`),
-  disambiguating duplicate headings and stripping punctuation.
+  disambiguating duplicate headings and stripping punctuation. (#1105)
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
   `client_activity`: the read-only inspection tool is now classified as a read
   in `tool_call_is_write`. (#1088)
