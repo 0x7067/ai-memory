@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Confined wiki reads, writes, indexing, recovery, and lifecycle cleanup to real
   project-tree directories by refusing symbolic links and filesystem reparse
-  points at namespace roots or descendants. (#NNN)
+  points at namespace roots or descendants. (#1107)
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
   `client_activity`: the read-only inspection tool is now classified as a read
   in `tool_call_is_write`. (#1088)
