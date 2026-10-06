@@ -381,24 +381,12 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
             }) => {
                 let mut text = String::new();
                 let mut inner_events = Vec::new();
-                let mut ended = false;
+                let mut end_level = None;
 
                 for next_event in self.iter.by_ref() {
                     match next_event {
-                        Event::End(TagEnd::Heading(end_level)) => {
-                            let id_str = match id {
-                                Some(custom) => self.slugger.deduplicate(custom.as_ref()),
-                                None => self.slugger.slugify(&text),
-                            };
-                            self.queue.push_back(Event::Start(Tag::Heading {
-                                level,
-                                id: Some(CowStr::Boxed(id_str.into_boxed_str())),
-                                classes,
-                                attrs,
-                            }));
-                            self.queue.extend(inner_events);
-                            self.queue.push_back(Event::End(TagEnd::Heading(end_level)));
-                            ended = true;
+                        Event::End(TagEnd::Heading(lvl)) => {
+                            end_level = Some(lvl);
                             break;
                         }
                         Event::Text(s) => {
@@ -423,18 +411,19 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
                     }
                 }
 
-                if !ended {
-                    let id_str = match id {
-                        Some(custom) => self.slugger.deduplicate(custom.as_ref()),
-                        None => self.slugger.slugify(&text),
-                    };
-                    self.queue.push_back(Event::Start(Tag::Heading {
-                        level,
-                        id: Some(CowStr::Boxed(id_str.into_boxed_str())),
-                        classes,
-                        attrs,
-                    }));
-                    self.queue.extend(inner_events);
+                let id_str = match id {
+                    Some(custom) => self.slugger.deduplicate(custom.as_ref()),
+                    None => self.slugger.slugify(&text),
+                };
+                self.queue.push_back(Event::Start(Tag::Heading {
+                    level,
+                    id: Some(CowStr::Boxed(id_str.into_boxed_str())),
+                    classes,
+                    attrs,
+                }));
+                self.queue.extend(inner_events);
+                if let Some(lvl) = end_level {
+                    self.queue.push_back(Event::End(TagEnd::Heading(lvl)));
                 }
 
                 self.queue.pop_front()
