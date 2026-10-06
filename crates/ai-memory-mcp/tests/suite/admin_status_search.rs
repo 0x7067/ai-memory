@@ -344,7 +344,7 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
             "private/repository-path-sentinel.md",
             "private-page-body-sentinel",
         ] {
-            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}"); // lgtm [rust/cleartext-logging]
         }
     }
     assert_eq!(snapshot(), before, "diagnostic calls must not mutate SQL");
@@ -398,7 +398,7 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
     ] {
         assert!(
             !ambiguous_rendered.contains(secret),
-            "leaked {secret}: {ambiguous_rendered}"
+            "leaked {secret}: {ambiguous_rendered}" // lgtm [rust/cleartext-logging]
         );
     }
     assert_eq!(
