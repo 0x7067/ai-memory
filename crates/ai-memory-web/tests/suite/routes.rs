@@ -233,17 +233,17 @@ async fn page_view_keeps_a_leading_h1_that_is_not_the_title() {
     let text = get("/w/default/scratch/p/decisions/auth.md").await;
     assert!(text.contains("Auth decisions"), "expected the title");
     assert!(
-        text.contains("<h1>Token refresh after sleep</h1>"),
+        text.contains(r#"<h1 id="token-refresh-after-sleep">Token refresh after sleep</h1>"#),
         "an H1 unlike the title was dropped: {text}"
     );
     let text = get("/w/default/scratch/p/notes/setext.md").await;
     assert!(
-        text.contains("<h1>Cache warmup</h1>"),
+        text.contains(r#"<h1 id="cache-warmup">Cache warmup</h1>"#),
         "a setext H1 unlike the title was dropped: {text}"
     );
     let text = get("/w/default/scratch/p/notes/same.md").await;
     assert!(
-        !text.contains("<h1>Same title</h1>"),
+        !text.contains("Same title</h1>"),
         "an H1 that repeats the title should not render twice: {text}"
     );
 }
