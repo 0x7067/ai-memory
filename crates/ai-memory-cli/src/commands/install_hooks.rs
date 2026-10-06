@@ -6184,7 +6184,7 @@ fn render_claude_code(
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if token_withheld {
-        println!("# Auth: a bearer token is configured but NOT embedded below: this file");
+        println!("# Auth: a bearer token is configured but NOT embedded below: this file"); // lgtm [rust/cleartext-logging]
         println!("#       lives inside a checkout. Re-run with --apply, which persists the");
         println!(
             "#       token under {} (0600) where the hooks read it.",

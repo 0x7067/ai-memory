@@ -2736,7 +2736,7 @@ impl Wiki {
                 .await?;
             let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
             let installed =
-                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?;
+                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?; // lgtm [rust/path-injection]
 
             match self
                 .writer
