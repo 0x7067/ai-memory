@@ -52,6 +52,25 @@ function Get-AiMemoryUserHome {
     return $trimmed
 }
 
+function Test-AiMemoryMarkerDeclaresSettings {
+    param([string] $File)
+    if (-not (Test-Path $File -PathType Leaf)) { return $false }
+    try {
+        $text = [IO.File]::ReadAllText($File)
+    } catch {
+        return $false
+    }
+    foreach ($key in @("workspace", "project", "project_strategy", "drop_subagent_captures", "identity", "identity_style")) {
+        if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
+    }
+    if ([regex]::IsMatch($text, '(?m)^\s*aliases\s*=')) { return $true }
+    if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
+    foreach ($key in @("default_global", "inject_on_session_start", "max_chars", "contribute", "consume")) {
+        if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
+    }
+    return $false
+}
+
 function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
@@ -82,7 +101,10 @@ function Get-AiMemoryMarkerToml {
     }
     while ($dir -and (Test-Path $dir)) {
         $candidate = Join-Path $dir ".ai-memory.toml"
-        if (Test-Path $candidate -PathType Leaf) { return $candidate }
+        if (Test-Path $candidate -PathType Leaf) {
+            if ($userHome -and $dir -eq $userHome) { return $candidate }
+            if (Test-AiMemoryMarkerDeclaresSettings -File $candidate) { return $candidate }
+        }
         if ($boundary -and $dir -eq $boundary) { return $null }
         $parent = Split-Path $dir -Parent
         if (-not $parent -or $parent -eq $dir) { return $null }
@@ -141,6 +163,237 @@ function Get-AiMemoryTomlKey {
 # `[briefing] inject_on_session_start = true` work quoted or not. Parity
 # with `parse_toml_flag` in hook_capture.rs: line-based, first match wins,
 # trailing `# comment` stripped.
+function Get-AiMemoryTomlAliases {
+    param([string] $File)
+    if (-not (Test-Path $File -PathType Leaf)) { return $null }
+    try {
+        $text = [IO.File]::ReadAllText($File)
+        $lines = $text -split "`r?`n"
+        $inTable = $false
+        $declarations = [Collections.Generic.List[string]]::new()
+        foreach ($line in $lines) {
+            $trimmed = $line.Trim()
+            if ($trimmed.StartsWith("[")) { $inTable = $true }
+            if ($trimmed -match '^aliases\s*=') {
+                if ($inTable) { return "invalid" }
+                $declarations.Add($trimmed)
+            }
+        }
+        if ($declarations.Count -eq 0) { return $null }
+        if ($declarations.Count -ne 1) { return "invalid" }
+        $match = [regex]::Match($declarations[0], '^aliases\s*=\s*\[([^\]]*)\]\s*$')
+        if (-not $match.Success) { return "invalid" }
+        $aliases = [Collections.Generic.List[string]]::new()
+        if (-not $match.Groups[1].Value.Trim()) { return $null }
+        $parts = $match.Groups[1].Value.Split(',')
+        if ($parts.Count -gt 16) { return "invalid" }
+        foreach ($part in $parts) {
+            if ($part.Contains("\")) { return "invalid" }
+            $item = [regex]::Match($part, '^\s*"([^"]*)"\s*$')
+            if (-not $item.Success) { return "invalid" }
+            $value = $item.Groups[1].Value.Trim()
+            if (-not $value -or $value.Length -gt 128 -or $value -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { return "invalid" }
+            if (-not $aliases.Contains($value)) {
+                $aliases.Add($value)
+            }
+        }
+        return [string](ConvertTo-Json -InputObject @($aliases) -Compress)
+    } catch {
+        return "invalid"
+    }
+}
+
+function Get-AiMemoryRemoteIdentity {
+    param([string] $Cwd)
+    if (-not $Cwd -or -not (Get-Command git -ErrorAction SilentlyContinue)) { return $null }
+    foreach ($name in @("upstream", "origin")) {
+        $url = (& git -C $Cwd config --get "remote.$name.url" 2>$null)
+        if (-not $url) { continue }
+        $value = ConvertTo-AiMemoryRepositoryIdentity -Url ([string]$url)
+        if ($value) { return $value }
+    }
+    return $null
+}
+
+function ConvertTo-AiMemoryRouteAliases {
+    param([string] $Raw)
+    if (-not $Raw) { return $null }
+    $match = [regex]::Match($Raw, '^\s*\[([^\]]*)\]\s*$')
+    if (-not $match.Success) { return "invalid" }
+    if (-not $match.Groups[1].Value.Trim()) { return $null }
+    $parts = $match.Groups[1].Value.Split(',')
+    if ($parts.Count -gt 16) { return "invalid" }
+    $aliases = [Collections.Generic.List[string]]::new()
+    foreach ($part in $parts) {
+        $item = [regex]::Match($part, '^\s*"([^"\\]*)"\s*$')
+        if (-not $item.Success) { return "invalid" }
+        $value = $item.Groups[1].Value.Trim()
+        if (-not $value -or $value.Length -gt 128 -or $value -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { return "invalid" }
+        if (-not $aliases.Contains($value)) { $aliases.Add($value) }
+    }
+    return [string](ConvertTo-Json -InputObject @($aliases) -Compress)
+}
+
+function ConvertTo-AiMemoryRoutePath {
+    param([string] $Raw, [string] $HomePath, [bool] $Bounded = $true)
+    if (-not $Raw -or ($Bounded -and [Text.Encoding]::UTF8.GetByteCount($Raw) -gt 512)) { return $null }
+    $value = $Raw.Replace('\', '/')
+    if ($value.StartsWith("~/")) {
+        $relativeDepth = 0
+        foreach ($part in $value.Substring(2).Split('/')) {
+            if (-not $part -or $part -eq ".") { continue }
+            if ($part -eq "..") {
+                if ($relativeDepth -eq 0) { return $null }
+                $relativeDepth--
+            } else {
+                $relativeDepth++
+            }
+        }
+        $value = $HomePath.Replace('\', '/').TrimEnd([char[]]@('/')) + "/" + $value.Substring(2)
+    }
+    $root = $null
+    $rest = $null
+    $windows = $false
+    if ($value.StartsWith("//")) {
+        $parts = @($value.Substring(2).Split('/') | Where-Object { $_ })
+        if ($parts.Count -lt 2) { return $null }
+        $root = "unc:" + $parts[0].ToLowerInvariant() + "/" + $parts[1].ToLowerInvariant()
+        $rest = @($parts | Select-Object -Skip 2)
+        $windows = $true
+    } elseif ($value -cmatch '^[A-Za-z]:/') {
+        $root = "drive:" + $value.Substring(0, 1).ToLowerInvariant()
+        $rest = @($value.Substring(3).Split('/') | Where-Object { $_ })
+        $windows = $true
+    } elseif ($value.StartsWith("/")) {
+        $root = "posix"
+        $rest = @($value.Substring(1).Split('/') | Where-Object { $_ })
+    } else {
+        return $null
+    }
+    $stack = [Collections.Generic.List[string]]::new()
+    foreach ($part in $rest) {
+        if ($part -eq ".") { continue }
+        if ($part -eq "..") {
+            if ($stack.Count) { $stack.RemoveAt($stack.Count - 1) }
+        } else {
+            $stack.Add($(if ($windows) { $part.ToLowerInvariant() } else { $part }))
+        }
+    }
+    if (-not $stack.Count) { return $null }
+    $key = $root + "/" + ($stack -join "/")
+    return [pscustomobject]@{ Key=$key; Depth=$stack.Count }
+}
+
+function Add-AiMemoryHomeRouteEntry {
+    param([object] $Entry, [object] $Entries, [hashtable] $PathSeen, [string] $HomePath)
+    if ($null -eq $Entry) { return $true }
+    $workspace = $Entry.Fields["route_workspace"]
+    $project = $Entry.Fields["route_project"]
+    $style = $Entry.Fields["route_identity_style"]
+    if (-not $workspace -or -not $project -or [Text.Encoding]::UTF8.GetByteCount($workspace) -gt 512 -or [Text.Encoding]::UTF8.GetByteCount($project) -gt 512 -or $workspace -cnotmatch '^[a-z0-9][a-z0-9._-]*$' -or $project -cnotmatch '^[a-z0-9][a-z0-9._-]*$') { return $false }
+    if ($style -and @("path", "host_path") -cnotcontains $style) { return $false }
+    $aliases = if ($Entry.Fields.ContainsKey("route_aliases")) { ConvertTo-AiMemoryRouteAliases $Entry.Fields["route_aliases"] } else { $null }
+    if ($aliases -eq "invalid") { return $false }
+    if ($Entry.Kind -eq "identity") {
+        $hostName = $Entry.Selector.Split('/')[0]
+        if ($Entry.Selector -cne $Entry.Selector.ToLowerInvariant() -or $Entry.Selector -cnotmatch '^[a-z0-9.-]+(/[a-z0-9._-]+)+$' -or $hostName.StartsWith('.') -or $hostName.EndsWith('.')) { return $false }
+    }
+    if ($Entry.Kind -eq "path") {
+        $normalized = ConvertTo-AiMemoryRoutePath -Raw $Entry.Selector -HomePath $HomePath
+        if ($null -eq $normalized -or $PathSeen.ContainsKey($normalized.Key)) { return $false }
+        $PathSeen[$normalized.Key] = $true
+        $Entry | Add-Member -NotePropertyName NormalizedPath -NotePropertyValue $normalized.Key -Force
+        $Entry | Add-Member -NotePropertyName PathDepth -NotePropertyValue $normalized.Depth -Force
+    }
+    $Entry | Add-Member -NotePropertyName Workspace -NotePropertyValue $workspace -Force
+    $Entry | Add-Member -NotePropertyName Project -NotePropertyValue $project -Force
+    $Entry | Add-Member -NotePropertyName Style -NotePropertyValue $style -Force
+    $Entry | Add-Member -NotePropertyName Aliases -NotePropertyValue $aliases -Force
+    $null = $Entries.Add($Entry)
+    return $true
+}
+
+function Get-AiMemoryHomeRoute {
+    param([string] $File, [string] $Cwd, [string] $Identity)
+    if (-not (Test-Path $File -PathType Leaf)) { return $null }
+    try {
+        $stream = [IO.File]::OpenRead($File)
+        try {
+            if ($stream.Length -gt 65536) { return "invalid" }
+            $bytes = New-Object byte[] ([int]$stream.Length)
+            $offset = 0
+            while ($offset -lt $bytes.Length) {
+                $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+                if ($read -eq 0) { break }
+                $offset += $read
+            }
+            if ($offset -ne $bytes.Length) { return "invalid" }
+            $text = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes)
+        } finally {
+            $stream.Dispose()
+        }
+        if (-not [regex]::IsMatch($text, '(?m)^\s*(?:\[routes|routes\s*=|routes\.|route_)')) { return $null }
+        $entries = [Collections.Generic.List[object]]::new()
+        $rawSeen = @{}
+        $pathSeen = @{}
+        $current = $null
+        $userHome = Get-AiMemoryUserHome
+        foreach ($line in ($text -split "`r?`n")) {
+            $trimmed = $line.Trim()
+            $header = [regex]::Match($trimmed, '^\[routes\.(identity|path)\."([^"\\]+)"\]$')
+            if ($header.Success) {
+                if (-not (Add-AiMemoryHomeRouteEntry -Entry $current -Entries $entries -PathSeen $pathSeen -HomePath $userHome)) { return "invalid" }
+                $selector = $header.Groups[2].Value
+                if ($entries.Count -ge 64 -or [Text.Encoding]::UTF8.GetByteCount($selector) -gt 512 -or $rawSeen.ContainsKey($selector)) { return "invalid" }
+                $rawSeen[$selector] = $true
+                $current = [pscustomobject]@{ Kind=$header.Groups[1].Value; Selector=$selector; Fields=@{} }
+                continue
+            }
+            if ($trimmed.StartsWith("[routes") -or $trimmed.StartsWith("routes.") -or $trimmed -match '^routes\s*=' -or ($trimmed.StartsWith("route_") -and $null -eq $current)) { return "invalid" }
+            if ($trimmed.StartsWith("[")) {
+                if (-not (Add-AiMemoryHomeRouteEntry -Entry $current -Entries $entries -PathSeen $pathSeen -HomePath $userHome)) { return "invalid" }
+                $current = $null
+                continue
+            }
+            if ($null -eq $current) {
+                if ($trimmed -match '^(workspace|project|project_strategy|drop_subagent_captures|identity|identity_style|server)\s*=' -and $trimmed -notmatch '^[A-Za-z0-9_]+\s*=\s*"[^"]*"$') { return "invalid" }
+                continue
+            }
+            if (-not $trimmed -or $trimmed.StartsWith("#")) { continue }
+            $field = [regex]::Match($trimmed, '^(route_workspace|route_project|route_identity_style|route_aliases)\s*=\s*(.*)$')
+            if (-not $field.Success -or $current.Fields.ContainsKey($field.Groups[1].Value)) { return "invalid" }
+            $name = $field.Groups[1].Value
+            $raw = $field.Groups[2].Value
+            if ($raw.Contains("\")) { return "invalid" }
+            if ($name -eq "route_aliases") {
+                if ([Text.Encoding]::UTF8.GetByteCount($raw) -gt 512 -or $raw -notmatch '^\[[^\]]*\]$') { return "invalid" }
+                $current.Fields[$name] = $raw
+            } else {
+                $value = [regex]::Match($raw, '^"([^"\\]+)"$')
+                if (-not $value.Success -or [Text.Encoding]::UTF8.GetByteCount($value.Groups[1].Value) -gt 512) { return "invalid" }
+                $current.Fields[$name] = $value.Groups[1].Value
+            }
+        }
+        if (-not (Add-AiMemoryHomeRouteEntry -Entry $current -Entries $entries -PathSeen $pathSeen -HomePath $userHome)) { return "invalid" }
+        $exact = @($entries | Where-Object { $_.Kind -eq "identity" -and $_.Selector -ceq $Identity })
+        if ($exact.Count -eq 1) { return $exact[0] }
+        $target = ConvertTo-AiMemoryRoutePath -Raw $Cwd -HomePath (Get-AiMemoryUserHome) -Bounded $false
+        if ($null -eq $target) { return "invalid" }
+        $routeMatches = [Collections.Generic.List[object]]::new()
+        foreach ($entry in $entries) {
+            if ($entry.Kind -ne "path") { continue }
+            if ($target.Key -eq $entry.NormalizedPath -or $target.Key.StartsWith($entry.NormalizedPath + "/", [StringComparison]::Ordinal)) {
+                $entry | Add-Member -NotePropertyName MatchLength -NotePropertyValue $entry.PathDepth -Force
+                $null = $routeMatches.Add($entry)
+            }
+        }
+        if ($routeMatches.Count) { return @($routeMatches | Sort-Object MatchLength -Descending)[0] }
+    } catch {
+        return "invalid"
+    }
+    return $null
+}
+
 function Get-AiMemoryTomlFlag {
     param([string] $File, [string] $Key)
     if (-not (Test-Path $File -PathType Leaf)) { return $null }
@@ -149,6 +402,15 @@ function Get-AiMemoryTomlFlag {
         if ($m.Success) { return $m.Groups[1].Value.Trim() }
     }
     return $null
+}
+
+# A resolved marker's `[profile]` flag as the explicit value the hook sends:
+# "0" for a falsy value, "1" for anything else, an absent key included.
+# Parity with `profile_flag_value` in hook_capture.rs.
+function ConvertTo-AiMemoryProfileFlag {
+    param([string] $Value)
+    if ($Value -and (@("0", "false", "no", "off") -contains $Value.Trim().ToLowerInvariant())) { return "0" }
+    return "1"
 }
 
 function Test-AiMemoryTruthy {
@@ -275,17 +537,28 @@ function ConvertTo-AiMemoryRepositoryIdentity {
     return $id
 }
 
+# Send a style with every valid git-remote identity. Explicit marker/home-route
+# values win; omission or invalid input sends `path`. A server receiving a truly
+# omitted field keeps legacy `host_path` behavior for old clients.
+function Get-AiMemoryIdentityStyleQuery {
+    param([string] $Style)
+    if ($Style -and $Style.Trim() -ceq "host_path") { return "&identity_style=host_path" }
+    return "&identity_style=path"
+}
+
 # `&identity=<v>&identity_src=<rung>` for the checkout at $Cwd, or "".
 # Mirrors `repository_identity` in hook_capture.rs: an explicit marker
 # `identity` is sent; a declared `project` outranks the remote and routes by
 # name, so git is not consulted; otherwise the `upstream` remote, else `origin`.
+# $Style (the marker's `identity_style`) is forwarded only with a remote
+# identity.
 function Get-AiMemoryIdentityQuery {
-    param([string] $Cwd, [string] $Explicit, [string] $Project)
-    if ($Explicit -and $Explicit.Trim()) {
+    param([string] $Cwd, [string] $Explicit, [string] $Project, [string] $Style, [string] $Aliases)
+    if (-not $Aliases -and $Explicit -and $Explicit.Trim()) {
         $value = $Explicit.Trim().ToLowerInvariant()
         return "&identity=$([uri]::EscapeDataString($value))&identity_src=explicit"
     }
-    if ($Project -and $Project.Trim()) { return "" }
+    if (-not $Aliases -and $Project -and $Project.Trim()) { return "" }
     if (-not $Cwd) { return "" }
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return "" }
     foreach ($name in @("upstream", "origin")) {
@@ -293,7 +566,7 @@ function Get-AiMemoryIdentityQuery {
         if (-not $url) { continue }
         $value = ConvertTo-AiMemoryRepositoryIdentity -Url ([string]$url)
         if ($value) {
-            return "&identity=$([uri]::EscapeDataString($value))&identity_src=git_remote"
+            return "&identity=$([uri]::EscapeDataString($value))&identity_src=git_remote" + (Get-AiMemoryIdentityStyleQuery -Style $Style)
         }
     }
     return ""
@@ -307,26 +580,64 @@ function Get-AiMemoryMarkerQuery {
     $proj = $null
     $strategy = $null
     $dropSubagent = $null
+    $defaultGlobal = $null
     # Provenance of $proj, forwarded as `project_src` so the server can tell a
     # deliberate marker rescope from a host-derived repo-root name. Only the
     # latter may yield to session-sticky attribution (#394).
     $projSrc = $null
     $explicitIdentity = $null
+    $identityStyle = $null
+    $profileContribute = $null
+    $profileConsume = $null
+    $aliases = $null
+    $identityQuery = ""
+    $homeRouted = $false
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
+    $homeMarker = if (Get-AiMemoryUserHome) { Join-Path (Get-AiMemoryUserHome) ".ai-memory.toml" } else { $null }
+    if (-not $marker -or $marker -eq $homeMarker) {
+        $routeIdentity = Get-AiMemoryRemoteIdentity -Cwd $Cwd
+        $route = Get-AiMemoryHomeRoute -File $homeMarker -Cwd $Cwd -Identity $routeIdentity
+        if ($route -eq "invalid") { return $null }
+        if ($route) {
+            $ws = $route.Workspace
+            $proj = $route.Project
+            $projSrc = "marker"
+            $homeRouted = $true
+            $identityStyle = $route.Style
+            $aliases = $route.Aliases
+            if ($routeIdentity) {
+                $identityQuery = "&identity=$([uri]::EscapeDataString($routeIdentity))&identity_src=git_remote" + (Get-AiMemoryIdentityStyleQuery -Style $identityStyle)
+            }
+            $marker = $homeMarker
+        }
+    }
     if ($marker) {
-        $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
-        $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
-        $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
+        if (-not $homeRouted) {
+            $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
+            $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
+            $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
+            $explicitIdentity = Get-AiMemoryTomlKey -File $marker -Key "identity"
+            $identityStyle = Get-AiMemoryTomlKey -File $marker -Key "identity_style"
+            $aliases = Get-AiMemoryTomlAliases -File $marker
+        }
         $dropSubagent = Get-AiMemoryTomlKey -File $marker -Key "drop_subagent_captures"
-        $explicitIdentity = Get-AiMemoryTomlKey -File $marker -Key "identity"
+        $defaultGlobal = Get-AiMemoryTomlFlag -File $marker -Key "default_global"
+        # `[profile] contribute` / `consume`, quoted or bare; the server
+        # decides truthiness and keeps both on unless explicitly falsy.
+        # Always explicit once a marker resolved (0 when falsy, else 1): removing
+        # the key re-enables; no marker sends nothing and the server keeps
+        # what it stored.
+        $profileContribute = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "contribute")
+        $profileConsume = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "consume")
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
     # the identity chain's declared-project rung means a name in the marker.
-    $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj
+    if (-not $identityQuery) { $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj -Style $identityStyle -Aliases $aliases }
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
-    # pinned one. A marker's explicit project / project_strategy still win.
+    # pins one. Explicit project/identity and home routing win; otherwise a
+    # valid remote identity wins and repo-root is the remote-less fallback.
     if (-not $strategy -and $env:AI_MEMORY_PROJECT_STRATEGY) {
         $strategy = $env:AI_MEMORY_PROJECT_STRATEGY
     }
@@ -341,9 +652,16 @@ function Get-AiMemoryMarkerQuery {
     if ($projSrc) { $qs += "&project_src=$([uri]::EscapeDataString($projSrc))" }
     if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
     $qs += $identityQuery
+    if ($aliases) {
+        if (-not $proj -or -not $identityQuery.Contains("identity_src=git_remote")) { $aliases = if ($homeRouted) { $null } else { "invalid" } }
+        if ($aliases) { $qs += "&aliases=$([uri]::EscapeDataString($aliases))" }
+    }
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     if ($dropSubagent) { $qs += "&drop_subagent=$([uri]::EscapeDataString($dropSubagent))" }
+    if ($defaultGlobal) { $qs += "&default_global=$([uri]::EscapeDataString($defaultGlobal))" }
+    if ($profileContribute) { $qs += "&profile_contribute=$([uri]::EscapeDataString($profileContribute))" }
+    if ($profileConsume) { $qs += "&profile_consume=$([uri]::EscapeDataString($profileConsume))" }
     return $qs
 }
 
@@ -462,6 +780,10 @@ function Invoke-AiMemoryHook {
         [Parameter(Mandatory = $true)] [string] $Event,
         [Parameter(Mandatory = $true)] [string] $Agent,
         [switch] $FetchHandoff,
+        # Copilot CLI requires SessionStart output as a top-level
+        # `{ "additionalContext": ... }` envelope rather than Claude Code's
+        # nested hookSpecificOutput shape.
+        [switch] $CopilotCliSessionStartOutput,
         [switch] $AntigravityPreInvocationOutput,
         # Deliver the `[briefing]` compiled project brief on the FIRST
         # handoff fetch of a session only (kimi-code's user-prompt path:
@@ -494,6 +816,10 @@ function Invoke-AiMemoryHook {
         return
     }
     $QS = Get-AiMemoryMarkerQuery -Cwd $Cwd
+    if ($Cwd -and $null -eq $QS) {
+        if ($AntigravityPreInvocationOutput -or $GrokPostTool) { [Console]::Out.Write("{}") }
+        return
+    }
     if ($env:AI_MEMORY_RUN_ID) {
         $QS += "&managed_run=$([Uri]::EscapeDataString($env:AI_MEMORY_RUN_ID))"
     }
@@ -576,7 +902,21 @@ function Invoke-AiMemoryHook {
         # supplies one; otherwise use a stable hash of agent+cwd.
         $BriefQS = ""
         $BriefFile = $null
+        $ProfileFile = $null
+        $ProfileQS = ""
         if ($BriefingOncePerSession) {
+            # The cross-project profile digest rides the first prompt only,
+            # like the brief, but is not tied to the [briefing] opt-in.
+            $ProfileKey = [string]$NativeSessionId
+            if (-not $ProfileKey) {
+                $ProfileSha = [System.Security.Cryptography.SHA256]::Create()
+                $ProfileBytes = $ProfileSha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$Agent`n$Cwd"))
+                $ProfileKey = (($ProfileBytes | ForEach-Object { $_.ToString("x2") }) -join "")
+            }
+            $ProfileFile = Get-AiMemoryBriefedFile -Key "profile-$ProfileKey"
+            if (Test-Path $ProfileFile -PathType Leaf) {
+                $ProfileQS = "&profile_digest=0"
+            }
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
             if ($BriefQS) {
                 $BriefKey = [string]$NativeSessionId
@@ -603,7 +943,7 @@ function Invoke-AiMemoryHook {
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
                 if ($GrokPostTool) {
@@ -614,6 +954,9 @@ function Invoke-AiMemoryHook {
                         }
                     }
                     [Console]::Out.Write(($Wrapped | ConvertTo-Json -Depth 5 -Compress))
+                } elseif ($CopilotCliSessionStartOutput) {
+                    $Payload = @{ additionalContext = $Response.Content }
+                    [Console]::Out.Write(($Payload | ConvertTo-Json -Depth 5 -Compress))
                 } elseif ($AntigravityPreInvocationOutput) {
                     $Payload = @{
                         injectSteps = @(@{ ephemeralMessage = $Response.Content })
@@ -622,11 +965,11 @@ function Invoke-AiMemoryHook {
                 } else {
                     [Console]::Out.Write($Response.Content)
                 }
-            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool) {
+            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
                 [Console]::Out.Write("{}")
             }
         } catch {
-            if ($AntigravityPreInvocationOutput -or $GrokPostTool) {
+            if ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
                 [Console]::Out.Write("{}")
             }
         }
@@ -639,6 +982,9 @@ function Invoke-AiMemoryHook {
         # anyway, and the one lost brief returns on the next session).
         if ($BriefFile) {
             Set-AiMemoryBriefed -Path $BriefFile
+        }
+        if ($ProfileFile) {
+            Set-AiMemoryBriefed -Path $ProfileFile
         }
     } elseif ($AntigravityPreInvocationOutput) {
         [Console]::Out.Write("{}")
