@@ -313,6 +313,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before use or persistence. Invalid historical identities were projected as
   unknown (`native_session_id: ""`) in workstream search without rewriting
   stored history; the CLI also protected reads from older servers. (#1079)
+- Ordered the default single-page and batch consolidation prompts for
+  prefix-cache reuse: in the user content, the fixed batch text (header +
+  field schema) and the project instructions now lead, followed by the
+  current body / slot and title state, with the session id and the
+  observation dump last. In the single-page prompt the current body is
+  the session's own page body, so the prefix shared across sessions of
+  one project is the system prompt plus the instructions block when
+  present. The system prompt, budget math, clipping, and observation
+  selection are unchanged — blocks were only permuted — and the input
+  budget remains an approximate character estimate (no tokenizer
+  ceiling, no cache hit guaranteed). (#1102)
 
 ### Fixed
 - Fixed hook `title_hint` extraction leaving a trailing CR on Windows CRLF
