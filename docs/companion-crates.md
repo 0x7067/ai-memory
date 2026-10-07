@@ -79,6 +79,10 @@ the public MCP write/delete tools. It must never open the wiki directory or
 SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
 MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
 
+Slice 1 (read-only export) shipped as
+[`ai-memory-wikisync`](#ai-memory-wikisync-read-only-team-wiki-export)
+below; the remaining slices are tracked in #986.
+
 ## `ai-memory-client`: shared private capture privacy
 
 [`ai-memory-client`](../companions/ai-memory-client) supplies four privacy
@@ -229,6 +233,75 @@ Re-home by kind:
 5. Add re-home/link-rewrite as a separate subcommand after import is stable.
 6. Only after repeated usage, consider whether ai-memory core lacks a small,
    generic API seam; do not start by patching core endpoints.
+
+## `ai-memory-wikisync`: read-only team-wiki export
+
+Slice 1 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
+shape, implemented at [`companions/ai-memory-wikisync`](../companions/ai-memory-wikisync)
+as a standalone Cargo package with its own `[workspace]` (mirroring the
+importer): it is not a member of the root workspace and is not covered by
+root `cargo test --workspace`.
+
+### Goal
+
+Mirror a team's shared ai-memory pages into a project repository as
+reviewable markdown, so the wiki a team actually maintains can travel with
+the code it documents — read-only, family-scoped, and dry-run by default.
+
+### How it talks to ai-memory
+
+- `plan` (always dry-run) and `export` (dry-run unless `--apply`) against
+  the documented read-only `/api/v1` surface: incremental `recent` listing
+  with cursor paging (legacy array accepted) plus single-page reads with
+  `ETag` / `If-None-Match` revalidation. No MCP, no admin routes, no
+  writes to the server.
+- `--include FAMILY` is an explicit, repeatable allowlist of top-level
+  wiki directories; at least one is required and a bare `*` is refused.
+- Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` only;
+  tokens are never logged or persisted.
+- Writes exactly the server's canonical projection (path, title, body)
+  with no forged attribution/generated frontmatter. All local bookkeeping
+  lives in one state file under the destination
+  (`.ai-memory-wikisync/state.json`, 0600, atomically replaced after each
+  successful write batch).
+
+### Safety requirements honored
+
+- Three-way classification per page (destination file, last exported
+  state, server body): files edited locally since the last export are
+  reported with a diff summary and the whole batch is refused without
+  `--force`.
+- Never deletes anything (deletes are slice 4); never runs git, commits,
+  or pushes — it prints the commands the operator may run.
+- Destination-path safety: traversal, dotfiles, reserved Windows names,
+  non-portable characters, case-fold collisions, oversized bodies,
+  symlinked destinations/components/state directories, and unknown page
+  frontmatter are all refused; files are replaced atomically
+  (tmp + rename + fsync).
+- Page bodies are untrusted data, transported verbatim and never executed
+  or rendered.
+
+### Validation
+
+```bash
+cargo fmt --check --manifest-path companions/ai-memory-wikisync/Cargo.toml
+cargo test --manifest-path companions/ai-memory-wikisync/Cargo.toml
+cargo clippy --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targets -- -D warnings
+```
+
+Unit tests cover the path-safety matrix, the allowlist rules, state
+hash/crash behavior and local-edit refusal; integration tests run the
+full plan/export flow against a fixture axum server serving `/api/v1`
+responses (200/ETag/304/401/404 and cursor pagination).
+
+### Roadmap (#986)
+
+1. This slice — read-only export into a project repository.
+2. Conditional mutation seam (compare-and-write) in core, if independently
+   justified.
+3. Bidirectional apply through public write tools.
+4. Deletes and conflict reporting.
+5. Post-merge hook / CI integration.
 
 ## `ai-memory-macos`: menu bar wrapper
 

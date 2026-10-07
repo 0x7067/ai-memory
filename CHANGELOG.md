@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added the `ai-memory-wikisync` companion (slice 1 of the accepted #986
+  team-wiki sync plan): a standalone read-only export tool that mirrors
+  explicitly allowlisted page families from a running server's `/api/v1`
+  surface into a directory inside a project repository. `plan` is always a
+  dry-run; `export` writes only with `--apply`, stores per-page hashes and
+  ETags in a single local state file, transports the server's canonical
+  page projection verbatim without forging frontmatter, refuses files
+  edited locally since the last export (with a diff summary) unless
+  `--force` is passed, never deletes anything, and never runs git — it
+  prints the commands instead. Bidirectional sync, deletes, and conflict
+  handling remain tracked in #986. (#986)
+
 ## [2.6.0] - 2026-10-07
 
 ### Added

@@ -119,6 +119,28 @@ Once the material is saved as pages in the right scope, any project can search
 it (`memory_query`) and read a specific document in full (`memory_read_page`)
 before implementing against it.
 
+## Recipe: mirror a team wiki into the repository (team wiki sync)
+
+To keep a team's shared memory reviewable next to the code it documents, use
+the [`ai-memory-wikisync`](../companions/ai-memory-wikisync) companion
+(boundary in [`companion-crates.md`](companion-crates.md)). It exports
+explicitly allowlisted page families from the server's read-only `/api/v1`
+surface into a directory in your repo — dry-run by default:
+
+```bash
+ai-memory-wikisync plan   --server http://127.0.0.1:49374 \
+    --workspace demo --project app --dest ./wiki \
+    --include _rules --include decisions     # lists create/update/unchanged; never writes
+ai-memory-wikisync export ...same args... --apply   # writes; prints the git commands to run
+```
+
+Everything is opt-in and fail-safe: the family allowlist must be explicit
+(`*` is refused), files edited locally since the last export are reported
+with a diff summary and refused without `--force`, nothing is ever deleted
+(that is a later slice), no frontmatter is forged, and the tool never runs
+git itself. Slice 1 is read-only export; bidirectional sync, deletes and
+conflict handling are tracked in #986.
+
 ## Recipe: control what gets kept, aged, or consolidated
 
 By default nothing you have to think about: memory decays on a single gentle
