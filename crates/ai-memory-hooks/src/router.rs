@@ -4381,9 +4381,41 @@ fn checkpoint_degrades_to_synth(error: &ConsolidatorError) -> bool {
     matches!(error, ConsolidatorError::Llm(_))
 }
 
+/// Pure formatting of the checkpoint fallback warning: the label message
+/// plus the redacted class/status summary from
+/// [`redacted_error_summary`]. Computed once so the `warn!` and the
+/// returned [`CheckpointOutcome`] cannot drift apart; neither string ever
+/// carries the provider body.
+fn checkpoint_fallback_warning(
+    checkpoint_label: &str,
+    error: &ConsolidatorError,
+) -> (String, String) {
+    (
+        format!(
+            "{checkpoint_label}: LLM consolidation unavailable; falling back to rule-based checkpoint"
+        ),
+        redacted_error_summary(error),
+    )
+}
+
 struct HookCheckpoint {
     label: &'static str,
     track_page_write: bool,
+}
+
+/// What one checkpoint run did. `fallback_reason` is set exactly when the
+/// LLM consolidation failed and the checkpoint degraded to the rule-based
+/// path: it carries the same redacted summary the fallback warning logs,
+/// so callers and tests observe the degraded checkpoint without depending
+/// on log capture (a callsite's cached `Interest` is process-wide and can
+/// be silenced by sibling tests under a single-process harness).
+#[derive(Debug)]
+struct CheckpointOutcome {
+    // Read by the checkpoint tests (compiled only under `cfg(test)`); the
+    // production caller deliberately ignores a successful checkpoint's
+    // outcome, so the lint must be allowed explicitly.
+    #[allow(dead_code)]
+    fallback_reason: Option<String>,
 }
 
 /// Write a fresh `sessions/<id>.md` for the current session without
@@ -4397,8 +4429,9 @@ async fn consolidate_or_synth(
     agent_kind: AgentKind,
     checkpoint: HookCheckpoint,
     actor: ai_memory_core::ActorContext,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CheckpointOutcome> {
     let checkpoint_label = checkpoint.label;
+    let mut fallback_reason = None;
     // First deliveries already stamped their observation write. Only a retry
     // needs to distinguish a recovered page write from an unchanged checkpoint.
     let previous_page_id = if checkpoint.track_page_write {
@@ -4453,25 +4486,28 @@ async fn consolidate_or_synth(
                         );
                         e
                     });
-                return Ok(());
+                return Ok(CheckpointOutcome { fallback_reason });
             }
             // Nothing to checkpoint. The rule-based path below no-ops on the
             // same condition, so this is success, not a failure worth logging.
-            Err(ConsolidatorError::EmptySession(_)) => return Ok(()),
+            Err(ConsolidatorError::EmptySession(_)) => {
+                return Ok(CheckpointOutcome { fallback_reason });
+            }
             Err(e) if checkpoint_degrades_to_synth(&e) => {
+                let (warning, error_summary) = checkpoint_fallback_warning(checkpoint_label, &e);
                 warn!(
-                    error_summary = %redacted_error_summary(&e),
+                    error_summary = %error_summary,
                     session = %session_id,
-                    "{}: LLM consolidation unavailable; falling back to rule-based checkpoint",
-                    checkpoint_label
+                    "{warning}"
                 );
+                fallback_reason = Some(error_summary);
             }
             Err(e) => return Err(e.into()),
         }
     }
     let observations = state.reader.observations_for_session(session_id).await?;
     if is_ephemeral_session(&observations) {
-        return Ok(());
+        return Ok(CheckpointOutcome { fallback_reason });
     }
     let new_page = synthesize_session_page(
         workspace_id,
@@ -4517,7 +4553,7 @@ async fn consolidate_or_synth(
             e
         });
     debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
-    Ok(())
+    Ok(CheckpointOutcome { fallback_reason })
 }
 
 fn short_id(s: &str) -> String {
@@ -5975,51 +6011,18 @@ mod tests {
         }
     }
 
-    /// Captures everything a subscriber writes so a test can assert on it.
-    /// `set_default` is thread-local and each `#[tokio::test]` runs on its
-    /// own thread, so parallel tests do not share (or fight over) a capture.
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-    impl CapturedLog {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// Mutation captured: logging the `ConsolidatorError`'s `Display` on the
     /// fallback path copies the provider body into the hook log. Both
     /// checkpoint flavors (PreCompact and PostCompaction) run the same
     /// function, so both labels are driven against the sentinel provider.
+    /// The warning is asserted from the returned `CheckpointOutcome`
+    /// rather than a capturing subscriber: a callsite's cached `Interest`
+    /// is computed process-wide by whichever thread first executes it, and
+    /// under the single-process test harness a sibling checkpoint test can
+    /// register this `warn!` callsite with no subscriber installed,
+    /// silencing it for this test however long it polls.
     #[tokio::test]
     async fn checkpoint_fallback_log_carries_class_status_not_provider_body() {
-        let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
         let tmp = TempDir::new().unwrap();
         let mut state = make_state(&tmp).await;
         state.consolidator = Some(Arc::new(Consolidator::new(
@@ -6033,7 +6036,7 @@ mod tests {
 
         for checkpoint_label in ["pre-compact", "post-compaction"] {
             let session_id = seed_checkpoint_observation(&state, "keep-this-working-state").await;
-            consolidate_or_synth(
+            let outcome = consolidate_or_synth(
                 &state,
                 session_id,
                 state.workspace_id,
@@ -6048,6 +6051,21 @@ mod tests {
             .await
             .expect("a provider 400 must not lose the checkpoint");
 
+            // `fallback_reason` is set in the same arm that emits the
+            // fallback warning, from the same helper call, so it proves the
+            // warning fired and carries exactly what the warning logged.
+            let reason = outcome
+                .fallback_reason
+                .unwrap_or_else(|| panic!("the fallback warning must fire for {checkpoint_label}"));
+            assert_eq!(
+                reason, "consolidation failed: class=provider status=400",
+                "the {checkpoint_label} fallback warning must carry class/status only"
+            );
+            assert!(
+                !reason.contains("SENTINEL_PRIVATE_BODY"),
+                "provider body leaked into the checkpoint log: {reason}"
+            );
+
             let path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md")).unwrap();
             let page = state
                 .wiki
@@ -6059,24 +6077,6 @@ mod tests {
                 page.body
             );
         }
-
-        let logged = captured.text();
-        for checkpoint_label in ["pre-compact", "post-compaction"] {
-            assert!(
-                logged.contains(&format!(
-                    "{checkpoint_label}: LLM consolidation unavailable; falling back to rule-based checkpoint"
-                )),
-                "the fallback warning must fire for {checkpoint_label}; captured log was: {logged:?}"
-            );
-        }
-        assert!(
-            logged.contains("class=provider status=400"),
-            "the redacted class/status must stay diagnosable: {logged}"
-        );
-        assert!(
-            !logged.contains("SENTINEL_PRIVATE_BODY"),
-            "provider body leaked into the checkpoint log: {logged}"
-        );
     }
 
     /// A provider failure happens after the consolidate preflight. The
@@ -6228,6 +6228,47 @@ mod tests {
             ))),
             "an admission rejection must never be laundered through the synth path"
         );
+    }
+
+    /// The provider-facing warning must expose the class/status and drop
+    /// the provider body: both strings come from the pure helper that
+    /// feeds the `warn!`, so this covers the logged text without a
+    /// log-capture subscriber.
+    #[test]
+    fn checkpoint_fallback_warning_carries_class_status_not_provider_body() {
+        let error = ConsolidatorError::Llm(CheckpointSentinelLlm.fail());
+        let (warning, summary) = checkpoint_fallback_warning("pre-compact", &error);
+        assert_eq!(
+            warning,
+            "pre-compact: LLM consolidation unavailable; falling back to rule-based checkpoint"
+        );
+        assert_eq!(summary, "consolidation failed: class=provider status=400");
+        for text in [&warning, &summary] {
+            assert!(
+                !text.contains("SENTINEL_PRIVATE_BODY"),
+                "provider body leaked into the checkpoint fallback warning: {text}"
+            );
+        }
+    }
+
+    /// Non-LLM control: the helper is pure over every `ConsolidatorError`
+    /// variant, so a non-provider error (which the degrade predicate keeps
+    /// off this path) still renders only class/status, never the payload.
+    #[test]
+    fn checkpoint_fallback_warning_non_llm_error_reports_class_status_only() {
+        let error = ConsolidatorError::Serde("SENTINEL_PRIVATE_BODY".into());
+        let (warning, summary) = checkpoint_fallback_warning("post-compaction", &error);
+        assert_eq!(
+            warning,
+            "post-compaction: LLM consolidation unavailable; falling back to rule-based checkpoint"
+        );
+        assert_eq!(summary, "consolidation failed: class=serde status=none");
+        for text in [&warning, &summary] {
+            assert!(
+                !text.contains("SENTINEL_PRIVATE_BODY"),
+                "provider body leaked into the checkpoint fallback warning: {text}"
+            );
+        }
     }
 
     #[test]
