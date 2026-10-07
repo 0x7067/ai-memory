@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [2.6.0] - 2026-10-07
+
 ### Added
 - Added the `ai-memory-wikisync` companion (slice 1 of the accepted #986
   team-wiki sync plan): a standalone read-only export tool that mirrors
@@ -19,10 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--force` is passed, never deletes anything, and never runs git — it
   prints the commands instead. Bidirectional sync, deletes, and conflict
   handling remain tracked in #986. (#986)
-
-## [2.6.0] - 2026-10-07
-
-### Added
 - The `openai-compat` provider now sends `X-Request-Id` with every chat
   attempt, carrying the logical operation id shared by all attempts of one
   operation — including the strict-to-tolerant fallback. A gateway that
