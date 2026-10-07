@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-10-07
+
 ### Added
 - The `openai-compat` provider now sends `X-Request-Id` with every chat
   attempt, carrying the logical operation id shared by all attempts of one
@@ -8291,7 +8293,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...HEAD
+[2.6.0]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...v2.6.0
 [2.5.2]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...v2.5.0
